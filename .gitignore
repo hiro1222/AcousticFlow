@@ -1,0 +1,47 @@
+# --- ビルド成果物 ---
+# CMake や MSVC が自動生成するもの。ソースから再生成できるので追跡しない。
+/build/
+/out/
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+*.exe
+
+# --- CMake ---
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake.stamp
+
+# --- Visual Studio ---
+.vs/
+*.user
+*.suo
+
+# --- .NET / C# ---
+bin/
+obj/
+*.csproj.user
+
+# --- Unity（後で追加するプロジェクト用）---
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]serSettings/
+*.tmp
+
+# 注：CMakeが生成する .sln / .vcxproj は /build/ 配下なので上の build 除外で対象外。
+#     手書きの C# プロジェクト(.csproj)は追跡したいのでここでは除外しない。
+
+# --- Claude Code ローカル設定 ---
+.claude/settings.local.json
+
+# --- Wwise 音声バンク（巨大＋楽曲の著作権のため公開リポジトリに含めない）---
+# .bnk は Wwise プロジェクトから生成する成果物。コードではないので追跡しない。
+# 詳細は docs/CODE_GUIDE.md（ビルド&デプロイ）参照。
+UnityDemo/Assets/StreamingAssets/WwiseBanks/*.bnk
