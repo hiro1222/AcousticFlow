@@ -269,6 +269,13 @@ namespace AcousticFlow
         public static void SetEmitterListenerVolume(ulong emitterId, ulong listenerId, float volume)
             => Native.AcousticEngine_SetEmitterListenerVolume(emitterId, listenerId, volume);
 
+        // 早期反射(A): AkReflect の aux バスへ像源(位置+線形レベル)を設定。毎フレーム呼ぶ想定。
+        // auxBusName 空/null で authoring 既定バス。positions は長さ count*3、levels は長さ count。
+        public static void SetEarlyReflections(ulong emitterId, string auxBusName,
+                                               float[] positions, float[] levels, int count)
+            => Native.AcousticEngine_SetEarlyReflections(
+                   emitterId, Utf8(auxBusName), positions, levels, count);
+
         public void Dispose()
         {
             if (_handle != IntPtr.Zero)

@@ -25,6 +25,7 @@
 
 #include "Core/aabb.h"
 #include "Core/material.h"
+#include "Core/utd.h"
 #include "Core/vec3.h"
 
 namespace acoustic {
@@ -80,6 +81,23 @@ inline float scatteringMean(const AcousticMaterial& m) {
     return s / static_cast<float>(kNumBands);
 }
 
+// 【回折(Phase 4)】迂回余剰長 δ(m) から帯域別回折ゲイン(0..1)を出す。
+//   ITU-R P.526 ナイフエッジ回折損 J(ν)（ν=Fresnel-Kirchhoff パラメータ）。
+//   Maekawa より連続で標準的。影境界(δ=0)で ~6dB=0.5、低域ほど回り込む（ν 小＝損小）。
+inline void knifeEdgeGain(float delta, float outGain[kNumBands]) {
+    const float kSpeed = 343.0f;
+    const float bandFreq[kNumBands] = {125.0f, 250.0f, 500.0f, 1000.0f, 2000.0f, 4000.0f};
+    const float dd = delta > 0.0f ? delta : 0.0f;
+    for (int b = 0; b < kNumBands; ++b) {
+        const float lambda = kSpeed / bandFreq[b];
+        const float nu = 2.0f * std::sqrt(dd / lambda);  // ν = 2√(δ/λ)（影側 δ≥0）
+        const float t = nu - 0.1f;
+        float J = 6.9f + 20.0f * std::log10(std::sqrt(t * t + 1.0f) + t);  // dB 損
+        if (J < 0.0f) J = 0.0f;
+        outGain[b] = std::pow(10.0f, -J / 20.0f);
+    }
+}
+
 }  // namespace scene_detail
 
 // シーン内の1つの占有物。Phase 0 では形状=OBB 固定（geomId は BLAS 導入時に使う予約）。
@@ -117,6 +135,7 @@ public:
         inst.obb = obb;
         inst.materialId = clampMaterialId(materialId);
         instances_.push_back(inst);
+        bvhDirty_ = true;
         return static_cast<int>(instances_.size()) - 1;
     }
 
@@ -125,118 +144,332 @@ public:
     void updateInstanceTransform(int instanceId, const Obb& obb) {
         if (!validInstance(instanceId)) return;
         instances_[instanceId].obb = obb;
+        bvhDirty_ = true;
     }
 
     // インスタンスの有効/無効を切り替える。
     void setInstanceActive(int instanceId, bool active) {
         if (!validInstance(instanceId)) return;
         instances_[instanceId].active = active;
+        bvhDirty_ = true;
     }
 
     // 全インスタンスを消す（材質テーブルは保持）。毎フレーム作り直す用途。
-    void clearInstances() { instances_.clear(); }
+    void clearInstances() { instances_.clear(); bvhDirty_ = true; }
 
     // 材質もインスタンスも全消し。
-    void clearAll() { instances_.clear(); materials_.clear(); }
+    void clearAll() { instances_.clear(); materials_.clear(); bvhDirty_ = true; }
 
     // --- クエリ ---
 
-    // origin から dir 方向へ最近傍ヒットを返す。dir は内部で正規化する。
+    // origin から dir 方向へ最近傍ヒットを返す。dir は内部で正規化する。BVH-of-OBB で加速。
     SceneHit raycastClosest(const Vec3& origin, const Vec3& dir, float maxDist) const {
+        ensureBvh();
         SceneHit best;
         const Vec3 d = normalized(dir);
         float closest = maxDist;
-        for (int i = 0; i < instanceCount(); ++i) {
-            const Instance& inst = instances_[i];
-            if (!inst.active) continue;
-            float t;
-            Vec3 n;
-            if (rayIntersectsObb(origin, d, inst.obb, closest, t, n) && t < closest) {
-                closest = t;
-                best.hit = true;
-                best.t = t;
-                best.point = origin + d * t;
-                best.normal = n;
-                best.instanceId = i;
-                best.materialId = inst.materialId;
+        if (bvhNodes_.empty()) return best;
+        int stack[64];
+        int sp = 0;
+        stack[sp++] = 0;
+        while (sp > 0) {
+            const BvhNode& node = bvhNodes_[stack[--sp]];
+            float tn;
+            Vec3 nn;
+            if (!rayIntersectsAabb(origin, d, node.bounds, closest, tn, nn)) continue;
+            if (node.count > 0) {  // 葉
+                for (int k = 0; k < node.count; ++k) {
+                    const int i = bvhOrder_[node.leftFirst + k];
+                    const Instance& inst = instances_[i];
+                    float t;
+                    Vec3 n;
+                    if (rayIntersectsObb(origin, d, inst.obb, closest, t, n) && t < closest) {
+                        closest = t;
+                        best.hit = true;
+                        best.t = t;
+                        best.point = origin + d * t;
+                        best.normal = n;
+                        best.instanceId = i;
+                        best.materialId = inst.materialId;
+                    }
+                }
+            } else if (sp + 2 <= 64) {
+                stack[sp++] = node.leftFirst;
+                stack[sp++] = node.leftFirst + 1;
             }
         }
         return best;
     }
 
-    // 2点間が何かに遮られているか（二値）。1本でも当たれば遮蔽。
+    // 2点間が何かに遮られているか（二値）。1本でも当たれば遮蔽。BVH で加速。
     bool isOccluded(const Vec3& from, const Vec3& to) const {
-        for (int i = 0; i < instanceCount(); ++i) {
-            const Instance& inst = instances_[i];
-            if (!inst.active) continue;
-            if (segmentIntersectsObb(from, to, inst.obb)) return true;
+        ensureBvh();
+        if (bvhNodes_.empty()) return false;
+        int stack[64];
+        int sp = 0;
+        stack[sp++] = 0;
+        while (sp > 0) {
+            const BvhNode& node = bvhNodes_[stack[--sp]];
+            if (!segmentIntersectsAabb(from, to, node.bounds)) continue;
+            if (node.count > 0) {
+                for (int k = 0; k < node.count; ++k) {
+                    const int i = bvhOrder_[node.leftFirst + k];
+                    if (segmentIntersectsObb(from, to, instances_[i].obb)) return true;
+                }
+            } else if (sp + 2 <= 64) {
+                stack[sp++] = node.leftFirst;
+                stack[sp++] = node.leftFirst + 1;
+            }
         }
         return false;
     }
 
-    // 直線 from->to が通る壁の帯域別透過ゲイン(0..1)を outGain に書く。
+    // isOccluded と同じだが、指定インスタンスを無視する。回折中の「当の箱」を除外して
+    // 「他の障害物だけ」で P 区間の見通しを見るのに使う（掠める点→音源が当の箱の裏に
+    // 再突入して自分で自分を遮る、を防ぐ）。except<0 は isOccluded と同じ。
+    bool isOccludedExcept(const Vec3& from, const Vec3& to, int except) const {
+        ensureBvh();
+        if (bvhNodes_.empty()) return false;
+        int stack[64];
+        int sp = 0;
+        stack[sp++] = 0;
+        while (sp > 0) {
+            const BvhNode& node = bvhNodes_[stack[--sp]];
+            if (!segmentIntersectsAabb(from, to, node.bounds)) continue;
+            if (node.count > 0) {
+                for (int k = 0; k < node.count; ++k) {
+                    const int i = bvhOrder_[node.leftFirst + k];
+                    if (i == except) continue;
+                    if (segmentIntersectsObb(from, to, instances_[i].obb)) return true;
+                }
+            } else if (sp + 2 <= 64) {
+                stack[sp++] = node.leftFirst;
+                stack[sp++] = node.leftFirst + 1;
+            }
+        }
+        return false;
+    }
+
+    // 直線 from->to が通る壁の帯域別透過ゲイン(0..1)を outGain に書く。BVH で加速。
     //   壁なし → 全帯域 1.0 / 壁を通るほど（材質次第で高域が）小さくなる。
-    // 複数の壁は帯域ごとに透過率を掛け合わせる（＝役割1「材質ベースのこもり」の素）。
     void computeTransmission(const Vec3& from, const Vec3& to,
                              float outGain[kNumBands]) const {
         for (int b = 0; b < kNumBands; ++b) outGain[b] = 1.0f;
-        for (int i = 0; i < instanceCount(); ++i) {
-            const Instance& inst = instances_[i];
-            if (!inst.active) continue;
-            if (!segmentIntersectsObb(from, to, inst.obb)) continue;
-            const AcousticMaterial& m = materialOf(inst.materialId);
-            for (int b = 0; b < kNumBands; ++b) outGain[b] *= m.transmission[b];
+        ensureBvh();
+        if (bvhNodes_.empty()) return;
+        int stack[64];
+        int sp = 0;
+        stack[sp++] = 0;
+        while (sp > 0) {
+            const BvhNode& node = bvhNodes_[stack[--sp]];
+            if (!segmentIntersectsAabb(from, to, node.bounds)) continue;
+            if (node.count > 0) {
+                for (int k = 0; k < node.count; ++k) {
+                    const int i = bvhOrder_[node.leftFirst + k];
+                    const Instance& inst = instances_[i];
+                    if (!segmentIntersectsObb(from, to, inst.obb)) continue;
+                    const AcousticMaterial& m = materialOf(inst.materialId);
+                    for (int b = 0; b < kNumBands; ++b) outGain[b] *= m.transmission[b];
+                }
+            } else if (sp + 2 <= 64) {
+                stack[sp++] = node.leftFirst;
+                stack[sp++] = node.leftFirst + 1;
+            }
         }
     }
 
-    // 【回折(Phase 1.5 暫定・可視化用)】直接 from->to が遮蔽されているとき、箱(OBB)の
-    // 稜線を回る「最短迂回」の余剰経路長 δ(= 迂回長 − 直線長, m)を返し、最良の迂回点を
-    // outPoint に書く。遮蔽なし or 迂回路なしは -1（outPoint 不定）。
-    //   ※ これは本実装 Phase 4（リスナー中心エッジカタログ + UTD）で置き換える前味。
-    //     単一回折・箱のみ・稜線を数点サンプルする近似（[[dynamic-ray-architecture]]）。
-    float diffractionDetour(const Vec3& from, const Vec3& to, Vec3& outPoint) const {
-        if (!isOccluded(from, to)) return -1.0f;
+    // ── B: キューブマップ エッジカタログ（Phase 4-B, [[dynamic-ray-architecture]] 項1） ──
+    // 回折に効くシルエット稜線。UTD のウェッジ幾何込み。
+    struct DiffEdge {
+        Vec3 p0, p1;      // 稜線の端点（ワールド）
+        Vec3 edgeDir;     // 単位エッジ方向
+        Vec3 refTangent;  // 0面接線（⊥edge, 外向き。UTD用）
+        float n;          // ウェッジ指数（箱=1.5）
+        int instance;     // この稜線が属するインスタンス（遮蔽判定の自己除外用。-1=不明）
+    };
+
+    // リスナー中心にキューブマップ(6面×res²)でレイを撒き、隣接セルの深度不連続を
+    // シルエット稜線として拾ってカタログ化する。1回撒けば全音源で共有できる（リスナー係留）。
+    // res=面解像度（例16〜32）、maxDist=レイ到達距離。毎フレーム or 低レートで呼ぶ。
+    void buildEdgeCatalog(const Vec3& listener, int res, float maxDist) const {
+        edgeCatalog_.clear();
+        if (instanceCount() == 0 || res < 2) return;
+        const int F = 6, R = res;
+        std::vector<float> depth(static_cast<size_t>(F) * R * R, 1e30f);
+        std::vector<int> inst(static_cast<size_t>(F) * R * R, -1);
+        std::vector<Vec3> hp(static_cast<size_t>(F) * R * R);
+        for (int f = 0; f < F; ++f)
+            for (int j = 0; j < R; ++j)
+                for (int i = 0; i < R; ++i) {
+                    const float u = (i + 0.5f) / R * 2.0f - 1.0f;
+                    const float v = (j + 0.5f) / R * 2.0f - 1.0f;
+                    const SceneHit h = raycastClosest(listener, cubeTexelDir(f, u, v), maxDist);
+                    const int idx = (f * R + j) * R + i;
+                    if (h.hit) { depth[idx] = h.t; inst[idx] = h.instanceId; hp[idx] = h.point; }
+                }
+        // 隣接セル（右・下、同一面内）で深度が飛ぶ＝シルエット。近い側のヒットを稜線点に。
+        auto consider = [&](int a, int b) {
+            int nearIdx = -1;
+            if (inst[a] >= 0 && inst[b] < 0) nearIdx = a;
+            else if (inst[a] < 0 && inst[b] >= 0) nearIdx = b;
+            else if (inst[a] >= 0 && inst[b] >= 0) {
+                const float dmin = std::min(depth[a], depth[b]);
+                if (std::fabs(depth[a] - depth[b]) > 0.15f * dmin)  // 相対15%以上の飛び
+                    nearIdx = (depth[a] < depth[b]) ? a : b;
+            }
+            if (nearIdx >= 0) addCatalogEdge(inst[nearIdx], hp[nearIdx]);
+        };
+        for (int f = 0; f < F; ++f)
+            for (int j = 0; j < R; ++j)
+                for (int i = 0; i < R; ++i) {
+                    const int idx = (f * R + j) * R + i;
+                    if (i + 1 < R) consider(idx, (f * R + j) * R + (i + 1));
+                    if (j + 1 < R) consider(idx, (f * R + (j + 1)) * R + i);
+                }
+    }
+
+    int edgeCatalogCount() const { return static_cast<int>(edgeCatalog_.size()); }
+    void clearEdgeCatalog() const { edgeCatalog_.clear(); }
+
+    // 【回折の候補列挙（共有）】遮蔽時、回り込み候補エッジを列挙し、各エッジで「掠める点 P
+    // （from→P→to が最短になる点＝三分探索）」と余剰経路 δ を、両区間見通せるものだけ
+    //   fn(P, delta, edgeDir, refT) で渡す。エッジカタログがあればそれを、無ければ箱稜線を使う
+    //   （カタログで有効候補が 0 なら箱へフォールバック）。単一最短(diffractionDetour)も
+    //   多重合成(diffractionComposite)もこれを土台にする。
+    template <class Fn>
+    void forEachDiffractionCandidate(const Vec3& from, const Vec3& to, Fn&& fn) const {
         const float direct = std::max(length(to - from), 1e-4f);
         const float margin = 0.15f;  // 箱を少し膨らませた稜線上を候補に（視線を通しやすく）
-        float best = -1.0f;
-        Vec3 bestP{0.0f, 0.0f, 0.0f};
 
-        auto tryPoint = [&](const Vec3& P) {
-            if (isOccluded(from, P) || isOccluded(P, to)) return;  // 両区間見通せる点だけ
-            float d = length(P - from) + length(to - P) - direct;
-            if (d < 0.0f) d = 0.0f;
-            if (best < 0.0f || d < best) { best = d; bestP = P; }
+        // 稜線 A-B 上で from→P→to が最短になる点（＝直線が掠める角）＋端点から、両区間見通せる
+        // 最短を1つ選んで fn に渡す。g(t)=|from-P|+|P-to| は単峰なので三分探索で最小点を得る。
+        // exceptInst = この稜線が属する箱（P区間の遮蔽判定から自己除外する。掠める点→音源が
+        // 当の箱の裏に再突入して自分で自分を遮る＝候補消滅・中央死角、を防ぐ）。
+        auto tryEdge = [&](const Vec3& A, const Vec3& B, const Vec3& edgeDir, const Vec3& refT,
+                           int exceptInst) -> bool {
+            auto Pf = [&](float t) { return A + (B - A) * t; };
+            auto g  = [&](float t) { const Vec3 p = Pf(t); return length(p - from) + length(to - p); };
+            float lo = 0.0f, hi = 1.0f;
+            for (int it = 0; it < 20; ++it) {
+                const float m1 = lo + (hi - lo) * (1.0f / 3.0f);
+                const float m2 = hi - (hi - lo) * (1.0f / 3.0f);
+                if (g(m1) < g(m2)) hi = m2; else lo = m1;
+            }
+            const Vec3 cands[3] = {Pf(0.5f * (lo + hi)), A, B};  // 掠める角＋端点
+            bool any = false; float bd = 0.0f; Vec3 bp{0, 0, 0};
+            for (const Vec3& P : cands) {
+                // 当の箱を除外して「他の障害物だけ」で両区間を見通せる点だけ採用。
+                if (isOccludedExcept(from, P, exceptInst) || isOccludedExcept(P, to, exceptInst)) continue;
+                float d = length(P - from) + length(to - P) - direct;
+                if (d < 0.0f) d = 0.0f;
+                if (!any || d < bd) { any = true; bd = d; bp = P; }
+            }
+            if (any) fn(bp, bd, edgeDir, refT);
+            return any;
         };
 
-        // 箱(OBB)の 12 稜線を数点サンプルして回り込み点候補にする（角のみだと薄い壁で失敗）。
-        const float ts[3] = {-0.6f, 0.0f, 0.6f};
+        // ★回折は「直接経路を実際に塞いでいる箱（ブロッカー）」の稜線だけを回る。部屋の床/天井/壁など
+        //   直接線と交差しない箱の稜線まで候補にすると、無関係な遠い方向へ候補が飛んで合成を濁す。
+        //   直接 from→to の線分が OBB と交差する箱＝ブロッカー、だけを対象にする。
+        auto isBlocker = [&](int inst) {
+            return inst >= 0 && inst < instanceCount() && instances_[inst].active &&
+                   segmentIntersectsObb(from, to, instances_[inst].obb);
+        };
+
+        // エッジカタログ（B: キューブマップ由来のシルエット稜線）と箱の実稜線の両方を候補にする（和集合）。
+        // カタログだけだと片側しか拾えないことがある（→両側から鳴らない・エッジ入替で方向が飛ぶ）ので、
+        // 箱の 12 稜線も必ず加えて両側を確実に取る。ただし双方ともブロッカーの稜線に限る。
+        if (!edgeCatalog_.empty())
+            for (const DiffEdge& e : edgeCatalog_)
+                if (isBlocker(e.instance))
+                    tryEdge(e.p0, e.p1, e.edgeDir, e.refTangent, e.instance);
+
+        // 箱(OBB)の 12 稜線それぞれで掠める角を探索（角のみだと薄い壁で失敗するので稜線全体）。
         const int fixed2[4][2] = {{-1, -1}, {-1, 1}, {1, -1}, {1, 1}};
         for (int i = 0; i < instanceCount(); ++i) {
             const Instance& inst = instances_[i];
             if (!inst.active) continue;
             const Obb& b = inst.obb;
+            if (!segmentIntersectsObb(from, to, b)) continue;  // ブロッカーだけ回折対象
+            const Vec3 ax[3] = {b.axisX, b.axisY, b.axisZ};
             const float h[3] = {b.halfExtents.x + margin, b.halfExtents.y + margin,
                                 b.halfExtents.z + margin};
             auto pointAt = [&](const float a[3]) {
-                return b.center + b.axisX * (h[0] * a[0]) + b.axisY * (h[1] * a[1]) +
-                       b.axisZ * (h[2] * a[2]);
+                return b.center + ax[0] * (h[0] * a[0]) + ax[1] * (h[1] * a[1]) + ax[2] * (h[2] * a[2]);
             };
             for (int freeAxis = 0; freeAxis < 3; ++freeAxis) {
                 const int o1 = (freeAxis + 1) % 3;
                 const int o2 = (freeAxis + 2) % 3;
                 for (const auto& sg : fixed2) {
-                    for (float t : ts) {
-                        float a[3];
-                        a[freeAxis] = t;
-                        a[o1] = static_cast<float>(sg[0]);
-                        a[o2] = static_cast<float>(sg[1]);
-                        tryPoint(pointAt(a));
-                    }
+                    // 稜線方向＝freeAxis 軸。0面(o1面)接線＝エッジから外側へ（−o2·sg1）。
+                    const Vec3 edgeDir = ax[freeAxis];
+                    const Vec3 refT = ax[o2] * (-static_cast<float>(sg[1]));
+                    float aA[3], aB[3];
+                    aA[freeAxis] = -1.0f; aA[o1] = static_cast<float>(sg[0]); aA[o2] = static_cast<float>(sg[1]);
+                    aB[freeAxis] = +1.0f; aB[o1] = static_cast<float>(sg[0]); aB[o2] = static_cast<float>(sg[1]);
+                    tryEdge(pointAt(aA), pointAt(aB), edgeDir, refT, i);
                 }
             }
         }
-        if (best >= 0.0f) outPoint = bestP;
+    }
+
+    // 【回折(Phase 1.5 暫定・可視化用)】直接 from->to が遮蔽されているとき、稜線を回る「最短迂回」の
+    // 余剰経路長 δ(= 迂回長 − 直線長, m)を返し、最良の迂回点を outPoint に書く。遮蔽なし or 迂回路なしは
+    // -1（outPoint 不定）。outEdgeDir/outRefTangent : null でなければ最良稜線の「エッジ方向」「0面接線」を書く。
+    float diffractionDetour(const Vec3& from, const Vec3& to, Vec3& outPoint,
+                            Vec3* outEdgeDir = nullptr, Vec3* outRefTangent = nullptr) const {
+        if (!isOccluded(from, to)) return -1.0f;
+        float best = -1.0f;
+        Vec3 bestP{0, 0, 0}, bestEdge{1, 0, 0}, bestRefT{0, 1, 0};
+        forEachDiffractionCandidate(from, to, [&](const Vec3& P, float d, const Vec3& e, const Vec3& r) {
+            if (best < 0.0f || d < best) { best = d; bestP = P; bestEdge = e; bestRefT = r; }
+        });
+        if (best >= 0.0f) {
+            outPoint = bestP;
+            if (outEdgeDir) *outEdgeDir = bestEdge;
+            if (outRefTangent) *outRefTangent = bestRefT;
+        }
         return best;
+    }
+
+    // 【回折の多重エッジ合成】遮蔽時、複数の回り込みエッジを合成した「届く方向」を outDir に書く。
+    // 単一最短エッジだけだと (1)エッジが入れ替わった瞬間に方向が飛ぶ (2)両側空いてても片側からしか
+    // 鳴らない。各エッジの掠める点の方向を、迂回の短さ w=exp(-(δ-δmin)/scale) で加重合成＝到来方向の
+    // インテンシティ重心。→ 滑らかに切替わり、複数の開口があれば両方から届く。
+    // 戻り値 = 最短δ（距離減衰/重み用、-1=迂回路なし）。outDir は迂回路なしのとき未書換。
+    float diffractionComposite(const Vec3& from, const Vec3& to, Vec3& outDir) const {
+        if (!isOccluded(from, to)) return -1.0f;
+        constexpr int kMaxCand = 64;  // 同時に合成する回り込み経路の上限（数十本まで）
+        Vec3 dirs[kMaxCand];
+        float deltas[kMaxCand];
+        int nc = 0;
+        float dmin = -1.0f;
+        forEachDiffractionCandidate(from, to, [&](const Vec3& P, float d, const Vec3&, const Vec3&) {
+            if (nc < kMaxCand) { dirs[nc] = normalized(P - from); deltas[nc] = d; ++nc; }
+            if (dmin < 0.0f || d < dmin) dmin = d;
+        });
+        if (nc == 0) return -1.0f;
+        // 重みの広がり。広いほど左右の候補が遷移中に両方寄与し、方向が中間を滑らかに通る
+        //（winner-take-all の飛びを防ぐ）。狭いと定位はシャープだが切替でガクッと飛ぶ。
+        const float scale = std::max(2.0f, dmin + 2.0f);
+        Vec3 acc{0, 0, 0};
+        for (int i = 0; i < nc; ++i) acc = acc + dirs[i] * std::exp(-(deltas[i] - dmin) / scale);
+        if (length(acc) < 1e-6f) acc = to - from;
+        outDir = normalized(acc);
+        return dmin;
+    }
+
+    // 【可視化】遮蔽時の回折候補（掠める点 P と余剰δ）を最大 maxCount 個 outP/outDelta に書き、
+    // 書いた個数を返す。全候補を描画し、最短δのものを呼び出し側で min を取って色分けするデバッグ用。
+    int diffractionCandidates(const Vec3& from, const Vec3& to,
+                              Vec3* outP, float* outDelta, int maxCount) const {
+        if (!outP || !outDelta || maxCount <= 0) return 0;
+        if (!isOccluded(from, to)) return 0;
+        int n = 0;
+        forEachDiffractionCandidate(from, to, [&](const Vec3& P, float d, const Vec3&, const Vec3&) {
+            if (n < maxCount) { outP[n] = P; outDelta[n] = d; ++n; }
+        });
+        return n;
     }
 
     // 【回折(Phase 1.5)】from->to の帯域別回折ゲイン(0..1)。
@@ -246,22 +479,14 @@ public:
             for (int b = 0; b < kNumBands; ++b) outGain[b] = 1.0f;
             return;
         }
-        Vec3 p;
-        const float delta = diffractionDetour(from, to, p);
+        Vec3 p, edgeDir, refT;
+        const float delta = diffractionDetour(from, to, p, &edgeDir, &refT);
         if (delta < 0.0f) {
             for (int b = 0; b < kNumBands; ++b) outGain[b] = 0.0f;
             return;
         }
-        // Maekawa: フレネル数 N=2δ/λ、減衰(dB)≈10 log10(3+20N)。低域ほど N 小＝よく回り込む。
-        const float kSpeed = 343.0f;
-        const float bandFreq[kNumBands] = {125.0f, 250.0f, 500.0f, 1000.0f, 2000.0f, 4000.0f};
-        for (int b = 0; b < kNumBands; ++b) {
-            const float lambda = kSpeed / bandFreq[b];
-            const float N = 2.0f * delta / lambda;
-            const float x = 3.0f + 20.0f * std::max(N, 0.0f);
-            const float attDb = 10.0f * std::log10(x);
-            outGain[b] = std::pow(10.0f, -attDb / 10.0f);
-        }
+        // UTD（複素ウェッジ回折）。from=リスナー/to=音源 の想定 → utd(source,P,listener)。
+        utd::utdWedgeGain(to, p, from, edgeDir, refT, 1.5f, outGain);
     }
 
     // 【役割1(Phase 2)：ソフト遮蔽】直接音を「音源周りの複数サンプル」で測り、遮られた割合を
@@ -270,8 +495,10 @@ public:
     //   numSamples : 音源周りのサンプル数（例 8） / sourceRadius : サンプル半径(m, 例 0.4)
     // 段差の主因（直接 1.0→材質透過 と 回折 1.0→Maekawa の一斉切替）を連続化する。
     // ※ 影境界の厳密な連続化は Phase 4（UTD 遷移関数）で。ここはその手前の緩和。
+    //   outDetourDelta : null でなければ 回折の迂回余剰長 δ(m) を書く（非遮蔽=0 / 完全遮蔽=大）。
+    //                    ステアの直接項を「実効経路=直接距離+δ」で重み付けするのに使う。
     void computeDirectSoft(const Vec3& listener, const Vec3& source, float outGain[kNumBands],
-                           int numSamples, float sourceRadius) const {
+                           int numSamples, float sourceRadius, float* outDetourDelta) const {
         using namespace scene_detail;
         Vec3 dir = source - listener;
         const float dist = length(dir);
@@ -298,15 +525,29 @@ public:
         const float inv = 1.0f / static_cast<float>(N);
         const float occFrac = static_cast<float>(occCount) * inv;
 
-        // 回折フロア（中心が遮蔽のときの Maekawa）を遮蔽割合でフェードイン。
-        float dif[kNumBands];
-        computeDiffraction(listener, source, dif);  // 中心非遮蔽なら全1.0
+        // 回折フロア：中心が遮蔽なら δ から Maekawa、非遮蔽なら 1.0。δ も一緒に得る。
         const bool centerOcc = isOccluded(listener, source);
+        float dif[kNumBands];
+        float detourDelta = 0.0f;   // 迂回余剰長(m)。非遮蔽=0 / 完全遮蔽(迂回路なし)=大
+        if (!centerOcc) {
+            for (int b = 0; b < kNumBands; ++b) dif[b] = 1.0f;
+        } else {
+            Vec3 dp, edgeDir, refT;
+            const float delta = diffractionDetour(listener, source, dp, &edgeDir, &refT);
+            if (delta < 0.0f) {
+                for (int b = 0; b < kNumBands; ++b) dif[b] = 0.0f;  // 完全遮蔽
+                detourDelta = 1e9f;
+            } else {
+                utd::utdWedgeGain(source, dp, listener, edgeDir, refT, 1.5f, dif);  // UTD
+                detourDelta = delta;
+            }
+        }
         for (int b = 0; b < kNumBands; ++b) {
             const float soft = transAccum[b] * inv;                       // 滑らかな直接透過
             const float diffFloor = centerOcc ? dif[b] * occFrac : 0.0f;  // 影で徐々に立つ回折
             outGain[b] = clamp01(std::max(soft, diffFloor));
         }
+        if (outDetourDelta) *outDetourDelta = detourDelta;
     }
 
     // 【役割2(Phase 5)：反射込み遮蔽】リスナー起点で numRays 本のレイを撒き、壁で反射
@@ -322,7 +563,7 @@ public:
 
         // 1) 直接経路＝ソフト遮蔽（透過⊕回折を半影で連続化）。
         float total[kNumBands];
-        computeDirectSoft(listener, source, total, 8, 0.4f);
+        computeDirectSoft(listener, source, total, 8, 0.4f, nullptr);
 
         // 2) 反射で回り込む成分（リスナーレイ＋next-event）。
         if (numRays > 0 && maxBounces > 0 && instanceCount() > 0) {
@@ -374,23 +615,58 @@ public:
     //   outOcc[j]   : 音源 j の遮蔽量(0..1)（null 可）
     //   outBands    : null でなければ j*kNumBands+b に 直接⊕回折⊕反射 の帯域別生存を書く
     // 大量音源でも raycast コストが増えない（next-event のみ音源数ぶん）。旧実装から移植。
+    //   outDir : null でなければ j*3+{0,1,2} に「エネルギーが届く支配方向(単位ベクトル)」を書く。
+    //            遮蔽時は反射/回折が支配し、音源真方向でなく“回り込んで届く方向”になる。
+    //            Wwise 側でこの方向に仮想エミッタを置き直すと「届く方向から聞こえる」になる。
+    //   directWeight : ステアの「直接項」の重み係数。大きいほど音源方向へ定位が張り付く。
+    //                  直接項は directGain × (直接距離/実効経路)² × directWeight で重み付け。
+    //                  実効経路 = 直接距離 + 回折δ（経路補完のぶん加算）＝遠回りほど直接が弱まりステアが開く。
     void occlusionReflectedMulti(const Vec3& listener, const Vec3* sources, int count,
-                                 float* outOcc, float* outBands,
-                                 int numRays, int maxBounces) const {
+                                 float* outOcc, float* outBands, float* outDir,
+                                 float directWeight, int numRays, int maxBounces) const {
         using namespace scene_detail;
         if (!sources || count <= 0) return;
         const float kEps = 1e-3f;
         std::vector<float> total(static_cast<size_t>(count) * kNumBands);
         std::vector<float> reflected(static_cast<size_t>(count) * kNumBands, 0.0f);
         std::vector<float> refDist(static_cast<size_t>(count));
+        std::vector<Vec3> dirAccum(static_cast<size_t>(count), Vec3(0.0f, 0.0f, 0.0f));
 
-        // 1) 直接（音源ごと）＝ソフト遮蔽（半影で連続化）。
+        // 1) 直接（音源ごと）＝ソフト遮蔽。定位を担う「第一波面」の到来方向を作る：
+        //    見通せる → 音源方向 / 遮蔽 → 回り込む角（回折の掠める点）方向。反射は方向に効かせない
+        //    （反射は現実でも先行音効果でほぼ定位せず、幅・広がりに化けるため。docs/EARLY_REFLECTIONS.md）。
         for (int j = 0; j < count; ++j) {
-            computeDirectSoft(listener, sources[j], &total[j * kNumBands], 8, 0.4f);
+            float detourDelta = 0.0f;
+            computeDirectSoft(listener, sources[j], &total[j * kNumBands], 8, 0.4f, &detourDelta);
             refDist[j] = std::max(length(sources[j] - listener), 1e-3f);
+            float directMean = 0.0f;
+            for (int b = 0; b < kNumBands; ++b) directMean += total[j * kNumBands + b];
+            directMean /= kNumBands;
+
+            // 第一波面の方向と重み。見通せれば音源方向、塞がれていれば複数エッジ合成の回り込み方向
+            //（滑らかに切替わり、複数開口があれば両側から）。実効経路が長いほど定位を弱める。
+            Vec3 firstDir = normalized(sources[j] - listener);
+            float firstW = directMean;  // 見通せる＝そのまま強い定位
+            if (isOccluded(listener, sources[j])) {
+                Vec3 cdir;
+                const float dd = diffractionComposite(listener, sources[j], cdir);
+                if (dd >= 0.0f) {
+                    // 遮蔽の“深さ”δで 音源方向→合成回り込み方向 を連続ブレンド。
+                    // δ=0（掠める＝遮蔽の境界）で音源方向に一致するので、遮蔽に入る瞬間の飛びが出ない。
+                    const Vec3 srcDir = normalized(sources[j] - listener);
+                    const float tau = 1.5f;             // ブレンドの深さスケール(m)。小=すぐ回り込み側へ
+                    const float t = dd / (dd + tau);    // 0(境界)→1(深い遮蔽)
+                    firstDir = normalized(srcDir * (1.0f - t) + cdir * t);
+                    const float distFactor = refDist[j] / std::max(refDist[j] + dd, 1e-3f);
+                    firstW = directMean * distFactor * distFactor;
+                } else {
+                    firstW = 0.0f;  // 迂回路なし＝定位ほぼ無し（ホスト側で真方向にフォールバック）
+                }
+            }
+            dirAccum[j] = firstDir * (firstW * directWeight);
         }
 
-        // 2) 反射（リスナーレイは1回だけ＝音源数非依存）。
+        // 2) 反射（リスナーレイは1回だけ＝音源数非依存）。到来方向は初期レイ方向 d0。
         if (numRays > 0 && maxBounces > 0 && instanceCount() > 0) {
             float maxRef = 1e-3f;
             for (int j = 0; j < count; ++j) maxRef = std::max(maxRef, refDist[j]);
@@ -420,6 +696,8 @@ public:
                         float atten = refDist[j] / pathLen;
                         atten *= atten;
                         if (atten > 1.0f) atten = 1.0f;
+                        // 反射エネルギーは帯域生存(音量・広がり)には効くが、方向(dirAccum)には
+                        // 効かせない（反射は定位を持たせない＝拡散扱い）。
                         for (int b = 0; b < kNumBands; ++b)
                             reflected[j * kNumBands + b] += carry[b] * refl[b] * seg[b] * atten;
                     }
@@ -444,6 +722,14 @@ public:
             for (int b = 0; b < kNumBands; ++b) mean += total[j * kNumBands + b];
             mean /= kNumBands;
             if (outOcc) outOcc[j] = clamp01(1.0f - mean);
+            if (outDir) {
+                Vec3 dv = dirAccum[j];
+                if (length(dv) < 1e-6f) dv = sources[j] - listener;  // エネルギー無ければ真方向
+                dv = normalized(dv);
+                outDir[j * 3 + 0] = dv.x;
+                outDir[j * 3 + 1] = dv.y;
+                outDir[j * 3 + 2] = dv.z;
+            }
         }
     }
 
@@ -526,6 +812,100 @@ public:
         }
     }
 
+    // 【早期反射タップ(A)】source→…→listener の主要な初期反射を最大 maxTaps 本抽出する。
+    //   出力タップ = imageSourcePos（= listener + 到来方向×経路長。定位/距離減衰用）＋6帯域ゲイン。
+    //   リスナー起点レイ×next-event で各反射の {到来方向 d0, 経路長, 帯域ゲイン} を集め、
+    //   エネルギー強い順に、方向が近いものはまとめて上位を返す。Wwise Reflect の image source
+    //   や仮想エミッタで「方向つき反射音」として鳴らす想定。戻り値=書き込んだタップ数。
+    int computeEarlyReflections(const Vec3& listener, const Vec3& source,
+                                Vec3* outImagePos, float* outGain, int maxTaps,
+                                int numRays, int maxBounces) const {
+        using namespace scene_detail;
+        if (maxTaps <= 0 || !outImagePos || !outGain || instanceCount() == 0) return 0;
+        struct Tap { Vec3 dir; float len; float g[kNumBands]; float e; };
+        std::vector<Tap> taps;
+        const float kEps = 1e-3f;
+        const float refDist = std::max(length(source - listener), 1e-3f);
+        const float maxDist = refDist * 8.0f + 50.0f;
+        for (int i = 0; i < numRays; ++i) {
+            Vec3 o = listener;
+            Vec3 d = fibonacciSphereDir(i, numRays);
+            const Vec3 d0 = d;  // リスナーに届く方向（第1レグ）
+            uint32_t rng = static_cast<uint32_t>(i) * 2654435761u + 12345u;
+            float carry[kNumBands] = {1, 1, 1, 1, 1, 1};
+            float totalLen = 0.0f;
+            float remaining = maxDist;
+            for (int bounce = 0; bounce < maxBounces; ++bounce) {
+                const SceneHit hit = raycastClosest(o, d, remaining);
+                if (!hit.hit) break;
+                totalLen += hit.t;
+                remaining -= hit.t;
+                if (remaining <= kEps) break;
+                const AcousticMaterial& mat = materialOf(hit.materialId);
+                const Vec3 q = hit.point + hit.normal * 0.02f;
+                float seg[kNumBands];
+                computeTransmission(q, source, seg);
+                Tap t;
+                t.dir = d0;
+                t.len = totalLen + length(source - q);
+                float e = 0.0f;
+                for (int b = 0; b < kNumBands; ++b) {
+                    const float refl = clamp01(1.0f - mat.absorption[b] - mat.transmission[b]);
+                    t.g[b] = carry[b] * refl * seg[b];
+                    e += t.g[b];
+                    carry[b] *= refl;
+                }
+                t.e = e / kNumBands;
+                if (t.e > 1e-4f) taps.push_back(t);
+                d = scatteredDir(d, hit.normal, scatteringMean(mat), rng);
+                o = q;
+            }
+        }
+        // エネルギー降順に、方向が近い(>~25°で同一とみなす)ものはまとめて上位を採る。
+        std::sort(taps.begin(), taps.end(), [](const Tap& a, const Tap& b) { return a.e > b.e; });
+        Vec3 pickedDir[64];
+        int n = 0;
+        for (const Tap& t : taps) {
+            if (n >= maxTaps || n >= 64) break;
+            bool dup = false;
+            for (int k = 0; k < n; ++k)
+                if (dot(t.dir, pickedDir[k]) > 0.9f) { dup = true; break; }
+            if (dup) continue;
+            pickedDir[n] = t.dir;
+            outImagePos[n] = listener + t.dir * t.len;
+            for (int b = 0; b < kNumBands; ++b) outGain[n * kNumBands + b] = t.g[b];
+            ++n;
+        }
+        return n;
+    }
+
+    // 【可視化】origin から dir 方向へ鏡面反射で maxBounces 回まで追い、通過点を outPoints に書く。
+    //   outPoints[0]=origin、以降=反射点、最後=終端（開放空間での到達点 or 最終反射点）。
+    //   返り値=書き込んだ点数。反響経路(reflection path)を Unity で線描画するための土台。
+    int traceReflectionPath(const Vec3& origin, const Vec3& dir, float maxDist, int maxBounces,
+                            Vec3* outPoints, int maxPoints) const {
+        using namespace scene_detail;
+        if (!outPoints || maxPoints < 2) return 0;
+        Vec3 o = origin;
+        Vec3 d = normalized(dir);
+        int n = 0;
+        outPoints[n++] = o;
+        float remaining = maxDist;
+        for (int b = 0; b < maxBounces && n < maxPoints; ++b) {
+            const SceneHit hit = raycastClosest(o, d, remaining);
+            if (!hit.hit) {
+                if (n < maxPoints) outPoints[n++] = o + d * remaining;  // 開放空間へ延長
+                return n;
+            }
+            if (n < maxPoints) outPoints[n++] = hit.point;
+            remaining -= hit.t;
+            if (remaining <= 1e-3f) return n;
+            d = reflect(d, hit.normal);
+            o = hit.point + hit.normal * 0.02f;  // 自己ヒット防止
+        }
+        return n;
+    }
+
     // --- 参照 ---
     int instanceCount() const { return static_cast<int>(instances_.size()); }
     int materialCount() const { return static_cast<int>(materials_.size()); }
@@ -546,8 +926,133 @@ private:
         return fallback;
     }
 
+    // ── BVH-of-OBB（broad-phase / TLAS）。インスタンス変更で lazy に再構築（[[dynamic-ray-architecture]] 追加ロック②）。──
+    struct BvhNode {
+        Aabb bounds;
+        int leftFirst;  // 内部ノード=左子index / 葉=bvhOrder_ の開始index
+        int count;      // 0=内部ノード / >0=葉（インスタンス数）
+    };
+
+    // OBB のワールド軸並行境界（各軸へ半サイズを射影して膨らませる）。
+    static Aabb obbWorldAabb(const Obb& b) {
+        const Vec3 e(
+            std::fabs(b.axisX.x) * b.halfExtents.x + std::fabs(b.axisY.x) * b.halfExtents.y + std::fabs(b.axisZ.x) * b.halfExtents.z,
+            std::fabs(b.axisX.y) * b.halfExtents.x + std::fabs(b.axisY.y) * b.halfExtents.y + std::fabs(b.axisZ.y) * b.halfExtents.z,
+            std::fabs(b.axisX.z) * b.halfExtents.x + std::fabs(b.axisY.z) * b.halfExtents.y + std::fabs(b.axisZ.z) * b.halfExtents.z);
+        Aabb a;
+        a.min = b.center - e;
+        a.max = b.center + e;
+        return a;
+    }
+
+    void ensureBvh() const {
+        if (!bvhDirty_) return;
+        buildBvh();
+        bvhDirty_ = false;
+    }
+
+    void buildBvh() const {
+        bvhNodes_.clear();
+        bvhOrder_.clear();
+        for (int i = 0; i < instanceCount(); ++i)
+            if (instances_[i].active) bvhOrder_.push_back(i);
+        const int n = static_cast<int>(bvhOrder_.size());
+        if (n == 0) return;
+        bvhNodes_.reserve(static_cast<size_t>(2 * n));
+        bvhNodes_.push_back(BvhNode{});
+        buildNode(0, 0, n);
+    }
+
+    void buildNode(int nodeIdx, int start, int count) const {
+        // ノード境界＝範囲内インスタンスのワールドAABB合併。
+        Aabb b = obbWorldAabb(instances_[bvhOrder_[start]].obb);
+        for (int k = 1; k < count; ++k) {
+            const Aabb a = obbWorldAabb(instances_[bvhOrder_[start + k]].obb);
+            b.min = Vec3(std::min(b.min.x, a.min.x), std::min(b.min.y, a.min.y), std::min(b.min.z, a.min.z));
+            b.max = Vec3(std::max(b.max.x, a.max.x), std::max(b.max.y, a.max.y), std::max(b.max.z, a.max.z));
+        }
+        bvhNodes_[nodeIdx].bounds = b;
+        if (count <= 2) {  // 葉
+            bvhNodes_[nodeIdx].leftFirst = start;
+            bvhNodes_[nodeIdx].count = count;
+            return;
+        }
+        // 最長軸で中央値分割。
+        const Vec3 ext = b.max - b.min;
+        const int axis = (ext.x > ext.y) ? (ext.x > ext.z ? 0 : 2) : (ext.y > ext.z ? 1 : 2);
+        const int mid = start + count / 2;
+        auto centroidOnAxis = [&](int idx) {
+            const Aabb a = obbWorldAabb(instances_[idx].obb);
+            const Vec3 c = a.min + a.max;  // 2×重心（比較のみなので係数不要）
+            return axis == 0 ? c.x : (axis == 1 ? c.y : c.z);
+        };
+        std::nth_element(bvhOrder_.begin() + start, bvhOrder_.begin() + mid, bvhOrder_.begin() + start + count,
+                         [&](int lhs, int rhs) { return centroidOnAxis(lhs) < centroidOnAxis(rhs); });
+        const int left = static_cast<int>(bvhNodes_.size());
+        bvhNodes_.push_back(BvhNode{});
+        bvhNodes_.push_back(BvhNode{});
+        bvhNodes_[nodeIdx].leftFirst = left;
+        bvhNodes_[nodeIdx].count = 0;
+        buildNode(left, start, mid - start);
+        buildNode(left + 1, mid, start + count - mid);
+    }
+
+    // ── エッジカタログ補助 ──
+    // キューブマップのテクセル方向（面f=0..5:+X,-X,+Y,-Y,+Z,-Z、u,v∈[-1,1]）。
+    static Vec3 cubeTexelDir(int face, float u, float v) {
+        switch (face) {
+            case 0:  return normalized(Vec3(1.0f, -v, -u));   // +X
+            case 1:  return normalized(Vec3(-1.0f, -v, u));   // -X
+            case 2:  return normalized(Vec3(u, 1.0f, v));     // +Y
+            case 3:  return normalized(Vec3(u, -1.0f, -v));   // -Y
+            case 4:  return normalized(Vec3(u, -v, 1.0f));    // +Z
+            default: return normalized(Vec3(-u, -v, -1.0f));  // -Z
+        }
+    }
+
+    // シルエットのヒット点を、その箱の最近傍稜線に snap してカタログへ（近接重複は除外）。
+    void addCatalogEdge(int instanceIdx, const Vec3& hitPoint) const {
+        if (instanceIdx < 0 || instanceIdx >= instanceCount()) return;
+        const Obb& b = instances_[instanceIdx].obb;
+        const Vec3 ax[3] = {b.axisX, b.axisY, b.axisZ};
+        const float h[3] = {std::max(b.halfExtents.x, 1e-4f), std::max(b.halfExtents.y, 1e-4f),
+                            std::max(b.halfExtents.z, 1e-4f)};
+        const Vec3 lp = obbToLocalPoint(hitPoint, b);
+        const float lc[3] = {lp.x, lp.y, lp.z};
+        // face軸=|lc|/h 最大、side軸=次点、edge軸=残り。
+        int faceAxis = 0;
+        float mx = std::fabs(lc[0]) / h[0];
+        for (int k = 1; k < 3; ++k) { const float r = std::fabs(lc[k]) / h[k]; if (r > mx) { mx = r; faceAxis = k; } }
+        const int a1 = (faceAxis + 1) % 3, a2 = (faceAxis + 2) % 3;
+        const int sideAxis = (std::fabs(lc[a1]) / h[a1] >= std::fabs(lc[a2]) / h[a2]) ? a1 : a2;
+        const int edgeAxis = (sideAxis == a1) ? a2 : a1;
+        const float faceSign = lc[faceAxis] >= 0.0f ? 1.0f : -1.0f;
+        const float sideSign = lc[sideAxis] >= 0.0f ? 1.0f : -1.0f;
+        // 稜線を外向き(2面法線の対角)に少し膨らませ、エッジ→音源が箱に再突入しないように。
+        const Vec3 outward = normalized(ax[faceAxis] * faceSign + ax[sideAxis] * sideSign);
+        const float margin = 0.15f;
+        const Vec3 base = b.center + ax[faceAxis] * (faceSign * h[faceAxis])
+                        + ax[sideAxis] * (sideSign * h[sideAxis]) + outward * margin;
+        DiffEdge e;
+        e.p0 = base - ax[edgeAxis] * h[edgeAxis];
+        e.p1 = base + ax[edgeAxis] * h[edgeAxis];
+        e.edgeDir = ax[edgeAxis];
+        e.refTangent = ax[sideAxis] * (-sideSign);  // 0面(face面)接線＝エッジから外へ
+        e.n = 1.5f;
+        e.instance = instanceIdx;  // 自己除外用
+        const Vec3 mid = (e.p0 + e.p1) * 0.5f;
+        for (const DiffEdge& x : edgeCatalog_)
+            if (length((x.p0 + x.p1) * 0.5f - mid) < 0.05f) return;  // 同一稜線
+        edgeCatalog_.push_back(e);
+    }
+
     std::vector<AcousticMaterial> materials_;  // 材質テーブル（インスタンスが matId で参照）
     std::vector<Instance> instances_;          // 占有物（毎フレーム更新可能）
+
+    mutable std::vector<BvhNode> bvhNodes_;    // BVH ノード列（lazy 構築）
+    mutable std::vector<int> bvhOrder_;        // アクティブなインスタンス index の並び
+    mutable bool bvhDirty_ = true;             // インスタンス変更で立つ再構築フラグ
+    mutable std::vector<DiffEdge> edgeCatalog_;  // キューブマップ由来のシルエット稜線
 };
 
 }  // namespace acoustic

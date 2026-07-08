@@ -189,7 +189,8 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneOcclusionReflectedMulti(
             IntPtr scene, AFVector3 listener, [In] AFVector3[] sources, int count,
-            [Out] float[] outOcc, [Out] float[] outBands, int numRays, int maxBounces);
+            [Out] float[] outOcc, [Out] float[] outBands, [Out] float[] outDir,
+            float directWeight, int numRays, int maxBounces);
 
         // 残響：到達時間ビンのエコグラムを outBins[numBins] に書く（RT60/wet 算出用）。
         [DllImport(Dll, CallingConvention = Cc)]
@@ -197,6 +198,33 @@ namespace AcousticFlow
             IntPtr scene, AFVector3 listener, [In] AFVector3[] sources, int count,
             [Out] float[] outBins, int numBins, float binSeconds, float speedOfSound,
             int numRays, int maxBounces);
+
+        // 反射経路トレース：origin→dir を鏡面反射で maxBounces 回追い、通過点を outPoints に書く。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneTraceReflectionPath(
+            IntPtr scene, AFVector3 origin, AFVector3 dir, float maxDist, int maxBounces,
+            [In, Out] AFVector3[] outPoints, int maxPoints);
+
+        // B: キューブマップ エッジカタログ構築（リスナー中心・全音源共有）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneBuildEdgeCatalog(IntPtr scene, AFVector3 listener, int res, float maxDist);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneEdgeCatalogCount(IntPtr scene);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneClearEdgeCatalog(IntPtr scene);
+
+        // 可視化：遮蔽時の回折候補の迂回点 P と余剰δを outPoints/outDeltas に書き、個数を返す。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneDiffractionCandidates(
+            IntPtr scene, AFVector3 from, AFVector3 to,
+            [Out] AFVector3[] outPoints, [Out] float[] outDeltas, int maxCount);
+
+        // A: 早期反射タップ抽出。像源位置を outImagePos[maxTaps]、帯域ゲインを outGain[maxTaps*6] に書く。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneComputeEarlyReflections(
+            IntPtr scene, AFVector3 listener, AFVector3 source,
+            [Out] AFVector3[] outImagePos, [Out] float[] outGain,
+            int maxTaps, int numRays, int maxBounces);
 
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneInstanceCount(IntPtr scene);
@@ -256,6 +284,12 @@ namespace AcousticFlow
         // RTPC をゲームオブジェクト単位で設定（帯域別EQの音源ごと駆動など）。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AcousticEngine_SetRTPCValueOnObject(byte[] name, float value, ulong gameObjectId);
+
+        // 早期反射(A): AkReflect の aux バスへ像源(位置+線形レベル)を設定。毎フレーム呼ぶ想定。
+        // auxBusName は UTF-8 byte[]（null/空で authoring 既定バス）。positions[count*3], levels[count]。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AcousticEngine_SetEarlyReflections(
+            ulong emitterId, byte[] auxBusName, [In] float[] positions, [In] float[] levels, int count);
 
         // 出力(マスターバス)の左右レベル(RMS, 線形)を取得。
         [DllImport(Dll, CallingConvention = Cc)]

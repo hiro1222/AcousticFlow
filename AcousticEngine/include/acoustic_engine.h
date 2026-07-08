@@ -357,6 +357,19 @@ ACOUSTIC_API void AcousticEngine_SetRTPCValue(const char* name, float value);
 ACOUSTIC_API void AcousticEngine_SetRTPCValueOnObject(const char* name, float value,
                                                       unsigned long long gameObjectId);
 
+/* 【早期反射(A)】emitterId の音源に、方向つき早期反射のイメージソースを AkReflect
+ * （auxBusName の aux バス）へ設定する。毎フレーム呼ぶ想定（先に既存を全消し→設定し直し）。
+ *   positions : 像源のワールド位置（count 個 = positions[i*3+0..2]）
+ *   levels    : 各タップの線形レベル（count 個）
+ *   auxBusName: AkReflect を載せた aux バス名（UTF-8）。null/空なら authoring 既定バス。
+ * AF_SceneComputeEarlyReflections の出力（像源位置＋帯域ゲイン）を渡して鳴らす。
+ * ※帯域ゲインは代表値（例 500Hz 帯）を level に使う想定。Wwise 側 AkReflect が空間化。 */
+ACOUSTIC_API void AcousticEngine_SetEarlyReflections(unsigned long long emitterId,
+                                                     const char* auxBusName,
+                                                     const float* positions,
+                                                     const float* levels,
+                                                     int count);
+
 /* 出力(マスターバス)の左右レベル(RMS, 線形 0..1程度)を取得する（メーター可視化用）。
  * outLeft / outRight に書き込む。未初期化・メータリング未対応なら 0。null 可。 */
 ACOUSTIC_API void AcousticEngine_GetOutputLevels(float* outLeft, float* outRight);

@@ -106,6 +106,14 @@ ACOUSTIC_API float AF_SceneDiffractionPath(AF_SceneHandle scene,
                                            AF_Vector3 from, AF_Vector3 to,
                                            AF_Vector3* outMidPoint);
 
+/* 【可視化】遮蔽時の回折候補の迂回点 P と余剰経路δを最大 maxCount 個 outPoints/outDeltas に書き、
+ * 書いた個数を返す。全候補（回り込み経路）を線で描画し、最短δを色分けするデバッグ用。遮蔽なしは 0。
+ *   outPoints : AF_Vector3 × maxCount（各候補の掠める迂回点 P）
+ *   outDeltas : float × maxCount（各候補の余剰経路長 δ=迂回長−直線長, m） */
+ACOUSTIC_API int AF_SceneDiffractionCandidates(AF_SceneHandle scene,
+                                               AF_Vector3 from, AF_Vector3 to,
+                                               AF_Vector3* outPoints, float* outDeltas, int maxCount);
+
 /* 【役割2：反射込み遮蔽】リスナー起点で numRays 本のレイを撒き、壁で反射させながら音源へ
  * next-event でつなぐ。直接(透過⊕回折)＋反射で回り込む成分から遮蔽量(0..1)を返す。
  * 反射経路があるので壁裏でも 1.0 に張り付かない（＝実際の部屋の「回り込み」）。
@@ -120,11 +128,15 @@ ACOUSTIC_API float AF_SceneOcclusionReflected(AF_SceneHandle scene,
  *   sources  : 音源位置（count 個） / outOcc : 音源ごとの遮蔽量(0..1)（count 個以上, null 可）
  *   outBands : null でなければ j*6+b に 直接⊕回折⊕反射 の帯域別生存(count*6)を書く
  * 大量音源でも raycast コストが増えない。 */
+/*   outDir : null でなければ j*3 に「エネルギーが届く支配方向(単位ベクトル)」を書く。
+ *            遮蔽時は反射/回折が支配し音源真方向でなく“回り込んで届く方向”になる。
+ *   directWeight : ステアの直接項の重み係数（大=音源方向に定位が張り付く / 小=反射方向へ開く）。
+ *                  直接項は directGain×(直接距離/実効経路)²×directWeight。実効経路=直接距離+回折δ。 */
 ACOUSTIC_API void AF_SceneOcclusionReflectedMulti(AF_SceneHandle scene,
                                                   AF_Vector3 listener,
                                                   const AF_Vector3* sources, int count,
-                                                  float* outOcc, float* outBands,
-                                                  int numRays, int maxBounces);
+                                                  float* outOcc, float* outBands, float* outDir,
+                                                  float directWeight, int numRays, int maxBounces);
 
 /* 【残響(Phase6)：エコグラム】リスナーに届くエネルギーを到達時間ビンに積む。
  * 直接音＋反射（共有レイ・多バウンス）。outBins[k]=時間[k*binSeconds,(k+1)*binSeconds)の合計。
@@ -136,6 +148,38 @@ ACOUSTIC_API void AF_SceneComputeEchogram(AF_SceneHandle scene,
                                           float* outBins, int numBins,
                                           float binSeconds, float speedOfSound,
                                           int numRays, int maxBounces);
+
+/* 【可視化】origin から dir 方向へ鏡面反射で maxBounces 回まで追った経路（通過点）を
+ * outPoints に書き、その点数を返す。outPoints[0]=origin/以降=反射点/最後=終端。
+ * outPoints は maxPoints 個以上（最低 maxBounces+2）。反響経路の線描画用。 */
+ACOUSTIC_API int AF_SceneTraceReflectionPath(AF_SceneHandle scene,
+                                             AF_Vector3 origin, AF_Vector3 dir,
+                                             float maxDist, int maxBounces,
+                                             AF_Vector3* outPoints, int maxPoints);
+
+/* 【B: キューブマップ エッジカタログ】リスナー中心に res²×6面のレイを撒き、深度不連続で
+ * シルエット稜線を拾ってカタログ化する。以降 diffraction はこのカタログの稜線を優先し、
+ * 有効な迂回が無ければ箱コーナー探索へフォールバック。1回撒けば全音源で共有（リスナー係留）。
+ *   res=面解像度(例16〜32) / maxDist=レイ到達距離。毎フレーム or 低レートで呼ぶ。 */
+ACOUSTIC_API void AF_SceneBuildEdgeCatalog(AF_SceneHandle scene, AF_Vector3 listener,
+                                           int res, float maxDist);
+
+/* カタログの稜線数（デバッグ用）。 */
+ACOUSTIC_API int AF_SceneEdgeCatalogCount(AF_SceneHandle scene);
+
+/* カタログを消す（箱コーナー探索に戻す）。 */
+ACOUSTIC_API void AF_SceneClearEdgeCatalog(AF_SceneHandle scene);
+
+/* 【早期反射タップ(A)】source→…→listener の主要な初期反射を最大 maxTaps 本抽出する。
+ * 各タップ = imageSourcePos（= listener + 到来方向×経路長。定位/距離減衰用の像源位置）＋
+ * 6帯域ゲイン。エネルギー強い順・近い方向はまとめる。書き込んだタップ数を返す。
+ *   outImagePos : AF_Vector3 × maxTaps（像源のワールド位置）
+ *   outGain     : float × maxTaps*6（タップごとの帯域ゲイン0..1）
+ * これを Wwise Reflect の image source / 仮想エミッタで「方向つき反射音」として鳴らす。 */
+ACOUSTIC_API int AF_SceneComputeEarlyReflections(AF_SceneHandle scene,
+                                                 AF_Vector3 listener, AF_Vector3 source,
+                                                 AF_Vector3* outImagePos, float* outGain,
+                                                 int maxTaps, int numRays, int maxBounces);
 
 /* 登録済みインスタンス数（デバッグ用）。 */
 ACOUSTIC_API int AF_SceneInstanceCount(AF_SceneHandle scene);

@@ -43,6 +43,7 @@ void setEmitterListenerVolume(unsigned long long, unsigned long long, float) {}
 void setState(const char*, const char*) {}
 void setRTPCValue(const char*, float) {}
 void setRTPCValueOnObject(const char*, float, unsigned long long) {}
+void setEarlyReflections(unsigned long long, const char*, const float*, const float*, int) {}
 void getOutputLevels(float* l, float* r) { if (l) *l = 0.0f; if (r) *r = 0.0f; }
 void renderAudio() {}
 

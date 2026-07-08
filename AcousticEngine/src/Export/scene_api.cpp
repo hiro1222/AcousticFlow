@@ -148,6 +148,20 @@ float AF_SceneDiffractionPath(AF_SceneHandle scene, AF_Vector3 from, AF_Vector3 
     return delta;
 }
 
+int AF_SceneDiffractionCandidates(AF_SceneHandle scene, AF_Vector3 from, AF_Vector3 to,
+                                  AF_Vector3* outPoints, float* outDeltas, int maxCount) {
+    Scene* s = asScene(scene);
+    if (!s || !outPoints || !outDeltas || maxCount <= 0) return 0;
+    std::vector<Vec3> pts(static_cast<size_t>(maxCount));
+    const int n = s->diffractionCandidates(toVec3(from), toVec3(to), pts.data(), outDeltas, maxCount);
+    for (int i = 0; i < n; ++i) {
+        outPoints[i].x = pts[i].x;
+        outPoints[i].y = pts[i].y;
+        outPoints[i].z = pts[i].z;
+    }
+    return n;
+}
+
 float AF_SceneOcclusionReflected(AF_SceneHandle scene, AF_Vector3 source, AF_Vector3 listener,
                                  float* outBands6, int numRays, int maxBounces) {
     Scene* s = asScene(scene);
@@ -157,15 +171,15 @@ float AF_SceneOcclusionReflected(AF_SceneHandle scene, AF_Vector3 source, AF_Vec
 
 void AF_SceneOcclusionReflectedMulti(AF_SceneHandle scene, AF_Vector3 listener,
                                      const AF_Vector3* sources, int count,
-                                     float* outOcc, float* outBands,
-                                     int numRays, int maxBounces) {
+                                     float* outOcc, float* outBands, float* outDir,
+                                     float directWeight, int numRays, int maxBounces) {
     Scene* s = asScene(scene);
     if (!s || !sources || count <= 0) return;
     // 境界の AF_Vector3 配列を Core の Vec3 へ詰め替える。
     std::vector<Vec3> src(static_cast<size_t>(count));
     for (int i = 0; i < count; ++i) src[i] = toVec3(sources[i]);
     s->occlusionReflectedMulti(toVec3(listener), src.data(), count,
-                               outOcc, outBands, numRays, maxBounces);
+                               outOcc, outBands, outDir, directWeight, numRays, maxBounces);
 }
 
 void AF_SceneComputeEchogram(AF_SceneHandle scene, AF_Vector3 listener,
@@ -179,6 +193,53 @@ void AF_SceneComputeEchogram(AF_SceneHandle scene, AF_Vector3 listener,
     for (int i = 0; i < count; ++i) src[i] = toVec3(sources[i]);
     s->computeEchogram(toVec3(listener), src.data(), count,
                        outBins, numBins, binSeconds, speedOfSound, numRays, maxBounces);
+}
+
+int AF_SceneTraceReflectionPath(AF_SceneHandle scene, AF_Vector3 origin, AF_Vector3 dir,
+                                float maxDist, int maxBounces,
+                                AF_Vector3* outPoints, int maxPoints) {
+    Scene* s = asScene(scene);
+    if (!s || !outPoints || maxPoints < 2) return 0;
+    std::vector<Vec3> buf(static_cast<size_t>(maxPoints));
+    const int n = s->traceReflectionPath(toVec3(origin), toVec3(dir), maxDist, maxBounces,
+                                         buf.data(), maxPoints);
+    for (int i = 0; i < n; ++i) {
+        outPoints[i].x = buf[i].x;
+        outPoints[i].y = buf[i].y;
+        outPoints[i].z = buf[i].z;
+    }
+    return n;
+}
+
+void AF_SceneBuildEdgeCatalog(AF_SceneHandle scene, AF_Vector3 listener, int res, float maxDist) {
+    Scene* s = asScene(scene);
+    if (s) s->buildEdgeCatalog(toVec3(listener), res, maxDist);
+}
+
+int AF_SceneEdgeCatalogCount(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    return s ? s->edgeCatalogCount() : 0;
+}
+
+void AF_SceneClearEdgeCatalog(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    if (s) s->clearEdgeCatalog();
+}
+
+int AF_SceneComputeEarlyReflections(AF_SceneHandle scene, AF_Vector3 listener, AF_Vector3 source,
+                                    AF_Vector3* outImagePos, float* outGain,
+                                    int maxTaps, int numRays, int maxBounces) {
+    Scene* s = asScene(scene);
+    if (!s || !outImagePos || !outGain || maxTaps <= 0) return 0;
+    std::vector<Vec3> pos(static_cast<size_t>(maxTaps));
+    const int n = s->computeEarlyReflections(toVec3(listener), toVec3(source),
+                                             pos.data(), outGain, maxTaps, numRays, maxBounces);
+    for (int i = 0; i < n; ++i) {
+        outImagePos[i].x = pos[i].x;
+        outImagePos[i].y = pos[i].y;
+        outImagePos[i].z = pos[i].z;
+    }
+    return n;
 }
 
 int AF_SceneInstanceCount(AF_SceneHandle scene) {

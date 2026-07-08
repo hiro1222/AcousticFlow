@@ -117,16 +117,18 @@ namespace AcousticFlow
 
         // 役割2・複数音源：リスナーレイ1回で全音源へ next-event。outOcc[count] に音源ごとの
         // 遮蔽量、outBands[count*6]（null 可）に帯域別生存を書く。raycast は音源数非依存。
+        // outDir[count*3] に「エネルギーが届く支配方向」(単位ベクトル)を書く（null 可）。
         private AFVector3[] _srcBuf;
         public void OcclusionReflectedMulti(Vector3 listener, Vector3[] sources, int count,
-                                            float[] outOcc, float[] outBands,
-                                            int numRays, int maxBounces)
+                                            float[] outOcc, float[] outBands, float[] outDir,
+                                            float directWeight, int numRays, int maxBounces)
         {
             if (_handle == IntPtr.Zero || sources == null || count <= 0) return;
             if (_srcBuf == null || _srcBuf.Length < count) _srcBuf = new AFVector3[count];
             for (int i = 0; i < count; i++) _srcBuf[i] = new AFVector3(sources[i]);
             Native.AF_SceneOcclusionReflectedMulti(
-                _handle, new AFVector3(listener), _srcBuf, count, outOcc, outBands, numRays, maxBounces);
+                _handle, new AFVector3(listener), _srcBuf, count, outOcc, outBands, outDir,
+                directWeight, numRays, maxBounces);
         }
 
         // 残響：到達時間ビンのエコグラムを outBins に書く（RT60/wet 算出用）。
@@ -141,6 +143,65 @@ namespace AcousticFlow
                 _handle, new AFVector3(listener), _srcBuf, count, outBins, numBins,
                 binSeconds, speedOfSound, numRays, maxBounces);
         }
+
+        // 反射経路：origin→dir を鏡面反射で maxBounces 回追い、通過点を outPoints に書き点数を返す。
+        // 内部バッファ(_pathBuf)を使い回して毎フレームの GC を避ける。
+        private AFVector3[] _pathBuf;
+        // 早期反射タップの像源位置バッファ（使い回し）。
+        private AFVector3[] _erBuf;
+        // 回折候補の迂回点バッファ（可視化用・使い回し）。
+        private AFVector3[] _candBuf;
+        public int TraceReflectionPath(Vector3 origin, Vector3 dir, float maxDist,
+                                       int maxBounces, Vector3[] outPoints)
+        {
+            if (_handle == IntPtr.Zero || outPoints == null || outPoints.Length < 2) return 0;
+            int cap = outPoints.Length;
+            if (_pathBuf == null || _pathBuf.Length < cap) _pathBuf = new AFVector3[cap];
+            int n = Native.AF_SceneTraceReflectionPath(
+                _handle, new AFVector3(origin), new AFVector3(dir), maxDist, maxBounces, _pathBuf, cap);
+            for (int i = 0; i < n; i++) outPoints[i] = new Vector3(_pathBuf[i].x, _pathBuf[i].y, _pathBuf[i].z);
+            return n;
+        }
+
+        // A: 早期反射タップ抽出。像源位置を outImagePos、帯域ゲインを outGain(len=maxTaps*6) に書く。
+        // 戻り値=書き込んだタップ数。outImagePos.Length を maxTaps とみなす。
+        public int ComputeEarlyReflections(Vector3 listener, Vector3 source,
+                                           Vector3[] outImagePos, float[] outGain,
+                                           int numRays, int maxBounces)
+        {
+            if (_handle == IntPtr.Zero || outImagePos == null || outGain == null) return 0;
+            int maxTaps = outImagePos.Length;
+            if (maxTaps <= 0 || outGain.Length < maxTaps * 6) return 0;
+            if (_erBuf == null || _erBuf.Length < maxTaps) _erBuf = new AFVector3[maxTaps];
+            int n = Native.AF_SceneComputeEarlyReflections(
+                _handle, new AFVector3(listener), new AFVector3(source),
+                _erBuf, outGain, maxTaps, numRays, maxBounces);
+            for (int i = 0; i < n; i++) outImagePos[i] = new Vector3(_erBuf[i].x, _erBuf[i].y, _erBuf[i].z);
+            return n;
+        }
+
+        // 可視化：遮蔽時の回折候補の迂回点を outPoints、余剰δを outDeltas に書く。戻り値=候補数。
+        // outPoints.Length と outDeltas.Length の小さい方を上限とみなす。
+        public int DiffractionCandidates(Vector3 from, Vector3 to, Vector3[] outPoints, float[] outDeltas)
+        {
+            if (_handle == IntPtr.Zero || outPoints == null || outDeltas == null) return 0;
+            int cap = Mathf.Min(outPoints.Length, outDeltas.Length);
+            if (cap <= 0) return 0;
+            if (_candBuf == null || _candBuf.Length < cap) _candBuf = new AFVector3[cap];
+            int n = Native.AF_SceneDiffractionCandidates(
+                _handle, new AFVector3(from), new AFVector3(to), _candBuf, outDeltas, cap);
+            for (int i = 0; i < n; i++) outPoints[i] = new Vector3(_candBuf[i].x, _candBuf[i].y, _candBuf[i].z);
+            return n;
+        }
+
+        // B: キューブマップ エッジカタログ構築（リスナー中心・全音源共有）。res=面解像度。
+        public void BuildEdgeCatalog(Vector3 listener, int res, float maxDist)
+        {
+            if (_handle == IntPtr.Zero) return;
+            Native.AF_SceneBuildEdgeCatalog(_handle, new AFVector3(listener), res, maxDist);
+        }
+        public int EdgeCatalogCount => _handle != IntPtr.Zero ? Native.AF_SceneEdgeCatalogCount(_handle) : 0;
+        public void ClearEdgeCatalog() { if (_handle != IntPtr.Zero) Native.AF_SceneClearEdgeCatalog(_handle); }
 
         public int InstanceCount => _handle != IntPtr.Zero ? Native.AF_SceneInstanceCount(_handle) : 0;
 

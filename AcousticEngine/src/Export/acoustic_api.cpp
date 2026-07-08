@@ -352,6 +352,14 @@ void AcousticEngine_SetRTPCValueOnObject(const char* name, float value,
     acoustic::adapter::setRTPCValueOnObject(name, value, gameObjectId);
 }
 
+void AcousticEngine_SetEarlyReflections(unsigned long long emitterId,
+                                        const char* auxBusName,
+                                        const float* positions,
+                                        const float* levels,
+                                        int count) {
+    acoustic::adapter::setEarlyReflections(emitterId, auxBusName, positions, levels, count);
+}
+
 void AcousticEngine_RenderAudio(void) {
     acoustic::adapter::renderAudio();
 }
