@@ -1,10 +1,6 @@
-/* Core/aabb.h
- * 軸並行ボックス(AABB)と、線分との交差判定。
- *
- * 障害物(壁)を最小実装として AABB で表す。
- * リスナー点と音源点を結ぶ線分が、このボックスを貫くかどうかで
- * 「遮蔽されているか」を判定する。
- */
+
+//遮蔽計算用、仮実装につき今後は回り込み制御に切替済んだらお役御免
+
 #ifndef ACOUSTICFLOW_CORE_AABB_H
 #define ACOUSTICFLOW_CORE_AABB_H
 
@@ -19,8 +15,7 @@ struct Aabb {
     Vec3 min;  // 各軸の最小座標
     Vec3 max;  // 各軸の最大座標
 
-    // 中心と「半分の大きさ(halfExtents)」から AABB を作る。
-    // Unity の Box は中心+サイズで扱うことが多いので、この形を用意しておく。
+    //基本的にサイズの半分を中心からとってAABB用意
     static Aabb fromCenterHalfExtents(const Vec3& center, const Vec3& halfExtents) {
         Aabb box;
         box.min = center - halfExtents;
@@ -29,15 +24,10 @@ struct Aabb {
     }
 };
 
-/* 線分 p0->p1 が AABB と交わるか判定する（スラブ法）。
- *
- * スラブ法の考え方:
- *   AABB は「x の範囲」「y の範囲」「z の範囲」という3枚の板(スラブ)の重なり。
- *   線分を媒介変数 t(0..1) で表し、各軸ごとに「線分がその範囲内にいる t 区間」を求め、
- *   3軸すべての区間の共通部分が残れば交差している。
- *
- * 線分内に端点が含まれる場合(点がボックス内)も交差と判定する。
- */
+
+//スラブ法使ってみる(もし今後OBBに変更するならSAT方式に切り替えてみる？)
+/**************************************************************************************/
+
 inline bool segmentIntersectsAabb(const Vec3& p0, const Vec3& p1, const Aabb& box) {
     const float dir[3] = { p1.x - p0.x, p1.y - p0.y, p1.z - p0.z };
     const float org[3] = { p0.x, p0.y, p0.z };
@@ -50,7 +40,6 @@ inline bool segmentIntersectsAabb(const Vec3& p0, const Vec3& p1, const Aabb& bo
 
     for (int axis = 0; axis < 3; ++axis) {
         if (std::fabs(dir[axis]) < kEps) {
-            // この軸方向に動いていない。範囲外に居れば交差し得ない。
             if (org[axis] < bmin[axis] || org[axis] > bmax[axis]) {
                 return false;
             }
@@ -58,23 +47,20 @@ inline bool segmentIntersectsAabb(const Vec3& p0, const Vec3& p1, const Aabb& bo
             const float ood = 1.0f / dir[axis];
             float t1 = (bmin[axis] - org[axis]) * ood;
             float t2 = (bmax[axis] - org[axis]) * ood;
-            if (t1 > t2) std::swap(t1, t2);  // t1 を近い側に揃える
+            if (t1 > t2) std::swap(t1, t2); 
             tmin = std::max(tmin, t1);
             tmax = std::min(tmax, t2);
             if (tmin > tmax) {
-                return false;  // 共通区間が消えた = 交差なし
+                //交わってない
+                return false; 
             }
         }
     }
     return true;
 }
 
-/* レイ(origin から dir 方向)と AABB の交差判定。
- * 線分版との違い:
- *   - 終点を持たず、距離 maxDist までの「光線」として扱う
- *   - ヒットした距離(outT)と、ヒット面の法線(outNormal)を返す
- * dir は正規化済みであることを前提とする（outT がそのまま距離になる）。
- */
+// レイとAABBの交差
+
 inline bool rayIntersectsAabb(const Vec3& origin, const Vec3& dir, const Aabb& box,
                               float maxDist, float& outT, Vec3& outNormal) {
     const float od[3]   = { origin.x, origin.y, origin.z };
@@ -86,7 +72,7 @@ inline bool rayIntersectsAabb(const Vec3& origin, const Vec3& dir, const Aabb& b
     float tmin = 0.0f;
     float tmax = maxDist;
     int   entryAxis = -1;   // tmin を決めた軸
-    float entrySign = 0.0f; // その面の法線の向き(+1/-1)
+    float entrySign = 0.0f; // 法線の向き
 
     for (int a = 0; a < 3; ++a) {
         if (std::fabs(dd[a]) < kEps) {
@@ -105,9 +91,9 @@ inline bool rayIntersectsAabb(const Vec3& origin, const Vec3& dir, const Aabb& b
     }
 
     if (entryAxis < 0) {
-        // 原点が箱の内部にある場合。距離0でヒット扱いにする。
+        /*もし箱の中にリスナーが入った時用*/
         outT = 0.0f;
-        outNormal = Vec3(0.0f, 1.0f, 0.0f);  // 便宜上の法線
+        outNormal = Vec3(0.0f, 1.0f, 0.0f);  // 仮法線・蟹工船みたい
         return true;
     }
 
@@ -120,6 +106,76 @@ inline bool rayIntersectsAabb(const Vec3& origin, const Vec3& dir, const Aabb& b
     return true;
 }
 
-}  // namespace acoustic
+/**************************************************************************************/
+// OBB（有向境界ボックス）= 回転した箱。
+// キモ：レイ/線分を箱のローカル空間へ移すと、その中では中心原点の軸並行AABBになる。
+//       だから既存のスラブ法（上の2関数）をそのまま呼べる。法線だけワールドへ戻す。
+//       AABBは「単位回転のOBB」なので、これ1本で軸並行も回転も扱える。
+
+struct Obb {
+    Vec3 center;
+    Vec3 halfExtents;
+    // ローカル軸のワールド向き（正規直交を前提）。Unityの transform.right/up/forward 相当。
+    Vec3 axisX{1.0f, 0.0f, 0.0f};  // right
+    Vec3 axisY{0.0f, 1.0f, 0.0f};  // up
+    Vec3 axisZ{0.0f, 0.0f, 1.0f};  // forward
+
+    // 軸並行（回転なし）。従来のAABDと同じ箱。
+    static Obb axisAligned(const Vec3& center, const Vec3& halfExtents) {
+        Obb b;
+        b.center = center;
+        b.halfExtents = halfExtents;
+        return b;
+    }
+
+    // right/up から正規直交基底を作る（forward = right×up、up は直交化し直す）。
+    // 入力が多少ずれてても内部で直す。
+    static Obb oriented(const Vec3& center, const Vec3& halfExtents,
+                        const Vec3& right, const Vec3& up) {
+        Obb b;
+        b.center = center;
+        b.halfExtents = halfExtents;
+        const Vec3 x = normalized(right);
+        const Vec3 z = normalized(cross(x, up));  // forward
+        const Vec3 y = cross(z, x);               // 直交化した up
+        b.axisX = x;
+        b.axisY = y;
+        b.axisZ = z;
+        return b;
+    }
+};
+
+// ワールド点 → OBBローカル（中心原点・軸並行）。R^T を掛けるのと同義。
+inline Vec3 obbToLocalPoint(const Vec3& p, const Obb& b) {
+    const Vec3 d = p - b.center;
+    return Vec3(dot(d, b.axisX), dot(d, b.axisY), dot(d, b.axisZ));
+}
+
+// ワールド方向 → OBBローカル（平行移動なし）。基底が正規直交なので長さは保存される。
+inline Vec3 obbToLocalDir(const Vec3& v, const Obb& b) {
+    return Vec3(dot(v, b.axisX), dot(v, b.axisY), dot(v, b.axisZ));
+}
+
+// 線分 p0->p1 が OBB と交わるか。端点をローカルへ移して既存のAABB線分判定に丸投げ。
+inline bool segmentIntersectsObb(const Vec3& p0, const Vec3& p1, const Obb& b) {
+    const Aabb local = Aabb::fromCenterHalfExtents(Vec3(0.0f, 0.0f, 0.0f), b.halfExtents);
+    return segmentIntersectsAabb(obbToLocalPoint(p0, b), obbToLocalPoint(p1, b), local);
+}
+
+// レイと OBB の交差。ローカルでAABB判定し、出てきた法線を基底でワールドへ戻す。
+// dir は呼び出し側で正規化済みを前提（outT がそのまま距離になる）。
+inline bool rayIntersectsObb(const Vec3& origin, const Vec3& dir, const Obb& b,
+                             float maxDist, float& outT, Vec3& outNormal) {
+    const Aabb local = Aabb::fromCenterHalfExtents(Vec3(0.0f, 0.0f, 0.0f), b.halfExtents);
+    const Vec3 lo = obbToLocalPoint(origin, b);
+    const Vec3 ld = obbToLocalDir(dir, b);
+    Vec3 nLocal;
+    if (!rayIntersectsAabb(lo, ld, local, maxDist, outT, nLocal)) return false;
+    // ローカル法線 (±e_k) を基底の線形結合でワールドへ。
+    outNormal = b.axisX * nLocal.x + b.axisY * nLocal.y + b.axisZ * nLocal.z;
+    return true;
+}
+
+}
 
 #endif  // ACOUSTICFLOW_CORE_AABB_H

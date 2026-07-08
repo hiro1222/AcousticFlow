@@ -12,13 +12,17 @@
 
 namespace acoustic {
 
+struct AcousticMaterial;  // 前方宣言（ポインタで参照するだけ。実体は material.h）
+
 // レイの当たり判定結果。
 struct RayHit {
     bool  hit = false;            // 何かにぶつかったか
     float distance = 0.0f;        // 原点からヒット点までの距離
     Vec3  point;                  // ヒットした座標
     Vec3  normal;                 // ヒット面の法線（反射計算に使う）
-    int   boxIndex = -1;          // ぶつかった障害物のインデックス
+    int   boxIndex = -1;          // ぶつかった箱障害物のインデックス（メッシュ時は -1）
+    // ぶつかった障害物の材質。箱でもメッシュでも共通に参照できるようポインタで持つ。
+    const AcousticMaterial* material = nullptr;
 };
 
 }  // namespace acoustic

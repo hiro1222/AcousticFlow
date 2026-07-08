@@ -2,6 +2,8 @@
 
 リアルタイム音響シミュレーション・エンジン。**自作のC++音響エンジン（DLL）** を **Unity** から呼び出し、計算結果を **Wwise**（オーディオミドルウェア）に流して、壁の遮蔽・残響・音源の指向性などを実際の音に反映する。
 
+> 最終更新: 2026-07-02。今セッションで **OBB（回転壁）/ CollArea エリア法 / メッシュ occluder + BVH / AcousticZone 音響LOD / 時間デシメーション** を追加した状態を反映。
+
 ---
 
 ## 1. 全体像（アーキテクチャ）
@@ -11,33 +13,26 @@
 ```
 ┌─────────────────────────────────────────────────────────┐
 │ Unity (C#)   AcousticFlowDemo.cs                         │
-│   ・シーン上の壁/音源/リスナーの座標を集める             │
+│   ・シーンの壁/音源/リスナー/ゾーンを集める              │
 │   ・毎フレーム エンジンに計算させ、結果を Wwise へ渡す   │
 └───────────────┬─────────────────────────────────────────┘
                 │ P/Invoke（C ABI 境界）
 ┌───────────────▼─────────────────────────────────────────┐
 │ AcousticEngine.dll（C++）                                │
-│                                                          │
-│  Export層  acoustic_api.cpp                              │
-│    └ C ABI の関数群（extern "C"）。C# と話す唯一の窓口   │
-│                                                          │
+│  Export層  acoustic_api.cpp    … C ABI の関数群          │
 │  Core層   acoustic_world / vec3 / aabb / ray / material  │
-│           source_directivity                             │
-│    └ 純粋な数学・物理計算。Wwiseにも C# にも依存しない   │
-│                                                          │
+│           triangle / bvh / source_directivity            │
 │  Adapter層  wwise_adapter / null_adapter                 │
-│    └ Wwiseを叩く（再生・遮蔽・残響RTPC・メーター）       │
 └───────────────┬─────────────────────────────────────────┘
                 │ Wwise SDK
 ┌───────────────▼─────────────────────────────────────────┐
 │ Wwise ランタイム  → 実際に音を鳴らす                    │
-│   バス: Music / Panning / Reverb(RoomVerb) / Master      │
 └─────────────────────────────────────────────────────────┘
 ```
 
 **なぜ層を分けるか**
 - **Core層** は Wwise も Unity も知らない純計算 → 単体テスト可能・移植可能・GPU化などの将来拡張がしやすい。
-- **Adapter層** が「音響ミドルウェアへの依存」を1か所に閉じ込める。Wwiseを別のものに差し替えても Core は無傷。`null_adapter.cpp` は音を出さないダミー実装（テスト/CI用）。
+- **Adapter層** が「音響ミドルウェアへの依存」を1か所に閉じ込める。`null_adapter.cpp` は無音ダミー実装（テスト/CI用）。
 - **Export層** は C++ のクラスを C の関数（ハンドル渡し）に変換する薄い殻。C# は C ABI しか呼べないため。
 
 ---
@@ -46,218 +41,226 @@
 
 ```
 AcousticEngine/                  ← C++ エンジン（DLL本体）
-  CMakeLists.txt                 ビルド定義
   include/acoustic_engine.h      公開C APIヘッダ（C#が参照する仕様書）
   src/
     Core/                        純計算層
       vec3.h                     3次元ベクトル + 演算
-      aabb.h                     軸並行ボックス & 線分/レイ交差（スラブ法）
-      ray.h                      レイ/ヒット結果の型
+      aabb.h                     AABB/OBB & 線分/レイ交差（スラブ法＋ローカル空間トリック）
+      triangle.h                 三角形 & Möller–Trumbore 交差
+      bvh.h                      三角形BVH（構築・raycast/occludes/countCrossings）※ヘッダオンリー
+      ray.h                      レイ/ヒット結果の型（materialポインタ付き）
       material.h / .cpp          6帯域マテリアル（透過率・吸収率）
-      source_directivity.h/.cpp  音源指向性（前方/背面のゲイン）
-      acoustic_world.h / .cpp    ★中核。障害物集合・レイ積分・エコグラム
-    Adapter/
-      wwise_adapter.h / .cpp     Wwise への実配線
-      null_adapter.cpp           無音ダミー実装
-    Export/
-      acoustic_api.cpp           C ABI 関数の実装
+      source_directivity.h/.cpp  音源指向性
+      acoustic_world.h / .cpp    ★中核。箱/メッシュ occluder・レイ積分・エコグラム
+    Adapter/  wwise_adapter / null_adapter
+    Export/   acoustic_api.cpp   C ABI 関数の実装
 
 AcousticEngineTest/main.cpp      C++単体テスト（Wwise無しでCoreを検証）
 
 UnityDemo/Assets/Scripts/AcousticFlow/
   AcousticEngineBindings.cs      DllImport 宣言（生のP/Invoke）
-  AcousticEngine.cs              ↑を包む薄いC#ラッパー（型を整える）
+  AcousticEngine.cs              ↑を包む薄いC#ラッパー
+  AcousticMaterial.cs            C#側の6帯域マテリアル（C++プリセットと同値）
+  AcousticSurface.cs             個別オブジェクトの材質明示（コンポーネント）
+  CollArea.cs                    範囲ボックス：忠実度LOD＋素材ゾーン（静的・オーサリング）
+  AcousticZone.cs                音響ゾーン：リスナー在否でメッシュBVHを有効/無効（動的LOD）
   AcousticFlowDemo.cs            ★デモ本体。毎フレームの統括
   Editor/
-    AcousticFlowDemoSetup.cs     シーン自動生成エディタ拡張
-    BandMonitorWindow.cs         6帯域の透過を可視化
-    ReverbMonitorWindow.cs       エコグラム（残響）可視化
-    OutputMonitorWindow.cs       出力L/Rレベル波形
-    SourcePathMonitorWindow.cs   音源面の到達ヒートマップ
+    AcousticFlowDemoSetup.cs         箱部屋デモの自動生成
+    AcousticFlowLivehouseSetup.cs    ライブハウスデモの自動生成（LiveStage＋ゾーン）
+    BandMonitor / ReverbMonitor / OutputMonitor / SourcePathMonitor  可視化ウィンドウ
 ```
 
 ---
 
 ## 3. データフロー（1フレームで何が起きるか）
 
-`AcousticFlowDemo.Update()` が毎フレーム回す処理：
+`AcousticFlowDemo.Update()`：
 
-1. **入力処理** — WASDでリスナー移動、矢印で音源移動、各種デバッグキー（後述）。
-2. **ジオメトリ反映** — シーンの壁配列 → `ClearGeometry()` + `AddBox()` でエンジンに登録（変更時のみ）。
-3. **遮蔽計算** — `occlusionScalarMultiSource()`：リスナーから1024本のレイを撒き、全音源ぶんの遮蔽量(0..1)を一括計算（**共有リスナーパス** = レイ本数は音源数に依存しない）。
-4. **残響計算**（4フレームに1回）— `computeEchogram()` で到達時間エコグラムを作り、そこから wet量 / RT60 を算出。
-5. **指向性計算** — 音源ごとに `ComputeDirectivity()` で向きによる音量・こもりを得る。
-6. **Wwiseへ反映** — 音源ごとに：
-   - `SetObstructionOcclusion()` … 遮蔽・こもりをLPF/音量へ
-   - `SetEmitterListenerVolume()` … 指向性ゲインを出力バス音量へ
-   - `SetRTPCValue("ReverbWet"/"ReverbDecay")` … 残響パラメータ
-7. **`RenderAudio()`** — Wwiseのイベント処理を1フレーム進める（必須）。
-8. **メーター取得** — `GetOutputLevels()` でマスターバスのL/R RMSを取り、波形履歴に積む。
+1. **入力・移動** — WASD等でリスナー移動、矢印で音源移動、各種トグルキー。
+2. **ジオメトリ反映** `RebuildGeometry()` — 箱 occluder を毎フレーム登録し直す（軽い）。メッシュは静的（初回1回だけ登録）。
+3. **ゾーン切替** `UpdateZones()` — リスナー在否で各 AcousticZone のメッシュBVHを有効/無効（`SetMeshActive`）。軽い（bounds判定のみ）。
+4. **重いソルブ（Nフレに1回 = `solveEveryNFrames`）**：
+   - `occlusionScalarMultiSource()` … 全音源の遮蔽(0..1)を共有リスナーパスで一括計算。
+   - モニター用（帯域透過・指向性・面ヒートマップ）。
+   - `computeEchogram()`（さらに間引き）… 到達時間エコグラム → RT60/wet。
+5. **Wwiseへ反映（毎フレーム）** — 遮蔽/指向性/残響RTPCを、間引きフレームでは前回値をスムージングして適用。
+6. **`RenderAudio()`（毎フレーム必須）**、メーター取得。
+
+> **時間デシメーション**：重いソルブだけ N フレに1回。間は前回の遮蔽値を保持＋MoveTowardsで滑らかに繋ぐ。計算msの表示もソルブフレームの値だけ保持（間の~0msで上書きしない）。
 
 ---
 
 ## 4. Core層（純計算）の詳細
 
-### vec3.h
-3次元ベクトル `Vec3` と演算（加減・内積・外積・正規化・長さ）。全計算の基礎型。
+### vec3.h / ray.h
+3次元ベクトルと演算。`RayHit` はヒット距離・点・法線に加え **材質ポインタ**（箱/メッシュ共通に材質を参照）。
 
-### aabb.h — 障害物と交差判定
-- `Aabb` … 軸並行ボックス（min/max）。壁の最小表現。
-- `segmentIntersectsAabb()` … **線分**が箱を貫くか（**スラブ法**）。遮蔽の有無判定に使う。
-- `rayIntersectsAabb()` … **レイ**が箱に当たる距離と**面の法線**を返す。反射計算に使う。
+### aabb.h — 箱と交差判定（AABB / OBB）
+- `Aabb` … 軸並行ボックス。`segmentIntersectsAabb` / `rayIntersectsAabb`（スラブ法）。
+- `Obb` … **回転した箱**（中心・halfExtents・正規直交基底）。**ローカル空間トリック**＝レイをOBBローカルへ移すと中心原点のAABBになるので、既存スラブ法をそのまま呼び、法線だけ基底でワールドへ戻す。`segmentIntersectsObb` / `rayIntersectsObb`。AABBは単位回転のOBBとして統一的に扱う。
 
-> **スラブ法**：箱を「x範囲・y範囲・z範囲」の3枚の板の重なりと見て、レイが各範囲内にいる媒介変数 t の区間を求め、3軸の共通区間が残れば交差。軽量で分岐が少ない王道アルゴリズム。
-
-### ray.h
-レイの方向と、ヒット結果（`RayHit`: 当たったか・距離・点・法線・どの箱か）。
+### triangle.h / bvh.h — メッシュ occluder
+- `Triangle` + `rayIntersectsTriangle`（Möller–Trumbore）/ `segmentIntersectsTriangle`。
+- `TriangleBvh`（ヘッダオンリー）… 三角形の中央値分割BVH（葉最大4）。`raycast`（最近ヒット）/ `occludes`（any-hit二値）/ `countCrossings`（横切り枚数＝透過の掛け合わせ回数）。構築は一度きり（静的前提）。
 
 ### material.h / .cpp — 6帯域マテリアル
 ```
-帯域: 125, 250, 500, 1k, 2k, 4k Hz （kNumBands = 6）
-transmission[6] … 透過率(0..1)。1=素通り。低域ほど高い＝壁越しにベースが回る
-absorption[6]   … 吸収率(0..1)。反射でどれだけエネルギーを失うか
+帯域: 125,250,500,1k,2k,4k Hz （kNumBands=6）
+transmission[6] … 透過率(0..1)  absorption[6] … 吸収率(0..1)
 ```
-プリセット：`defaultWall()` / `concrete()` / `glass()`。
-> 係数は現状「それらしい暫定値」。本番は実測/文献値に差し替え予定。
+プリセット：`defaultWall()` / `concrete()` / `glass()`。※係数は暫定（実測差し替え予定）。
 
-### source_directivity.h / .cpp — 音源指向性
-音源の正面・側面・背面で音量と「こもり」が変わるモデル（Bプラン＝広帯域ゲイン＋背面ローパス）。
-タイプ：`Omni / Cardioid / Supercardioid / Bidirectional / Beam`。
-ステートレス関数で、音源ごとに毎フレーム呼ぶ。
+### source_directivity.h / .cpp
+Omni/Cardioid/Supercardioid/Bidirectional/Beam の広帯域ゲイン＋背面ローパス。ステートレス。
 
 ### acoustic_world.cpp — ★中核
-障害物（AABB＋マテリアル）の集合を持ち、以下を計算：
+占有物を **箱（動的）とメッシュ（静的・BVH保持）** に分けて保持：
+```cpp
+std::vector<BoxOccluder>  boxes_;   // Obb+材質。clearGeometry() で毎フレーム作り直す
+std::vector<MeshOccluder> meshes_;  // BVH+材質+active。clearMeshes() まで保持
+```
 
 | メソッド | 役割 |
 |---|---|
-| `isOccluded` | 2点間が壁で遮られてるか（線分判定・二値） |
-| `raycastClosest` | 最も近い壁との交差（反射の土台） |
-| `traceReflectionPath` | 鏡面反射で経路点を追う（可視化用） |
-| `computeTransmission` | 直線が貫く壁の帯域別透過率を掛け合わせ |
-| `occlusionScalar` | 透過の広帯域平均 → 遮蔽スカラ（簡易） |
-| `occlusionScalarRayIntegrated` | **レイ積分**で反射の回り込みも数える遮蔽 |
-| `occlusionScalarMultiSource` | ↑の多音源・共有リスナーパス版 |
-| `computeEchogram` | 到達時間ごとのエネルギー＝**残響の形** |
-| `computeFaceReachability` | 音源面の「どこが届くか」グリッド |
+| `addBox / addBoxOriented` | 箱（軸並行/回転）を材質付きで追加 |
+| `addMesh` → ID | メッシュを BVH 構築して追加。**IDを返す** |
+| `setMeshActive(id, on)` | メッシュを**有効/無効**（BVH保持のまま走査からスキップ＝音響LOD） |
+| `clearGeometry` / `clearMeshes` | 箱のみ / メッシュのみ消去 |
+| `isOccluded` | 二値遮蔽（箱=線分、メッシュ=BVH occludes） |
+| `raycastClosest` | 最近ヒット（箱＋各メッシュBVH。非アクティブはスキップ） |
+| `computeTransmission` | 直線が貫く箱/メッシュの帯域別透過率（メッシュは横切り枚数ぶん） |
+| `occlusionScalarMultiSource` | **共有リスナーパス**で多音源の遮蔽を一括 |
+| `computeEchogram` | 到達時間エコグラム＝残響の形 |
 
-**レイ積分のキモ**（`computeEchogram` 等）：
-リスナーから球面上に均一にレイを撒き、壁で反射させながら各バウンス点から各音源へ「next-event」でつなぐ。各レイは帯域別エネルギーを運び、距離減衰・反射率・透過で減衰する。これを到達時間でビン分けすると「直接音の大ピーク → 初期反射 → 減衰する尾」という残響の形が物理から出てくる。
-> 反射場は球面全方向からの到達の**積分**なので、レイ合算には立体角係数（2π）を掛ける。単なる平均(1/N)にすると反射が約1桁過小評価され残響が乾く（実際にあったバグ）。
+**レイ積分のキモ**：リスナーから球面（フィボナッチ）にレイを撒き、壁で反射させながら各バウンス点から各音源へ next-event でつなぐ。各レイは帯域別エネルギーを運び、距離減衰・反射率・透過で減衰。到達時間でビン分け＝残響。反射場は立体角の積分なので合算に **2π係数**（単純平均だと反射が約1桁過小評価＝残響が乾く。過去のバグ）。
+> ⚠ **エネルギー正規化・反射の重みは現状 placeholder**（聴感チューニングの当て値）。scattering・空気吸収も未実装。ここが「オールスペック化」で確定させる対象（§10）。
 
 ---
 
 ## 5. Adapter層 — Wwiseへの配線
 
-`wwise_adapter.cpp` が Wwise SDK を叩く。主な関数：
+`wwise_adapter.cpp`。`initAudio`/`loadBank`/`postEvent`/`executeActionOnEvent`（Stop/Pause/Resume）/`setObstructionOcclusion`（遮蔽→LPF/音量）/`setEmitterListenerVolume`（指向性ゲイン）/`setRTPCValue(OnObject)`（残響/EQ）/`setState`（HRTF↔Panning）/バスRMSメータリング。
 
-| 関数 | Wwise API | 用途 |
-|---|---|---|
-| `initAudio` / `loadBank` | Init / LoadBank | 起動・バンク読込 |
-| `postEvent` | PostEvent | 音源イベント再生 |
-| `executeActionOnEvent` | ExecuteActionOnEvent | Stop/Pause/Resume（止めて残響の尾を聴く） |
-| `setObstructionOcclusion` | SetObjectObstructionAndOcclusion | 遮蔽→LPF/音量 |
-| `setEmitterListenerVolume` | SetGameObjectOutputBusVolume | 指向性ゲイン |
-| `setRTPCValue` / `OnObject` | SetRTPCValue | 残響/EQ パラメータ駆動 |
-| `setState` | SetState | 空間化(HRTF/Panning)切替 |
-| `BusMeteringCallback` | RegisterBusMeteringCallback | マスターバスRMS取得 |
-
-**Wwise側のバス構成**（プロジェクトは repo 外）：
-```
-Master Audio Bus
-├ Music_TokyoGeto        … 音楽のドライ
-├ Panning_TokyoGeto(Aux) … パンニング実験用
-└ Reverb_TokyoGeto(Aux)  … RoomVerb（残響）。音源から-12dBで送る
-```
-残響は **`ReverbDecay → RoomVerbのDecay Time`** と **`ReverbWet → Reverbバスの音量`** をRTPCで駆動 → 部屋の形・材質に応じて響きが変わる（geometry駆動）。
-
-> 重要なはまりどころ：RoomVerb等のプラグインは**自前DLLに Factory を静的リンク**しないと、そのバンクの読込/再生が失敗して無音になる。
+**Wwiseバス**（プロジェクトは repo 外）：Master ← Music / Panning(Aux) / Reverb(RoomVerb, Aux)。残響は `ReverbDecay`/`ReverbWet` をRTPCで geometry 駆動。
+> はまりどころ：RoomVerb等は自前DLLに Factory を**静的リンク**しないと無音。
 
 ---
 
 ## 6. Export層 — C ABI 境界
 
-`acoustic_api.cpp` / `include/acoustic_engine.h`。
-- C++のクラス `AcousticWorld` を **不透明ハンドル**（`AcousticEngineHandle`）として C# に渡す。
-- 全関数 `extern "C"`（名前マングリングを無効化）＝ C# の `DllImport` から呼べる形。
-- ベクトルは `AF_Vector3`（plain struct）で受け渡し。
+`acoustic_api.cpp` / `include/acoustic_engine.h`。C++クラスを不透明ハンドルで渡し、全関数 `extern "C"`、ベクトルは `AF_Vector3`(POD)。主な公開群：
 
-これが「C# ↔ C++」の唯一の契約。ヘッダのコメントがそのまま仕様書になっている。
+- **生成/破棄**：`Create` / `Destroy`
+- **箱ジオメトリ**：`AddBox` / `AddBoxOriented`（回転＋6+6帯域素材配列） / `ClearGeometry`
+- **メッシュ**：`AddMesh`（ワールド頂点＋インデックス＋6+6素材、**ID返し**） / `SetMeshActive`(id,on) / `ClearMeshes`
+- **遮蔽**：`IsOccluded` / `ComputeOcclusion` / `ComputeOcclusionRayIntegrated` / `ComputeOcclusionMultiSource`
+- **可視化**：`ComputeTransmissionBands` / `DebugRaycast` / `TraceReflectionPath` / `ComputeEchogram` / `ComputeFaceReachability`
+- **指向性**：`ComputeDirectivity`
+- **Wwise**：Init/Load/PostEvent/Action/ObstructionOcclusion/EmitterVolume/State/RTPC/GetOutputLevels/RenderAudio
 
 ---
 
 ## 7. Unity (C#) 側
 
-### AcousticEngineBindings.cs
-`[DllImport("AcousticEngine")]` の生宣言。C API と1:1。文字列は UTF-8 の `byte[]` で渡す。
+### Bindings / AcousticEngine ラッパー
+`DllImport` の生宣言と、それを包む使いやすいラッパー（Vector3変換・UTF-8化・`AddMesh`はID返し・`SetMeshActive` 等）。
 
-### AcousticEngine.cs
-Bindings を包む薄いラッパー。`Vector3`↔`AF_Vector3` 変換、文字列のUTF-8化、`NumBands` 等の定数、`ActionPause/Resume` などを提供。ゲーム側はこのクラスだけ見ればよい。
+### ジオメトリ収集パイプライン（AcousticFlowDemo）
+「**忠実度と素材は収集時に一度きり静的決定／位置・回転は毎フレームlive**」が基本方針。
 
-### AcousticFlowDemo.cs — ★デモ本体
-- シーンの壁/音源/リスナーを集めて毎フレーム統括（§3のフロー）。
-- HUD（FPS・遮蔽量・残響wet/RT・指向性など）を描画。
-- デバッグ用の可視化モード・各種トグルキー。
+- **箱 occluder**：`walls`（Transform配列）or `autoCollectColliders`（BoxCollider自動収集）。各エントリの忠実度は `defaultFidelityObb` と CollArea(provideFidelity) の重なりで OBB/AABB を決める。素材は AcousticSurface＞素材CollArea(中心包含・priority)＞既定。
+- **メッシュ occluder**：`meshOccluders`（明示Transform配列。非空ならそれ“だけ”を丸ごとメッシュ化）or `meshOccluderRoots`（子MeshFilterを走査、fidelity CollArea内のみメッシュ化）。**全fidelityメッシュは1本のBVHに統合**（occluder数に依存させない）。未readable/対象外は箱にフォールバック。
+- **音響ゾーン**：`RegisterZones()` が各 `AcousticZone` を**別々の統合BVH**で登録（初回）、`UpdateZones()` が毎フレーム、リスナー在否で `SetMeshActive`（出る時だけ hysteresis で緩める）。アクティブ集合は普段1〜3個＝軽い。
 
-### Editor/ 監視ウィンドウ群
-再生中のエンジン内部状態を別ウィンドウで可視化（エンジンの「中身」を見せる差別化要素）：
-- **BandMonitor** … 6帯域の透過ゲイン
-- **ReverbMonitor** … エコグラム（到達時間×エネルギー）
-- **OutputMonitor** … 出力L/RのRMS波形
-- **SourcePathMonitor** … 音源面の到達ヒートマップ
+### 主なコンポーネント / インスペクタ項目
+- **CollArea**（静的オーサリング）：`provideFidelity`（実形状 or OBB化する範囲）/ `provideMaterial`＋`material`＋`priority`（素材ゾーン）。
+- **AcousticSurface**：個別オブジェクトの材質を明示（最優先）。
+- **AcousticZone**（動的LOD）：`meshes`（所属メッシュ）/ `material` / `hysteresis` / `startActive`。範囲=Collider or position×lossyScale。
+- **AcousticFlowDemo**：`meshOccluders` / `meshOccluderRoots` / `defaultFidelityObb` / `autoCollectColliders` / `solveEveryNFrames`（重いソルブの更新頻度）ほか。
+
+### Editor / 監視ウィンドウ
+BandMonitor（6帯域透過）/ ReverbMonitor（エコグラム）/ OutputMonitor（L/R RMS波形）/ SourcePathMonitor（音源面ヒートマップ）。
 
 ---
 
-## 8. 音響の概念と実装段階
+## 8. ジオメトリ忠実度 & 音響LOD（今回の追加の核）
 
-| 概念 | 内容 | 現状 |
+| レベル | 表現 | いつ使う |
 |---|---|---|
-| **遮蔽 (Occlusion)** | 壁が直接音を遮る | レイ積分で反射の回り込みも考慮 |
-| **透過 (Transmission)** | 壁を抜ける（低域ほど） | 6帯域マテリアルで実装。Wwiseには現状スカラで渡す |
-| **残響 (Reverb)** | 反射の積み重なり | エコグラム→RT60/wet→RoomVerb駆動 |
-| **指向性 (Directivity)** | 音源の向きで音が変わる | 広帯域ゲイン+背面LPF |
-| **距離 (Distance)** | 遠いと小さく・こもる | 音量は1/r²。空気吸収LPFは今後 |
-| **空間化 (HRTF/Panning)** | 立体定位 | パンニング採用（HRTFは環境都合で見送り） |
+| **AABB** | 軸並行の箱 | 既定・遠景・回転不要な壁 |
+| **OBB** | 回転した箱 | 回した壁を正しく遮蔽（`defaultFidelityObb` / fidelity CollArea） |
+| **Mesh+BVH** | 三角形の実形状 | 忠実に見せたい面（`meshOccluders` / fidelity CollArea / AcousticZone） |
+
+- **CollArea** = 静的な「どこを高忠実度・どの素材」のオーサリング。判定は Play開始1フレーム目に一度きり（毎フレームBVH再構築を避ける意図）。
+- **AcousticZone** = 動的な「入ったら有効化」の音響LODストリーミング。BVHは保持したまま `active` を切替＝再構築なし。均一ボクセルでなく“置きたい所にゾーン”方式。
+- **時間デシメーション** `solveEveryNFrames` = 重いソルブを1/Nに。スムージングで音は連続。
 
 ---
 
-## 9. ビルド & デプロイ
+## 9. 音響の概念と実装段階
+
+| 概念 | 現状 |
+|---|---|
+| 遮蔽 | レイ積分で反射の回り込みも考慮（箱＋メッシュ） |
+| 透過 | 6帯域マテリアル。Wwiseには現状スカラで渡す |
+| 残響 | エコグラム→RT60/wet→RoomVerb駆動 |
+| 指向性 | 広帯域ゲイン+背面LPF |
+| 距離 | 音量1/r²。空気吸収LPFは**未実装** |
+| 空間化 | パンニング採用（HRTFはSteam Audio等で後日） |
+| 拡散反射(scattering) | **未実装**（鏡面平行反射のみ） |
+| 音響LOD | AcousticZone で入場アクティブ化＋Nフレ・スロットル |
+
+---
+
+## 10. 現状の「仮」と次の一手（オールスペック → 凍結 → GPU）
+
+方針（2026-07-02決定）：**CPUで音響モデルをオールスペックまで詰めて凍結してから GPU コンピュートへ移植**（仮モデルをGPU化すると二度手間）。
+
+**GPU移植で凍結が要る＝レイ内側ループ**（先に確定させる）：
+1. 反射の重み較正（今は placeholder。Sabine/Eyring RT60 等の解析解を基準にすると客観的に較正できる）
+2. scattering（拡散反射）
+3. 距離の空気吸収LPF
+4. 帯域積算の確定・エコグラムのビン設計
+
+**GPUと直交＝後でよい**：マテリアル実測値／Wwise帯域別受け渡し（6帯域→1スカラ卒業）／HRTF／Sphere・Capsule形状。回折をやるならレイループ側なので凍結前に。
+
+移植先は Unity ComputeShader（BVH/三角形をGPUバッファへ、1スレッド=1レイ、`AsyncGPUReadback`＋`solveEveryNFrames`＋スムージングで遅延吸収）。C++ CPU版はリファレンス/フォールバックとして残す。
+
+---
+
+## 11. ビルド & デプロイ
 
 ```bash
-# C++ DLL をビルド
-cmake --build build --config Debug
-#   → build/bin/Debug/AcousticEngine.dll
-
-# Unity へ反映（Unityを閉じてから。開いてるとDLLロックでコピー失敗）
+cmake --build build --config Debug          # → build/bin/Debug/AcousticEngine.dll
 cp build/bin/Debug/AcousticEngine.dll UnityDemo/Assets/Plugins/x86_64/
-
-# Wwise バンク更新時（Wwiseで Generate 後）
-#   GeneratedSoundBanks/Windows/{Init,TokyoGeto}.bnk を
-#   UnityDemo/Assets/StreamingAssets/WwiseBanks/ へコピー
 ```
-> C#だけの変更なら Unity が自動再コンパイルするのでDLLビルドは不要。
+- C#だけの変更なら Unity が自動再コンパイル（DLLビルド不要）。
+- **⚠ ネイティブDLLの新API追加時は Unity Editor を再起動**（Unityは native plugin をホットリロードしない＝`EntryPointNotFound` になる）。
+- **⚠ メッシュを occluder にする FBX は Read/Write Enabled 必須**（`isReadable:1`）。無効だと `mesh.vertices` が実行時例外（現コードは検知して箱にフォールバック）。
+- Wwiseバンク更新時：`GeneratedSoundBanks/Windows/*.bnk` を `StreamingAssets/WwiseBanks/` へ。
 
 ---
 
-## 10. 操作キー一覧（デモ）
+## 12. 操作キー（デモ）
 
 | キー | 動作 |
 |---|---|
-| WASD / 右ドラッグ | リスナー移動・回転 |
+| WASD / Space / LeftShift | リスナー移動 |
 | 矢印 / PgUp / PgDn | 選択音源の移動 |
 | Tab | 音源選択を巡回 |
 | H | 空間化 HRTF↔Panning |
 | 1 / 2 | 表示モード（届く経路 / 指向性） |
-| R | 残響のみ（ドライをミュート） |
-| O | obstruction強制（LPF経路テスト） |
-| T | 残響強制ON（残響経路テスト） |
-| P | 全音源一時停止（残響の尾を聴く） |
+| R / O / T / P | 残響のみ / obstruction強制 / 残響強制 / 全音源一時停止 |
+
+※ `solveEveryNFrames`・`meshOccluders`・忠実度・ゾーンは AcousticFlowDemo/各コンポーネントのインスペクタで設定。
 
 ---
 
-## 設計上の意図（就活向けの見どころ）
+## 設計上の意図（見どころ）
 
-- **層分離**で「音響計算エンジン」を音響ミドルウェアから独立させた（Coreは単体テスト可能）。
-- **レイトレ的なエネルギー積分**で遮蔽・残響を物理ベースに（直線1本の近似から脱却）。
-- **共有リスナーパス**で多音源でもraycastコストが音源数に依存しない設計（実ゲームのスケールを意識）。
-- **6帯域**の周波数依存（低域は壁を回り込む等）をミドルウェア境界まで持っている。
+- **層分離**で音響計算エンジンをミドルウェアから独立（Coreは単体テスト可能・GPU移植の土台）。
+- **レイエネルギー積分**で遮蔽・残響を物理ベースに。
+- **共有リスナーパス**で多音源でも raycast コストが音源数に非依存。
+- **忠実度LOD（AABB/OBB/Mesh）＋CollArea＋AcousticZone＋時間デシメーション**で、重いメッシュ音響を破綻させず回す設計。
 - エンジン内部状態を**可視化ツール**で見せ、ブラックボックスにしない。

@@ -13,8 +13,10 @@
 #include <vector>
 
 #include "Core/aabb.h"
+#include "Core/bvh.h"
 #include "Core/material.h"
 #include "Core/ray.h"
+#include "Core/triangle.h"
 #include "Core/vec3.h"
 
 namespace acoustic {
@@ -28,8 +30,40 @@ public:
     void addBox(const Vec3& center, const Vec3& halfExtents,
                 const AcousticMaterial& material);
 
-    // 登録済みの障害物をすべて消す（シーン再構築用）。
+    // 回転対応の障害物ボックス（OBB）を追加する（既定マテリアル）。
+    // right/up からローカル基底を作る（内部で正規直交化）。
+    // Unity の transform.right / transform.up をそのまま渡せばよい。
+    void addBoxOriented(const Vec3& center, const Vec3& halfExtents,
+                        const Vec3& right, const Vec3& up);
+
+    // マテリアル指定版の回転対応ボックス（OBB）。
+    void addBoxOriented(const Vec3& center, const Vec3& halfExtents,
+                        const Vec3& right, const Vec3& up,
+                        const AcousticMaterial& material);
+
+    // 三角形メッシュ occluder を追加する（CollArea 内など実形状で見せたい領域用）。
+    //   verticesXYZ : 頂点座標を x,y,z の並びで vertexCount 個ぶん（ワールド座標）。
+    //   indices     : 三角形を成す頂点番号を 3 個ずつ indexCount 個。
+    //   material    : このメッシュ全体の音響材質。
+    // 追加時に BVH を構築する（重い＝静的ジオメトリ前提。毎フレーム呼ばない）。
+    // 箱(clearGeometry)とは別管理で、clearMeshes まで保持される。
+    // 戻り値: このメッシュの ID（0起点。setMeshActive で個別に有効/無効を切替える用）。
+    //         失敗時は -1。ID は clearMeshes まで安定。
+    int addMesh(const float* verticesXYZ, int vertexCount,
+                const int* indices, int indexCount,
+                const AcousticMaterial& material);
+
+    // メッシュ occluder を有効/無効にする（BVHは保持したまま走査対象から外すだけ＝軽い）。
+    // 音響LODストリーミング（エリア入場で該当ゾーンだけ有効化）に使う。
+    // 範囲外 ID は無視。
+    void setMeshActive(int meshId, bool active);
+
+    // 箱 occluder（動的）をすべて消す。毎フレームのシーン再構築用（軽い）。
+    // メッシュ occluder はこれでは消えない（clearMeshes を使う）。
     void clearGeometry();
+
+    // メッシュ occluder（静的）をすべて消す。BVH ごと破棄する。
+    void clearMeshes();
 
     // 2点 from->to の間が障害物で遮られているか。
     //   true  = 遮蔽あり（直線で見通せない）
@@ -57,6 +91,18 @@ public:
     // これが「材質ベースのこもり」の素。
     void computeTransmission(const Vec3& from, const Vec3& to,
                              float outGain[kNumBands]) const;
+
+    // 【回折】直接 from->to が遮蔽されているとき、遮蔽している箱の角を回る「最短迂回」の
+    // 余剰経路長 δ（= 迂回長 − 直線長, m）を返す。遮蔽が無い or 迂回路が見つからない場合は -1。
+    // 箱(OBB)の8隅を候補に、from→隅→to が両方見通せる隅の中で δ 最小を採る（Phase1: 箱のみ）。
+    float diffractionDetour(const Vec3& from, const Vec3& to) const;
+
+    // 【回折】from->to の帯域別「回折ゲイン」(0..1)を outGain に書く。
+    //   遮蔽なし          → 全帯域 1.0（直接が素通り）
+    //   遮蔽あり+迂回路あり → Maekawa 近似（フレネル数 N=2δ/λ、低域ほど回り込んで大きい）
+    //   遮蔽あり+迂回路なし → 全帯域 0.0
+    // 透過(computeTransmission)とは別経路。呼び出し側で「透過 or 回折の大きい方/和」を採る。
+    void computeDiffraction(const Vec3& from, const Vec3& to, float outGain[kNumBands]) const;
 
     // 透過の広帯域平均から求めた遮蔽スカラー(0..1, 1=ほぼ遮断)。
     // 既存の Wwise Occlusion ノブ（1値）に渡す用の簡易指標。
@@ -107,15 +153,23 @@ public:
                                 float* outGrid, int cols, int rows) const;
 
     // 登録済み障害物の数（デバッグ用）。
-    int boxCount() const { return static_cast<int>(occluders_.size()); }
+    int boxCount() const { return static_cast<int>(boxes_.size()); }
+    int meshCount() const { return static_cast<int>(meshes_.size()); }
 
 private:
-    // 障害物 = 形状(AABB) + 材質。
-    struct Occluder {
-        Aabb box;
+    // 箱障害物 = 形状(OBB) + 材質。OBBは単位回転で軸並行(AABB)も兼ねる。
+    struct BoxOccluder {
+        Obb box;
         AcousticMaterial material;
     };
-    std::vector<Occluder> occluders_;
+    // メッシュ障害物 = 三角形BVH + 材質（メッシュ全体で一様）+ 有効フラグ。
+    struct MeshOccluder {
+        TriangleBvh bvh;
+        AcousticMaterial material;
+        bool active = true;  // false のとき全走査(遮蔽/透過/レイキャスト)からスキップ
+    };
+    std::vector<BoxOccluder> boxes_;    // 動的（毎フレーム clearGeometry で作り直す）
+    std::vector<MeshOccluder> meshes_;  // 静的（clearMeshes まで保持。BVH を持つので重い）
 };
 
 }  // namespace acoustic
