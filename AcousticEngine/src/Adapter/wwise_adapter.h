@@ -83,6 +83,13 @@ void setRTPCValue(const char* name, float value);
 // 音源ごとに別々の値を当てたい用途（帯域別EQの Gain を音源ごとに駆動するなど）。
 void setRTPCValueOnObject(const char* name, float value, unsigned long long gameObjectId);
 
+// 【早期反射(A)】emitterId の音源に、早期反射のイメージソースを AkReflect（auxBusName の
+// aux バス）へ設定する。count 個の像源＝positions[i*3]=x,y,z（ワールド位置）＋levels[i]=線形ゲイン。
+// 毎フレーム呼ぶ想定（先に既存を全消し→設定し直す）。auxBusName 空/未検出なら authoring 既定の
+// reflections aux バスを使う。AK::SpatialAudio::SetImageSource 経由。
+void setEarlyReflections(unsigned long long emitterId, const char* auxBusName,
+                         const float* positions, const float* levels, int count);
+
 // 出力(マスターバス)の左右レベル(RMS, 線形)を取得する（メーター可視化用）。
 // メータリング未対応/未初期化なら 0 を返す。
 void getOutputLevels(float* outLeft, float* outRight);

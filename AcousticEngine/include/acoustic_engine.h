@@ -69,13 +69,57 @@ ACOUSTIC_API void AcousticEngine_Destroy(AcousticEngineHandle engine);
 
 /* ===== ジオメトリ登録 & 可視性判定（ステップ3） ===== */
 
-/* 障害物ボックスを中心+halfExtentsで追加する。 */
+/* 障害物ボックスを中心+halfExtentsで追加する（軸並行・既定マテリアル）。 */
 ACOUSTIC_API void AcousticEngine_AddBox(AcousticEngineHandle engine,
                                         AF_Vector3 center,
                                         AF_Vector3 halfExtents);
 
-/* 登録済みの障害物をすべて消す。 */
+/* 回転対応の障害物ボックス（OBB）を、帯域別マテリアル付きで追加する。
+ *   right / up    : 箱のローカル軸のワールド向き（内部で正規直交化。forward=right×up）。
+ *                   Unity の transform.right / transform.up をそのまま渡せる。
+ *   transmission  : 各帯域の透過率(0..1) 配列。null なら既定値。
+ *   absorption    : 各帯域の吸収率(0..1) 配列。null なら既定値。
+ *   scattering    : 各帯域の散乱率(0..1) 配列（鏡面⇄拡散の混合率）。null なら既定値。
+ *   numBands      : 上記配列の要素数。内部帯域数(6)未満なら不足分は既定値で補う。
+ * 各配列は独立に反映（null の配列だけ既定値のまま）。numBands<=0 は全て既定。 */
+ACOUSTIC_API void AcousticEngine_AddBoxOriented(AcousticEngineHandle engine,
+                                                AF_Vector3 center,
+                                                AF_Vector3 halfExtents,
+                                                AF_Vector3 right,
+                                                AF_Vector3 up,
+                                                const float* transmission,
+                                                const float* absorption,
+                                                const float* scattering,
+                                                int numBands);
+
+/* 三角形メッシュ occluder を追加する（CollArea 内など実形状で見せたい領域用）。
+ *   vertices  : 頂点を x,y,z の並びで vertexCount 個（ワールド座標。C# が transform 適用済み）。
+ *   indices   : 三角形を成す頂点番号を 3 個ずつ indexCount 個。
+ *   transmission/absorption/scattering : メッシュ全体の帯域別材質（AddBoxOriented と同仕様。null 可）。
+ * 追加時に内部で BVH を構築する（重い＝静的ジオメトリ前提。毎フレーム呼ばない）。
+ * 箱(ClearGeometry)とは別管理で、ClearMeshes まで保持される。
+ * 戻り値: メッシュ ID（0起点。SetMeshActive で個別に有効/無効を切替える用）。失敗時 -1。 */
+ACOUSTIC_API int AcousticEngine_AddMesh(AcousticEngineHandle engine,
+                                        const float* vertices,
+                                        int vertexCount,
+                                        const int* indices,
+                                        int indexCount,
+                                        const float* transmission,
+                                        const float* absorption,
+                                        const float* scattering,
+                                        int numBands);
+
+/* メッシュ occluder を有効/無効にする（active: 1=有効 / 0=無効）。
+ * BVH は保持したまま走査対象から外すだけ＝軽い。エリア入場での音響LODに使う。 */
+ACOUSTIC_API void AcousticEngine_SetMeshActive(AcousticEngineHandle engine,
+                                               int meshId, int active);
+
+/* 箱 occluder（動的）をすべて消す。毎フレームのシーン再構築用（軽い）。
+ * メッシュ occluder は消えない（ClearMeshes を使う）。 */
 ACOUSTIC_API void AcousticEngine_ClearGeometry(AcousticEngineHandle engine);
+
+/* メッシュ occluder（静的・BVH付き）をすべて消す。 */
+ACOUSTIC_API void AcousticEngine_ClearMeshes(AcousticEngineHandle engine);
 
 /* 2点 from->to が障害物で遮られているか。
  * 戻り値: 1 = 遮蔽あり / 0 = 見通せる
@@ -131,6 +175,16 @@ ACOUSTIC_API int AcousticEngine_ComputeTransmissionBands(AcousticEngineHandle en
                                                          AF_Vector3 to,
                                                          float* outGains,
                                                          int count);
+
+/* from→to の帯域別「回折ゲイン」(0..1)を outGains に書く。
+ *   遮蔽なし → 全帯域 1.0 / 遮蔽+迂回路あり → Maekawa（低域ほど大きい）/ 迂回路なし → 0。
+ * 直接が壁で塞がれても、角を回り込む成分を周波数別に与える（低域が回り込む物理）。
+ * outGains は 6 要素以上。実際に書き込んだ帯域数を返す。 */
+ACOUSTIC_API int AcousticEngine_ComputeDiffractionBands(AcousticEngineHandle engine,
+                                                        AF_Vector3 from,
+                                                        AF_Vector3 to,
+                                                        float* outGains,
+                                                        int count);
 
 /* 【デバッグ/可視化用】origin から dir 方向へレイを飛ばし、最も近い障害物
  * までの距離を返す。ヒットしなければ -1 を返す。
@@ -302,6 +356,19 @@ ACOUSTIC_API void AcousticEngine_SetRTPCValue(const char* name, float value);
  * 帯域別EQの Gain を音源ごとに独立駆動するなど、音源ごとに別値を当てる用途。 */
 ACOUSTIC_API void AcousticEngine_SetRTPCValueOnObject(const char* name, float value,
                                                       unsigned long long gameObjectId);
+
+/* 【早期反射(A)】emitterId の音源に、方向つき早期反射のイメージソースを AkReflect
+ * （auxBusName の aux バス）へ設定する。毎フレーム呼ぶ想定（先に既存を全消し→設定し直し）。
+ *   positions : 像源のワールド位置（count 個 = positions[i*3+0..2]）
+ *   levels    : 各タップの線形レベル（count 個）
+ *   auxBusName: AkReflect を載せた aux バス名（UTF-8）。null/空なら authoring 既定バス。
+ * AF_SceneComputeEarlyReflections の出力（像源位置＋帯域ゲイン）を渡して鳴らす。
+ * ※帯域ゲインは代表値（例 500Hz 帯）を level に使う想定。Wwise 側 AkReflect が空間化。 */
+ACOUSTIC_API void AcousticEngine_SetEarlyReflections(unsigned long long emitterId,
+                                                     const char* auxBusName,
+                                                     const float* positions,
+                                                     const float* levels,
+                                                     int count);
 
 /* 出力(マスターバス)の左右レベル(RMS, 線形 0..1程度)を取得する（メーター可視化用）。
  * outLeft / outRight に書き込む。未初期化・メータリング未対応なら 0。null 可。 */

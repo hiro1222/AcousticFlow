@@ -6,7 +6,7 @@
  *   Scene/Game の隣にドッキングでき、ゲーム画面（OnGUI）は一切いじらない。
  *
  * 値の出どころ: AcousticFlowDemo が毎フレーム計算して
- *   AcousticFlowDemo.LatestBandGains に公開している 6 帯域の透過ゲイン(0..1)。
+ *   AcousticFlowSceneDemo.LatestBandGains に公開している 6 帯域の透過ゲイン(0..1)。
  *   1=素通り（バー満タン）/ 0=完全遮断（バー空）。壁を出入りすると動く。
  */
 using UnityEditor;
@@ -46,7 +46,7 @@ namespace AcousticFlow.EditorTools
                 return;
             }
 
-            float[] gains = AcousticFlowDemo.LatestBandGains;
+            float[] gains = AcousticFlowSceneDemo.LatestBandGains;
             if (gains == null || gains.Length == 0)
             {
                 EditorGUILayout.HelpBox(

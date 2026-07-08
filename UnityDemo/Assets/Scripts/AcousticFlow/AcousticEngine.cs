@@ -35,6 +35,54 @@ namespace AcousticFlow
                 Native.AcousticEngine_AddBox(_handle, new AFVector3(center), new AFVector3(halfExtents));
         }
 
+        // 回転対応(OBB)＋帯域別マテリアルで障害物を追加する。
+        //   right/up : 箱のローカル軸（transform.right / transform.up をそのまま渡せる）。内部で正規直交化。
+        //   material : 透過/吸収を6帯域で持つ。null なら既定マテリアル。
+        // CollArea/AcousticSurface で解決したOBB＋材質を、ここから一本でエンジンに渡す。
+        public void AddBoxOriented(Vector3 center, Vector3 halfExtents,
+                                   Vector3 right, Vector3 up, AcousticMaterial material = null)
+        {
+            if (_handle == IntPtr.Zero) return;
+            float[] trans = material?.transmission;   // null のまま渡すと C 側で既定マテリアル
+            float[] absorp = material?.absorption;
+            float[] scat = material?.scattering;
+            int numBands = (trans != null && absorp != null) ? NumBands : 0;
+            Native.AcousticEngine_AddBoxOriented(
+                _handle, new AFVector3(center), new AFVector3(halfExtents),
+                new AFVector3(right), new AFVector3(up), trans, absorp, scat, numBands);
+        }
+
+        // 三角形メッシュ occluder を追加する（CollArea 内など実形状で見せたい領域用）。
+        //   worldVerticesXYZ : 頂点を x,y,z 並びで（ワールド座標。呼び出し側で transform 適用済み）。
+        //   triangles        : 三角形インデックス（Unity Mesh.triangles をそのまま）。
+        //   material         : メッシュ全体の材質。null なら既定。
+        // 追加時にネイティブ側で BVH を構築する（重い＝静的前提。毎フレーム呼ばない）。
+        // 戻り値: メッシュID（SetMeshActive で有効/無効を切替える用。失敗 -1）。
+        public int AddMesh(float[] worldVerticesXYZ, int[] triangles, AcousticMaterial material = null)
+        {
+            if (_handle == IntPtr.Zero || worldVerticesXYZ == null || triangles == null) return -1;
+            float[] trans = material?.transmission;
+            float[] absorp = material?.absorption;
+            float[] scat = material?.scattering;
+            int numBands = (trans != null && absorp != null) ? NumBands : 0;
+            return Native.AcousticEngine_AddMesh(_handle, worldVerticesXYZ, worldVerticesXYZ.Length / 3,
+                                                 triangles, triangles.Length, trans, absorp, scat, numBands);
+        }
+
+        // メッシュ occluder の有効/無効を切替える（エリア入場での音響LOD用）。BVHは保持＝軽い。
+        public void SetMeshActive(int meshId, bool active)
+        {
+            if (_handle == IntPtr.Zero || meshId < 0) return;
+            Native.AcousticEngine_SetMeshActive(_handle, meshId, active ? 1 : 0);
+        }
+
+        // メッシュ occluder（静的）を全消去。ClearGeometry（箱）とは別。
+        public void ClearMeshes()
+        {
+            if (_handle != IntPtr.Zero)
+                Native.AcousticEngine_ClearMeshes(_handle);
+        }
+
         // --- 判定 ---
         public bool IsOccluded(Vector3 from, Vector3 to)
         {
@@ -220,6 +268,13 @@ namespace AcousticFlow
         // 音源→リスナー間の出力バス音量(線形ゲイン)。指向性ゲインの反映に使う。
         public static void SetEmitterListenerVolume(ulong emitterId, ulong listenerId, float volume)
             => Native.AcousticEngine_SetEmitterListenerVolume(emitterId, listenerId, volume);
+
+        // 早期反射(A): AkReflect の aux バスへ像源(位置+線形レベル)を設定。毎フレーム呼ぶ想定。
+        // auxBusName 空/null で authoring 既定バス。positions は長さ count*3、levels は長さ count。
+        public static void SetEarlyReflections(ulong emitterId, string auxBusName,
+                                               float[] positions, float[] levels, int count)
+            => Native.AcousticEngine_SetEarlyReflections(
+                   emitterId, Utf8(auxBusName), positions, levels, count);
 
         public void Dispose()
         {

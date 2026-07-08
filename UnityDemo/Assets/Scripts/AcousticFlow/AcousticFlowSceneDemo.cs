@@ -1,0 +1,918 @@
+// AcousticFlowSceneDemo.cs
+// 新アーキ(2026-07) Phase1c/5：新コア(AcousticScene)で動く最小デモ（複数音源対応）。
+//
+//   1. シーンの BoxCollider を occluder としてインスタンス登録（geomId+OBB+matId）。
+//   2. 毎フレーム、各インスタンスの transform を更新（動的ジオメトリ）。
+//   3. リスナー↔各音源の遮蔽を「反射込み・共有レイ1回」で計算（役割2＝音源数非依存）。
+//   4. 6帯域→広帯域(低域加重)の遮蔽量に落として Wwise(既存 static API) の Occlusion を駆動。
+//   5. WASD で歩き回れる（一人称）。
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace AcousticFlow
+{
+    [DisallowMultipleComponent]
+    public sealed class AcousticFlowSceneDemo : MonoBehaviour
+    {
+        [Header("必須オブジェクト")]
+        [Tooltip("リスナー（無指定ならメインカメラを使う）。")]
+        public Transform listener;
+        [Tooltip("主音源（0番）。回折経路の可視化はこの音源を対象にする。")]
+        public Transform source;
+        [Tooltip("追加音源（1番以降）。source と合わせて全音源になる。")]
+        public Transform[] extraSources;
+        [Tooltip("各音源の Wwise イベント名（並びは source, extraSources… の順）。")]
+        public string[] sourceEvents = { "Vocal", "Guitar", "Piano", "Bass", "Drums", "Other" };
+
+        [Header("occluder")]
+        [Tooltip("ON: シーン内の BoxCollider を自動収集して壁にする（listener/source 配下は除外）。")]
+        public bool autoCollectBoxColliders = true;
+        [Tooltip("手動指定の occluder（autoCollect と併用可）。")]
+        public BoxCollider[] extraOccluders;
+        [Tooltip("occluder の材質プリセット（全 occluder 共通・最小デモ用）。")]
+        public AcousticMaterialPreset occluderMaterial = AcousticMaterialPreset.Concrete;
+
+        [Header("移動 (WASD)")]
+        public bool enableMovement = true;
+        public float moveSpeed = 4f;
+        public float turnSpeed = 120f;
+        public float mouseSensitivity = 2.5f;
+        public bool firstPersonCamera = true;
+        public float eyeHeight = 0f;
+
+        [Header("回折 エッジカタログ (Phase4-B)")]
+        [Tooltip("ON: リスナー中心キューブマップでシルエット稜線を拾い回折に使う（無効時は箱コーナー探索）。")]
+        public bool useEdgeCatalog = true;
+        [Tooltip("キューブマップ面解像度（大きいほど精密・重い。例16〜32）。")]
+        public int edgeCatalogRes = 16;
+        [Tooltip("カタログ更新間隔（フレーム）。リスナーが動くので数フレーム毎。")]
+        public int catalogUpdateEveryFrames = 3;
+
+        [Header("反射 (役割2)")]
+        [Tooltip("ON: 壁で反射して回り込む成分も含めて遮蔽を計算（壁裏でも聞こえる）。")]
+        public bool useReflections = true;
+        [Tooltip("ON: 遮蔽時、音源を『エネルギーが届く方向』へ置き直す（壁越しでも開いてる側から聞こえる）。G キー切替。")]
+        public bool useDirectionalSteering = true;
+        [Tooltip("ステアの直接項の重み。大=音源方向に定位が張り付く / 小=反射方向へ開く。" +
+                 "直接がしっかり届くほど音源方向、遠回り(回折δ)ほど開く。")]
+        [Range(0f, 4f)] public float directLocalizeWeight = 1f;
+        [Tooltip("この遮蔽量まではステアせず直接音最優先（音源方向）。超えた分だけステアへ切替。" +
+                 "0=常にステア / 大きいほど直接優先。")]
+        [Range(0f, 1f)] public float steerThreshold = 0.2f;
+        [Tooltip("見かけ方向の平滑時間(秒)。臨界減衰(SmoothDamp)でこの時定数で追従。"
+                 + "大きいほど滑らか＝経路が切り替わっても速度制限つきでスッと補完（大=もっさり/小=機敏）。")]
+        [Range(0.02f, 0.6f)] public float directionSmoothTime = 0.18f;
+        [Tooltip("反射計算のリスナーレイ本数（共有＝音源数非依存。例 256〜1024）。")]
+        public int reflectionRays = 256;
+        [Tooltip("反射の最大回数（例 2〜3）。")]
+        public int reflectionBounces = 3;
+
+        [Header("残響 (Phase6)")]
+        [Tooltip("ON: エコグラムから RT60/wet を算出して Wwise 残響(RoomVerb)を駆動する。")]
+        public bool enableReverb = true;
+        [Tooltip("エコグラムの時間ビン数。bins×binMs が窓幅（例 100×10ms=1秒）。")]
+        public int echogramBins = 100;
+        public float echogramBinMs = 10f;
+        [Tooltip("残響用レイ本数（共有）と反射回数。尾を追うので反射は多め。")]
+        public int echogramRays = 512;
+        public int echogramBounces = 8;
+        [Tooltip("残響の更新間隔（フレーム）。重いので数フレームに1回で十分（部屋は緩変）。")]
+        public int reverbUpdateEveryFrames = 4;
+        [Tooltip("拡散リバーブ(RoomVerb)の wet 倍率。反響が強すぎるなら下げる（0=残響なし）。")]
+        [Range(0f, 2f)] public float reverbWetScale = 0.8f;
+
+        [Header("早期反射 (A: 仮想エミッタ)")]
+        [Tooltip("ON: 各音源の主要な初期反射を像源として抽出し、像源位置に『普通の3Dボイス』を立てて"
+                 + "音源と同じ音をタップゲインで鳴らす。Wwise コアの3D定位のみ使用（プラグイン不要）。"
+                 + "RoomVerb の拡散残響とは別に、壁からの鏡面反射が定位付きで聞こえる。F キー切替。")]
+        public bool enableEarlyReflections = true;
+        [Tooltip("音源あたりの最大反射タップ数（＝像源＝仮想ボイス数）。多いほど密だがボイスを食う（例 3〜6）。"
+                 + "総仮想ボイス数 = 音源数 × これ。")]
+        [Range(1, 8)] public int earlyReflectTaps = 4;
+        [Tooltip("早期反射抽出のレイ本数（音源ごと）。")]
+        public int earlyReflectRays = 256;
+        [Tooltip("早期反射の反射回数（1〜2で初期反射のみ）。")]
+        public int earlyReflectBounces = 2;
+        [Tooltip("早期反射の更新間隔（フレーム）。音源ごとにレイを撒くので数フレーム毎。")]
+        public int earlyReflectUpdateEveryFrames = 3;
+        [Tooltip("反射タップの全体レベル倍率（線形）。大きいほど反射音が大きい。")]
+        [Range(0f, 4f)] public float earlyReflectLevelScale = 1f;
+
+        [Header("可視化")]
+        [Tooltip("ON: 反響経路（リスナーから撒いた反射レイの跳ね返り）を線で表示。R キー切替。" +
+                 "※Game ビューでは上部の Gizmos ボタンを ON にすると見える。")]
+        public bool showReflectionPaths = false;
+        [Tooltip("表示する反射レイの本数（見やすさ優先で少なめ）。")]
+        public int reflectionPathRays = 24;
+        [Tooltip("表示する反射の跳ね返り回数。")]
+        public int reflectionPathBounces = 3;
+        [Tooltip("反射レイの最大到達距離。")]
+        public float reflectionPathMaxDist = 40f;
+        [Tooltip("ON: 主音源(0)の回折候補の迂回経路を全部線で表示（最短だけ水色で強調）。C キー切替。")]
+        public bool showDiffractionCandidates = true;
+
+        [Header("遮蔽チューニング")]
+        [Tooltip("遮蔽量が変化する速さ（毎秒）。小さいほど滑らか。")]
+        public float occlusionSmoothSpeed = 4f;
+        [Tooltip("遮蔽量の上限(0..1)。分断壁で塞ぎたいなら高め、裏で消えすぎるなら下げる。")]
+        [Range(0f, 1f)] public float maxOcclusion = 0.92f;
+        [Tooltip("遮蔽量全体の強さ倍率。小さいほど遮蔽が緩い。")]
+        [Range(0f, 2f)] public float occlusionStrength = 1f;
+
+        [Header("音声(Wwise)")]
+        [Tooltip("ON: Wwise を初期化して各音源のイベントを再生する（バンクが無ければ幾何計算のみ）。")]
+        public bool enableAudio = true;
+        [Tooltip("ON: HRTF（両耳の頭部伝達）で空間化。OFF: パンニング。H キーで切替。")]
+        public bool useHrtf = true;
+        public string[] banks = { "Init.bnk", "TokyoGeto.bnk" };
+
+        private const ulong ListenerObjId = 2;
+        private const ulong SourceObjIdBase = 10;
+        private ulong SourceId(int i) => SourceObjIdBase + (ulong)i;
+        // 早期反射の仮想エミッタ（像源）ID。音源 s × タップ t で一意。基底は音源IDと衝突しない値。
+        private const ulong ReflectObjIdBase = 1000;
+        private ulong ReflectId(int s, int t) => ReflectObjIdBase + (ulong)(s * _erTapCap + t);
+
+        private AcousticScene _scene;
+        private int _materialId;
+        private readonly List<BoxCollider> _occluders = new List<BoxCollider>();
+        private readonly List<int> _instanceIds = new List<int>();
+
+        private Transform[] _sources;   // source + extraSources
+        private Vector3[] _srcPos;      // 音源位置バッファ
+        private float[] _occSmoothed;   // 音源ごとの平滑化遮蔽
+        private float[] _bandsPerSource; // 音源ごとの6帯域生存（count*6）
+        private float[] _arrivalDir;    // engine出力: エネルギー到来方向（count*3）
+        private Vector3[] _apparentDir; // 平滑化した見かけ方向（単位）
+        private Vector3[] _apparentVel; // SmoothDamp の速度状態（音源ごと）
+        private Vector3[] _srcHome;     // 音源の元配置（Space で復帰）
+        private Vector3 _stackPoint;    // 重ねる座標（元配置の重心）
+        private bool _stacked;          // true=全音源を1点に重ねる
+
+        // 主音源(0番)の表示用。
+        private readonly float[] _bands = new float[AcousticEngine.NumBands];
+        private readonly float[] _diffBands = new float[AcousticEngine.NumBands];
+        private float _diffDelta = -1f;
+        private Vector3 _diffMid;
+        // 遮蔽量の帯域加重（低域=大。低音は回り込んで残るため重い）。
+        private static readonly float[] _bandWeights = { 3f, 2.5f, 2f, 1.3f, 1f, 0.8f };
+
+        private float[] _echogram;      // 到達時間ビン
+        private float _reverbWet, _reverbDecay;  // エコグラムから算出（RTPCへ）
+        private int _echoCountdown = 1;
+        private int _catalogCountdown = 1;
+
+        // 早期反射(A) 用バッファ。音源ごとに像源位置＋帯域ゲインを受け、仮想エミッタへ反映。
+        private Vector3[] _erImagePos;  // 像源位置（earlyReflectTaps）
+        private float[] _erGain;        // 帯域ゲイン（earlyReflectTaps*6）
+        private int _erCountdown = 1;
+        private int _erActiveTaps;      // 直近フレームで鳴っているタップ総数（表示用）
+        private int _erTapCap;          // 仮想エミッタ プールの1音源あたり容量（＝初期化時の earlyReflectTaps）
+        private bool _erPoolReady;      // 仮想エミッタを登録＆イベント投入済みか
+
+        // --- モニター窓向け static フィード（Editor の *MonitorWindow が読む） ---
+        public const int OutHistLen = 256;
+        public static float[] LatestEchogram { get; private set; }
+        public static int EchogramBins { get; private set; }
+        public static float EchogramBinMs { get; private set; }
+        public static float[] LatestBandGains { get; private set; }  // 主音源の帯域別生存
+        public static float[] OutHistoryL { get; private set; }
+        public static float[] OutHistoryR { get; private set; }
+        public static int OutHistoryHead { get; private set; }
+        private static float[] _monBandGains;
+
+        private bool _audioReady;
+        private string _status = "未初期化";
+        private Camera _cam;
+        private float _pitch;
+
+        private Vector3[][] _reflPaths; // 反響経路の可視化バッファ
+        private int[] _reflPathLens;
+
+        // 回折候補の可視化バッファ（主音源0）。全候補の迂回点＋δ、最短のインデックス。
+        private Vector3[] _diffCandPts;
+        private float[] _diffCandDelta;
+        private int _diffCandCount;
+        private int _diffCandMinIdx = -1;
+
+        // パフォーマンス計測
+        private readonly System.Diagnostics.Stopwatch _acStopwatch = new System.Diagnostics.Stopwatch();
+        private double _acousticMs;   // 音響計算1フレームの所要時間(ms, 平滑化)
+        private float _fps;           // 平滑化FPS
+
+        private void OnEnable()
+        {
+            if (listener == null && Camera.main != null) listener = Camera.main.transform;
+
+            _scene = new AcousticScene();
+            if (!_scene.IsValid)
+            {
+                _status = "Scene 生成失敗（DLL を確認）";
+                Debug.LogError("[AcousticFlowScene] AF_SceneCreate が失敗しました。");
+                return;
+            }
+
+            BuildSources();
+
+            // モニター窓向けの static バッファを用意。
+            OutHistoryL = new float[OutHistLen];
+            OutHistoryR = new float[OutHistLen];
+            OutHistoryHead = 0;
+            _monBandGains = new float[AcousticEngine.NumBands];
+            LatestBandGains = _monBandGains;
+
+            _materialId = _scene.AddMaterial(AcousticMaterial.FromPreset(occluderMaterial));
+            CollectOccluders();
+            RegisterInstances();
+            SetupCamera();
+            if (enableAudio) SetupAudio();
+
+            _status = $"Scene OK / instances={_scene.InstanceCount} / sources={_sources.Length}"
+                    + (_audioReady ? " / 再生中" : (enableAudio ? " / 音声なし" : ""));
+        }
+
+        // source + extraSources を結合して音源配列とバッファを確定する。
+        private void BuildSources()
+        {
+            var list = new List<Transform>();
+            if (source != null) list.Add(source);
+            if (extraSources != null)
+                foreach (var s in extraSources)
+                    if (s != null && s != source && !list.Contains(s)) list.Add(s);
+            _sources = list.ToArray();
+
+            int n = Mathf.Max(1, _sources.Length);
+            _srcPos = new Vector3[n];
+            _occSmoothed = new float[n];
+            _bandsPerSource = new float[n * AcousticEngine.NumBands];
+            _arrivalDir = new float[n * 3];
+            _apparentDir = new Vector3[n];
+            _apparentVel = new Vector3[n];
+
+            // 元配置を控え、重ね座標＝元配置の重心を求める（Space で切替）。
+            _srcHome = new Vector3[_sources.Length];
+            Vector3 sum = Vector3.zero;
+            for (int i = 0; i < _sources.Length; i++)
+            {
+                _srcHome[i] = _sources[i] != null ? _sources[i].position : Vector3.zero;
+                sum += _srcHome[i];
+            }
+            _stackPoint = _sources.Length > 0 ? sum / _sources.Length : Vector3.zero;
+            _stacked = false;
+
+            _echogram = new float[Mathf.Max(1, echogramBins)];
+
+            // 早期反射(A) バッファ。1音源分を使い回す（音源ごとに順次計算→仮想エミッタへ反映）。
+            _erTapCap = Mathf.Max(1, earlyReflectTaps);
+            _erImagePos = new Vector3[_erTapCap];
+            _erGain = new float[_erTapCap * AcousticEngine.NumBands];
+
+            // 回折候補の可視化バッファ（エンジンの合成上限に合わせて64）。
+            _diffCandPts = new Vector3[64];
+            _diffCandDelta = new float[64];
+        }
+
+        // 音源を「元配置」⇄「1点に重ね」で配置し直す。
+        private void ApplySourceLayout()
+        {
+            if (_sources == null || _srcHome == null) return;
+            for (int i = 0; i < _sources.Length; i++)
+                if (_sources[i] != null)
+                    _sources[i].position = _stacked ? _stackPoint : _srcHome[i];
+        }
+
+        private void CollectOccluders()
+        {
+            _occluders.Clear();
+            if (autoCollectBoxColliders)
+            {
+                foreach (var col in FindObjectsOfType<BoxCollider>())
+                {
+                    if (col == null || !col.enabled) continue;
+                    if (IsExcluded(col.transform)) continue;
+                    _occluders.Add(col);
+                }
+            }
+            if (extraOccluders != null)
+                foreach (var col in extraOccluders)
+                    if (col != null && !_occluders.Contains(col)) _occluders.Add(col);
+        }
+
+        // listener / 各音源の階層下（本人含む）は occluder から除外する。
+        private bool IsExcluded(Transform t)
+        {
+            for (Transform p = t; p != null; p = p.parent)
+            {
+                if (p == listener) return true;
+                if (_sources != null)
+                    foreach (var s in _sources) if (p == s) return true;
+            }
+            return false;
+        }
+
+        private void RegisterInstances()
+        {
+            _instanceIds.Clear();
+            foreach (var col in _occluders)
+            {
+                GetObb(col, out Vector3 c, out Vector3 half, out Vector3 right, out Vector3 up);
+                _instanceIds.Add(_scene.AddInstanceBox(c, half, right, up, _materialId));
+            }
+        }
+
+        private static void GetObb(BoxCollider col, out Vector3 center, out Vector3 half,
+                                   out Vector3 right, out Vector3 up)
+        {
+            Transform t = col.transform;
+            center = t.TransformPoint(col.center);
+            Vector3 s = t.lossyScale;
+            half = new Vector3(
+                Mathf.Abs(col.size.x * 0.5f * s.x),
+                Mathf.Abs(col.size.y * 0.5f * s.y),
+                Mathf.Abs(col.size.z * 0.5f * s.z));
+            right = t.right;
+            up = t.up;
+        }
+
+        private void SetupCamera()
+        {
+            if (!firstPersonCamera) return;
+            _cam = Camera.main;
+            if (listener != null)
+            {
+                var rend = listener.GetComponentInChildren<Renderer>();
+                if (rend != null) rend.enabled = false;
+            }
+            _pitch = 0f;
+        }
+
+        private string EventFor(int i)
+        {
+            if (sourceEvents != null && i < sourceEvents.Length && !string.IsNullOrEmpty(sourceEvents[i]))
+                return sourceEvents[i];
+            return "Vocal";
+        }
+
+        private void SetupAudio()
+        {
+            if (!AcousticEngine.IsWwiseAvailable) { _status = "Wwise 非搭載ビルド"; return; }
+            if (!AcousticEngine.InitAudio()) { _status = "Wwise 初期化失敗"; return; }
+
+            string bankPath = System.IO.Path.Combine(Application.streamingAssetsPath, "WwiseBanks");
+            AcousticEngine.SetBankPath(bankPath);
+            bool banksOk = true;
+            if (banks != null)
+                foreach (var b in banks)
+                    if (!string.IsNullOrEmpty(b)) banksOk &= AcousticEngine.LoadBank(b);
+            if (!banksOk)
+            {
+                _status = "バンク未検出（StreamingAssets/WwiseBanks を確認）";
+                Debug.LogWarning($"[AcousticFlowScene] バンク読込失敗: {bankPath}");
+                return;
+            }
+
+            AcousticEngine.RegisterGameObject(ListenerObjId, "Listener");
+            AcousticEngine.SetDefaultListener(ListenerObjId);
+            for (int i = 0; i < _sources.Length; i++)
+                AcousticEngine.RegisterGameObject(SourceId(i), "Source" + i);
+            UpdateAudioTransforms();
+
+            int playing = 0;
+            for (int i = 0; i < _sources.Length; i++)
+                if (AcousticEngine.PostEvent(EventFor(i), SourceId(i)) != 0) playing++;
+            _audioReady = playing > 0;
+            if (!_audioReady)
+                Debug.LogWarning("[AcousticFlowScene] PostEvent 失敗。イベント名（sourceEvents）を確認。");
+
+            // 早期反射の仮想エミッタ（像源ボイス）を用意。直接音と同フレームで同期投入する
+            // （後からバラバラに鳴らすと拍がズレるため、初期化時にまとめて立てる）。
+            if (_audioReady && enableEarlyReflections) SetupReflectionEmitters();
+
+            ApplySpatializationState();  // HRTF/パンニングを反映
+        }
+
+        // 早期反射の仮想エミッタを登録し、各音源と同じイベントを同フレームで再生（初期はミュート）。
+        // 以降は毎フレーム、像源位置と出力音量だけを更新する（拍ズレ防止のため再生し直さない）。
+        private void SetupReflectionEmitters()
+        {
+            if (!_audioReady || _erPoolReady || _sources == null) return;
+            for (int s = 0; s < _sources.Length; s++)
+            {
+                for (int t = 0; t < _erTapCap; t++)
+                {
+                    ulong id = ReflectId(s, t);
+                    AcousticEngine.RegisterGameObject(id, $"Refl{s}_{t}");
+                    // 初期位置＝リスナー、出力音量0（次の UpdateEarlyReflections で正しく置き直す）。
+                    AcousticEngine.SetGameObjectPosition(id, listener.position, listener.forward, listener.up);
+                    AcousticEngine.SetEmitterListenerVolume(id, ListenerObjId, 0f);
+                    AcousticEngine.PostEvent(EventFor(s), id);  // 直接と同じ stem を同期再生
+                }
+            }
+            _erPoolReady = true;
+        }
+
+        // 全仮想エミッタをミュート（F で OFF にしたとき。ボイスは残すが無音にする）。
+        private void MuteAllReflections()
+        {
+            if (!_erPoolReady) return;
+            for (int s = 0; s < _sources.Length; s++)
+                for (int t = 0; t < _erTapCap; t++)
+                    AcousticEngine.SetEmitterListenerVolume(ReflectId(s, t), ListenerObjId, 0f);
+            _erActiveTaps = 0;
+        }
+
+        // Wwise の空間化 State を useHrtf に合わせて設定（HRTF↔パンニング）。
+        private void ApplySpatializationState()
+        {
+            if (!AcousticEngine.IsAudioInitialized) return;
+            try { AcousticEngine.SetState("Spatialization", useHrtf ? "HRTF" : "Panning"); }
+            catch (System.EntryPointNotFoundException) { /* 古いDLLでは無視 */ }
+        }
+
+        private void HandleMovement()
+        {
+            float dt = Time.deltaTime;
+            float yaw = 0f;
+            if (Input.GetKey(KeyCode.Q)) yaw -= turnSpeed * dt;
+            if (Input.GetKey(KeyCode.E)) yaw += turnSpeed * dt;
+            if (Input.GetMouseButton(1))
+            {
+                yaw += Input.GetAxis("Mouse X") * mouseSensitivity;
+                _pitch = Mathf.Clamp(_pitch - Input.GetAxis("Mouse Y") * mouseSensitivity, -80f, 80f);
+            }
+            if (Mathf.Abs(yaw) > 0f) listener.Rotate(0f, yaw, 0f, Space.World);
+
+            float x = Input.GetAxisRaw("Horizontal");
+            float z = Input.GetAxisRaw("Vertical");
+            if (x != 0f || z != 0f)
+            {
+                Vector3 fwd = listener.forward; fwd.y = 0f; fwd.Normalize();
+                Vector3 right = listener.right; right.y = 0f; right.Normalize();
+                Vector3 move = (fwd * z + right * x).normalized;
+                float speed = moveSpeed * (Input.GetKey(KeyCode.LeftShift) ? 2.5f : 1f);
+                listener.position += move * speed * dt;
+            }
+        }
+
+        private void Update()
+        {
+            if (_scene == null || !_scene.IsValid || listener == null || _sources == null) return;
+            if (_sources.Length == 0) return;
+
+            // Space：音源を「元配置」⇄「1点に重ね」でトグル。
+            if (Input.GetKeyDown(KeyCode.Space)) { _stacked = !_stacked; ApplySourceLayout(); }
+            // H：HRTF↔パンニング切替。
+            if (Input.GetKeyDown(KeyCode.H)) { useHrtf = !useHrtf; ApplySpatializationState(); }
+            // G：方向ステアリング（到来方向で置き直す）ON/OFF。
+            if (Input.GetKeyDown(KeyCode.G)) useDirectionalSteering = !useDirectionalSteering;
+            // R：反響経路の表示 ON/OFF。
+            if (Input.GetKeyDown(KeyCode.R)) showReflectionPaths = !showReflectionPaths;
+            // C：回折候補経路の表示 ON/OFF。
+            if (Input.GetKeyDown(KeyCode.C)) showDiffractionCandidates = !showDiffractionCandidates;
+            // F：早期反射(仮想エミッタ)の ON/OFF。ON=像源ボイスを鳴らす / OFF=全ミュート。
+            if (Input.GetKeyDown(KeyCode.F))
+            {
+                enableEarlyReflections = !enableEarlyReflections;
+                if (_audioReady)
+                {
+                    if (enableEarlyReflections)
+                    {
+                        if (!_erPoolReady) SetupReflectionEmitters();  // 初回ONで遅延生成
+                        _erCountdown = 1;  // 次フレームで即更新
+                    }
+                    else MuteAllReflections();
+                }
+            }
+
+            _fps = Mathf.Lerp(_fps, 1f / Mathf.Max(1e-4f, Time.unscaledDeltaTime), 0.1f);
+
+            if (enableMovement) HandleMovement();
+
+            // 1) 動的ジオメトリ更新（動いた分だけ）。
+            for (int i = 0; i < _occluders.Count; i++)
+            {
+                var col = _occluders[i];
+                if (col == null || _instanceIds[i] < 0) continue;
+                GetObb(col, out Vector3 c, out Vector3 half, out Vector3 right, out Vector3 up);
+                _scene.UpdateInstance(_instanceIds[i], c, half, right, up);
+            }
+
+            // 1.5) エッジカタログを低レートで構築（リスナー中心・全音源共有）→ 回折が使う。
+            if (useEdgeCatalog)
+            {
+                if (--_catalogCountdown <= 0)
+                {
+                    _catalogCountdown = Mathf.Max(1, catalogUpdateEveryFrames);
+                    _scene.BuildEdgeCatalog(listener.position, edgeCatalogRes, 40f);
+                }
+            }
+            else { _scene.ClearEdgeCatalog(); }
+
+            // 2) 音源位置バッファ。
+            for (int i = 0; i < _sources.Length; i++)
+                _srcPos[i] = _sources[i] != null ? _sources[i].position : listener.position;
+
+            // 3) 帯域別生存を音源ごとに求める（ここから音響計算の時間計測）。
+            _acStopwatch.Restart();
+            if (useReflections)
+            {
+                // 共有レイ1回で全音源へ（役割2＝音源数非依存）。_arrivalDir に到来方向も受ける。
+                _scene.OcclusionReflectedMulti(listener.position, _srcPos, _sources.Length,
+                                               null, _bandsPerSource, _arrivalDir,
+                                               directLocalizeWeight, reflectionRays, reflectionBounces);
+            }
+            else
+            {
+                // 反射なし＝音源ごとに直接（透過⊕回折）。到来方向は真方向。
+                for (int i = 0; i < _sources.Length; i++)
+                {
+                    _scene.ComputeTransmissionBands(_srcPos[i], listener.position, _bands);
+                    _scene.ComputeDiffractionBands(_srcPos[i], listener.position, _diffBands);
+                    for (int b = 0; b < AcousticEngine.NumBands; b++)
+                        _bandsPerSource[i * AcousticEngine.NumBands + b] = Mathf.Max(_bands[b], _diffBands[b]);
+                    Vector3 td = (_srcPos[i] - listener.position).normalized;
+                    _arrivalDir[i * 3] = td.x; _arrivalDir[i * 3 + 1] = td.y; _arrivalDir[i * 3 + 2] = td.z;
+                }
+            }
+
+            // 見かけ方向：遮蔽量でゲート。クリア=直接最優先(音源方向)、遮蔽が混じった分だけステアへ。
+            int nbDir = AcousticEngine.NumBands;
+            for (int i = 0; i < _sources.Length; i++)
+            {
+                // このソースの遮蔽量（低域加重）。
+                float wsum = 0f, gsum = 0f;
+                for (int b = 0; b < nbDir; b++)
+                {
+                    float w = _bandWeights[b];
+                    gsum += w * _bandsPerSource[i * nbDir + b];
+                    wsum += w;
+                }
+                float occ = Mathf.Clamp01(1f - (wsum > 0f ? gsum / wsum : 0f));
+                // 閾値まではステア0（直接優先）、超えた分を 0..1 に再マップ。
+                float steer = (steerThreshold < 1f)
+                    ? Mathf.Clamp01((occ - steerThreshold) / (1f - steerThreshold)) : 0f;
+
+                Vector3 trueDir = (_srcPos[i] - listener.position).normalized;
+                Vector3 engDir = new Vector3(_arrivalDir[i * 3], _arrivalDir[i * 3 + 1], _arrivalDir[i * 3 + 2]);
+                if (engDir.sqrMagnitude < 1e-8f) engDir = trueDir;
+                engDir.Normalize();
+                // クリア→音源方向 / 遮蔽→エネルギー到来方向。
+                Vector3 target = Vector3.Slerp(trueDir, engDir, steer);
+
+                // 臨界減衰の SmoothDamp で追従。経路が切り替わって target が飛んでも、速度制限つきで
+                // S字に補完される（指数追従の「最初だけ速いスウッシュ」が出ない）。方向なので後で正規化。
+                if (_apparentDir[i].sqrMagnitude < 1e-8f) { _apparentDir[i] = target; _apparentVel[i] = Vector3.zero; }
+                else
+                {
+                    _apparentDir[i] = Vector3.SmoothDamp(_apparentDir[i], target, ref _apparentVel[i],
+                                                         Mathf.Max(0.01f, directionSmoothTime));
+                    if (_apparentDir[i].sqrMagnitude > 1e-8f) _apparentDir[i].Normalize();
+                }
+            }
+
+            // 4) 反射込みの遮蔽（反射が効くと音源が明るく残る）→ Occlusion で駆動。
+            //    直接が塞がれても反射が帯域を持ち上げる＝方向性のある反射音として音源が聞こえる。
+            float dt = Time.deltaTime;
+            int nb = AcousticEngine.NumBands;
+            for (int i = 0; i < _sources.Length; i++)
+            {
+                float wsum = 0f, gsum = 0f;
+                for (int b = 0; b < nb; b++)
+                {
+                    float w = _bandWeights[b];
+                    gsum += w * _bandsPerSource[i * nb + b];  // 反射込みの帯域生存
+                    wsum += w;
+                }
+                float avgGain = (wsum > 0f) ? gsum / wsum : 0f;
+                float target = Mathf.Clamp(Mathf.Clamp01(1f - avgGain) * occlusionStrength, 0f, maxOcclusion);
+                _occSmoothed[i] = Mathf.MoveTowards(_occSmoothed[i], target, occlusionSmoothSpeed * dt);
+
+                if (_audioReady)
+                    AcousticEngine.SetObstructionOcclusion(SourceId(i), ListenerObjId, 0f, _occSmoothed[i]);
+            }
+
+            // 4.5) 早期反射(A)：音源ごとに主要な初期反射を像源として抽出し Wwise Reflect へ。
+            //      拡散残響(RoomVerb)と別に、壁からの鏡面反射が『方向つきの反射音』として鳴る。
+            if (enableEarlyReflections && _audioReady)
+            {
+                if (--_erCountdown <= 0)
+                {
+                    _erCountdown = Mathf.Max(1, earlyReflectUpdateEveryFrames);
+                    UpdateEarlyReflections(listener.position);
+                }
+            }
+
+            // 5) 主音源(0番)の透過/回折/回折経路を表示用に取得。
+            _scene.ComputeTransmissionBands(_srcPos[0], listener.position, _bands);
+            _scene.ComputeDiffractionBands(_srcPos[0], listener.position, _diffBands);
+            _diffDelta = _scene.DiffractionPath(_srcPos[0], listener.position, out _diffMid);
+
+            // 回折候補（主音源0）を全部取得し、最短δのインデックスを求める（可視化用）。
+            if (showDiffractionCandidates)
+            {
+                _diffCandCount = _scene.DiffractionCandidates(_srcPos[0], listener.position,
+                                                              _diffCandPts, _diffCandDelta);
+                _diffCandMinIdx = -1;
+                float md = float.MaxValue;
+                for (int i = 0; i < _diffCandCount; i++)
+                    if (_diffCandDelta[i] < md) { md = _diffCandDelta[i]; _diffCandMinIdx = i; }
+            }
+            else _diffCandCount = 0;
+
+            // 6) 残響（低レートでエコグラム→RT60/wet→Wwise RoomVerb を RTPC 駆動）。
+            if (enableReverb && _audioReady && _echogram != null)
+            {
+                if (--_echoCountdown <= 0)
+                {
+                    _echoCountdown = Mathf.Max(1, reverbUpdateEveryFrames);
+                    _scene.ComputeEchogram(listener.position, _srcPos, _sources.Length,
+                        _echogram, _echogram.Length, echogramBinMs * 0.001f, 343f,
+                        echogramRays, echogramBounces);
+                    UpdateReverbFromEchogram();
+                    // Reverb Monitor 窓へ。
+                    LatestEchogram = _echogram;
+                    EchogramBins = _echogram.Length;
+                    EchogramBinMs = echogramBinMs;
+                }
+            }
+
+            _acStopwatch.Stop();
+            _acousticMs = _acousticMs * 0.9 + _acStopwatch.Elapsed.TotalMilliseconds * 0.1;
+
+            if (showReflectionPaths) TraceReflectionPaths();
+
+            PublishMonitors();
+            if (_audioReady) { UpdateAudioTransforms(); AcousticEngine.RenderAudio(); }
+        }
+
+        // モニター窓向け：主音源の帯域別生存＋出力(マスターL/R)波形を static へ流す。
+        private void PublishMonitors()
+        {
+            if (_monBandGains != null && _bandsPerSource != null)
+            {
+                for (int b = 0; b < AcousticEngine.NumBands; b++) _monBandGains[b] = _bandsPerSource[b];
+                LatestBandGains = _monBandGains;
+            }
+            if (_audioReady && OutHistoryL != null)
+            {
+                AcousticEngine.GetOutputLevels(out float l, out float r);
+                OutHistoryL[OutHistoryHead] = l;
+                OutHistoryR[OutHistoryHead] = r;
+                OutHistoryHead = (OutHistoryHead + 1) % OutHistLen;
+            }
+        }
+
+        // 早期反射(A)：各音源の主要な初期反射を像源として抽出し、仮想エミッタ（像源位置の3Dボイス）へ反映。
+        //   Core が像源位置(= listener + 到来方向×経路長)と6帯域ゲインを返す。
+        //   像源ボイスの出力音量 = 帯域ゲインを低域加重で1つに畳んだ値 × 全体スケール。
+        //   遅延は付けない（=ゼロ遅延の方向つきコピー）。初期反射は直接音と融合して空間の"広がり/音色"を作る
+        //   成分なので、方向つきの同期コピーで空間印象を与えるのは妥当な近似。
+        private void UpdateEarlyReflections(Vector3 listenerPos)
+        {
+            if (!_erPoolReady || _erImagePos == null || _erGain == null) return;
+            int nb = AcousticEngine.NumBands;
+            _erActiveTaps = 0;
+
+            for (int s = 0; s < _sources.Length; s++)
+            {
+                int n = _scene.ComputeEarlyReflections(listenerPos, _srcPos[s],
+                                                       _erImagePos, _erGain,
+                                                       earlyReflectRays, earlyReflectBounces);
+                for (int t = 0; t < _erTapCap; t++)
+                {
+                    ulong id = ReflectId(s, t);
+                    if (t < n)
+                    {
+                        // 像源位置に置く（向きは点音源なので任意＝リスナー向き）。
+                        AcousticEngine.SetGameObjectPosition(id, _erImagePos[t], listener.forward, listener.up);
+                        float wsum = 0f, gsum = 0f;
+                        for (int b = 0; b < nb; b++)
+                        {
+                            float w = _bandWeights[b];
+                            gsum += w * _erGain[t * nb + b];
+                            wsum += w;
+                        }
+                        float lvl = (wsum > 0f ? gsum / wsum : 0f) * earlyReflectLevelScale;
+                        AcousticEngine.SetEmitterListenerVolume(id, ListenerObjId, Mathf.Clamp(lvl, 0f, 2f));
+                        _erActiveTaps++;
+                    }
+                    else
+                    {
+                        // 余ったタップ枠はミュート（ボイスは残すが無音）。
+                        AcousticEngine.SetEmitterListenerVolume(id, ListenerObjId, 0f);
+                    }
+                }
+            }
+        }
+
+        // エコグラムから wet量（反射割合）と RT60（尾の長さ）を算出し、Wwise 残響へ RTPC 送出。
+        //   ReverbWet   : 0..100（反射割合×100） / ReverbDecay : 秒（尾の長さ）
+        private void UpdateReverbFromEchogram()
+        {
+            int bins = _echogram.Length;
+            float peak = 0f, total = 0f;
+            for (int k = 0; k < bins; k++) { float e = _echogram[k]; if (e > peak) peak = e; total += e; }
+            if (peak <= 0f) return;
+
+            float tail = Mathf.Max(0f, total - peak);
+            float wet = Mathf.Clamp01(tail / Mathf.Max(total, 1e-6f));
+            float floor = peak * 0.001f;   // -60dB
+            int tailBin = 0;
+            for (int k = 0; k < bins; k++) if (_echogram[k] > floor) tailBin = k;
+            float rt60 = (tailBin + 1) * echogramBinMs * 0.001f;
+
+            _reverbWet = Mathf.Lerp(_reverbWet, wet, 0.2f);
+            _reverbDecay = Mathf.Lerp(_reverbDecay, rt60, 0.2f);
+            AcousticEngine.SetRTPCValue("ReverbWet", _reverbWet * 100f * reverbWetScale);
+            AcousticEngine.SetRTPCValue("ReverbDecay", _reverbDecay);
+        }
+
+        // 反響経路：リスナーから反射レイを撒き、跳ね返り経路をバッファに貯める（Gizmoが描く）。
+        private void TraceReflectionPaths()
+        {
+            int rays = Mathf.Max(1, reflectionPathRays);
+            int cap = Mathf.Max(2, reflectionPathBounces + 2);
+            if (_reflPaths == null || _reflPaths.Length != rays || _reflPaths[0].Length != cap)
+            {
+                _reflPaths = new Vector3[rays][];
+                _reflPathLens = new int[rays];
+                for (int i = 0; i < rays; i++) _reflPaths[i] = new Vector3[cap];
+            }
+            for (int i = 0; i < rays; i++)
+            {
+                Vector3 dir = FibonacciSphereDir(i, rays);
+                _reflPathLens[i] = _scene.TraceReflectionPath(
+                    listener.position, dir, reflectionPathMaxDist, reflectionPathBounces, _reflPaths[i]);
+            }
+        }
+
+        private static Vector3 FibonacciSphereDir(int i, int n)
+        {
+            float k = i + 0.5f;
+            float phi = Mathf.Acos(1f - 2f * k / n);
+            float theta = Mathf.PI * (1f + Mathf.Sqrt(5f)) * k;
+            float s = Mathf.Sin(phi);
+            return new Vector3(s * Mathf.Cos(theta), Mathf.Cos(phi), s * Mathf.Sin(theta));
+        }
+
+        private void LateUpdate()
+        {
+            if (!firstPersonCamera || _cam == null || listener == null) return;
+            if (_cam.transform == listener) return;
+            _cam.transform.position = listener.position + Vector3.up * eyeHeight;
+            _cam.transform.rotation = Quaternion.Euler(_pitch, listener.eulerAngles.y, 0f);
+        }
+
+        private void UpdateAudioTransforms()
+        {
+            AcousticEngine.SetGameObjectPosition(ListenerObjId, listener.position, listener.forward, listener.up);
+            if (_sources == null) return;
+            for (int i = 0; i < _sources.Length; i++)
+            {
+                if (_sources[i] == null) continue;
+                Vector3 pos = _sources[i].position;
+                // 方向ステアリング：真位置と同じ距離を保ちつつ、向きを「エネルギーが届く方向」に置き直す。
+                if (useDirectionalSteering && _apparentDir != null && _apparentDir[i].sqrMagnitude > 1e-8f)
+                {
+                    float dist = Vector3.Distance(_sources[i].position, listener.position);
+                    pos = listener.position + _apparentDir[i] * dist;
+                }
+                AcousticEngine.SetGameObjectPosition(SourceId(i), pos, _sources[i].forward, _sources[i].up);
+            }
+        }
+
+        private void OnDisable()
+        {
+            if (_audioReady && AcousticEngine.IsAudioInitialized)
+            {
+                if (_sources != null)
+                    for (int i = 0; i < _sources.Length; i++)
+                        AcousticEngine.UnregisterGameObject(SourceId(i));
+                // 早期反射の仮想エミッタも解除。
+                if (_erPoolReady && _sources != null)
+                    for (int s = 0; s < _sources.Length; s++)
+                        for (int t = 0; t < _erTapCap; t++)
+                            AcousticEngine.UnregisterGameObject(ReflectId(s, t));
+                AcousticEngine.UnregisterGameObject(ListenerObjId);
+                AcousticEngine.ShutdownAudio();
+            }
+            _erPoolReady = false;
+            _audioReady = false;
+            _scene?.Dispose();
+            _scene = null;
+        }
+
+        // 可視化：各音源の直接線（緑=素通り/赤=遮蔽）＋主音源の回折経路（青の折れ線）。
+        private void OnDrawGizmos()
+        {
+            if (listener == null) return;
+
+            // 反響経路（反射レイの跳ね返り）。バウンスが進むほど薄い黄色。
+            if (showReflectionPaths && _reflPaths != null && _reflPathLens != null)
+            {
+                for (int i = 0; i < _reflPaths.Length; i++)
+                {
+                    int len = _reflPathLens[i];
+                    for (int p = 0; p + 1 < len; p++)
+                    {
+                        float a = 1f - (float)p / Mathf.Max(1, reflectionPathBounces);
+                        Gizmos.color = new Color(1f, 0.82f, 0.2f, Mathf.Clamp01(a * 0.9f));
+                        Gizmos.DrawLine(_reflPaths[i][p], _reflPaths[i][p + 1]);
+                    }
+                }
+            }
+            if (_sources != null && _occSmoothed != null)
+            {
+                for (int i = 0; i < _sources.Length; i++)
+                {
+                    if (_sources[i] == null) continue;
+                    Gizmos.color = Color.Lerp(Color.green, Color.red, _occSmoothed[i]);
+                    Gizmos.DrawLine(_sources[i].position, listener.position);
+                }
+            }
+            else if (source != null)
+            {
+                Gizmos.color = Color.green;
+                Gizmos.DrawLine(source.position, listener.position);
+            }
+
+            Vector3 src0 = (_sources != null && _sources.Length > 0 && _sources[0] != null)
+                ? _sources[0].position : (source != null ? source.position : listener.position);
+
+            // 回折候補（主音源0）：全候補を source→P→listener で描画。最短δだけ水色で強調、他は薄い橙。
+            if (showDiffractionCandidates && _diffCandCount > 0)
+            {
+                for (int i = 0; i < _diffCandCount; i++)
+                {
+                    bool isMin = (i == _diffCandMinIdx);
+                    Gizmos.color = isMin ? new Color(0.1f, 0.9f, 1f, 1f)     // 最短＝水色
+                                         : new Color(1f, 0.6f, 0.15f, 0.35f); // 他＝薄い橙
+                    Gizmos.DrawLine(src0, _diffCandPts[i]);
+                    Gizmos.DrawLine(_diffCandPts[i], listener.position);
+                    Gizmos.DrawSphere(_diffCandPts[i], isMin ? 0.16f : 0.08f);
+                }
+            }
+            else if (_diffDelta >= 0f)  // 候補表示OFF時は従来の単一最短のみ（青）。
+            {
+                Gizmos.color = new Color(0.2f, 0.6f, 1f);
+                Gizmos.DrawLine(src0, _diffMid);
+                Gizmos.DrawLine(_diffMid, listener.position);
+                Gizmos.DrawSphere(_diffMid, 0.15f);
+            }
+        }
+
+        private void OnGUI()
+        {
+            var style = new GUIStyle(GUI.skin.label) { fontSize = 13 };
+            GUILayout.BeginArea(new Rect(10, 10, 480, 300), GUI.skin.box);
+            GUILayout.Label($"[新コア Scene] {_status}", style);
+            GUILayout.Label($"FPS: {_fps:F0}    音響計算: {_acousticMs:F2} ms/frame    " +
+                            $"空間化: {(useHrtf ? "HRTF" : "パン")} (H)    " +
+                            $"方向ステア: {(useDirectionalSteering ? "ON" : "OFF")} (G)", style);
+            if (enableMovement)
+                GUILayout.Label("操作: WASD / 右ドラッグ / QE / Shift / Space:重ね / H:HRTF / G:ステア / R:反響経路 / C:回折候補 / F:早期反射", style);
+            GUILayout.Label($"音源配置: {(_stacked ? "重ね(1点)" : "展開")}", style);
+            if (enableReverb)
+            {
+                float wetP = _reverbWet * 100f;                 // 物理wet%（echogram: tail/total）
+                float sendP = wetP * reverbWetScale;            // 送出 RTPC 値（0..100）
+                GUILayout.Label(
+                    $"直接:反響(物理) = {100f - wetP:F0}:{wetP:F0}   " +
+                    $"送出RTPC {sendP:F0}(×{reverbWetScale:F2})   RT {_reverbDecay:F2}s", style);
+            }
+
+            if (_sources != null && _occSmoothed != null)
+            {
+                string occ = "遮蔽/音源: ";
+                for (int i = 0; i < _sources.Length; i++)
+                    occ += $"{EventFor(i)}:{_occSmoothed[i]:F2}  ";
+                GUILayout.Label(occ, style);
+            }
+            GUILayout.Label(_diffDelta >= 0f
+                ? $"主音源の回折: 迂回路あり δ={_diffDelta:F2} m（青=経路補完）"
+                : "主音源の回折: なし", style);
+            if (useEdgeCatalog && _scene != null && _scene.IsValid)
+                GUILayout.Label($"エッジカタログ: {_scene.EdgeCatalogCount} 稜線 (res {edgeCatalogRes})", style);
+            if (showDiffractionCandidates)
+                GUILayout.Label($"回折候補(主音源): {_diffCandCount} 本合成 (水色=最短) (C)", style);
+            GUILayout.Label(enableEarlyReflections
+                ? $"早期反射(仮想エミッタ): ON  鳴動 {_erActiveTaps} 本/上限 {_sources?.Length * _erTapCap} (F)"
+                : "早期反射(仮想エミッタ): OFF (F)", style);
+
+            if (_scene != null && _scene.IsValid)
+            {
+                GUILayout.Label(BandLine("主音源 透過", _bands), style);
+                GUILayout.Label(BandLine("主音源 回折", _diffBands), style);
+            }
+            GUILayout.EndArea();
+        }
+
+        private static string BandLine(string label, float[] g)
+        {
+            string s = label + " ";
+            for (int b = 0; b < g.Length; b++)
+                s += $"{AcousticEngine.BandFreqs[b]}:{g[b]:F2} ";
+            return s;
+        }
+    }
+}

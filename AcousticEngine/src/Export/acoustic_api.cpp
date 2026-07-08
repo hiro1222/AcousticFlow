@@ -33,6 +33,24 @@ acoustic::Vec3 toVec3(const AF_Vector3& v) {
     return acoustic::Vec3(v.x, v.y, v.z);
 }
 
+// 帯域別の transmission/absorption/scattering 配列から AcousticMaterial を作る。
+// 各配列は独立に反映（null の配列だけ既定値のまま）。numBands<=0 は全て既定。
+// 内部帯域数に足りないぶんは既定値のまま残す。AddBoxOriented / AddMesh で共用する。
+acoustic::AcousticMaterial materialFromArrays(const float* transmission,
+                                              const float* absorption,
+                                              const float* scattering, int numBands) {
+    acoustic::AcousticMaterial m = acoustic::AcousticMaterial::defaultWall();
+    if (numBands > 0) {
+        const int n = (numBands < acoustic::kNumBands) ? numBands : acoustic::kNumBands;
+        for (int b = 0; b < n; ++b) {
+            if (transmission != nullptr) m.transmission[b] = transmission[b];
+            if (absorption != nullptr)   m.absorption[b]   = absorption[b];
+            if (scattering != nullptr)   m.scattering[b]   = scattering[b];
+        }
+    }
+    return m;
+}
+
 }  // namespace
 
 int AcousticEngine_GetVersion(void) {
@@ -56,9 +74,48 @@ void AcousticEngine_AddBox(AcousticEngineHandle engine,
     asWorld(engine)->addBox(toVec3(center), toVec3(halfExtents));
 }
 
+void AcousticEngine_AddBoxOriented(AcousticEngineHandle engine,
+                                   AF_Vector3 center,
+                                   AF_Vector3 halfExtents,
+                                   AF_Vector3 right,
+                                   AF_Vector3 up,
+                                   const float* transmission,
+                                   const float* absorption,
+                                   const float* scattering,
+                                   int numBands) {
+    if (!engine) return;
+    asWorld(engine)->addBoxOriented(
+        toVec3(center), toVec3(halfExtents), toVec3(right), toVec3(up),
+        materialFromArrays(transmission, absorption, scattering, numBands));
+}
+
+int AcousticEngine_AddMesh(AcousticEngineHandle engine,
+                           const float* vertices,
+                           int vertexCount,
+                           const int* indices,
+                           int indexCount,
+                           const float* transmission,
+                           const float* absorption,
+                           const float* scattering,
+                           int numBands) {
+    if (!engine) return -1;
+    return asWorld(engine)->addMesh(vertices, vertexCount, indices, indexCount,
+                                    materialFromArrays(transmission, absorption, scattering, numBands));
+}
+
+void AcousticEngine_SetMeshActive(AcousticEngineHandle engine, int meshId, int active) {
+    if (!engine) return;
+    asWorld(engine)->setMeshActive(meshId, active != 0);
+}
+
 void AcousticEngine_ClearGeometry(AcousticEngineHandle engine) {
     if (!engine) return;
     asWorld(engine)->clearGeometry();
+}
+
+void AcousticEngine_ClearMeshes(AcousticEngineHandle engine) {
+    if (!engine) return;
+    asWorld(engine)->clearMeshes();
 }
 
 int AcousticEngine_IsOccluded(AcousticEngineHandle engine,
@@ -113,6 +170,19 @@ int AcousticEngine_ComputeTransmissionBands(AcousticEngineHandle engine,
     float gains[acoustic::kNumBands];
     asWorld(engine)->computeTransmission(toVec3(from), toVec3(to), gains);
 
+    const int n = (count < acoustic::kNumBands) ? count : acoustic::kNumBands;
+    for (int b = 0; b < n; ++b) outGains[b] = gains[b];
+    return n;
+}
+
+int AcousticEngine_ComputeDiffractionBands(AcousticEngineHandle engine,
+                                           AF_Vector3 from,
+                                           AF_Vector3 to,
+                                           float* outGains,
+                                           int count) {
+    if (!engine || !outGains || count <= 0) return 0;
+    float gains[acoustic::kNumBands];
+    asWorld(engine)->computeDiffraction(toVec3(from), toVec3(to), gains);
     const int n = (count < acoustic::kNumBands) ? count : acoustic::kNumBands;
     for (int b = 0; b < n; ++b) outGains[b] = gains[b];
     return n;
@@ -280,6 +350,14 @@ void AcousticEngine_SetRTPCValue(const char* name, float value) {
 void AcousticEngine_SetRTPCValueOnObject(const char* name, float value,
                                          unsigned long long gameObjectId) {
     acoustic::adapter::setRTPCValueOnObject(name, value, gameObjectId);
+}
+
+void AcousticEngine_SetEarlyReflections(unsigned long long emitterId,
+                                        const char* auxBusName,
+                                        const float* positions,
+                                        const float* levels,
+                                        int count) {
+    acoustic::adapter::setEarlyReflections(emitterId, auxBusName, positions, levels, count);
 }
 
 void AcousticEngine_RenderAudio(void) {

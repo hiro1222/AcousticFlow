@@ -6,7 +6,7 @@
  *
  * 値の出どころ: AcousticFlowDemo が毎フレーム AcousticEngine.GetOutputLevels で
  *   マスターバスの L/R RMS（線形）を取り、リングバッファ
- *   AcousticFlowDemo.OutHistoryL/R に積んでいる（OutHistoryHead が最古位置）。
+ *   AcousticFlowSceneDemo.OutHistoryL/R に積んでいる（OutHistoryHead が最古位置）。
  *   左右の振幅が時間で動く＝音の鳴り・定位の偏りが波形として見える。
  *   ※ Windows Sonic の「前」のバス値なので HRTF の頭部回り込みは映らない。
  */
@@ -39,14 +39,14 @@ namespace AcousticFlow.EditorTools
                 return;
             }
 
-            float[] hl = AcousticFlowDemo.OutHistoryL;
-            float[] hr = AcousticFlowDemo.OutHistoryR;
+            float[] hl = AcousticFlowSceneDemo.OutHistoryL;
+            float[] hr = AcousticFlowSceneDemo.OutHistoryR;
             if (hl == null || hr == null || hl.Length == 0)
             {
                 EditorGUILayout.HelpBox("データ待ち…（再生中か確認）", MessageType.Warning);
                 return;
             }
-            int head = AcousticFlowDemo.OutHistoryHead;
+            int head = AcousticFlowSceneDemo.OutHistoryHead;
             int len = hl.Length;
 
             // 直近値（メータリングが効いているかの確認にもなる）。

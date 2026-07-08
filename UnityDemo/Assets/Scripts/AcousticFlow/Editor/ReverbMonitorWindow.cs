@@ -5,7 +5,7 @@
  *   メニュー: AcousticFlow > Reverb Monitor で開く。
  *
  * 値の出どころ: AcousticFlowDemo が数フレームごとに音源面→リスナーのレイ積分を
- *   到達時間ビンに積算し、AcousticFlowDemo.LatestEchogram に公開している。
+ *   到達時間ビンに積算し、AcousticFlowSceneDemo.LatestEchogram に公開している。
  *     先頭の大ピーク = 直接音 / その後のまばらな山 = 初期反射 /
  *     指数的に減衰する尾 = 残響。尾が長い = よく響く部屋。
  *   縦軸は dB 表示（ピーク基準 0〜-60dB）で、減衰の様子が直線的に見える。
@@ -39,9 +39,9 @@ namespace AcousticFlow.EditorTools
                 return;
             }
 
-            float[] bins = AcousticFlowDemo.LatestEchogram;
-            int n = AcousticFlowDemo.EchogramBins;
-            float binMs = AcousticFlowDemo.EchogramBinMs;
+            float[] bins = AcousticFlowSceneDemo.LatestEchogram;
+            int n = AcousticFlowSceneDemo.EchogramBins;
+            float binMs = AcousticFlowSceneDemo.EchogramBinMs;
             if (bins == null || n <= 0 || bins.Length < n)
             {
                 EditorGUILayout.HelpBox("データ待ち…（AcousticFlowDemo が動いているか確認）", MessageType.Warning);

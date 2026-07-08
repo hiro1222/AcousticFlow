@@ -22,6 +22,10 @@
 // Wwise RoomVerb（残響エフェクト）。これを include + .lib リンクしないと、
 // RoomVerb を使うバンクの読込/再生が失敗して無音になる。
 #include <AK/Plugin/AkRoomVerbFXFactory.h>            // Wwise RoomVerb
+// Wwise Reflect（イメージソース早期反射）と Spatial Audio。これを include + .lib
+// リンクしないと SetImageSource による方向つき反射(A)が使えない。
+#include <AK/Plugin/AkReflectFXFactory.h>             // Wwise Reflect
+#include <AK/SpatialAudio/Common/AkSpatialAudio.h>    // AK::SpatialAudio::Init / SetImageSource
 
 // Wwise サンプルの Low-Level I/O（バンクをディスクから読むための実装）。
 // これがないと LoadBank がファイルを開けない。
@@ -133,6 +137,11 @@ bool initAudio() {
         return false;
     }
 
+    // 5) スペーシャルオーディオ（早期反射=AkReflect のイメージソースに必要）。
+    //    失敗しても致命ではない（早期反射だけ無効になる）ので、init 全体は成功のまま続行。
+    AkSpatialAudioInitSettings spatialSettings;  // 既定でよい
+    AK::SpatialAudio::Init(spatialSettings);
+
     return true;
 }
 
@@ -201,6 +210,9 @@ void setGameObjectPosition(unsigned long long id,
 void setDefaultListener(unsigned long long id) {
     const AkGameObjectID listener = static_cast<AkGameObjectID>(id);
     AK::SoundEngine::SetDefaultListeners(&listener, 1);
+    // 早期反射(AkReflect)は Spatial Audio のリスナー基準で像源を空間化する。
+    // 既定リスナー1つなら自動選択されるが、明示登録しておくと確実。
+    AK::SpatialAudio::RegisterListener(listener);
 }
 
 unsigned int postEvent(const char* eventName, unsigned long long gameObjectId) {
@@ -265,6 +277,30 @@ void setRTPCValueOnObject(const char* name, float value, unsigned long long game
     // 帯域別EQの Gain を音源ごとに独立駆動するのに使う。
     AK::SoundEngine::SetRTPCValue(name, static_cast<AkRtpcValue>(value),
                                   static_cast<AkGameObjectID>(gameObjectId));
+}
+
+void setEarlyReflections(unsigned long long emitterId, const char* auxBusName,
+                         const float* positions, const float* levels, int count) {
+    const AkGameObjectID emitter = static_cast<AkGameObjectID>(emitterId);
+    // auxBusName が指定されていればそのバス、空/未指定なら authoring 既定の reflections バス。
+    AkUniqueID auxBusID = AK_INVALID_AUX_ID;
+    if (auxBusName && auxBusName[0] != '\0') {
+        auxBusID = AK::SoundEngine::GetIDFromString(auxBusName);
+    }
+    // 先に既存の像源を全消し（毎フレーム作り直す前提。emitter×auxBus 単位で消す）。
+    AK::SpatialAudio::ClearImageSources(auxBusID, emitter);
+    if (!positions || !levels || count <= 0) return;
+
+    for (int i = 0; i < count; ++i) {
+        const AkVector64 pos{ positions[i * 3 + 0],
+                              positions[i * 3 + 1],
+                              positions[i * 3 + 2] };
+        // 距離スケール 1.0（Core が像源位置に距離減衰を織り込み済み）＋タップの線形レベル。
+        AkImageSourceSettings info(pos, 1.0f, levels[i]);
+        // 像源ID はタップ番号。フレーム間で同じ番号に上書き更新される。
+        AK::SpatialAudio::SetImageSource(static_cast<AkImageSourceID>(i), info, "ER",
+                                         auxBusID, emitter);
+    }
 }
 
 void renderAudio() {

@@ -22,6 +22,7 @@ endif()
 # --- ソース構成 ---
 set(ACOUSTIC_SOURCES
     src/Export/acoustic_api.cpp
+    src/Export/scene_api.cpp
     src/Core/acoustic_world.cpp
     src/Core/material.cpp
     src/Core/source_directivity.cpp
@@ -83,6 +84,9 @@ if(WITH_WWISE)
         AkToneSource
         # エフェクトプラグイン: RoomVerb（残響。使うバンクの読込/再生に必須）
         AkRoomVerbFX
+        # 早期反射(A): Reflect プラグイン + Spatial Audio（SetImageSource で方向つき反射）
+        AkReflectFX
+        AkSpatialAudio
         # Windows システムライブラリ（デバイス列挙などで必要）
         Ole32
     )
