@@ -98,6 +98,22 @@ namespace AcousticFlow
         [Tooltip("反射タップの全体レベル倍率（線形）。大きいほど反射音が大きい。")]
         [Range(0f, 4f)] public float earlyReflectLevelScale = 1f;
 
+        [Header("回折の二次音源 (エッジ=音源)")]
+        [Tooltip("ON: 遮蔽時の回折を『エッジ＝二次音源』として、各開口の方向に仮想音源を立てて鳴らす。"
+                 + "両側に開口があれば左右2音源として両方から聞こえ、リスナー移動で音量比が滑らかに変わる"
+                 + "（1点合成のパッパッ切替を解消）。GTD/ホイヘンスの原理。V キー切替。")]
+        public bool enableDiffractionSources = true;
+        [Tooltip("音源あたりの二次音源数（＝開口クラスタ数）。2〜3で『両側から』のイメージ。")]
+        [Range(1, 5)] public int diffractionSourceCount = 3;
+        [Tooltip("回折二次音源の全体レベル倍率（線形）。")]
+        [Range(0f, 3f)] public float diffractionLevelScale = 1f;
+        [Tooltip("回折二次音源の更新間隔（フレーム）。")]
+        public int diffractionUpdateEveryFrames = 2;
+        [Tooltip("二次音源レベルの平滑時間(秒)。大きいほど音量比がなめらかに動く。")]
+        [Range(0.02f, 0.5f)] public float diffractionLevelSmoothTime = 0.12f;
+        [Tooltip("二次音源の位置(方向)の平滑時間(秒)。エッジ切替時の飛びを抑える。")]
+        [Range(0.02f, 0.5f)] public float diffractionPosSmoothTime = 0.1f;
+
         [Header("可視化")]
         [Tooltip("ON: 反響経路（リスナーから撒いた反射レイの跳ね返り）を線で表示。R キー切替。" +
                  "※Game ビューでは上部の Gizmos ボタンを ON にすると見える。")]
@@ -124,7 +140,17 @@ namespace AcousticFlow
         public bool enableAudio = true;
         [Tooltip("ON: HRTF（両耳の頭部伝達）で空間化。OFF: パンニング。H キーで切替。")]
         public bool useHrtf = true;
-        public string[] banks = { "Init.bnk", "TokyoGeto.bnk" };
+        public string[] banks = { "Init.bnk", "Acoustic.bnk" };
+        [Tooltip("ON: 全音源を足音SE(footstepEvent)に切替。B キー。トランジェント音は回折/反射の効きが分かりやすい。")]
+        public bool useFootstepSE = false;
+        [Tooltip("足音SEのイベント名（バンクに含まれる想定）。")]
+        public string footstepEvent = "WalkSE_01";
+        [Tooltip("Enter で『音源0のみ足音ループ』に切替。足音の再トリガ間隔(秒)＝歩く周期。ワンショットSE前提で使う（footstepEventLoops=OFF時のみ有効）。")]
+        public float footstepLoopSeconds = 0.5f;
+        [Tooltip("ON: 足音イベントは Wwise 側で Loop 済み → 1回だけ Post して鳴らし続ける（再トリガしない）。"
+                 + "OFF: ワンショット素材前提で footstepLoopSeconds 間隔で再トリガしてループ化する。"
+                 + "※Loop素材にOFFを使うと再生インスタンスが積み上がって多重再生になる。")]
+        public bool footstepEventLoops = true;
 
         private const ulong ListenerObjId = 2;
         private const ulong SourceObjIdBase = 10;
@@ -132,6 +158,10 @@ namespace AcousticFlow
         // 早期反射の仮想エミッタ（像源）ID。音源 s × タップ t で一意。基底は音源IDと衝突しない値。
         private const ulong ReflectObjIdBase = 1000;
         private ulong ReflectId(int s, int t) => ReflectObjIdBase + (ulong)(s * _erTapCap + t);
+        // 回折二次音源のエミッタID。音源 s × クラスタ k で一意。
+        private const ulong DiffObjIdBase = 5000;
+        private int _diffCap;  // 1音源あたりの二次音源スロット数（＝初期化時の diffractionSourceCount）
+        private ulong DiffId(int s, int k) => DiffObjIdBase + (ulong)(s * _diffCap + k);
 
         private AcousticScene _scene;
         private int _materialId;
@@ -141,6 +171,7 @@ namespace AcousticFlow
         private Transform[] _sources;   // source + extraSources
         private Vector3[] _srcPos;      // 音源位置バッファ
         private float[] _occSmoothed;   // 音源ごとの平滑化遮蔽
+        private float[] _srcSurvival;   // 音源ごとの帯域生存(低域加重平均)。回折二次音源のレベルに使う
         private float[] _bandsPerSource; // 音源ごとの6帯域生存（count*6）
         private float[] _arrivalDir;    // engine出力: エネルギー到来方向（count*3）
         private Vector3[] _apparentDir; // 平滑化した見かけ方向（単位）
@@ -170,6 +201,19 @@ namespace AcousticFlow
         private int _erTapCap;          // 仮想エミッタ プールの1音源あたり容量（＝初期化時の earlyReflectTaps）
         private bool _erPoolReady;      // 仮想エミッタを登録＆イベント投入済みか
 
+        // 回折二次音源プール。音源ごとにクラスタ方向へ仮想音源を立て、音量比を滑らかに動かす。
+        private Vector3[] _diffSrcPos;  // 二次音源位置（diffractionSourceCount）
+        private float[] _diffSrcGain;   // 相対ゲイン（diffractionSourceCount）
+        private float[] _diffLevel;     // 平滑中のレベル（音源×スロット）
+        private float[] _diffLevelVel;  // SmoothDamp 速度（音源×スロット）
+        private Vector3[] _diffSlotDir; // 各スロットが追っている方向（トラッキング用, 音源×スロット）
+        private Vector3[] _diffSlotPos; // 平滑中の位置（音源×スロット）
+        private Vector3[] _diffSlotPosVel; // 位置 SmoothDamp 速度
+        private int[] _diffSlotCluster; // 割当作業用（スロット→クラスタindex, 毎フレーム）
+        private int _diffCountdown = 1;
+        private bool _diffPoolReady;
+        private int _diffActive;        // 表示用：鳴っている二次音源総数
+
         // --- モニター窓向け static フィード（Editor の *MonitorWindow が読む） ---
         public const int OutHistLen = 256;
         public static float[] LatestEchogram { get; private set; }
@@ -180,6 +224,32 @@ namespace AcousticFlow
         public static float[] OutHistoryR { get; private set; }
         public static int OutHistoryHead { get; private set; }
         private static float[] _monBandGains;
+
+        // Status Monitor 窓向けの状態スナップショット。PublishMonitors() で毎フレーム更新する。
+        // 配列は既存インスタンス配列を参照共有（＝ゼロGC。LatestBandGains と同じ流儀）。
+        public static class Status
+        {
+            public static bool Valid;
+            public static float Fps;
+            public static float AcousticMs;
+            public static bool UseHrtf;
+            public static bool UseSteer;
+            public static string[] SourceNames;   // 音源ごとの表示名（EventFor）
+            public static float[] Occlusion;      // 音源ごとの遮蔽 0..1（大=遮られてる）
+            public static float[] Survival;       // 音源ごとの帯域生存（低域加重）
+            public static float DiffDelta;        // 主音源の回折 迂回余剰長δ(m)。-1=迂回路なし
+            public static bool UseEdgeCatalog;
+            public static int EdgeCatalogCount;
+            public static int DiffCandCount;
+            public static bool ShowDiffCandidates;
+            public static bool EarlyReflEnabled;
+            public static int ErActive, ErCap;      // 早期反射 鳴動/上限
+            public static bool DiffSrcEnabled;
+            public static int DiffActive, DiffCap;  // 回折二次音源 鳴動/上限
+            public static float[] BandsTransmit;    // 主音源 6帯域 透過
+            public static float[] BandsDiffract;    // 主音源 6帯域 回折
+        }
+        private string[] _statusNames;  // Status.SourceNames の使い回しバッファ
 
         private bool _audioReady;
         private string _status = "未初期化";
@@ -244,6 +314,7 @@ namespace AcousticFlow
             int n = Mathf.Max(1, _sources.Length);
             _srcPos = new Vector3[n];
             _occSmoothed = new float[n];
+            _srcSurvival = new float[n];
             _bandsPerSource = new float[n * AcousticEngine.NumBands];
             _arrivalDir = new float[n * 3];
             _apparentDir = new Vector3[n];
@@ -270,6 +341,17 @@ namespace AcousticFlow
             // 回折候補の可視化バッファ（エンジンの合成上限に合わせて64）。
             _diffCandPts = new Vector3[64];
             _diffCandDelta = new float[64];
+
+            // 回折二次音源バッファ。
+            _diffCap = Mathf.Max(1, diffractionSourceCount);
+            _diffSrcPos = new Vector3[_diffCap];
+            _diffSrcGain = new float[_diffCap];
+            _diffLevel = new float[n * _diffCap];
+            _diffLevelVel = new float[n * _diffCap];
+            _diffSlotDir = new Vector3[n * _diffCap];
+            _diffSlotPos = new Vector3[n * _diffCap];
+            _diffSlotPosVel = new Vector3[n * _diffCap];
+            _diffSlotCluster = new int[_diffCap];
         }
 
         // 音源を「元配置」⇄「1点に重ね」で配置し直す。
@@ -348,9 +430,70 @@ namespace AcousticFlow
 
         private string EventFor(int i)
         {
+            if (useFootstepSE)
+                return string.IsNullOrEmpty(footstepEvent) ? "WalkSE_01" : footstepEvent;
             if (sourceEvents != null && i < sourceEvents.Length && !string.IsNullOrEmpty(sourceEvents[i]))
                 return sourceEvents[i];
             return "Vocal";
+        }
+
+        // Enter：音源0のみ足音ループに切替（他音源は停止）。ワンショットSEでも footstepLoopSeconds 間隔で
+        // 再トリガして歩行ループにする。回折/反射の二次エミッタも一緒に鳴らすので足音が空間を通る。
+        private bool _singleFootstep;
+        private float _footstepTimer;
+
+        private string FootstepEvt() => string.IsNullOrEmpty(footstepEvent) ? "WalkSE_01" : footstepEvent;
+
+        // 音源 s とそのエミッタ群に、指定イベントを Post（回折/反射も含めて同期）。
+        private void PostAllVoices(int s, string evt)
+        {
+            AcousticEngine.PostEvent(evt, SourceId(s));
+            if (_erPoolReady) for (int t = 0; t < _erTapCap; t++) AcousticEngine.PostEvent(evt, ReflectId(s, t));
+            if (_diffPoolReady) for (int k = 0; k < _diffCap; k++) AcousticEngine.PostEvent(evt, DiffId(s, k));
+        }
+        // 音源 s とそのエミッタ群で、指定イベントを Stop。
+        private void StopAllVoices(int s, string evt)
+        {
+            AcousticEngine.ExecuteActionOnEvent(evt, 0, SourceId(s));  // 0 = Stop
+            if (_erPoolReady) for (int t = 0; t < _erTapCap; t++) AcousticEngine.ExecuteActionOnEvent(evt, 0, ReflectId(s, t));
+            if (_diffPoolReady) for (int k = 0; k < _diffCap; k++) AcousticEngine.ExecuteActionOnEvent(evt, 0, DiffId(s, k));
+        }
+
+        private void SetSingleFootstep(bool on)
+        {
+            if (_singleFootstep == on) return;
+            _singleFootstep = on;
+            if (!_audioReady) return;
+            if (on)
+            {
+                for (int s = 0; s < _sources.Length; s++) StopAllVoices(s, EventFor(s));  // 背景を全停止
+                PostAllVoices(0, FootstepEvt());   // 音源0だけ足音
+                _footstepTimer = Mathf.Max(0.1f, footstepLoopSeconds);
+            }
+            else
+            {
+                StopAllVoices(0, FootstepEvt());   // 足音停止
+                for (int s = 0; s < _sources.Length; s++) PostAllVoices(s, EventFor(s));  // 背景を復帰
+            }
+        }
+
+        // 全音源＋各エミッタプールの再生イベントを（音楽↔足音SE）切り替える。
+        // 現在のイベントを Stop → フラグ反転 → 新イベントを全ゲームオブジェクトへ Post（同期再投入）。
+        private void SwitchSourceSound()
+        {
+            if (!_audioReady) { useFootstepSE = !useFootstepSE; return; }
+            for (int s = 0; s < _sources.Length; s++) StopAllVoices(s, EventFor(s));  // 旧を全停止
+            useFootstepSE = !useFootstepSE;
+            if (useFootstepSE)
+            {
+                // 足音は音源0の一個だけ（他音源は鳴らさない）。
+                PostAllVoices(0, EventFor(0));
+            }
+            else
+            {
+                // 音楽は全音源復帰。
+                for (int s = 0; s < _sources.Length; s++) PostAllVoices(s, EventFor(s));
+            }
         }
 
         private void SetupAudio()
@@ -387,8 +530,90 @@ namespace AcousticFlow
             // 早期反射の仮想エミッタ（像源ボイス）を用意。直接音と同フレームで同期投入する
             // （後からバラバラに鳴らすと拍がズレるため、初期化時にまとめて立てる）。
             if (_audioReady && enableEarlyReflections) SetupReflectionEmitters();
+            if (_audioReady && enableDiffractionSources) SetupDiffractionEmitters();
 
             ApplySpatializationState();  // HRTF/パンニングを反映
+        }
+
+        // 回折二次音源のエミッタを登録し、各音源と同じイベントを同フレームで再生（初期はミュート）。
+        private void SetupDiffractionEmitters()
+        {
+            if (!_audioReady || _diffPoolReady || _sources == null) return;
+            for (int s = 0; s < _sources.Length; s++)
+                for (int k = 0; k < _diffCap; k++)
+                {
+                    ulong id = DiffId(s, k);
+                    AcousticEngine.RegisterGameObject(id, $"Diff{s}_{k}");
+                    AcousticEngine.SetGameObjectPosition(id, listener.position, listener.forward, listener.up);
+                    AcousticEngine.SetEmitterListenerVolume(id, ListenerObjId, 0f);
+                    AcousticEngine.PostEvent(EventFor(s), id);  // 直接と同じ stem を同期再生
+                }
+            _diffPoolReady = true;
+        }
+
+        // 全回折二次音源をミュート（V で OFF にしたとき）。
+        private void MuteAllDiffractionSources()
+        {
+            if (!_diffPoolReady) return;
+            for (int s = 0; s < _sources.Length; s++)
+                for (int k = 0; k < _diffCap; k++)
+                    AcousticEngine.SetEmitterListenerVolume(DiffId(s, k), ListenerObjId, 0f);
+            if (_diffLevel != null) System.Array.Clear(_diffLevel, 0, _diffLevel.Length);
+            _diffActive = 0;
+        }
+
+        // 回折の二次音源を更新：音源ごとに遮蔽時のエッジをクラスタ（＝開口）し、各開口の方向へ
+        //   仮想音源を置き、レベル＝相対ゲイン×その音源の生存×スケール。レベルは SmoothDamp で
+        //   滑らかに動かすので、左右の開口の音量比がシームレスに変わる（＝パッパッ切替を解消）。
+        private void UpdateDiffractionSources()
+        {
+            if (!_diffPoolReady || _diffSrcPos == null) return;
+            _diffActive = 0;
+            Vector3 lp = listener.position;
+            for (int s = 0; s < _sources.Length; s++)
+            {
+                int n = _scene.ComputeDiffractionSources(lp, _srcPos[s], _diffSrcPos, _diffSrcGain);
+                float survival = (_srcSurvival != null) ? _srcSurvival[s] : 0f;
+
+                // クラスタ→スロットを「前フレーム方向に一番近い順」で安定割当（スロット入れ替わりの飛びを防ぐ）。
+                for (int k = 0; k < _diffCap; k++) _diffSlotCluster[k] = -1;
+                for (int c = 0; c < n; c++)
+                {
+                    Vector3 dirC = (_diffSrcPos[c] - lp).normalized;
+                    int best = -1; float bestDot = -2f;
+                    for (int k = 0; k < _diffCap; k++)
+                    {
+                        if (_diffSlotCluster[k] >= 0) continue;
+                        float d = Vector3.Dot(dirC, _diffSlotDir[s * _diffCap + k]);  // 未使用スロットは0ベクトル→0
+                        if (d > bestDot) { bestDot = d; best = k; }
+                    }
+                    if (best >= 0) _diffSlotCluster[best] = c;
+                }
+
+                for (int k = 0; k < _diffCap; k++)
+                {
+                    ulong id = DiffId(s, k);
+                    int li = s * _diffCap + k;
+                    int c = _diffSlotCluster[k];
+                    float targetLvl = 0f;
+                    if (c >= 0)
+                    {
+                        Vector3 tp = _diffSrcPos[c];
+                        _diffSlotDir[li] = (tp - lp).normalized;
+                        if (_diffSlotPos[li] == Vector3.zero) _diffSlotPos[li] = tp;  // 初回は snap
+                        // 位置(方向＋実距離)を SmoothDamp → 手前↔奥の乗り換えも地続きに。
+                        _diffSlotPos[li] = Vector3.SmoothDamp(_diffSlotPos[li], tp, ref _diffSlotPosVel[li],
+                                                              Mathf.Max(0.02f, diffractionPosSmoothTime));
+                        AcousticEngine.SetGameObjectPosition(id, _diffSlotPos[li], listener.forward, listener.up);
+                        targetLvl = Mathf.Clamp(_diffSrcGain[c] * survival * diffractionLevelScale, 0f, 2f);
+                        _diffActive++;
+                    }
+                    // レベルを SmoothDamp（音量比のクロスフェード）。
+                    _diffLevel[li] = Mathf.SmoothDamp(_diffLevel[li], targetLvl, ref _diffLevelVel[li],
+                                                      Mathf.Max(0.02f, diffractionLevelSmoothTime));
+                    AcousticEngine.SetEmitterListenerVolume(id, ListenerObjId, Mathf.Clamp(_diffLevel[li], 0f, 2f));
+                }
+            }
         }
 
         // 早期反射の仮想エミッタを登録し、各音源と同じイベントを同フレームで再生（初期はミュート）。
@@ -481,6 +706,25 @@ namespace AcousticFlow
                         _erCountdown = 1;  // 次フレームで即更新
                     }
                     else MuteAllReflections();
+                }
+            }
+            // B：全音源を 音楽 ↔ 足音SE(WalkSE_01) に切替。
+            if (Input.GetKeyDown(KeyCode.B)) SwitchSourceSound();
+            // Enter：音源0のみ足音ループ に切替。
+            if (Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.KeypadEnter))
+                SetSingleFootstep(!_singleFootstep);
+            // V：回折の二次音源（エッジ＝音源）の ON/OFF。
+            if (Input.GetKeyDown(KeyCode.V))
+            {
+                enableDiffractionSources = !enableDiffractionSources;
+                if (_audioReady)
+                {
+                    if (enableDiffractionSources)
+                    {
+                        if (!_diffPoolReady) SetupDiffractionEmitters();
+                        _diffCountdown = 1;
+                    }
+                    else MuteAllDiffractionSources();
                 }
             }
 
@@ -584,6 +828,7 @@ namespace AcousticFlow
                     wsum += w;
                 }
                 float avgGain = (wsum > 0f) ? gsum / wsum : 0f;
+                _srcSurvival[i] = avgGain;  // 回折二次音源のレベル基準
                 float target = Mathf.Clamp(Mathf.Clamp01(1f - avgGain) * occlusionStrength, 0f, maxOcclusion);
                 _occSmoothed[i] = Mathf.MoveTowards(_occSmoothed[i], target, occlusionSmoothSpeed * dt);
 
@@ -599,6 +844,29 @@ namespace AcousticFlow
                 {
                     _erCountdown = Mathf.Max(1, earlyReflectUpdateEveryFrames);
                     UpdateEarlyReflections(listener.position);
+                }
+            }
+
+            // 4.6) 回折の二次音源（エッジ＝音源）：遮蔽時、開口の方向へ仮想音源を立て音量比を滑らかに。
+            if (enableDiffractionSources && _audioReady && _diffPoolReady)
+            {
+                if (--_diffCountdown <= 0)
+                {
+                    _diffCountdown = Mathf.Max(1, diffractionUpdateEveryFrames);
+                    UpdateDiffractionSources();
+                }
+            }
+
+            // 4.7) 足音ループ：ワンショット素材のときだけ一定間隔で再トリガして歩行ループ化する。
+            //   footstepEventLoops=ON（Wwise側でLoop済み）のときは再トリガ禁止。1回のPostで鳴り続けるので、
+            //   再トリガすると15秒ループの新インスタンスが積み上がって多重再生になる（このバグの原因だった）。
+            if (_singleFootstep && _audioReady && !footstepEventLoops)
+            {
+                _footstepTimer -= Time.deltaTime;
+                if (_footstepTimer <= 0f)
+                {
+                    _footstepTimer = Mathf.Max(0.1f, footstepLoopSeconds);
+                    PostAllVoices(0, FootstepEvt());  // 音源0＋その回折/反射エミッタを再生（空間を通る足音）
                 }
             }
 
@@ -660,6 +928,35 @@ namespace AcousticFlow
                 OutHistoryR[OutHistoryHead] = r;
                 OutHistoryHead = (OutHistoryHead + 1) % OutHistLen;
             }
+
+            // Status Monitor 窓向けスナップショット（HUD と同じ数値を別タブで見られるように）。
+            Status.Valid = _scene != null && _scene.IsValid;
+            Status.Fps = _fps;
+            Status.AcousticMs = (float)_acousticMs;
+            Status.UseHrtf = useHrtf;
+            Status.UseSteer = useDirectionalSteering;
+            if (_sources != null)
+            {
+                if (_statusNames == null || _statusNames.Length != _sources.Length)
+                    _statusNames = new string[_sources.Length];
+                for (int i = 0; i < _sources.Length; i++) _statusNames[i] = EventFor(i);
+                Status.SourceNames = _statusNames;
+            }
+            Status.Occlusion = _occSmoothed;
+            Status.Survival = _srcSurvival;
+            Status.DiffDelta = _diffDelta;
+            Status.UseEdgeCatalog = useEdgeCatalog;
+            Status.EdgeCatalogCount = (_scene != null && _scene.IsValid) ? _scene.EdgeCatalogCount : 0;
+            Status.DiffCandCount = _diffCandCount;
+            Status.ShowDiffCandidates = showDiffractionCandidates;
+            Status.EarlyReflEnabled = enableEarlyReflections;
+            Status.ErActive = _erActiveTaps;
+            Status.ErCap = (_sources != null) ? _sources.Length * _erTapCap : 0;
+            Status.DiffSrcEnabled = enableDiffractionSources;
+            Status.DiffActive = _diffActive;
+            Status.DiffCap = (_sources != null) ? _sources.Length * _diffCap : 0;
+            Status.BandsTransmit = _bands;
+            Status.BandsDiffract = _diffBands;
         }
 
         // 早期反射(A)：各音源の主要な初期反射を像源として抽出し、仮想エミッタ（像源位置の3Dボイス）へ反映。
@@ -771,8 +1068,9 @@ namespace AcousticFlow
             {
                 if (_sources[i] == null) continue;
                 Vector3 pos = _sources[i].position;
+                // 回折二次音源ON時は直接音を真位置に固定（回り込みの定位はエッジ音源が担う）。
                 // 方向ステアリング：真位置と同じ距離を保ちつつ、向きを「エネルギーが届く方向」に置き直す。
-                if (useDirectionalSteering && _apparentDir != null && _apparentDir[i].sqrMagnitude > 1e-8f)
+                if (!enableDiffractionSources && useDirectionalSteering && _apparentDir != null && _apparentDir[i].sqrMagnitude > 1e-8f)
                 {
                     float dist = Vector3.Distance(_sources[i].position, listener.position);
                     pos = listener.position + _apparentDir[i] * dist;
@@ -793,10 +1091,16 @@ namespace AcousticFlow
                     for (int s = 0; s < _sources.Length; s++)
                         for (int t = 0; t < _erTapCap; t++)
                             AcousticEngine.UnregisterGameObject(ReflectId(s, t));
+                // 回折二次音源も解除。
+                if (_diffPoolReady && _sources != null)
+                    for (int s = 0; s < _sources.Length; s++)
+                        for (int k = 0; k < _diffCap; k++)
+                            AcousticEngine.UnregisterGameObject(DiffId(s, k));
                 AcousticEngine.UnregisterGameObject(ListenerObjId);
                 AcousticEngine.ShutdownAudio();
             }
             _erPoolReady = false;
+            _diffPoolReady = false;
             _audioReady = false;
             _scene?.Dispose();
             _scene = null;
@@ -870,7 +1174,8 @@ namespace AcousticFlow
                             $"空間化: {(useHrtf ? "HRTF" : "パン")} (H)    " +
                             $"方向ステア: {(useDirectionalSteering ? "ON" : "OFF")} (G)", style);
             if (enableMovement)
-                GUILayout.Label("操作: WASD / 右ドラッグ / QE / Shift / Space:重ね / H:HRTF / G:ステア / R:反響経路 / C:回折候補 / F:早期反射", style);
+                GUILayout.Label("操作: WASD / 右ドラッグ / QE / Shift / Space:重ね / H:HRTF / G:ステア / R:反響経路 / C:回折候補 / F:早期反射 / V:回折二次音源 / B:足音SE / Enter:足音ループ(音源0)", style);
+            GUILayout.Label($"音: {(_singleFootstep ? $"足音ループ・音源0のみ ({footstepEvent})" : (useFootstepSE ? $"足音SE・音源0のみ ({footstepEvent})" : "音楽ステム"))}  (B:足音切替 / Enter:足音ループ)", style);
             GUILayout.Label($"音源配置: {(_stacked ? "重ね(1点)" : "展開")}", style);
             if (enableReverb)
             {
@@ -898,6 +1203,9 @@ namespace AcousticFlow
             GUILayout.Label(enableEarlyReflections
                 ? $"早期反射(仮想エミッタ): ON  鳴動 {_erActiveTaps} 本/上限 {_sources?.Length * _erTapCap} (F)"
                 : "早期反射(仮想エミッタ): OFF (F)", style);
+            GUILayout.Label(enableDiffractionSources
+                ? $"回折二次音源(エッジ=音源): ON  鳴動 {_diffActive} 本/上限 {_sources?.Length * _diffCap} (V)"
+                : "回折二次音源(エッジ=音源): OFF (V)", style);
 
             if (_scene != null && _scene.IsValid)
             {

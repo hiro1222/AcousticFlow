@@ -151,6 +151,8 @@ namespace AcousticFlow
         private AFVector3[] _erBuf;
         // 回折候補の迂回点バッファ（可視化用・使い回し）。
         private AFVector3[] _candBuf;
+        // 回折二次音源の位置バッファ（使い回し）。
+        private AFVector3[] _diffSrcBuf;
         public int TraceReflectionPath(Vector3 origin, Vector3 dir, float maxDist,
                                        int maxBounces, Vector3[] outPoints)
         {
@@ -191,6 +193,20 @@ namespace AcousticFlow
             int n = Native.AF_SceneDiffractionCandidates(
                 _handle, new AFVector3(from), new AFVector3(to), _candBuf, outDeltas, cap);
             for (int i = 0; i < n; i++) outPoints[i] = new Vector3(_candBuf[i].x, _candBuf[i].y, _candBuf[i].z);
+            return n;
+        }
+
+        // 回折の二次音源：遮蔽時のエッジをクラスタし、方向つき仮想音源を outPos/outGain に書く。戻り=本数。
+        public int ComputeDiffractionSources(Vector3 listener, Vector3 source,
+                                             Vector3[] outPos, float[] outGain)
+        {
+            if (_handle == IntPtr.Zero || outPos == null || outGain == null) return 0;
+            int cap = Mathf.Min(outPos.Length, outGain.Length);
+            if (cap <= 0) return 0;
+            if (_diffSrcBuf == null || _diffSrcBuf.Length < cap) _diffSrcBuf = new AFVector3[cap];
+            int n = Native.AF_SceneComputeDiffractionSources(
+                _handle, new AFVector3(listener), new AFVector3(source), _diffSrcBuf, outGain, cap);
+            for (int i = 0; i < n; i++) outPos[i] = new Vector3(_diffSrcBuf[i].x, _diffSrcBuf[i].y, _diffSrcBuf[i].z);
             return n;
         }
 

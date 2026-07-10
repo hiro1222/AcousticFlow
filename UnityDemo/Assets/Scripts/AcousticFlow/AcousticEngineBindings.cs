@@ -219,6 +219,12 @@ namespace AcousticFlow
             IntPtr scene, AFVector3 from, AFVector3 to,
             [Out] AFVector3[] outPoints, [Out] float[] outDeltas, int maxCount);
 
+        // 回折を二次音源として：遮蔽時のエッジをクラスタして方向つき仮想音源(位置+ゲイン)を返す。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneComputeDiffractionSources(
+            IntPtr scene, AFVector3 listener, AFVector3 source,
+            [Out] AFVector3[] outPos, [Out] float[] outGain, int maxN);
+
         // A: 早期反射タップ抽出。像源位置を outImagePos[maxTaps]、帯域ゲインを outGain[maxTaps*6] に書く。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneComputeEarlyReflections(

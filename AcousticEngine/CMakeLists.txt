@@ -82,6 +82,8 @@ if(WITH_WWISE)
         AkMusicEngine
         # ソースプラグイン: Tone Generator（無いと再生しても無音）
         AkToneSource
+        # Vorbis デコーダ（バンク音源が Vorbis の場合、無いとデコードできず無音）
+        AkVorbisDecoder
         # エフェクトプラグイン: RoomVerb（残響。使うバンクの読込/再生に必須）
         AkRoomVerbFX
         # 早期反射(A): Reflect プラグイン + Spatial Audio（SetImageSource で方向つき反射）

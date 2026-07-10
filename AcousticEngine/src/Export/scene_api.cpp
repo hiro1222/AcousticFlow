@@ -162,6 +162,21 @@ int AF_SceneDiffractionCandidates(AF_SceneHandle scene, AF_Vector3 from, AF_Vect
     return n;
 }
 
+int AF_SceneComputeDiffractionSources(AF_SceneHandle scene, AF_Vector3 listener, AF_Vector3 source,
+                                      AF_Vector3* outPos, float* outGain, int maxN) {
+    Scene* s = asScene(scene);
+    if (!s || !outPos || !outGain || maxN <= 0) return 0;
+    std::vector<Vec3> pos(static_cast<size_t>(maxN));
+    const int n = s->computeDiffractionSources(toVec3(listener), toVec3(source),
+                                               pos.data(), outGain, maxN);
+    for (int i = 0; i < n; ++i) {
+        outPos[i].x = pos[i].x;
+        outPos[i].y = pos[i].y;
+        outPos[i].z = pos[i].z;
+    }
+    return n;
+}
+
 float AF_SceneOcclusionReflected(AF_SceneHandle scene, AF_Vector3 source, AF_Vector3 listener,
                                  float* outBands6, int numRays, int maxBounces) {
     Scene* s = asScene(scene);

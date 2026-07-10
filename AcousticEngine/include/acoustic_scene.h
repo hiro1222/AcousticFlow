@@ -114,6 +114,15 @@ ACOUSTIC_API int AF_SceneDiffractionCandidates(AF_SceneHandle scene,
                                                AF_Vector3 from, AF_Vector3 to,
                                                AF_Vector3* outPoints, float* outDeltas, int maxCount);
 
+/* 【回折を二次音源として鳴らす（GTD/ホイヘンス）】遮蔽時、回り込みエッジを「エッジ＝二次音源」として
+ * 最大 maxN 個の方向つき仮想音源に束ねて返す（近い方向はクラスタ統合）。両側開口なら左右に分かれ、
+ * リスナー移動で各ゲインが滑らかに変化する。書いた音源数を返す。遮蔽なし/迂回なしは 0。
+ *   outPos  : AF_Vector3 × maxN（二次音源のワールド位置 = listener + 方向×音源距離）
+ *   outGain : float × maxN（相対ゲイン, 合計で正規化・短い迂回ほど大） */
+ACOUSTIC_API int AF_SceneComputeDiffractionSources(AF_SceneHandle scene,
+                                                   AF_Vector3 listener, AF_Vector3 source,
+                                                   AF_Vector3* outPos, float* outGain, int maxN);
+
 /* 【役割2：反射込み遮蔽】リスナー起点で numRays 本のレイを撒き、壁で反射させながら音源へ
  * next-event でつなぐ。直接(透過⊕回折)＋反射で回り込む成分から遮蔽量(0..1)を返す。
  * 反射経路があるので壁裏でも 1.0 に張り付かない（＝実際の部屋の「回り込み」）。

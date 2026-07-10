@@ -449,11 +449,10 @@ public:
             if (dmin < 0.0f || d < dmin) dmin = d;
         });
         if (nc == 0) return -1.0f;
-        // 重みの広がり。広いほど左右の候補が遷移中に両方寄与し、方向が中間を滑らかに通る
-        //（winner-take-all の飛びを防ぐ）。狭いと定位はシャープだが切替でガクッと飛ぶ。
-        const float scale = std::max(2.0f, dmin + 2.0f);
+        // 全候補を同等の重みで合成（最短偏重をやめる）。どのエッジも定位に等しく効くので、
+        // エッジが1本入れ替わっても方向の変化が概ね 1/本数 に収まり、切替のガクつきが減る。
         Vec3 acc{0, 0, 0};
-        for (int i = 0; i < nc; ++i) acc = acc + dirs[i] * std::exp(-(deltas[i] - dmin) / scale);
+        for (int i = 0; i < nc; ++i) acc = acc + dirs[i];
         if (length(acc) < 1e-6f) acc = to - from;
         outDir = normalized(acc);
         return dmin;
@@ -469,6 +468,67 @@ public:
         forEachDiffractionCandidate(from, to, [&](const Vec3& P, float d, const Vec3&, const Vec3&) {
             if (n < maxCount) { outP[n] = P; outDelta[n] = d; ++n; }
         });
+        return n;
+    }
+
+    // 【回折を二次音源として鳴らす（GTD/ホイヘンス）】遮蔽時、回り込みエッジを「エッジ＝二次音源」として
+    // 最大 maxN 個の仮想音源（方向つき）に束ねて返す。近い方向のエッジはクラスタ統合するので、両側に
+    // 開口があれば左右2音源…のように分かれ、リスナー移動で各ゲインが滑らかに変わる（＝1点合成の飛びを排除）。
+    //   outPos[k]  : 二次音源のワールド位置（= listener + 方向 × 音源距離。Wwise がこの方向へ定位）
+    //   outGain[k] : 相対ゲイン（全クラスタ合計で正規化, 短い迂回ほど大）。総和 ≤ 1
+    // 戻り値 = 書き込んだ音源数。遮蔽なし/迂回なしは 0。
+    int computeDiffractionSources(const Vec3& listener, const Vec3& source,
+                                  Vec3* outPos, float* outGain, int maxN) const {
+        if (!outPos || !outGain || maxN <= 0) return 0;
+        if (!isOccluded(listener, source)) return 0;
+
+        // 低域加重（回折は低域が回り込む）で UTD 6帯域を1スカラに畳む＝各エッジの広帯域ゲイン重み。
+        auto bbGain = [](const float g[kNumBands]) {
+            const float w[kNumBands] = {3.0f, 2.5f, 2.0f, 1.3f, 1.0f, 0.8f};
+            float gs = 0.0f, ws = 0.0f;
+            for (int b = 0; b < kNumBands; ++b) { gs += w[b] * g[b]; ws += w[b]; }
+            return ws > 0.0f ? gs / ws : 0.0f;
+        };
+
+        // 開口＝方向クラスタ。掠める点は「クラスタ内エッジの UTD重み付き重心」で連続にスライドさせる
+        // （手前稜線↔奥稜線の乗り換えが、重心が滑らかに移る＝飛ばない）。
+        struct Cl { Vec3 pAcc; Vec3 dir; float w; };  // pAcc=Σ w*P（重心用）, dir=平均方向, w=Σ
+        Cl cl[24];
+        int ncl = 0;
+        const float cosThresh = 0.90f;  // ~25°以内は同じ開口として統合
+        forEachDiffractionCandidate(listener, source, [&](const Vec3& P, float, const Vec3& edgeDir, const Vec3& refT) {
+            float g6[kNumBands];
+            utd::utdWedgeGain(source, P, listener, edgeDir, refT, 1.5f, g6);  // このエッジの UTD ゲイン
+            const float w = bbGain(g6);
+            if (w < 1e-4f) return;
+            const Vec3 dir = normalized(P - listener);
+            int best = -1; float bestDot = cosThresh;
+            for (int i = 0; i < ncl; ++i) { const float dt = dot(dir, cl[i].dir); if (dt > bestDot) { bestDot = dt; best = i; } }
+            if (best >= 0) {
+                cl[best].pAcc = cl[best].pAcc + P * w;
+                cl[best].dir = normalized(cl[best].dir * cl[best].w + dir * w);
+                cl[best].w += w;
+            } else if (ncl < 24) {
+                cl[ncl].pAcc = P * w; cl[ncl].dir = dir; cl[ncl].w = w; ++ncl;
+            }
+        });
+        if (ncl == 0) return 0;
+
+        float sum = 0.0f; for (int i = 0; i < ncl; ++i) sum += cl[i].w;
+        bool used[24] = {false};
+        int n = 0;
+        while (n < maxN && n < ncl) {  // 重み上位から maxN 本を採用
+            int bi = -1; float bw = -1.0f;
+            for (int i = 0; i < ncl; ++i) if (!used[i] && cl[i].w > bw) { bw = cl[i].w; bi = i; }
+            if (bi < 0) break;
+            used[bi] = true;
+            const Vec3 Pc = cl[bi].pAcc * (1.0f / std::max(cl[bi].w, 1e-6f));  // UTD重み付き重心（連続）
+            const Vec3 dir = normalized(Pc - listener);
+            const float pathLen = length(Pc - listener) + length(source - Pc);  // 実経路長
+            outPos[n] = listener + dir * std::max(pathLen, 0.5f);  // 方向＝重心 / 距離＝実経路長
+            outGain[n] = cl[bi].w / std::max(sum, 1e-6f);
+            ++n;
+        }
         return n;
     }
 

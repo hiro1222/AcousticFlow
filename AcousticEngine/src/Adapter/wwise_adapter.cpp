@@ -19,6 +19,9 @@
 // Tone Generator がサウンドエンジンに登録される（対応する .lib のリンクも必要）。
 // これが無いと、イベント再生は成功するのに音が生成されず無音になる。
 #include <AK/Plugin/AkToneSourceFactory.h>            // Wwise Tone Generator
+// Vorbis コーデックのデコーダ。バンクの音源を Vorbis 形式にした場合、これを include + .lib
+// リンクしないと「バンク読込もイベント再生も成功するのにデコードできず無音」になる。
+#include <AK/Plugin/AkVorbisDecoderFactory.h>         // Vorbis デコーダ
 // Wwise RoomVerb（残響エフェクト）。これを include + .lib リンクしないと、
 // RoomVerb を使うバンクの読込/再生が失敗して無音になる。
 #include <AK/Plugin/AkRoomVerbFXFactory.h>            // Wwise RoomVerb
