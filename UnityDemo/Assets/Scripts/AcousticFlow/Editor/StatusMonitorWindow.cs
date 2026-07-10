@@ -103,6 +103,22 @@ namespace AcousticFlow.EditorTools
             DrawBands("透過", AcousticFlowSceneDemo.Status.BandsTransmit);
             DrawBands("回折", AcousticFlowSceneDemo.Status.BandsDiffract);
 
+            // --- 3バンドEQ 送出(dB)：Wwise の Occ_Low/Mid/High RTPC に送る値 ---
+            EditorGUILayout.Space(8f);
+            EditorGUILayout.LabelField(
+                AcousticFlowSceneDemo.Status.UseBandEq
+                    ? "3バンドEQ 送出(dB)  [ON]" : "3バンドEQ 送出(dB)  [OFF: useBandEq を ON に]",
+                EditorStyles.boldLabel);
+            var eq = AcousticFlowSceneDemo.Status.EqDb;
+            var enames = AcousticFlowSceneDemo.Status.SourceNames;
+            if (eq != null && enames != null)
+            {
+                int ns = Mathf.Min(enames.Length, eq.Length / 3);
+                for (int i = 0; i < ns; i++)
+                    EditorGUILayout.LabelField(enames[i],
+                        $"Low {eq[i * 3 + 0]:F1}   Mid {eq[i * 3 + 1]:F1}   High {eq[i * 3 + 2]:F1}  dB");
+            }
+
             // --- 次に何を見るべきかのヒント（回折が鳴らない切り分け） ---
             EditorGUILayout.Space(8f);
             DrawHint(dOn, dAct, dd);

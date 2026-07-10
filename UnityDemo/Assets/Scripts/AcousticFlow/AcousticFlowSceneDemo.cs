@@ -134,6 +134,12 @@ namespace AcousticFlow
         [Range(0f, 1f)] public float maxOcclusion = 0.92f;
         [Tooltip("遮蔽量全体の強さ倍率。小さいほど遮蔽が緩い。")]
         [Range(0f, 2f)] public float occlusionStrength = 1f;
+        [Tooltip("ON: 遮蔽を3バンドEQ(Occ_Low/Mid/High RTPC)で周波数別に鳴らす（要Wwise側EQ配線）。"
+                 + "OFF: 従来の単一Occlusionスカラ。Wwise側のEQ/RTPCが未配線のうちはOFFのままにする"
+                 + "（ONにするとドライ音量をEQに委ねてOcclusion=0にするため、EQ未配線だと遮蔽が効かなくなる）。")]
+        public bool useBandEq = false;
+        [Tooltip("3バンドEQの最大減衰(dB)。RTPCの範囲と合わせる（例 -36）。")]
+        [Range(-60f, -6f)] public float occlusionEqFloorDb = -36f;
 
         [Header("音声(Wwise)")]
         [Tooltip("ON: Wwise を初期化して各音源のイベントを再生する（バンクが無ければ幾何計算のみ）。")]
@@ -171,6 +177,7 @@ namespace AcousticFlow
         private Transform[] _sources;   // source + extraSources
         private Vector3[] _srcPos;      // 音源位置バッファ
         private float[] _occSmoothed;   // 音源ごとの平滑化遮蔽
+        private float[] _eqDbSmoothed;  // 音源ごと×3バンド(Low/Mid/High)の平滑化EQゲイン(dB)
         private float[] _srcSurvival;   // 音源ごとの帯域生存(低域加重平均)。回折二次音源のレベルに使う
         private float[] _bandsPerSource; // 音源ごとの6帯域生存（count*6）
         private float[] _arrivalDir;    // engine出力: エネルギー到来方向（count*3）
@@ -248,6 +255,8 @@ namespace AcousticFlow
             public static int DiffActive, DiffCap;  // 回折二次音源 鳴動/上限
             public static float[] BandsTransmit;    // 主音源 6帯域 透過
             public static float[] BandsDiffract;    // 主音源 6帯域 回折
+            public static bool UseBandEq;           // 3バンドEQモードか
+            public static float[] EqDb;             // 音源ごと×3(Low/Mid/High) の送出EQゲイン(dB)
         }
         private string[] _statusNames;  // Status.SourceNames の使い回しバッファ
 
@@ -314,6 +323,7 @@ namespace AcousticFlow
             int n = Mathf.Max(1, _sources.Length);
             _srcPos = new Vector3[n];
             _occSmoothed = new float[n];
+            _eqDbSmoothed = new float[n * 3];
             _srcSurvival = new float[n];
             _bandsPerSource = new float[n * AcousticEngine.NumBands];
             _arrivalDir = new float[n * 3];
@@ -830,10 +840,41 @@ namespace AcousticFlow
                 float avgGain = (wsum > 0f) ? gsum / wsum : 0f;
                 _srcSurvival[i] = avgGain;  // 回折二次音源のレベル基準
                 float target = Mathf.Clamp(Mathf.Clamp01(1f - avgGain) * occlusionStrength, 0f, maxOcclusion);
-                _occSmoothed[i] = Mathf.MoveTowards(_occSmoothed[i], target, occlusionSmoothSpeed * dt);
+                _occSmoothed[i] = Mathf.MoveTowards(_occSmoothed[i], target, occlusionSmoothSpeed * dt);  // 表示/後方互換用に常時更新
+
+                // 3バンドEQゲイン(dB)は常時計算しておく（Status Monitorのプレビュー用＋EQモードの送出用）。
+                //   6帯域生存を Low/Mid/High に畳み、生存→dB。生存1.0→0dB(素通り) / 0.1→-20dB。
+                if (nb >= 6)
+                {
+                    int bb = i * nb, e = i * 3;
+                    float lo = 0.5f * (_bandsPerSource[bb + 0] + _bandsPerSource[bb + 1]);
+                    float mi = 0.5f * (_bandsPerSource[bb + 2] + _bandsPerSource[bb + 3]);
+                    float hi = 0.5f * (_bandsPerSource[bb + 4] + _bandsPerSource[bb + 5]);
+                    _eqDbSmoothed[e + 0] = Mathf.MoveTowards(_eqDbSmoothed[e + 0],
+                        Mathf.Clamp(20f * Mathf.Log10(Mathf.Max(lo, 1e-3f)), occlusionEqFloorDb, 0f), 48f * dt);
+                    _eqDbSmoothed[e + 1] = Mathf.MoveTowards(_eqDbSmoothed[e + 1],
+                        Mathf.Clamp(20f * Mathf.Log10(Mathf.Max(mi, 1e-3f)), occlusionEqFloorDb, 0f), 48f * dt);
+                    _eqDbSmoothed[e + 2] = Mathf.MoveTowards(_eqDbSmoothed[e + 2],
+                        Mathf.Clamp(20f * Mathf.Log10(Mathf.Max(hi, 1e-3f)), occlusionEqFloorDb, 0f), 48f * dt);
+                }
 
                 if (_audioReady)
-                    AcousticEngine.SetObstructionOcclusion(SourceId(i), ListenerObjId, 0f, _occSmoothed[i]);
+                {
+                    if (useBandEq && nb >= 6)
+                    {
+                        // 周波数別の遮蔽を3バンドEQ(音源ごとRTPC)で鳴らす。ドライ音量もEQが担うので
+                        // Occlusion は無効化（二重減衰回避）。※EQ未配線のうちは useBandEq=OFF のままにする。
+                        int e = i * 3;
+                        AcousticEngine.SetRTPCValueOnObject("Occ_Low", _eqDbSmoothed[e + 0], SourceId(i));
+                        AcousticEngine.SetRTPCValueOnObject("Occ_Mid", _eqDbSmoothed[e + 1], SourceId(i));
+                        AcousticEngine.SetRTPCValueOnObject("Occ_High", _eqDbSmoothed[e + 2], SourceId(i));
+                        AcousticEngine.SetObstructionOcclusion(SourceId(i), ListenerObjId, 0f, 0f);
+                    }
+                    else
+                    {
+                        AcousticEngine.SetObstructionOcclusion(SourceId(i), ListenerObjId, 0f, _occSmoothed[i]);
+                    }
+                }
             }
 
             // 4.5) 早期反射(A)：音源ごとに主要な初期反射を像源として抽出し Wwise Reflect へ。
@@ -957,6 +998,8 @@ namespace AcousticFlow
             Status.DiffCap = (_sources != null) ? _sources.Length * _diffCap : 0;
             Status.BandsTransmit = _bands;
             Status.BandsDiffract = _diffBands;
+            Status.UseBandEq = useBandEq;
+            Status.EqDb = _eqDbSmoothed;
         }
 
         // 早期反射(A)：各音源の主要な初期反射を像源として抽出し、仮想エミッタ（像源位置の3Dボイス）へ反映。
