@@ -269,6 +269,8 @@ namespace AcousticFlow
             public static float[] TapDelayMs;       // タップ遅延(ms, 直接=0)
             public static float[] TapGain;          // 広帯域ゲイン
             public static float[] TapBandGain;      // タップ×3バンド(low/mid/high) ゲイン（段2 畳み込み用）
+            public static float[] TapPanL;          // 段3a: タップの左右パン（等パワー）
+            public static float[] TapPanR;
             public static char[] TapType;           // 'D'/'R'/'F'
         }
         private string[] _statusNames;  // Status.SourceNames の使い回しバッファ
@@ -295,6 +297,8 @@ namespace AcousticFlow
         private float[] _tapDelayMs = new float[64];  // 直接音基準の相対遅延(ms)
         private float[] _tapGain = new float[64];      // 広帯域ゲイン(0..1, プロット/表示用)
         private float[] _tapBandGain = new float[64 * 3]; // 段2: タップ×3バンド(low/mid/high)ゲイン（畳み込みの音色）
+        private float[] _tapPanL = new float[64];       // 段3a: 到来方向→左右パン（等パワー）
+        private float[] _tapPanR = new float[64];
         private char[] _tapType = new char[64];        // 'D'直接 / 'R'反射 / 'F'回折
         private int _tapCount;
         private float _itdgMs;                         // 最初の反射までの相対遅延=ITDG(広さの手がかり)
@@ -1053,6 +1057,8 @@ namespace AcousticFlow
             Status.TapDelayMs = _tapDelayMs;
             Status.TapGain = _tapGain;
             Status.TapBandGain = _tapBandGain;
+            Status.TapPanL = _tapPanL;
+            Status.TapPanR = _tapPanR;
             Status.TapType = _tapType;
         }
 
@@ -1071,7 +1077,7 @@ namespace AcousticFlow
 
             int n = 0;
             // 直接タップ（基準 0ms）。6帯域透過×空気吸収 を low/mid/high にまとめる。
-            WriteTap3(n++, _bands, 0, directDist, 'D', 0f);
+            WriteTap3(n++, _bands, 0, directDist, sp, 'D', 0f);
 
             // 反射タップ（像源位置から経路長→遅延、6帯域ゲイン×空気吸収→3バンド）。
             int er = _scene.ComputeEarlyReflections(lp, sp, _tapErPos, _tapErGain, earlyReflectRays, earlyReflectBounces);
@@ -1080,7 +1086,7 @@ namespace AcousticFlow
                 float pl = Vector3.Distance(lp, _tapErPos[t]);  // 全経路長
                 float rel = (pl - directDist) * toMs;
                 if (rel < 0f) rel = 0f;
-                WriteTap3(n++, _tapErGain, t * 6, pl, 'R', rel);
+                WriteTap3(n++, _tapErGain, t * 6, pl, _tapErPos[t], 'R', rel);
             }
             // 回折タップ（遮蔽時のみ。ゲインはスカラ=v1で3バンド一律、6帯域化は後段。空気吸収は広帯域で乗算）。
             int df = _scene.ComputeDiffractionSources(lp, sp, _tapDiffPos, _tapDiffGain);
@@ -1090,7 +1096,7 @@ namespace AcousticFlow
                 float rel = (pl - directDist) * toMs;
                 if (rel < 0f) rel = 0f;
                 AirAbsorptionBands(pl, _airTmp);
-                WriteTapFlat(n++, _tapDiffGain[t] * Mean6(_airTmp, 0), 'F', rel);
+                WriteTapFlat(n++, _tapDiffGain[t] * Mean6(_airTmp, 0), _tapDiffPos[t], 'F', rel);
             }
             _tapCount = n;
 
@@ -1120,8 +1126,8 @@ namespace AcousticFlow
             }
         }
 
-        // 6帯域(gOff..)×空気吸収(pathLen) を low/mid/high にまとめてタップnに書く（段2）。
-        private void WriteTap3(int n, float[] g, int gOff, float pathLen, char type, float delayMs)
+        // 6帯域(gOff..)×空気吸収(pathLen) を low/mid/high にまとめてタップnに書く（段2）＋到来方向パン（段3a）。
+        private void WriteTap3(int n, float[] g, int gOff, float pathLen, Vector3 arrival, char type, float delayMs)
         {
             AirAbsorptionBands(pathLen, _airTmp);
             float lo = 0.5f * (g[gOff + 0] * _airTmp[0] + g[gOff + 1] * _airTmp[1]);
@@ -1130,16 +1136,28 @@ namespace AcousticFlow
             int o = n * 3;
             _tapBandGain[o] = lo; _tapBandGain[o + 1] = mi; _tapBandGain[o + 2] = hi;
             _tapGain[n] = (lo + mi + hi) / 3f;      // 広帯域（プロット/表示用）
+            ComputePan(arrival, out _tapPanL[n], out _tapPanR[n]);
             _tapType[n] = type; _tapDelayMs[n] = delayMs;
         }
 
-        // スカラゲインを3バンド一律で書く（回折タップ用・v1）。
-        private void WriteTapFlat(int n, float g, char type, float delayMs)
+        // スカラゲインを3バンド一律で書く（回折タップ用・v1）＋到来方向パン（段3a）。
+        private void WriteTapFlat(int n, float g, Vector3 arrival, char type, float delayMs)
         {
             int o = n * 3;
             _tapBandGain[o] = g; _tapBandGain[o + 1] = g; _tapBandGain[o + 2] = g;
             _tapGain[n] = g;
+            ComputePan(arrival, out _tapPanL[n], out _tapPanR[n]);
             _tapType[n] = type; _tapDelayMs[n] = delayMs;
+        }
+
+        // 到来点→リスナー左右軸への投影→等パワーパン（段3a：簡易ステレオ。前後・上下は中央＝HRTFは段3b）。
+        private void ComputePan(Vector3 arrival, out float panL, out float panR)
+        {
+            Vector3 dir = arrival - listener.position;
+            float x = (dir.sqrMagnitude > 1e-8f) ? Vector3.Dot(dir.normalized, listener.right) : 0f;  // -1..1
+            float t = (x + 1f) * 0.5f;
+            panL = Mathf.Sqrt(1f - t);
+            panR = Mathf.Sqrt(t);
         }
 
         // 早期反射(A)：各音源の主要な初期反射を像源として抽出し、仮想エミッタ（像源位置の3Dボイス）へ反映。

@@ -29,7 +29,7 @@ namespace AcousticFlow
         private const float kSplitLowHz = 350f;
         private const float kSplitHighHz = 1400f;
 
-        private struct ConvTap { public int delaySamples; public float gLo, gMid, gHi; }
+        private struct ConvTap { public int delaySamples; public float gLo, gMid, gHi, panL, panR; }
 
         // RBJ バイカッド（Direct Form II Transposed）。struct をフィールドに置いて in-place で使う。
         private struct Biquad
@@ -101,6 +101,8 @@ namespace AcousticFlow
             var d = AcousticFlowSceneDemo.Status.TapDelayMs;
             var bg = AcousticFlowSceneDemo.Status.TapBandGain;
             var bb = AcousticFlowSceneDemo.Status.TapGain;   // フォールバック（広帯域）
+            var pl = AcousticFlowSceneDemo.Status.TapPanL;
+            var pr = AcousticFlowSceneDemo.Status.TapPanR;
             int tc = AcousticFlowSceneDemo.Status.TapCount;
             if (d == null || tc <= 0) { _ir = new ConvTap[0]; return; }
 
@@ -122,6 +124,8 @@ namespace AcousticFlow
                     float g = (bb != null && i < bb.Length) ? bb[i] : 0f;   // 3バンド無ければ広帯域一律
                     ir[n].gLo = g; ir[n].gMid = g; ir[n].gHi = g;
                 }
+                ir[n].panL = (pl != null && i < pl.Length) ? pl[i] : 0.70710678f;   // 段3a パン（無ければ中央）
+                ir[n].panR = (pr != null && i < pr.Length) ? pr[i] : 0.70710678f;
                 n++;
             }
             if (n != ir.Length) System.Array.Resize(ref ir, n);
@@ -159,16 +163,24 @@ namespace AcousticFlow
                 int wi = _writePos & _ringMask;
                 _ringLo[wi] = lo; _ringMid[wi] = mid; _ringHi[wi] = hi;
 
-                float outv = 0f;
+                float outL = 0f, outR = 0f;
                 if (ir != null)
                     for (int k = 0; k < ir.Length; k++)
                     {
                         int rp = (_writePos - ir[k].delaySamples) & _ringMask;
-                        outv += ir[k].gLo * _ringLo[rp] + ir[k].gMid * _ringMid[rp] + ir[k].gHi * _ringHi[rp];
+                        float tv = ir[k].gLo * _ringLo[rp] + ir[k].gMid * _ringMid[rp] + ir[k].gHi * _ringHi[rp];
+                        outL += tv * ir[k].panL;   // 段3a: 到来方向で左右に振る
+                        outR += tv * ir[k].panR;
                     }
-                outv *= outputGain;
+                outL *= outputGain; outR *= outputGain;
 
-                for (int c = 0; c < channels; c++) data[f * channels + c] = outv;  // 段2までモノ→全ch同値
+                int baseI = f * channels;
+                if (channels >= 2)
+                {
+                    data[baseI] = outL; data[baseI + 1] = outR;
+                    for (int c = 2; c < channels; c++) data[baseI + c] = (outL + outR) * 0.5f;
+                }
+                else data[baseI] = (outL + outR) * 0.5f;
                 _writePos++;
             }
         }
