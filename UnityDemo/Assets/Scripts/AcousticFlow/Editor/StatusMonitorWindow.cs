@@ -119,6 +119,27 @@ namespace AcousticFlow.EditorTools
                         $"Low {eq[i * 3 + 0]:F1}   Mid {eq[i * 3 + 1]:F1}   High {eq[i * 3 + 2]:F1}  dB");
             }
 
+            // --- #2: IRタップ / 伝搬遅延（主音源） ---
+            EditorGUILayout.Space(8f);
+            EditorGUILayout.LabelField("IRタップ / 伝搬遅延（主音源）", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField("ITDG(最初の反射まで)",
+                $"{AcousticFlowSceneDemo.Status.ItdgMs:F1} ms   （大=広い / 小=狭い）");
+            var td = AcousticFlowSceneDemo.Status.TapDelayMs;
+            var tg = AcousticFlowSceneDemo.Status.TapGain;
+            var tt = AcousticFlowSceneDemo.Status.TapType;
+            int tc = AcousticFlowSceneDemo.Status.TapCount;
+            if (td != null && tg != null && tt != null)
+            {
+                int show = Mathf.Min(tc, Mathf.Min(td.Length, Mathf.Min(tg.Length, tt.Length)));
+                for (int i = 0; i < show; i++)
+                {
+                    string label = tt[i] == 'D' ? "直接" : (tt[i] == 'R' ? "反射" : "回折");
+                    EditorGUILayout.LabelField($"  {label}", $"{td[i]:F1} ms    gain {tg[i]:F2}");
+                }
+            }
+            EditorGUILayout.LabelField("※まだ音には未反映（遅延データの検証段階＝Part A）",
+                EditorStyles.miniLabel);
+
             // --- 次に何を見るべきかのヒント（回折が鳴らない切り分け） ---
             EditorGUILayout.Space(8f);
             DrawHint(dOn, dAct, dd);

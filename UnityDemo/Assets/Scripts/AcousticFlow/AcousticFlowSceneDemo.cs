@@ -257,6 +257,12 @@ namespace AcousticFlow
             public static float[] BandsDiffract;    // 主音源 6帯域 回折
             public static bool UseBandEq;           // 3バンドEQモードか
             public static float[] EqDb;             // 音源ごと×3(Low/Mid/High) の送出EQゲイン(dB)
+            // #2 伝搬遅延の検証（主音源のIRタップ）
+            public static int TapCount;
+            public static float ItdgMs;             // 最初の反射までの相対遅延=ITDG
+            public static float[] TapDelayMs;       // タップ遅延(ms, 直接=0)
+            public static float[] TapGain;          // 広帯域ゲイン
+            public static char[] TapType;           // 'D'/'R'/'F'
         }
         private string[] _statusNames;  // Status.SourceNames の使い回しバッファ
 
@@ -273,6 +279,21 @@ namespace AcousticFlow
         private float[] _diffCandDelta;
         private int _diffCandCount;
         private int _diffCandMinIdx = -1;
+
+        // #2: 主音源(0)のIRタップ（伝搬遅延の検証用）。delayMs=直接音を0とした相対遅延。
+        // これがIRの生材料＝時間軸。ここが正しければ後段(IR組み立て/畳み込み)にそのまま乗る。
+        private const float kSpeedOfSound = 343f;
+        private int _tapUpdateEveryFrames = 3;
+        private int _tapCountdown = 1;
+        private float[] _tapDelayMs = new float[64];  // 直接音基準の相対遅延(ms)
+        private float[] _tapGain = new float[64];      // 広帯域ゲイン(0..1)
+        private char[] _tapType = new char[64];        // 'D'直接 / 'R'反射 / 'F'回折
+        private int _tapCount;
+        private float _itdgMs;                         // 最初の反射までの相対遅延=ITDG(広さの手がかり)
+        private Vector3[] _tapErPos = new Vector3[8];  // 早期反射 像源バッファ(主音源のタップ計算用)
+        private float[] _tapErGain = new float[8 * 6];
+        private Vector3[] _tapDiffPos = new Vector3[8];
+        private float[] _tapDiffGain = new float[8];
 
         // パフォーマンス計測
         private readonly System.Diagnostics.Stopwatch _acStopwatch = new System.Diagnostics.Stopwatch();
@@ -928,6 +949,13 @@ namespace AcousticFlow
             }
             else _diffCandCount = 0;
 
+            // #2: 主音源のIRタップを低レートで再構築（伝搬遅延の検証。_bandsはこのフレームで更新済み）。
+            if (--_tapCountdown <= 0)
+            {
+                _tapCountdown = Mathf.Max(1, _tapUpdateEveryFrames);
+                BuildMainSourceTaps();
+            }
+
             // 6) 残響（低レートでエコグラム→RT60/wet→Wwise RoomVerb を RTPC 駆動）。
             if (enableReverb && _audioReady && _echogram != null)
             {
@@ -1000,6 +1028,61 @@ namespace AcousticFlow
             Status.BandsDiffract = _diffBands;
             Status.UseBandEq = useBandEq;
             Status.EqDb = _eqDbSmoothed;
+            Status.TapCount = _tapCount;
+            Status.ItdgMs = _itdgMs;
+            Status.TapDelayMs = _tapDelayMs;
+            Status.TapGain = _tapGain;
+            Status.TapType = _tapType;
+        }
+
+        // #2: 主音源(0)の全経路を「タップ」に束ねる（直接/反射/回折）。IRの生材料＝時間軸。
+        //   各タップ = {相対遅延(ms, 直接=0), 広帯域ゲイン, 種別}。
+        //   遅延 = (経路長 − 直接距離) ÷ 音速。まずは数値で妥当性を検証（小部屋=数ms / ホール=数十ms）。
+        private void BuildMainSourceTaps()
+        {
+            _tapCount = 0;
+            _itdgMs = 0f;
+            if (_scene == null || !_scene.IsValid || _srcPos == null || _srcPos.Length == 0) return;
+            Vector3 lp = listener.position;
+            Vector3 sp = _srcPos[0];
+            float directDist = Vector3.Distance(lp, sp);
+            float toMs = 1000f / kSpeedOfSound;  // 距離(m) → ms（÷c ×1000）
+
+            int n = 0;
+            // 直接タップ（基準 0ms）。_bands = このフレームの src0→listener 透過(6帯域)。
+            _tapDelayMs[n] = 0f; _tapGain[n] = Mean6(_bands, 0); _tapType[n] = 'D'; n++;
+
+            // 反射タップ（像源位置から経路長→遅延、6帯域ゲイン）。
+            int er = _scene.ComputeEarlyReflections(lp, sp, _tapErPos, _tapErGain, earlyReflectRays, earlyReflectBounces);
+            for (int t = 0; t < er && n < _tapDelayMs.Length; t++)
+            {
+                float rel = (Vector3.Distance(lp, _tapErPos[t]) - directDist) * toMs;
+                if (rel < 0f) rel = 0f;
+                _tapDelayMs[n] = rel; _tapGain[n] = Mean6(_tapErGain, t * 6); _tapType[n] = 'R'; n++;
+            }
+            // 回折タップ（遮蔽時のみ。ゲインはスカラ=v1、6帯域化は後段の refinement）。
+            int df = _scene.ComputeDiffractionSources(lp, sp, _tapDiffPos, _tapDiffGain);
+            for (int t = 0; t < df && n < _tapDelayMs.Length; t++)
+            {
+                float rel = (Vector3.Distance(lp, _tapDiffPos[t]) - directDist) * toMs;
+                if (rel < 0f) rel = 0f;
+                _tapDelayMs[n] = rel; _tapGain[n] = _tapDiffGain[t]; _tapType[n] = 'F'; n++;
+            }
+            _tapCount = n;
+
+            // ITDG = 直接以外の最小遅延（＝広さの主要な手がかり）。
+            float best = float.MaxValue;
+            for (int i = 0; i < n; i++)
+                if (_tapType[i] != 'D' && _tapDelayMs[i] < best) best = _tapDelayMs[i];
+            _itdgMs = (best == float.MaxValue) ? 0f : best;
+        }
+
+        // 6帯域の単純平均（広帯域ゲイン表示用）。
+        private static float Mean6(float[] g, int off)
+        {
+            float s = 0f;
+            for (int b = 0; b < 6; b++) s += g[off + b];
+            return s / 6f;
         }
 
         // 早期反射(A)：各音源の主要な初期反射を像源として抽出し、仮想エミッタ（像源位置の3Dボイス）へ反映。
