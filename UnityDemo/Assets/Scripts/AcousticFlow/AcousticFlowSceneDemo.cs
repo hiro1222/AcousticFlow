@@ -140,6 +140,8 @@ namespace AcousticFlow
         public bool useBandEq = false;
         [Tooltip("3バンドEQの最大減衰(dB)。RTPCの範囲と合わせる（例 -36）。")]
         [Range(-60f, -6f)] public float occlusionEqFloorDb = -36f;
+        [Tooltip("空気吸収の強さ倍率。1=物理相当（ゲーム距離だと薄め）。距離のこもりを分かりやすくするなら3〜5へ。0で無効。")]
+        [Range(0f, 8f)] public float airAbsorptionScale = 1f;
 
         [Header("音声(Wwise)")]
         [Tooltip("ON: Wwise を初期化して各音源のイベントを再生する（バンクが無ければ幾何計算のみ）。")]
@@ -178,6 +180,9 @@ namespace AcousticFlow
         private Vector3[] _srcPos;      // 音源位置バッファ
         private float[] _occSmoothed;   // 音源ごとの平滑化遮蔽
         private float[] _eqDbSmoothed;  // 音源ごと×3バンド(Low/Mid/High)の平滑化EQゲイン(dB)
+        // #3 空気吸収：帯域別 dB/m（125..4k, 20℃相当のざっくり値）。距離×scaleで高域を削る。
+        private static readonly float[] _airAbsDbPerM = { 0.0003f, 0.0008f, 0.0017f, 0.003f, 0.0085f, 0.025f };
+        private readonly float[] _airTmp = new float[6];
         private float[] _srcSurvival;   // 音源ごとの帯域生存(低域加重平均)。回折二次音源のレベルに使う
         private float[] _bandsPerSource; // 音源ごとの6帯域生存（count*6）
         private float[] _arrivalDir;    // engine出力: エネルギー到来方向（count*3）
@@ -186,6 +191,7 @@ namespace AcousticFlow
         private Vector3[] _srcHome;     // 音源の元配置（Space で復帰）
         private Vector3 _stackPoint;    // 重ねる座標（元配置の重心）
         private bool _stacked;          // true=全音源を1点に重ねる
+        private bool _wwiseMuted;       // M: Wwise音源を一括ミュート（IR畳み込みテストで楽曲を止める用）
 
         // 主音源(0番)の表示用。
         private readonly float[] _bands = new float[AcousticEngine.NumBands];
@@ -741,6 +747,16 @@ namespace AcousticFlow
             }
             // B：全音源を 音楽 ↔ 足音SE(WalkSE_01) に切替。
             if (Input.GetKeyDown(KeyCode.B)) SwitchSourceSound();
+            // M：Wwise音源を一括ミュート/復帰（IR畳み込みテストで楽曲を止めてクリックを聞く用）。
+            //   ミュート=全ボイスStop、復帰=再Post（拍は頭出しに戻る）。IrConvolver(Unity)は無関係に鳴り続ける。
+            if (Input.GetKeyDown(KeyCode.M))
+            {
+                _wwiseMuted = !_wwiseMuted;
+                if (_audioReady)
+                    for (int s = 0; s < _sources.Length; s++)
+                        if (_wwiseMuted) StopAllVoices(s, EventFor(s));
+                        else PostAllVoices(s, EventFor(s));
+            }
             // Enter：音源0のみ足音ループ に切替。
             if (Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.KeypadEnter))
                 SetSingleFootstep(!_singleFootstep);
@@ -868,9 +884,11 @@ namespace AcousticFlow
                 if (nb >= 6)
                 {
                     int bb = i * nb, e = i * 3;
-                    float lo = 0.5f * (_bandsPerSource[bb + 0] + _bandsPerSource[bb + 1]);
-                    float mi = 0.5f * (_bandsPerSource[bb + 2] + _bandsPerSource[bb + 3]);
-                    float hi = 0.5f * (_bandsPerSource[bb + 4] + _bandsPerSource[bb + 5]);
+                    // #3 空気吸収：直接距離ぶんの帯域別減衰を生存に乗算（遠いほど高域が削れる）。
+                    AirAbsorptionBands(Vector3.Distance(listener.position, _srcPos[i]), _airTmp);
+                    float lo = 0.5f * (_bandsPerSource[bb + 0] * _airTmp[0] + _bandsPerSource[bb + 1] * _airTmp[1]);
+                    float mi = 0.5f * (_bandsPerSource[bb + 2] * _airTmp[2] + _bandsPerSource[bb + 3] * _airTmp[3]);
+                    float hi = 0.5f * (_bandsPerSource[bb + 4] * _airTmp[4] + _bandsPerSource[bb + 5] * _airTmp[5]);
                     _eqDbSmoothed[e + 0] = Mathf.MoveTowards(_eqDbSmoothed[e + 0],
                         Mathf.Clamp(20f * Mathf.Log10(Mathf.Max(lo, 1e-3f)), occlusionEqFloorDb, 0f), 48f * dt);
                     _eqDbSmoothed[e + 1] = Mathf.MoveTowards(_eqDbSmoothed[e + 1],
@@ -1049,24 +1067,27 @@ namespace AcousticFlow
             float toMs = 1000f / kSpeedOfSound;  // 距離(m) → ms（÷c ×1000）
 
             int n = 0;
-            // 直接タップ（基準 0ms）。_bands = このフレームの src0→listener 透過(6帯域)。
-            _tapDelayMs[n] = 0f; _tapGain[n] = Mean6(_bands, 0); _tapType[n] = 'D'; n++;
+            // 直接タップ（基準 0ms）。_bands = このフレームの src0→listener 透過(6帯域)。#3 空気吸収を乗算。
+            _tapDelayMs[n] = 0f; _tapGain[n] = Mean6Air(_bands, 0, directDist); _tapType[n] = 'D'; n++;
 
-            // 反射タップ（像源位置から経路長→遅延、6帯域ゲイン）。
+            // 反射タップ（像源位置から経路長→遅延、6帯域ゲイン＋空気吸収）。
             int er = _scene.ComputeEarlyReflections(lp, sp, _tapErPos, _tapErGain, earlyReflectRays, earlyReflectBounces);
             for (int t = 0; t < er && n < _tapDelayMs.Length; t++)
             {
-                float rel = (Vector3.Distance(lp, _tapErPos[t]) - directDist) * toMs;
+                float pl = Vector3.Distance(lp, _tapErPos[t]);  // 全経路長
+                float rel = (pl - directDist) * toMs;
                 if (rel < 0f) rel = 0f;
-                _tapDelayMs[n] = rel; _tapGain[n] = Mean6(_tapErGain, t * 6); _tapType[n] = 'R'; n++;
+                _tapDelayMs[n] = rel; _tapGain[n] = Mean6Air(_tapErGain, t * 6, pl); _tapType[n] = 'R'; n++;
             }
-            // 回折タップ（遮蔽時のみ。ゲインはスカラ=v1、6帯域化は後段の refinement）。
+            // 回折タップ（遮蔽時のみ。ゲインはスカラ=v1、6帯域化は後段。空気吸収は広帯域で乗算）。
             int df = _scene.ComputeDiffractionSources(lp, sp, _tapDiffPos, _tapDiffGain);
             for (int t = 0; t < df && n < _tapDelayMs.Length; t++)
             {
-                float rel = (Vector3.Distance(lp, _tapDiffPos[t]) - directDist) * toMs;
+                float pl = Vector3.Distance(lp, _tapDiffPos[t]);
+                float rel = (pl - directDist) * toMs;
                 if (rel < 0f) rel = 0f;
-                _tapDelayMs[n] = rel; _tapGain[n] = _tapDiffGain[t]; _tapType[n] = 'F'; n++;
+                AirAbsorptionBands(pl, _airTmp);
+                _tapDelayMs[n] = rel; _tapGain[n] = _tapDiffGain[t] * Mean6(_airTmp, 0); _tapType[n] = 'F'; n++;
             }
             _tapCount = n;
 
@@ -1082,6 +1103,26 @@ namespace AcousticFlow
         {
             float s = 0f;
             for (int b = 0; b < 6; b++) s += g[off + b];
+            return s / 6f;
+        }
+
+        // #3 空気吸収：経路長ぶんの帯域別ゲイン(0..1)を outGain に書く。gain = 10^(-α·len·scale/20)。
+        //   低域はほぼ1、高域ほど距離で小さくなる。scale=0 で全帯域1（無効）。
+        private void AirAbsorptionBands(float pathLen, float[] outGain)
+        {
+            for (int b = 0; b < 6; b++)
+            {
+                float dB = _airAbsDbPerM[b] * pathLen * airAbsorptionScale;
+                outGain[b] = Mathf.Pow(10f, -dB / 20f);
+            }
+        }
+
+        // 6帯域に空気吸収を乗算してから平均（タップの広帯域ゲイン用）。
+        private float Mean6Air(float[] g, int off, float pathLen)
+        {
+            AirAbsorptionBands(pathLen, _airTmp);
+            float s = 0f;
+            for (int b = 0; b < 6; b++) s += g[off + b] * _airTmp[b];
             return s / 6f;
         }
 
@@ -1300,7 +1341,7 @@ namespace AcousticFlow
                             $"空間化: {(useHrtf ? "HRTF" : "パン")} (H)    " +
                             $"方向ステア: {(useDirectionalSteering ? "ON" : "OFF")} (G)", style);
             if (enableMovement)
-                GUILayout.Label("操作: WASD / 右ドラッグ / QE / Shift / Space:重ね / H:HRTF / G:ステア / R:反響経路 / C:回折候補 / F:早期反射 / V:回折二次音源 / B:足音SE / Enter:足音ループ(音源0)", style);
+                GUILayout.Label("操作: WASD / 右ドラッグ / QE / Shift / Space:重ね / H:HRTF / G:ステア / R:反響経路 / C:回折候補 / F:早期反射 / V:回折二次音源 / B:足音SE / Enter:足音ループ(音源0) / M:楽曲ミュート", style);
             GUILayout.Label($"音: {(_singleFootstep ? $"足音ループ・音源0のみ ({footstepEvent})" : (useFootstepSE ? $"足音SE・音源0のみ ({footstepEvent})" : "音楽ステム"))}  (B:足音切替 / Enter:足音ループ)", style);
             GUILayout.Label($"音源配置: {(_stacked ? "重ね(1点)" : "展開")}", style);
             if (enableReverb)

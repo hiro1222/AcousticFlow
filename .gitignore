@@ -45,3 +45,8 @@ obj/
 # .bnk は Wwise プロジェクトから生成する成果物。コードではないので追跡しない。
 # 詳細は docs/CODE_GUIDE.md（ビルド&デプロイ）参照。
 UnityDemo/Assets/StreamingAssets/WwiseBanks/*.bnk
+
+# OneDrive/Windows がフォルダに作るゴミ
+desktop.ini
+**/desktop.ini
+**/desktop.ini.meta

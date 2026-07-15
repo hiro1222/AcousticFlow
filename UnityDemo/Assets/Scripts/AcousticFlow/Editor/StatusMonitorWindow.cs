@@ -128,6 +128,9 @@ namespace AcousticFlow.EditorTools
             var tg = AcousticFlowSceneDemo.Status.TapGain;
             var tt = AcousticFlowSceneDemo.Status.TapType;
             int tc = AcousticFlowSceneDemo.Status.TapCount;
+            DrawIrPlot(td, tg, tt, tc, 120f);   // 反射パターン＝時間軸に各タップを縦線で（インパルス応答）
+            EditorGUILayout.LabelField("  白=直接 / 緑=反射 / 水色=回折  （X=時間 0〜120ms, Y=ゲイン）",
+                EditorStyles.miniLabel);
             if (td != null && tg != null && tt != null)
             {
                 int show = Mathf.Min(tc, Mathf.Min(td.Length, Mathf.Min(tg.Length, tt.Length)));
@@ -137,7 +140,7 @@ namespace AcousticFlow.EditorTools
                     EditorGUILayout.LabelField($"  {label}", $"{td[i]:F1} ms    gain {tg[i]:F2}");
                 }
             }
-            EditorGUILayout.LabelField("※まだ音には未反映（遅延データの検証段階＝Part A）",
+            EditorGUILayout.LabelField("※このタップ列を IrConvolver が畳み込んで鳴らす（段1）",
                 EditorStyles.miniLabel);
 
             // --- 次に何を見るべきかのヒント（回折が鳴らない切り分け） ---
@@ -185,6 +188,34 @@ namespace AcousticFlow.EditorTools
                 float v = Mathf.Clamp01(g[b]);
                 DrawBar(fl, v, v.ToString("F2"),
                         new Color(0.85f, 0.25f, 0.20f), new Color(0.25f, 0.80f, 0.35f));
+            }
+        }
+
+        // 反射パターン＝IR（インパルス応答）のプロット。X=時間(0..maxMs)、縦線=各タップ、高さ=ゲイン、色=種別。
+        //   直接が左端(0ms)、反射が右に散る。狭い部屋=左に密集 / 広い空間=右まで広がる。
+        private static void DrawIrPlot(float[] delayMs, float[] gain, char[] type, int count, float maxMs)
+        {
+            Rect r = GUILayoutUtility.GetRect(200f, 90f, GUILayout.ExpandWidth(true));
+            EditorGUI.DrawRect(r, new Color(0.11f, 0.11f, 0.12f));                 // 背景
+            float baseY = r.yMax - 4f;
+            EditorGUI.DrawRect(new Rect(r.x, baseY, r.width, 1f), new Color(0.35f, 0.35f, 0.35f));  // 基線
+            // 目盛（0 / 中間 / max ms）
+            for (int k = 0; k <= 2; k++)
+            {
+                float gx = r.x + r.width * (k / 2f);
+                EditorGUI.DrawRect(new Rect(gx, r.y, 1f, r.height), new Color(0.2f, 0.2f, 0.22f));
+            }
+            if (delayMs == null || gain == null || type == null || count <= 0 || maxMs <= 0f) return;
+
+            float h = r.height - 8f;
+            int m = Mathf.Min(count, Mathf.Min(delayMs.Length, Mathf.Min(gain.Length, type.Length)));
+            for (int i = 0; i < m; i++)
+            {
+                float x = r.x + Mathf.Clamp01(delayMs[i] / maxMs) * r.width;
+                float barH = Mathf.Clamp01(gain[i]) * h;
+                Color c = type[i] == 'D' ? Color.white
+                        : (type[i] == 'R' ? new Color(0.30f, 0.85f, 0.40f) : new Color(0.30f, 0.80f, 0.95f));
+                EditorGUI.DrawRect(new Rect(x, baseY - barH, 2f, barH), c);
             }
         }
 
