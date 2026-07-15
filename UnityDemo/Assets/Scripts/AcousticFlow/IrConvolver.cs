@@ -7,6 +7,7 @@
 //   使い方：空GameObjectに AudioSource + このコンポーネント → Play。
 //     generateTestSignal=ON で内部クリックを畳み込む（ドライ素材不要・手を叩いて反響を聞く感覚）。
 //   段3で空間化(HRTF)、段4で動的クロスフェード。
+using System.Threading;
 using UnityEngine;
 
 namespace AcousticFlow
@@ -14,8 +15,10 @@ namespace AcousticFlow
     [RequireComponent(typeof(AudioSource))]
     public class IrConvolver : MonoBehaviour
     {
-        [Tooltip("ON: 内部クリックを畳み込む（ドライ素材不要）。OFF: このAudioSourceのクリップを畳み込む。")]
+        [Tooltip("ON: 内部テスト信号を畳み込む（ドライ素材不要）。OFF: このAudioSourceのクリップを畳み込む。")]
         public bool generateTestSignal = true;
+        [Tooltip("ON: テスト信号を連続ノイズにする（途切れ確認用・常時鳴る）。OFF: クリック列（反射パターンが聞き取りやすい）。")]
+        public bool testContinuousNoise = false;
         [Tooltip("テストクリックの間隔(秒)。")]
         public float clickIntervalSec = 0.6f;
         [Tooltip("IRの最大長(ms)。これを超える遅延のタップは切り捨て。")]
@@ -24,6 +27,8 @@ namespace AcousticFlow
         public float irUpdateSec = 0.05f;
         [Tooltip("全体出力ゲイン。")]
         [Range(0f, 4f)] public float outputGain = 0.6f;
+        [Tooltip("IR切替のクロスフェード長(ms)。壁変化などでIRが変わる時のプチ音を消す。")]
+        [Range(2f, 100f)] public float crossfadeMs = 30f;
 
         // 3バンド分割のクロスオーバー周波数（低/中/高 の境目）。
         private const float kSplitLowHz = 350f;
@@ -57,12 +62,17 @@ namespace AcousticFlow
             }
         }
 
-        private ConvTap[] _ir = new ConvTap[0];   // audio-thread が読む（参照swapで受け渡し）
+        private ConvTap[] _ir = new ConvTap[0];      // 現在のIR（フェード元）
+        private ConvTap[] _irNext = new ConvTap[0];  // フェード先のIR
+        private ConvTap[] _pendingIr;                // main→audio 受け渡し（Interlockedで取得）
+        private bool _fading;
+        private int _xfadePos, _xfadeLen;            // クロスフェード進捗/長さ(サンプル)
         private float[] _ringLo, _ringMid, _ringHi;  // 3バンドに分けた dry の履歴
         private int _ringMask;
         private int _writePos;
         private int _sampleRate;
         private double _clickTimer;
+        private uint _noiseState = 2463534242u;  // 連続ノイズ用 xorshift
         private float _irTimer;
         private AudioSource _src;
         private Biquad _lp, _hp;   // Low = LP, High = HP, Mid = dry - Low - High
@@ -76,6 +86,7 @@ namespace AcousticFlow
             _ringMid = new float[ringSize];
             _ringHi = new float[ringSize];
             _ringMask = ringSize - 1;
+            _xfadeLen = Mathf.Max(1, Mathf.RoundToInt(crossfadeMs * 0.001f * _sampleRate));
 
             _lp.SetLowpass(kSplitLowHz, _sampleRate);
             _hp.SetHighpass(kSplitHighHz, _sampleRate);
@@ -104,7 +115,7 @@ namespace AcousticFlow
             var pl = AcousticFlowSceneDemo.Status.TapPanL;
             var pr = AcousticFlowSceneDemo.Status.TapPanR;
             int tc = AcousticFlowSceneDemo.Status.TapCount;
-            if (d == null || tc <= 0) { _ir = new ConvTap[0]; return; }
+            if (d == null || tc <= 0) return;   // タップが無い瞬間は前のIRを保持（無音IRへフェードして途切れるのを防ぐ）
 
             int maxDelay = Mathf.CeilToInt(maxIrMs * 0.001f * _sampleRate);
             var ir = new ConvTap[tc];
@@ -129,13 +140,19 @@ namespace AcousticFlow
                 n++;
             }
             if (n != ir.Length) System.Array.Resize(ref ir, n);
-            _ir = ir;   // 参照swap（段2までクロスフェード無し＝切替でプチる場合あり→段4で解消）
+            _pendingIr = ir;   // audio-thread が次ブロックで拾ってクロスフェード（段4）
         }
 
-        // audio-thread：3バンド分割 → バンドごとマルチタップ・ディレイ → 合算。
+        // audio-thread：3バンド分割 → バンドごとマルチタップ → ステレオ合算。IR切替は新旧クロスフェード。
         private void OnAudioFilterRead(float[] data, int channels)
         {
-            var ir = _ir;
+            // 新IRをブロック頭で受け取る（Interlockedで取得＆クリア＝取りこぼし無し）。
+            var pending = Interlocked.Exchange(ref _pendingIr, null);
+            if (pending != null)
+            {
+                if (_fading) _ir = _irNext;   // 進行中のフェードは確定してから次へ
+                _irNext = pending; _xfadePos = 0; _fading = true;
+            }
             int frames = data.Length / channels;
             double clickPeriod = clickIntervalSec * _sampleRate;
 
@@ -144,9 +161,17 @@ namespace AcousticFlow
                 float dry;
                 if (generateTestSignal)
                 {
-                    _clickTimer += 1.0;
-                    if (_clickTimer >= clickPeriod) { _clickTimer -= clickPeriod; dry = 1f; }
-                    else dry = 0f;
+                    if (testContinuousNoise)
+                    {
+                        _noiseState ^= _noiseState << 13; _noiseState ^= _noiseState >> 17; _noiseState ^= _noiseState << 5;
+                        dry = (int)_noiseState * (1f / 2147483648f) * 0.25f;   // 連続ホワイトノイズ
+                    }
+                    else
+                    {
+                        _clickTimer += 1.0;
+                        if (_clickTimer >= clickPeriod) { _clickTimer -= clickPeriod; dry = 1f; }
+                        else dry = 0f;
+                    }
                 }
                 else
                 {
@@ -163,17 +188,19 @@ namespace AcousticFlow
                 int wi = _writePos & _ringMask;
                 _ringLo[wi] = lo; _ringMid[wi] = mid; _ringHi[wi] = hi;
 
-                float outL = 0f, outR = 0f;
-                if (ir != null)
-                    for (int k = 0; k < ir.Length; k++)
-                    {
-                        int rp = (_writePos - ir[k].delaySamples) & _ringMask;
-                        float tv = ir[k].gLo * _ringLo[rp] + ir[k].gMid * _ringMid[rp] + ir[k].gHi * _ringHi[rp];
-                        outL += tv * ir[k].panL;   // 段3a: 到来方向で左右に振る
-                        outR += tv * ir[k].panR;
-                    }
-                outL *= outputGain; outR *= outputGain;
+                ConvOne(_ir, _writePos, out float aL, out float aR);
+                float outL, outR;
+                if (_fading)
+                {
+                    ConvOne(_irNext, _writePos, out float bL, out float bR);
+                    float t = (float)_xfadePos / _xfadeLen;
+                    outL = aL * (1f - t) + bL * t;   // 段4: 新旧IRをクロスフェード
+                    outR = aR * (1f - t) + bR * t;
+                    if (++_xfadePos >= _xfadeLen) { _fading = false; _ir = _irNext; }
+                }
+                else { outL = aL; outR = aR; }
 
+                outL *= outputGain; outR *= outputGain;
                 int baseI = f * channels;
                 if (channels >= 2)
                 {
@@ -183,6 +210,20 @@ namespace AcousticFlow
                 else data[baseI] = (outL + outR) * 0.5f;
                 _writePos++;
             }
+        }
+
+        // 1つのIRを畳んで L/R を返す（3バンド×タップ×パン）。クロスフェード中は新旧2回呼ぶ。
+        private void ConvOne(ConvTap[] ir, int wp, out float L, out float R)
+        {
+            float l = 0f, r = 0f;
+            if (ir != null)
+                for (int k = 0; k < ir.Length; k++)
+                {
+                    int rp = (wp - ir[k].delaySamples) & _ringMask;
+                    float tv = ir[k].gLo * _ringLo[rp] + ir[k].gMid * _ringMid[rp] + ir[k].gHi * _ringHi[rp];
+                    l += tv * ir[k].panL; r += tv * ir[k].panR;
+                }
+            L = l; R = r;
         }
     }
 }
