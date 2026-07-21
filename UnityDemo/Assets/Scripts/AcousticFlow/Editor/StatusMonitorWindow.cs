@@ -97,6 +97,18 @@ namespace AcousticFlow.EditorTools
                 EditorGUILayout.LabelField("回折候補(主音源)",
                     $"{AcousticFlowSceneDemo.Status.DiffCandCount} 本 (C)");
 
+            // --- 後期残響(FDN)を決めてる値 ---
+            EditorGUILayout.Space(8f);
+            EditorGUILayout.LabelField("後期残響(FDN)を決めてる値", EditorStyles.boldLabel);
+            float rt = AcousticFlowSceneDemo.Status.RtSeconds;
+            float wet = AcousticFlowSceneDemo.Status.Wet;
+            float slv = AcousticFlowSceneDemo.Status.SourceLevel;
+            EditorGUILayout.LabelField("  RT60(尾の長さ)", $"{rt:F2} s");
+            EditorGUILayout.LabelField("  Wet(反響割合)", $"{wet:F2}");
+            EditorGUILayout.LabelField("  遮蔽レベル(SourceLevel)", $"{slv:F2}  （1=素通り / 小=遮蔽）");
+            EditorGUILayout.LabelField("  → 残響の効き ≈ Wet×遮蔽", $"{wet * slv:F3}  （小さいほど残響ほぼ無し）");
+            EditorGUILayout.LabelField("  ※開けた場所は Wet≈0 か 遮蔽小 で残響が消えるべき", EditorStyles.miniLabel);
+
             // --- 帯域（主音源） ---
             EditorGUILayout.Space(8f);
             EditorGUILayout.LabelField("主音源 帯域ゲイン (1=素通り / 0=遮断)", EditorStyles.boldLabel);

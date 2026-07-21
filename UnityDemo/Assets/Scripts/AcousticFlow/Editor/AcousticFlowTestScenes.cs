@@ -22,8 +22,9 @@ namespace AcousticFlow.EditorTools
             MakeBox("Floor", new Vector3(0f, -0.5f, 0f), new Vector3(30f, 1f, 30f));
             var barrier = MakeBox("Barrier", new Vector3(0f, 2f, 0f), new Vector3(6f, 4f, 0.4f)); // 有限＝縁で回折
             Tint(barrier, new Color(0.85f, 0.55f, 0.35f));
-            AddDemo(listener, new Vector3(0f, 1.6f, 4f), AcousticMaterialPreset.Concrete);   // 6音源を衝立の真裏に重ねる
-            AddConvolver();
+            var srcPos = new Vector3(0f, 1.6f, 4f);   // 衝立の真裏
+            AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);   // 6音源を重ねる
+            AddConvolver(srcPos);
             Save(scene, "Test_Diffraction.unity",
                 "回折: 衝立の裏(+Z)に6音源。左右(A/D)に動くと縁を回り込む回折が変わる。Status Monitorで水色(回折)タップを確認。");
         }
@@ -42,8 +43,9 @@ namespace AcousticFlow.EditorTools
             MakeBox("Box_Right", new Vector3(2f, 2f, 4f), new Vector3(0.3f, 4f, 4f));
             MakeBox("Box_Top", new Vector3(0f, 4f, 4f), new Vector3(4f, 0.3f, 4f));
             MakeBox("Box_Bottom", new Vector3(0f, 0f, 4f), new Vector3(4f, 0.3f, 4f));
-            AddDemo(listener, new Vector3(0f, 2f, 4f), AcousticMaterialPreset.Default);       // 6音源を箱の中に重ねる（Default=石膏ボード相当）
-            AddConvolver();
+            var srcPos = new Vector3(0f, 2f, 4f);   // 密閉箱の中
+            AddDemo(listener, srcPos, AcousticMaterialPreset.Default);   // 6音源を重ねる（Default=石膏ボード相当）
+            AddConvolver(srcPos);
             Save(scene, "Test_Transmission.unity",
                 "透過: 密閉ボックス内の6音源。開口が無いので透過だけ(低域寄りにこもる)。occluderMaterialをConcrete/Glassに変えて比較。");
         }
@@ -53,10 +55,11 @@ namespace AcousticFlow.EditorTools
         public static void SmallRoom()
         {
             var scene = NewScene();
-            var listener = MakeListener(new Vector3(-1f, 1.2f, -0.9f));
+            var listener = MakeListener(new Vector3(0f, 1.6f, -1f));       // 中心付近・音源との距離2m（大部屋と統一）
             MakeRoom("Small", new Vector3(4f, 2.5f, 3f), 0.4f);            // 4×3m・高2.5m
-            AddDemo(listener, new Vector3(1f, 1.2f, 0.9f), AcousticMaterialPreset.Concrete);  // 硬い壁＝反射多く残響が分かりやすい
-            AddConvolver();
+            var srcPos = new Vector3(0f, 1.6f, 1f);   // 中心付近
+            AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);  // 硬い壁＝反射多く残響が分かりやすい
+            AddConvolver(srcPos);
             Save(scene, "Test_SmallRoom.unity",
                 "小部屋: 反射がすぐ返る(ITDG小)。Status MonitorのIRプロットが左に密集。広い部屋と聞き比べ。");
         }
@@ -66,10 +69,11 @@ namespace AcousticFlow.EditorTools
         public static void LargeRoom()
         {
             var scene = NewScene();
-            var listener = MakeListener(new Vector3(0f, 1.6f, -8f));
+            var listener = MakeListener(new Vector3(0f, 1.6f, -1f));       // 中心付近・音源との距離2m（小部屋と統一）
             MakeRoom("Large", new Vector3(30f, 12f, 24f), 0.6f);          // 30×24m・高12m
-            AddDemo(listener, new Vector3(0f, 1.6f, 8f), AcousticMaterialPreset.Concrete);
-            AddConvolver();
+            var srcPos = new Vector3(0f, 1.6f, 1f);   // 中心付近
+            AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);
+            AddConvolver(srcPos);
             Save(scene, "Test_LargeRoom.unity",
                 "広い部屋: 反射が遅れて返る(ITDG大)。IRプロットが右まで広がる。小部屋と聞き比べ。");
         }
@@ -137,14 +141,22 @@ namespace AcousticFlow.EditorTools
             demo.autoCollectBoxColliders = true;
             demo.occluderMaterial = material;
             demo.firstPersonCamera = true;
+            demo.distanceRef = 4f;   // 全シーン統一：距離減衰ゆるめ（直接音を前に）
         }
 
-        // IR畳み込みのテスト機（クリックで反射パターンを聞く）。Play→M で楽曲ミュートして試聴。
-        private static void AddConvolver()
+        // IR畳み込みのテスト機。全シーン統一：TokyoGeto.wav を畳み込み・tailLevel=0.3。
+        //   Play→M で Wwise 楽曲をミュートして、畳み込み音だけ聴く。
+        private static void AddConvolver(Vector3 pos)
         {
             var go = new GameObject("IrConvolverTest");
-            go.AddComponent<AudioSource>();
-            go.AddComponent<IrConvolver>();
+            go.transform.position = pos;   // スピーカ(音源)と同じ位置に置く
+            var src = go.AddComponent<AudioSource>();
+            var clip = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Audio/TokyoGeto.wav");
+            if (clip != null) src.clip = clip;
+
+            var conv = go.AddComponent<IrConvolver>();
+            conv.tailLevel = 0.3f;                       // 全シーン統一
+            conv.generateTestSignal = (clip == null);    // clipがあれば実音源を畳み込み / 無ければテスト信号
         }
 
         private static void Tint(Transform t, Color c)

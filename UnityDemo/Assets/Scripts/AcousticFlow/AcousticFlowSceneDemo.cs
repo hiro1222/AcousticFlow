@@ -142,6 +142,8 @@ namespace AcousticFlow
         [Range(-60f, -6f)] public float occlusionEqFloorDb = -36f;
         [Tooltip("空気吸収の強さ倍率。1=物理相当（ゲーム距離だと薄め）。距離のこもりを分かりやすくするなら3〜5へ。0で無効。")]
         [Range(0f, 8f)] public float airAbsorptionScale = 1f;
+        [Tooltip("距離減衰の基準距離(m)。この距離でゲイン1、以遠は 1/r（refDist/経路長）で減衰。近距離はクランプ。0で無効。")]
+        [Range(0f, 5f)] public float distanceRef = 1.5f;
 
         [Header("音声(Wwise)")]
         [Tooltip("ON: Wwise を初期化して各音源のイベントを再生する（バンクが無ければ幾何計算のみ）。")]
@@ -272,6 +274,10 @@ namespace AcousticFlow
             public static float[] TapPanL;          // 段3a: タップの左右パン（等パワー）
             public static float[] TapPanR;
             public static char[] TapType;           // 'D'/'R'/'F'
+            // 後期残響尾（ハイブリッド）用：エコグラム由来のRT60/wet
+            public static float RtSeconds;          // 残響RT60(秒)
+            public static float Wet;                // 残響wet(0..1, tail/total)
+            public static float SourceLevel;        // 主音源の直線透過(遮蔽)レベル(0..1)。残響を遮蔽で絞る用
         }
         private string[] _statusNames;  // Status.SourceNames の使い回しバッファ
 
@@ -1060,6 +1066,9 @@ namespace AcousticFlow
             Status.TapPanL = _tapPanL;
             Status.TapPanR = _tapPanR;
             Status.TapType = _tapType;
+            Status.RtSeconds = _reverbDecay;
+            Status.Wet = _reverbWet;
+            Status.SourceLevel = Mean6(_bands, 0);   // 主音源の直線透過(遮蔽)＝残響を遮蔽で絞る用
         }
 
         // #2: 主音源(0)の全経路を「タップ」に束ねる（直接/反射/回折）。IRの生材料＝時間軸。
@@ -1096,7 +1105,7 @@ namespace AcousticFlow
                 float rel = (pl - directDist) * toMs;
                 if (rel < 0f) rel = 0f;
                 AirAbsorptionBands(pl, _airTmp);
-                WriteTapFlat(n++, _tapDiffGain[t] * Mean6(_airTmp, 0), _tapDiffPos[t], 'F', rel);
+                WriteTapFlat(n++, _tapDiffGain[t] * Mean6(_airTmp, 0), pl, _tapDiffPos[t], 'F', rel);
             }
             _tapCount = n;
 
@@ -1126,13 +1135,14 @@ namespace AcousticFlow
             }
         }
 
-        // 6帯域(gOff..)×空気吸収(pathLen) を low/mid/high にまとめてタップnに書く（段2）＋到来方向パン（段3a）。
+        // 6帯域(gOff..)×空気吸収(pathLen) を low/mid/high にまとめてタップnに書く（段2）＋到来方向パン（段3a）＋距離減衰（③）。
         private void WriteTap3(int n, float[] g, int gOff, float pathLen, Vector3 arrival, char type, float delayMs)
         {
             AirAbsorptionBands(pathLen, _airTmp);
-            float lo = 0.5f * (g[gOff + 0] * _airTmp[0] + g[gOff + 1] * _airTmp[1]);
-            float mi = 0.5f * (g[gOff + 2] * _airTmp[2] + g[gOff + 3] * _airTmp[3]);
-            float hi = 0.5f * (g[gOff + 4] * _airTmp[4] + g[gOff + 5] * _airTmp[5]);
+            float da = DistAtten(pathLen);   // ③ 絶対距離減衰（1/r）
+            float lo = 0.5f * (g[gOff + 0] * _airTmp[0] + g[gOff + 1] * _airTmp[1]) * da;
+            float mi = 0.5f * (g[gOff + 2] * _airTmp[2] + g[gOff + 3] * _airTmp[3]) * da;
+            float hi = 0.5f * (g[gOff + 4] * _airTmp[4] + g[gOff + 5] * _airTmp[5]) * da;
             int o = n * 3;
             _tapBandGain[o] = lo; _tapBandGain[o + 1] = mi; _tapBandGain[o + 2] = hi;
             _tapGain[n] = (lo + mi + hi) / 3f;      // 広帯域（プロット/表示用）
@@ -1140,14 +1150,22 @@ namespace AcousticFlow
             _tapType[n] = type; _tapDelayMs[n] = delayMs;
         }
 
-        // スカラゲインを3バンド一律で書く（回折タップ用・v1）＋到来方向パン（段3a）。
-        private void WriteTapFlat(int n, float g, Vector3 arrival, char type, float delayMs)
+        // スカラゲインを3バンド一律で書く（回折タップ用・v1）＋到来方向パン（段3a）＋距離減衰（③）。
+        private void WriteTapFlat(int n, float g, float pathLen, Vector3 arrival, char type, float delayMs)
         {
+            g *= DistAtten(pathLen);   // ③ 絶対距離減衰（1/r）
             int o = n * 3;
             _tapBandGain[o] = g; _tapBandGain[o + 1] = g; _tapBandGain[o + 2] = g;
             _tapGain[n] = g;
             ComputePan(arrival, out _tapPanL[n], out _tapPanR[n]);
             _tapType[n] = type; _tapDelayMs[n] = delayMs;
+        }
+
+        // ③ 絶対距離減衰（1/r・振幅）。distanceRef でゲイン1、以遠は refDist/pathLen。0で無効(=1)。
+        private float DistAtten(float pathLen)
+        {
+            if (distanceRef <= 0f) return 1f;
+            return distanceRef / Mathf.Max(pathLen, distanceRef);
         }
 
         // 到来点→リスナー左右軸への投影→等パワーパン（段3a：簡易ステレオ。前後・上下は中央＝HRTFは段3b）。
