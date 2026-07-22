@@ -158,6 +158,23 @@ ACOUSTIC_API void AF_SceneComputeEchogram(AF_SceneHandle scene,
                                           float binSeconds, float speedOfSound,
                                           int numRays, int maxBounces);
 
+/* 【残響】上の帯域別版。outBins は numBins*6 要素で、outBins[k*6 + b] に
+ * 時間ビン k・帯域 b(125/250/500/1k/2k/4kHz) のエネルギーを書く。
+ * 実際の部屋は高域ほど速く減衰するため、実測された尾を IR 畳み込みで鳴らすには
+ * 広帯域平均ではなくこの帯域別カーブが要る。
+ *
+ * distanceRef: 音源からの広がり損失の基準距離（0以下で無効＝旧APIと同じ相対の形）。
+ *   減衰は atten = distanceRef / max(d, distanceRef)、エネルギーはその2乗。
+ *   d は「音源→反射点」の区間長。リスナーまでの総経路長ではないことに注意
+ *   （総経路長で掛けると尾に 1/t² の偽の減衰が乗り、広い部屋の中央で反響が痩せる）。 */
+ACOUSTIC_API void AF_SceneComputeEchogramBands(AF_SceneHandle scene,
+                                               AF_Vector3 listener,
+                                               const AF_Vector3* sources, int count,
+                                               float* outBins, int numBins,
+                                               float binSeconds, float speedOfSound,
+                                               int numRays, int maxBounces,
+                                               float distanceRef);
+
 /* 【可視化】origin から dir 方向へ鏡面反射で maxBounces 回まで追った経路（通過点）を
  * outPoints に書き、その点数を返す。outPoints[0]=origin/以降=反射点/最後=終端。
  * outPoints は maxPoints 個以上（最低 maxBounces+2）。反響経路の線描画用。 */

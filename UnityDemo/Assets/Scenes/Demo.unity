@@ -1892,7 +1892,7 @@ MonoBehaviour:
   useHrtf: 1
   banks:
   - Init.bnk
-  - Acoustic.bnk
+  - TokyoGeto.bnk
   useFootstepSE: 0
   footstepEvent: WalkSE_01
   footstepLoopSeconds: 0.5

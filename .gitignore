@@ -1,3 +1,9 @@
+# --- ルート直下の stray Unity プロジェクト ---
+# 本体は UnityDemo/ 配下。ルートの Packages/ ProjectSettings/ は誤って生成された
+# 空プロジェクトなので追跡しない（UnityDemo/ 配下は別途追跡される）。
+/Packages/
+/ProjectSettings/
+
 # --- ビルド成果物 ---
 # CMake や MSVC が自動生成するもの。ソースから再生成できるので追跡しない。
 /build/

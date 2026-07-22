@@ -144,6 +144,32 @@ namespace AcousticFlow
                 binSeconds, speedOfSound, numRays, maxBounces);
         }
 
+        // 残響：帯域別エコグラムを outBins[numBins*6] に書く。高域ほど速く減衰する実測カーブが取れる。
+        // 古いDLLではエクスポートが無いので、その場合 false を返す（呼び手は広帯域版へフォールバック）。
+        private bool _echogramBandsMissing;
+        public bool ComputeEchogramBands(Vector3 listener, Vector3[] sources, int count,
+                                         float[] outBins, int numBins, float binSeconds,
+                                         float speedOfSound, int numRays, int maxBounces,
+                                         float distanceRef)
+        {
+            if (_handle == IntPtr.Zero || sources == null || count <= 0 || outBins == null) return false;
+            if (_echogramBandsMissing) return false;
+            if (_srcBuf == null || _srcBuf.Length < count) _srcBuf = new AFVector3[count];
+            for (int i = 0; i < count; i++) _srcBuf[i] = new AFVector3(sources[i]);
+            try
+            {
+                Native.AF_SceneComputeEchogramBands(
+                    _handle, new AFVector3(listener), _srcBuf, count, outBins, numBins,
+                    binSeconds, speedOfSound, numRays, maxBounces, distanceRef);
+                return true;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _echogramBandsMissing = true;   // 以後は問い合わせない
+                return false;
+            }
+        }
+
         // 反射経路：origin→dir を鏡面反射で maxBounces 回追い、通過点を outPoints に書き点数を返す。
         // 内部バッファ(_pathBuf)を使い回して毎フレームの GC を避ける。
         private AFVector3[] _pathBuf;

@@ -73,9 +73,12 @@ namespace AcousticFlow
         [Tooltip("エコグラムの時間ビン数。bins×binMs が窓幅（例 100×10ms=1秒）。")]
         public int echogramBins = 100;
         public float echogramBinMs = 10f;
-        [Tooltip("残響用レイ本数（共有）と反射回数。尾を追うので反射は多め。")]
+        [Tooltip("残響用レイ本数（共有）と反射回数。尾を追うので反射は多め。\n"
+                 + "バウンス数が足りないと、尾の後半に届くレイが激減して包絡がガタつき、"
+                 + "『残響の粒立ち』として聞こえる。必要数の目安は 尾の長さ×音速÷平均自由行程 で、"
+                 + "平均自由行程 4V/S が小さい部屋（＝狭い/複雑）ほど多く要る。")]
         public int echogramRays = 512;
-        public int echogramBounces = 8;
+        public int echogramBounces = 24;
         [Tooltip("残響の更新間隔（フレーム）。重いので数フレームに1回で十分（部屋は緩変）。")]
         public int reverbUpdateEveryFrames = 4;
         [Tooltip("拡散リバーブ(RoomVerb)の wet 倍率。反響が強すぎるなら下げる（0=残響なし）。")]
@@ -89,8 +92,13 @@ namespace AcousticFlow
         [Tooltip("音源あたりの最大反射タップ数（＝像源＝仮想ボイス数）。多いほど密だがボイスを食う（例 3〜6）。"
                  + "総仮想ボイス数 = 音源数 × これ。")]
         [Range(1, 8)] public int earlyReflectTaps = 4;
-        [Tooltip("早期反射抽出のレイ本数（音源ごと）。")]
-        public int earlyReflectRays = 256;
+        [Tooltip("早期反射抽出のレイ本数（音源ごと）。多いほど角度分解能が上がり、"
+                 + "リスナー移動でタップの入れ替わりがカクつきにくい。総コスト = 音源数 × これ。"
+                 + "広い部屋（壁が遠い）ほど本数を要する。")]
+        public int earlyReflectRays = 512;
+        [Tooltip("像源エミッタ音量の追従速度(1/秒)。小さいほどゆっくり。タップが消える瞬間に"
+                 + "音量が 0 へスナップして『物っと切れる』のを防ぐため、目標へ滑らかに寄せる。")]
+        [Range(1f, 40f)] public float earlyReflectFadeSpeed = 12f;
         [Tooltip("早期反射の反射回数（1〜2で初期反射のみ）。")]
         public int earlyReflectBounces = 2;
         [Tooltip("早期反射の更新間隔（フレーム）。音源ごとにレイを撒くので数フレーム毎。")]
@@ -150,7 +158,7 @@ namespace AcousticFlow
         public bool enableAudio = true;
         [Tooltip("ON: HRTF（両耳の頭部伝達）で空間化。OFF: パンニング。H キーで切替。")]
         public bool useHrtf = true;
-        public string[] banks = { "Init.bnk", "Acoustic.bnk" };
+        public string[] banks = { "Init.bnk", "TokyoGeto.bnk" };
         [Tooltip("ON: 全音源を足音SE(footstepEvent)に切替。B キー。トランジェント音は回折/反射の効きが分かりやすい。")]
         public bool useFootstepSE = false;
         [Tooltip("足音SEのイベント名（バンクに含まれる想定）。")]
@@ -203,7 +211,8 @@ namespace AcousticFlow
         // 遮蔽量の帯域加重（低域=大。低音は回り込んで残るため重い）。
         private static readonly float[] _bandWeights = { 3f, 2.5f, 2f, 1.3f, 1f, 0.8f };
 
-        private float[] _echogram;      // 到達時間ビン
+        private float[] _echogram;      // 到達時間ビン（広帯域）
+        private float[] _echogramBands; // 到達時間ビン×6帯域（実測された尾のIR用）
         private float _reverbWet, _reverbDecay;  // エコグラムから算出（RTPCへ）
         private int _echoCountdown = 1;
         private int _catalogCountdown = 1;
@@ -211,6 +220,7 @@ namespace AcousticFlow
         // 早期反射(A) 用バッファ。音源ごとに像源位置＋帯域ゲインを受け、仮想エミッタへ反映。
         private Vector3[] _erImagePos;  // 像源位置（earlyReflectTaps）
         private float[] _erGain;        // 帯域ゲイン（earlyReflectTaps*6）
+        private float[] _erVolSmooth;   // 像源エミッタ音量の平滑状態（音源×タップ枠）
         private int _erCountdown = 1;
         private int _erActiveTaps;      // 直近フレームで鳴っているタップ総数（表示用）
         private int _erTapCap;          // 仮想エミッタ プールの1音源あたり容量（＝初期化時の earlyReflectTaps）
@@ -270,11 +280,24 @@ namespace AcousticFlow
             public static float ItdgMs;             // 最初の反射までの相対遅延=ITDG
             public static float[] TapDelayMs;       // タップ遅延(ms, 直接=0)
             public static float[] TapGain;          // 広帯域ゲイン
-            public static float[] TapBandGain;      // タップ×3バンド(low/mid/high) ゲイン（段2 畳み込み用）
+            public static float[] TapBandGain;      // タップ×6帯域(125/250/500/1k/2k/4kHz) ゲイン（畳み込み用）
             public static float[] TapPanL;          // 段3a: タップの左右パン（等パワー）
             public static float[] TapPanR;
             public static char[] TapType;           // 'D'/'R'/'F'
             // 後期残響尾（ハイブリッド）用：エコグラム由来のRT60/wet
+            // 実測された尾のIR生成用。EchogramBands[k*6 + b] = 時間ビンk・帯域b のエネルギー。
+            // 古いDLL（帯域別エクスポート無し）では null。
+            public static float[] EchogramBands;
+            public static float EchogramBinMs;
+            public static int EchogramBinCount;
+            public static int EchogramVersion;      // 更新のたびに増える。再生成の判定用。
+            public static float DistanceRef;        // 距離減衰の基準距離（尾を早期と同じ土俵に乗せる）
+            // 残響/直接エネルギーの物理目標比 (r/r_c)²。尾の絶対レベルはこれで決める
+            //   （エコグラムの尾/直接比は 2π 結合などで信用できないため、形だけ使い量はこれ）。
+            public static float ReverbTargetRatio;
+            // 早期↔後期の境目(mixing time)の目安 ≈ √V(ms)。広い部屋ほど遅い。
+            //   これより前の反射は方向つき早期タップ、後は拡散尾として扱う。
+            public static float MixingTimeMs;
             public static float RtSeconds;          // 残響RT60(秒)
             public static float Wet;                // 残響wet(0..1, tail/total)
             public static float SourceLevel;        // 主音源の直線透過(遮蔽)レベル(0..1)。残響を遮蔽で絞る用
@@ -302,7 +325,8 @@ namespace AcousticFlow
         private int _tapCountdown = 1;
         private float[] _tapDelayMs = new float[64];  // 直接音基準の相対遅延(ms)
         private float[] _tapGain = new float[64];      // 広帯域ゲイン(0..1, プロット/表示用)
-        private float[] _tapBandGain = new float[64 * 3]; // 段2: タップ×3バンド(low/mid/high)ゲイン（畳み込みの音色）
+        // タップ×6帯域ゲイン（畳み込みの音色）。エンジン出力の6帯域を潰さずそのまま渡す。
+        private float[] _tapBandGain = new float[64 * AcousticEngine.NumBands];
         private float[] _tapPanL = new float[64];       // 段3a: 到来方向→左右パン（等パワー）
         private float[] _tapPanR = new float[64];
         private char[] _tapType = new char[64];        // 'D'直接 / 'R'反射 / 'F'回折
@@ -381,11 +405,14 @@ namespace AcousticFlow
             _stacked = false;
 
             _echogram = new float[Mathf.Max(1, echogramBins)];
+            _echogramBands = new float[_echogram.Length * AcousticEngine.NumBands];
 
             // 早期反射(A) バッファ。1音源分を使い回す（音源ごとに順次計算→仮想エミッタへ反映）。
             _erTapCap = Mathf.Max(1, earlyReflectTaps);
             _erImagePos = new Vector3[_erTapCap];
             _erGain = new float[_erTapCap * AcousticEngine.NumBands];
+            // 像源エミッタ音量の平滑状態（音源×タップ枠）。スナップ防止。
+            _erVolSmooth = new float[Mathf.Max(1, _sources.Length) * _erTapCap];
 
             // 回折候補の可視化バッファ（エンジンの合成上限に合わせて64）。
             _diffCandPts = new Vector3[64];
@@ -987,15 +1014,41 @@ namespace AcousticFlow
             }
 
             // 6) 残響（低レートでエコグラム→RT60/wet→Wwise RoomVerb を RTPC 駆動）。
-            if (enableReverb && _audioReady && _echogram != null)
+            //    ※ Wwise 非依存の畳み込み経路もエコグラムを使うので、_audioReady では止めない。
+            if (enableReverb && _echogram != null)
             {
                 if (--_echoCountdown <= 0)
                 {
                     _echoCountdown = Mathf.Max(1, reverbUpdateEveryFrames);
-                    _scene.ComputeEchogram(listener.position, _srcPos, _sources.Length,
-                        _echogram, _echogram.Length, echogramBinMs * 0.001f, 343f,
-                        echogramRays, echogramBounces);
+                    // まず帯域別を試す（実測された尾のIR用）。古いDLLなら広帯域版へフォールバック。
+                    bool haveBands = _scene.ComputeEchogramBands(
+                        listener.position, _srcPos, _sources.Length,
+                        _echogramBands, _echogram.Length, echogramBinMs * 0.001f, 343f,
+                        echogramRays, echogramBounces, distanceRef);
+                    if (haveBands)
+                    {
+                        // 広帯域エコグラム（RT60/wet 用）は帯域平均として導出する。
+                        for (int k = 0; k < _echogram.Length; k++)
+                        {
+                            float e = 0f;
+                            for (int b = 0; b < nb; b++) e += _echogramBands[k * nb + b];
+                            _echogram[k] = e / nb;
+                        }
+                        Status.EchogramBands = _echogramBands;
+                    }
+                    else
+                    {
+                        _scene.ComputeEchogram(listener.position, _srcPos, _sources.Length,
+                            _echogram, _echogram.Length, echogramBinMs * 0.001f, 343f,
+                            echogramRays, echogramBounces);
+                        Status.EchogramBands = null;
+                    }
+                    Status.EchogramBinMs = echogramBinMs;
+                    Status.DistanceRef = distanceRef;
+                    Status.EchogramBinCount = _echogram.Length;
+                    Status.EchogramVersion++;
                     UpdateReverbFromEchogram();
+                    UpdateReverbTargetRatio();
                     // Reverb Monitor 窓へ。
                     LatestEchogram = _echogram;
                     EchogramBins = _echogram.Length;
@@ -1086,7 +1139,7 @@ namespace AcousticFlow
 
             int n = 0;
             // 直接タップ（基準 0ms）。6帯域透過×空気吸収 を low/mid/high にまとめる。
-            WriteTap3(n++, _bands, 0, directDist, sp, 'D', 0f);
+            WriteTapBands(n++, _bands, 0, directDist, sp, 'D', 0f);
 
             // 反射タップ（像源位置から経路長→遅延、6帯域ゲイン×空気吸収→3バンド）。
             int er = _scene.ComputeEarlyReflections(lp, sp, _tapErPos, _tapErGain, earlyReflectRays, earlyReflectBounces);
@@ -1095,7 +1148,7 @@ namespace AcousticFlow
                 float pl = Vector3.Distance(lp, _tapErPos[t]);  // 全経路長
                 float rel = (pl - directDist) * toMs;
                 if (rel < 0f) rel = 0f;
-                WriteTap3(n++, _tapErGain, t * 6, pl, _tapErPos[t], 'R', rel);
+                WriteTapBands(n++, _tapErGain, t * 6, pl, _tapErPos[t], 'R', rel);
             }
             // 回折タップ（遮蔽時のみ。ゲインはスカラ=v1で3バンド一律、6帯域化は後段。空気吸収は広帯域で乗算）。
             int df = _scene.ComputeDiffractionSources(lp, sp, _tapDiffPos, _tapDiffGain);
@@ -1136,16 +1189,20 @@ namespace AcousticFlow
         }
 
         // 6帯域(gOff..)×空気吸収(pathLen) を low/mid/high にまとめてタップnに書く（段2）＋到来方向パン（段3a）＋距離減衰（③）。
-        private void WriteTap3(int n, float[] g, int gOff, float pathLen, Vector3 arrival, char type, float delayMs)
+        private void WriteTapBands(int n, float[] g, int gOff, float pathLen, Vector3 arrival, char type, float delayMs)
         {
             AirAbsorptionBands(pathLen, _airTmp);
             float da = DistAtten(pathLen);   // ③ 絶対距離減衰（1/r）
-            float lo = 0.5f * (g[gOff + 0] * _airTmp[0] + g[gOff + 1] * _airTmp[1]) * da;
-            float mi = 0.5f * (g[gOff + 2] * _airTmp[2] + g[gOff + 3] * _airTmp[3]) * da;
-            float hi = 0.5f * (g[gOff + 4] * _airTmp[4] + g[gOff + 5] * _airTmp[5]) * da;
-            int o = n * 3;
-            _tapBandGain[o] = lo; _tapBandGain[o + 1] = mi; _tapBandGain[o + 2] = hi;
-            _tapGain[n] = (lo + mi + hi) / 3f;      // 広帯域（プロット/表示用）
+            int nb = AcousticEngine.NumBands;
+            int o = n * nb;
+            float sum = 0f;
+            for (int b = 0; b < nb; b++)
+            {
+                float v = g[gOff + b] * _airTmp[b] * da;
+                _tapBandGain[o + b] = v;
+                sum += v;
+            }
+            _tapGain[n] = sum / nb;                 // 広帯域（プロット/表示用）
             ComputePan(arrival, out _tapPanL[n], out _tapPanR[n]);
             _tapType[n] = type; _tapDelayMs[n] = delayMs;
         }
@@ -1154,8 +1211,9 @@ namespace AcousticFlow
         private void WriteTapFlat(int n, float g, float pathLen, Vector3 arrival, char type, float delayMs)
         {
             g *= DistAtten(pathLen);   // ③ 絶対距離減衰（1/r）
-            int o = n * 3;
-            _tapBandGain[o] = g; _tapBandGain[o + 1] = g; _tapBandGain[o + 2] = g;
+            int nb = AcousticEngine.NumBands;
+            int o = n * nb;
+            for (int b = 0; b < nb; b++) _tapBandGain[o + b] = g;
             _tapGain[n] = g;
             ComputePan(arrival, out _tapPanL[n], out _tapPanR[n]);
             _tapType[n] = type; _tapDelayMs[n] = delayMs;
@@ -1189,6 +1247,10 @@ namespace AcousticFlow
             int nb = AcousticEngine.NumBands;
             _erActiveTaps = 0;
 
+            // 平滑係数：この更新までの経過時間ベース（更新間隔に依らず一定の追従時間）。
+            float dt = Time.deltaTime * Mathf.Max(1, earlyReflectUpdateEveryFrames);
+            float k = 1f - Mathf.Exp(-earlyReflectFadeSpeed * dt);
+
             for (int s = 0; s < _sources.Length; s++)
             {
                 int n = _scene.ComputeEarlyReflections(listenerPos, _srcPos[s],
@@ -1197,9 +1259,10 @@ namespace AcousticFlow
                 for (int t = 0; t < _erTapCap; t++)
                 {
                     ulong id = ReflectId(s, t);
+                    // 目標音量（タップが無い枠は 0）。存在する枠だけ像源位置を更新する。
+                    float target = 0f;
                     if (t < n)
                     {
-                        // 像源位置に置く（向きは点音源なので任意＝リスナー向き）。
                         AcousticEngine.SetGameObjectPosition(id, _erImagePos[t], listener.forward, listener.up);
                         float wsum = 0f, gsum = 0f;
                         for (int b = 0; b < nb; b++)
@@ -1208,15 +1271,13 @@ namespace AcousticFlow
                             gsum += w * _erGain[t * nb + b];
                             wsum += w;
                         }
-                        float lvl = (wsum > 0f ? gsum / wsum : 0f) * earlyReflectLevelScale;
-                        AcousticEngine.SetEmitterListenerVolume(id, ListenerObjId, Mathf.Clamp(lvl, 0f, 2f));
+                        target = Mathf.Clamp((wsum > 0f ? gsum / wsum : 0f) * earlyReflectLevelScale, 0f, 2f);
                         _erActiveTaps++;
                     }
-                    else
-                    {
-                        // 余ったタップ枠はミュート（ボイスは残すが無音）。
-                        AcousticEngine.SetEmitterListenerVolume(id, ListenerObjId, 0f);
-                    }
+                    // 目標へ滑らかに寄せる（0 へ落ちる枠は前回位置のままフェードアウト＝スナップしない）。
+                    int si = s * _erTapCap + t;
+                    _erVolSmooth[si] = Mathf.Lerp(_erVolSmooth[si], target, k);
+                    AcousticEngine.SetEmitterListenerVolume(id, ListenerObjId, _erVolSmooth[si]);
                 }
             }
         }
@@ -1239,8 +1300,51 @@ namespace AcousticFlow
 
             _reverbWet = Mathf.Lerp(_reverbWet, wet, 0.2f);
             _reverbDecay = Mathf.Lerp(_reverbDecay, rt60, 0.2f);
+            // RTPC は Wwise が生きているときだけ。畳み込み経路は Status 経由で読む（Wwise非依存）。
+            if (!_audioReady) return;
             AcousticEngine.SetRTPCValue("ReverbWet", _reverbWet * 100f * reverbWetScale);
             AcousticEngine.SetRTPCValue("ReverbDecay", _reverbDecay);
+        }
+
+        // 尾の絶対レベルの土台＝残響/直接エネルギーの物理目標比 (r/r_c)² を出す。
+        //
+        // なぜ物理式か:
+        //   エコグラムの「尾/直接」比は、反射側にだけ立体角積分(2π)が掛かった非対称な量で、
+        //   本当の残響/直接比ではない（部屋ごとに桁でズレる原因だった）。
+        //   拡散音場の古典的結果 残響/直接 = (r/r_c)²、臨界距離 r_c = 0.057√(V/RT60) は、
+        //   部屋の広さ V と残響 RT60 だけで正しい比を与える。エコグラムは尾の“形”に専念させ、
+        //   “量”はこの式で決める。→ tailLevel=1.0 が全部屋で物理どおりになり、部屋間で一貫する。
+        //
+        // V は occluder(壁)の AABB から推定する。閉じた部屋なら外形箱＝ほぼ V。
+        //   ※ 開けた地面だけのシーンでは過大評価になるが、そこは RT60 が小さく残響自体が僅少。
+        private void UpdateReverbTargetRatio()
+        {
+            if (_srcPos == null || _srcPos.Length == 0 || listener == null) return;
+
+            // 部屋の体積を occluder の合成 AABB から推定。
+            bool has = false;
+            Bounds b = default;
+            foreach (var col in _occluders)
+            {
+                if (col == null) continue;
+                if (!has) { b = col.bounds; has = true; }
+                else b.Encapsulate(col.bounds);
+            }
+            if (!has) { Status.ReverbTargetRatio = 0f; return; }
+            Vector3 sz = b.size;
+            float vol = Mathf.Max(1f, sz.x * sz.y * sz.z);
+
+            float r = Mathf.Max(0.1f, Vector3.Distance(listener.position, _srcPos[0]));
+            float rt = Mathf.Max(0.05f, _reverbDecay);
+            // 臨界距離（メートル法, RT60[s], V[m³]）。
+            float rc = 0.057f * Mathf.Sqrt(vol / rt);
+            float t = (r * r) / Mathf.Max(rc * rc, 1e-4f);
+            // 暴走防止のクランプ（極端な V/RT60 推定の保険）。
+            Status.ReverbTargetRatio = Mathf.Clamp(t, 0f, 50f);
+
+            // mixing time ≈ √V(ms)（Polack の目安）。広い部屋ほど反射が拡散に溶けるのが遅い＝
+            // 早期タップとして扱える時間が長い。特大部屋で遠壁の反射が早期窓から漏れるのを防ぐ。
+            Status.MixingTimeMs = Mathf.Clamp(Mathf.Sqrt(vol), 5f, 500f);
         }
 
         // 反響経路：リスナーから反射レイを撒き、跳ね返り経路をバッファに貯める（Gizmoが描く）。

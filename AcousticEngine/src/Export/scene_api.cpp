@@ -210,6 +210,19 @@ void AF_SceneComputeEchogram(AF_SceneHandle scene, AF_Vector3 listener,
                        outBins, numBins, binSeconds, speedOfSound, numRays, maxBounces);
 }
 
+void AF_SceneComputeEchogramBands(AF_SceneHandle scene, AF_Vector3 listener,
+                                  const AF_Vector3* sources, int count,
+                                  float* outBins, int numBins,
+                                  float binSeconds, float speedOfSound,
+                                  int numRays, int maxBounces, float distanceRef) {
+    Scene* s = asScene(scene);
+    if (!s || !sources || count <= 0) return;
+    std::vector<Vec3> src(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) src[i] = toVec3(sources[i]);
+    s->computeEchogramBands(toVec3(listener), src.data(), count, outBins, numBins,
+                            binSeconds, speedOfSound, numRays, maxBounces, distanceRef);
+}
+
 int AF_SceneTraceReflectionPath(AF_SceneHandle scene, AF_Vector3 origin, AF_Vector3 dir,
                                 float maxDist, int maxBounces,
                                 AF_Vector3* outPoints, int maxPoints) {

@@ -199,6 +199,13 @@ namespace AcousticFlow
             [Out] float[] outBins, int numBins, float binSeconds, float speedOfSound,
             int numRays, int maxBounces);
 
+        // 残響：帯域別エコグラムを outBins[numBins*6] に書く（実測された尾のIR生成用）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneComputeEchogramBands(
+            IntPtr scene, AFVector3 listener, [In] AFVector3[] sources, int count,
+            [Out] float[] outBins, int numBins, float binSeconds, float speedOfSound,
+            int numRays, int maxBounces, float distanceRef);
+
         // 反射経路トレース：origin→dir を鏡面反射で maxBounces 回追い、通過点を outPoints に書く。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneTraceReflectionPath(

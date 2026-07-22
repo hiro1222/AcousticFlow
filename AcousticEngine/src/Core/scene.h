@@ -801,28 +801,68 @@ public:
     void computeEchogram(const Vec3& listener, const Vec3* sources, int count,
                          float* outBins, int numBins, float binSeconds, float speedOfSound,
                          int numRays, int maxBounces) const {
+        // 帯域版を計算して広帯域平均に潰す（実装は1本に保つ）。
+        if (!outBins || numBins <= 0) return;
+        std::vector<float> bands(static_cast<size_t>(numBins) * kNumBands, 0.0f);
+        // 旧APIは「相対の形」用途（RT60推定）なので広がり損失なし＝従来どおり。
+        computeEchogramBands(listener, sources, count, bands.data(), numBins,
+                             binSeconds, speedOfSound, numRays, maxBounces, 0.0f);
+        for (int k = 0; k < numBins; ++k) {
+            float e = 0.0f;
+            for (int b = 0; b < kNumBands; ++b) e += bands[static_cast<size_t>(k) * kNumBands + b];
+            outBins[k] = e / kNumBands;
+        }
+    }
+
+    // 【残響：帯域別エコグラム】上と同じだが、帯域を潰さず outBins[k*kNumBands + b] に書く。
+    //   実際の部屋は高域ほど速く減衰する（吸収が高域で大きい）。広帯域平均だとその差が消え、
+    //   後期尾の「暗くなっていく」挙動を別途ダンピングで捏造することになる。
+    //   IR 畳み込みで“実測された尾”を鳴らすには、この帯域別の減衰カーブが要る。
+    // distanceRef: 音源からの広がり損失の基準距離。0 以下で無効（従来どおり損失なし）。
+    //   減衰は host 側の早期反射タップと同じ規約 atten = distanceRef / max(d, distanceRef)、
+    //   エネルギーにはその2乗を掛ける。
+    //
+    //   ※ 掛ける相手は「音源→反射点」の区間長であって、リスナーまでの総経路長ではない。
+    //     反射点→リスナー側の広がりは、レイ1本が立体角を代表していること自体が担っている。
+    //     総経路長で掛けると、時間が経つほど（＝経路が長いほど）一律に減衰が強まり、
+    //     尾に本来存在しない 1/t² の減衰が乗る。拡散音場のエネルギー密度は空間的にほぼ一様で、
+    //     時間減衰は吸音だけが担うのが正しい。広い部屋の中央ほど経路が長いので、
+    //     総経路長で掛けるとそこの反響だけが痩せる。
+    void computeEchogramBands(const Vec3& listener, const Vec3* sources, int count,
+                              float* outBins, int numBins, float binSeconds, float speedOfSound,
+                              int numRays, int maxBounces, float distanceRef) const {
         using namespace scene_detail;
         if (!outBins || numBins <= 0 || !sources || count <= 0) return;
-        for (int k = 0; k < numBins; ++k) outBins[k] = 0.0f;
+        for (int k = 0; k < numBins * kNumBands; ++k) outBins[k] = 0.0f;
 
         const float kEps = 1e-3f;
         const float invC = (speedOfSound > 1e-3f) ? 1.0f / speedOfSound : 0.0f;
         const float invBin = (binSeconds > 1e-6f) ? 1.0f / binSeconds : 0.0f;
 
-        auto addBin = [&](float dist, float energy) {
-            if (energy <= 0.0f) return;
-            const int k = static_cast<int>(dist * invC * invBin);
-            if (k < 0 || k >= numBins) return;
-            outBins[k] += energy;
+        // 音源からの距離 d に対する広がり損失（エネルギー）。
+        auto spreadEnergy = [distanceRef](float d) -> float {
+            if (distanceRef <= 0.0f) return 1.0f;
+            const float a = distanceRef / std::max(d, distanceRef);
+            return a * a;
         };
 
-        // 直接音（直線の透過・広帯域平均）。
+        // 帯域別にビンへ積む。energy6 は kNumBands 要素。
+        auto addBin = [&](float dist, const float* energy6, float scale) {
+            const int k = static_cast<int>(dist * invC * invBin);
+            if (k < 0 || k >= numBins) return;
+            float* dst = outBins + static_cast<size_t>(k) * kNumBands;
+            for (int b = 0; b < kNumBands; ++b) {
+                const float e = energy6[b] * scale;
+                if (e > 0.0f) dst[b] += e;
+            }
+        };
+
+        // 直接音（直線の透過）。音源→リスナーの広がり損失を掛ける。
         for (int j = 0; j < count; ++j) {
             float g[kNumBands];
             computeTransmission(listener, sources[j], g);
-            float mean = 0.0f;
-            for (int b = 0; b < kNumBands; ++b) mean += g[b];
-            addBin(length(sources[j] - listener), mean / kNumBands);
+            const float d = length(sources[j] - listener);
+            addBin(d, g, spreadEnergy(d));
         }
 
         // 反射（共有レイ・尾が窓内に入るまでレイを伸ばす）。
@@ -859,10 +899,12 @@ public:
                     for (int j = 0; j < count; ++j) {
                         float seg[kNumBands];
                         computeTransmission(q, sources[j], seg);
-                        const float pathLen = totalLen + length(sources[j] - q);
-                        float e = 0.0f;
-                        for (int b = 0; b < kNumBands; ++b) e += carry[b] * refl[b] * seg[b];
-                        addBin(pathLen, (e / kNumBands) * inv);
+                        const float srcLeg = length(sources[j] - q);   // 音源→反射点
+                        const float pathLen = totalLen + srcLeg;
+                        float e[kNumBands];
+                        for (int b = 0; b < kNumBands; ++b) e[b] = carry[b] * refl[b] * seg[b];
+                        // 広がり損失は「音源→反射点」の区間にだけ掛ける（総経路長ではない）。
+                        addBin(pathLen, e, inv * spreadEnergy(srcLeg));
                     }
                     for (int b = 0; b < kNumBands; ++b) carry[b] *= refl[b];
                     d = scatteredDir(d, hit.normal, scatteringMean(mat), rng);

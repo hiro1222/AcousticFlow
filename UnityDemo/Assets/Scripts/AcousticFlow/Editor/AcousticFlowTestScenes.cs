@@ -61,7 +61,8 @@ namespace AcousticFlow.EditorTools
             AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);  // 硬い壁＝反射多く残響が分かりやすい
             AddConvolver(srcPos);
             Save(scene, "Test_SmallRoom.unity",
-                "小部屋: 反射がすぐ返る(ITDG小)。Status MonitorのIRプロットが左に密集。広い部屋と聞き比べ。");
+                "小部屋: 反射がすぐ返る(ITDG小)。Status MonitorのIRプロットが左に密集。" +
+                "実行中に [ ] キーで部屋を拡縮できる（1/2/3=小/中/大プリセット）。");
         }
 
         // ── 広い部屋：ITDGが大きく反射が広がる ──
@@ -75,7 +76,8 @@ namespace AcousticFlow.EditorTools
             AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);
             AddConvolver(srcPos);
             Save(scene, "Test_LargeRoom.unity",
-                "広い部屋: 反射が遅れて返る(ITDG大)。IRプロットが右まで広がる。小部屋と聞き比べ。");
+                "広い部屋: 反射が遅れて返る(ITDG大)。IRプロットが右まで広がる。" +
+                "実行中に [ ] キーで部屋を拡縮できる（1/2/3=小/中/大プリセット）。");
         }
 
         // ── 共有ヘルパ ──
@@ -110,16 +112,14 @@ namespace AcousticFlow.EditorTools
         }
 
         // 内寸 innerSize(幅x, 高y, 奥z) の囲まれた部屋（床y=0, 天井y=高）。
+        // 壁6枚は ResizableRoom が持ち、実行中に [ ] キーや Inspector で内寸を変えられる。
         private static void MakeRoom(string prefix, Vector3 innerSize, float thick)
         {
-            float w = innerSize.x, h = innerSize.y, d = innerSize.z;
-            float hw = w * 0.5f, hd = d * 0.5f;
-            MakeBox(prefix + "_Floor", new Vector3(0f, -thick * 0.5f, 0f), new Vector3(w + thick * 2f, thick, d + thick * 2f));
-            MakeBox(prefix + "_Ceiling", new Vector3(0f, h + thick * 0.5f, 0f), new Vector3(w + thick * 2f, thick, d + thick * 2f));
-            MakeBox(prefix + "_Wall_E", new Vector3(hw + thick * 0.5f, h * 0.5f, 0f), new Vector3(thick, h, d));
-            MakeBox(prefix + "_Wall_W", new Vector3(-hw - thick * 0.5f, h * 0.5f, 0f), new Vector3(thick, h, d));
-            MakeBox(prefix + "_Wall_N", new Vector3(0f, h * 0.5f, hd + thick * 0.5f), new Vector3(w, h, thick));
-            MakeBox(prefix + "_Wall_S", new Vector3(0f, h * 0.5f, -hd - thick * 0.5f), new Vector3(w, h, thick));
+            var go = new GameObject(prefix + "_Room");
+            var room = go.AddComponent<ResizableRoom>();
+            room.innerSize = innerSize;
+            room.thickness = thick;
+            room.ApplyNow();   // 壁を生成して保存対象にする（Awake を待たない）
         }
 
         // 本編と同じ6ステム音源を srcPos に全部重ねて配置し、デモ制御を付ける（座標かぶりOK）。
