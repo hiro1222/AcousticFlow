@@ -10,13 +10,21 @@
 set(WWISE_SDK_DIR "C:/Audiokinetic/Wwise_2024.1.14.9084/SDK"
     CACHE PATH "Wwise SDK のルート（include と x64_vc170 を含むフォルダ）")
 
-# include フォルダの有無で Wwise の利用可否を判定する。
-if(EXISTS "${WWISE_SDK_DIR}/include/AK/SoundEngine/Common/AkSoundEngine.h")
+# Wwise 連携を使うか。既定 OFF＝スタンドアロン（Wwise/bnk 不要、畳み込み経路のみ）。
+#   Wwise の音楽/RTPC/像源ボイスを使いたくなったら再構成時に上書き:
+#     cmake -S . -B build -DAF_USE_WWISE=ON
+option(AF_USE_WWISE "本物の Wwise Adapter をリンクする（OFF=Wwise非依存ビルド）" OFF)
+
+# AF_USE_WWISE が ON かつ SDK が実在するときだけ本物の Adapter を使う。
+if(AF_USE_WWISE AND EXISTS "${WWISE_SDK_DIR}/include/AK/SoundEngine/Common/AkSoundEngine.h")
     set(WITH_WWISE ON)
-    message(STATUS "AcousticEngine: Wwise SDK を検出 -> 本物の Adapter をビルド (${WWISE_SDK_DIR})")
+    message(STATUS "AcousticEngine: Wwise 連携 ON -> 本物の Adapter をビルド (${WWISE_SDK_DIR})")
+elseif(AF_USE_WWISE)
+    set(WITH_WWISE OFF)
+    message(WARNING "AcousticEngine: AF_USE_WWISE=ON だが SDK 未検出 -> スタブ Adapter をビルド")
 else()
     set(WITH_WWISE OFF)
-    message(STATUS "AcousticEngine: Wwise SDK 未検出 -> スタブ Adapter をビルド")
+    message(STATUS "AcousticEngine: Wwise 連携 OFF -> スタブ Adapter（Wwise非依存ビルド）")
 endif()
 
 # --- ソース構成 ---

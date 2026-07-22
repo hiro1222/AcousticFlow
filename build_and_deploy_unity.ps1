@@ -10,12 +10,15 @@
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 
-# 1) DLL をビルド（Debug）。
-& cmake --build (Join-Path $root "build") --config Debug
+# 1) DLL をビルド（Release）。
+#    Release CRT は再頒布可能なので、Wwise非依存(既定 AF_USE_WWISE=OFF)の DLL は
+#    開発ツールの無い PC でもそのまま動く。Wwise 連携を戻すときは再構成時に
+#    cmake -S . -B build -DAF_USE_WWISE=ON を指定してから本スクリプトを実行。
+& cmake --build (Join-Path $root "build") --config Release
 if (-not $?) { throw "DLL のビルドに失敗しました。" }
 
 # 2) Unity の Plugins へコピー。
-$src = Join-Path $root "build\bin\Debug\AcousticEngine.dll"
+$src = Join-Path $root "build\bin\Release\AcousticEngine.dll"
 $dstDir = Join-Path $root "UnityDemo\Assets\Plugins\x86_64"
 if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Force -Path $dstDir | Out-Null }
 $dst = Join-Path $dstDir "AcousticEngine.dll"

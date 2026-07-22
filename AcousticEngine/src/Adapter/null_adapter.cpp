@@ -38,6 +38,7 @@ void setGameObjectPosition(unsigned long long,
                            float, float, float) {}
 void setDefaultListener(unsigned long long) {}
 unsigned int postEvent(const char*, unsigned long long) { return 0; }
+void executeActionOnEvent(const char*, int, unsigned long long) {}
 void setObstructionOcclusion(unsigned long long, unsigned long long, float, float) {}
 void setEmitterListenerVolume(unsigned long long, unsigned long long, float) {}
 void setState(const char*, const char*) {}
