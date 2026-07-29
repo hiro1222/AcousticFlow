@@ -221,14 +221,12 @@ namespace AcousticFlow
         private float[] _echogram;      // 到達時間ビン（広帯域）
         private float[] _echogramBands; // 到達時間ビン×6帯域（実測された尾のIR用）
         private float _reverbWet, _reverbDecay;  // エコグラムから算出（RTPCへ）
-        private int _echoCountdown = 1;
-        private int _catalogCountdown = 1;
+        // ※ 各役割の更新レートはエンジンが持つ（段2）。ホストはカウンタを持たない。
 
         // 早期反射(A) 用バッファ。音源ごとに像源位置＋帯域ゲインを受け、仮想エミッタへ反映。
         private Vector3[] _erImagePos;  // 像源位置（earlyReflectTaps）
         private float[] _erGain;        // 帯域ゲイン（earlyReflectTaps*6）
         private float[] _erVolSmooth;   // 像源エミッタ音量の平滑状態（音源×タップ枠）
-        private int _erCountdown = 1;
         private int _erActiveTaps;      // 直近フレームで鳴っているタップ総数（表示用）
         private int _erTapCap;          // 仮想エミッタ プールの1音源あたり容量（＝初期化時の earlyReflectTaps）
         private bool _erPoolReady;      // 仮想エミッタを登録＆イベント投入済みか
@@ -242,7 +240,6 @@ namespace AcousticFlow
         private Vector3[] _diffSlotPos; // 平滑中の位置（音源×スロット）
         private Vector3[] _diffSlotPosVel; // 位置 SmoothDamp 速度
         private int[] _diffSlotCluster; // 割当作業用（スロット→クラスタindex, 毎フレーム）
-        private int _diffCountdown = 1;
         private bool _diffPoolReady;
         private int _diffActive;        // 表示用：鳴っている二次音源総数
 
@@ -446,6 +443,45 @@ namespace AcousticFlow
             for (int i = 0; i < _sources.Length; i++)
                 if (_sources[i] != null)
                     _sources[i].position = _stacked ? _stackPoint : _srcHome[i];
+        }
+
+        // Inspector の設定をエンジンのバッチ更新設定へ写す（段2）。
+        // 更新レートもここで渡すので、ホスト側のカウンタは持たない。
+        private Native.AFUpdateConfig BuildUpdateConfig()
+        {
+            var c = new Native.AFUpdateConfig
+            {
+                role1EveryN = 1,
+                role2EveryN = Mathf.Max(1, reverbUpdateEveryFrames),
+                earlyEveryN = Mathf.Max(1, earlyReflectUpdateEveryFrames),
+                diffSrcEveryN = Mathf.Max(1, diffractionUpdateEveryFrames),
+                catalogEveryN = Mathf.Max(1, catalogUpdateEveryFrames),
+
+                reflectionRays = reflectionRays,
+                reflectionBounces = reflectionBounces,
+                directWeight = directLocalizeWeight,
+                useReflections = useReflections ? 1 : 0,
+
+                useEdgeCatalog = useEdgeCatalog ? 1 : 0,
+                edgeCatalogRes = edgeCatalogRes,
+                edgeCatalogMaxDist = 40f,
+
+                enableReverb = enableReverb ? 1 : 0,
+                echogramBins = Mathf.Max(1, echogramBins),
+                echogramBinSeconds = echogramBinMs * 0.001f,
+                echogramRays = echogramRays,
+                echogramBounces = echogramBounces,
+                speedOfSound = kSpeedOfSound,
+                distanceRef = distanceRef,
+
+                enableEarlyReflections = enableEarlyReflections ? 1 : 0,
+                earlyTaps = Mathf.Max(1, earlyReflectTaps),
+                earlyRays = earlyReflectRays,
+                earlyBounces = earlyReflectBounces,
+                enableDiffractionSources = enableDiffractionSources ? 1 : 0,
+                diffSources = Mathf.Max(1, diffractionSourceCount),
+            };
+            return c;
         }
 
         private void CollectOccluders()
@@ -657,7 +693,8 @@ namespace AcousticFlow
             Vector3 lp = listener.position;
             for (int s = 0; s < _sources.Length; s++)
             {
-                int n = _scene.ComputeDiffractionSources(lp, _srcPos[s], _diffSrcPos, _diffSrcGain);
+                // 段2: 計算はバッチ更新で済んでいるので、結果を受け取るだけ。
+                int n = _scene.GetDiffractionSources(_scene.SourceIndex(SourceId(s)), _diffSrcPos, _diffSrcGain);
                 float survival = (_srcSurvival != null) ? _srcSurvival[s] : 0f;
 
                 // クラスタ→スロットを「前フレーム方向に一番近い順」で安定割当（スロット入れ替わりの飛びを防ぐ）。
@@ -788,7 +825,6 @@ namespace AcousticFlow
                     if (enableEarlyReflections)
                     {
                         if (!_erPoolReady) SetupReflectionEmitters();  // 初回ONで遅延生成
-                        _erCountdown = 1;  // 次フレームで即更新
                     }
                     else MuteAllReflections();
                 }
@@ -817,7 +853,6 @@ namespace AcousticFlow
                     if (enableDiffractionSources)
                     {
                         if (!_diffPoolReady) SetupDiffractionEmitters();
-                        _diffCountdown = 1;
                     }
                     else MuteAllDiffractionSources();
                 }
@@ -836,51 +871,34 @@ namespace AcousticFlow
                 _scene.UpdateInstance(_instanceIds[i], c, half, right, up);
             }
 
-            // 1.5) エッジカタログを低レートで構築（リスナー中心・全音源共有）→ 回折が使う。
-            if (useEdgeCatalog)
-            {
-                if (--_catalogCountdown <= 0)
-                {
-                    _catalogCountdown = Mathf.Max(1, catalogUpdateEveryFrames);
-                    _scene.BuildEdgeCatalog(listener.position, edgeCatalogRes, 40f);
-                }
-            }
-            else { _scene.ClearEdgeCatalog(); }
-
             // 2) 音源位置バッファ。
             for (int i = 0; i < _sources.Length; i++)
                 _srcPos[i] = _sources[i] != null ? _sources[i].position : listener.position;
 
-            // 2-b) リスナー/音源をエンジンにも登録する（API移行 段1）。
-            //   これまで listener/source はクエリごとに引数で渡していたが、SPEC §2 では
-            //   エンジンが保持して内部で音源ループを回す。段1では登録するだけで、
-            //   計算はまだ引数版のクエリが行う＝音は変わらない。
+            // 2-b) リスナー/音源をエンジンに登録し、バッチ更新を1発回す（API移行 段2）。
+            //   エッジカタログ / 遮蔽・回折 / 早期反射 / 回折二次音源 / エコグラム を
+            //   エンジンが内部レートで実行する。ホストはカウンタを持たない
+            //   （＝「どの計算をいつ走らせるか」はエンジンの知識。移植時に書き直さずに済む）。
             //   ID は Wwise の GameObject ID と同じ SourceId(i) を使い、配線を揃えておく。
             _scene.SetListener(listener.position);
             for (int i = 0; i < _sources.Length; i++)
                 _scene.SetSource(SourceId(i), _srcPos[i]);
 
-            // 3) 帯域別生存を音源ごとに求める（ここから音響計算の時間計測）。
+            // 3) バッチ更新（ここから音響計算の時間計測）。
             _acStopwatch.Restart();
-            if (useReflections)
+            _scene.SetUpdateConfig(BuildUpdateConfig());
+            _scene.Update(Time.deltaTime);
+
+            // 3-b) 音源ごとの帯域別生存と到来方向を受け取る。
+            for (int i = 0; i < _sources.Length; i++)
             {
-                // 共有レイ1回で全音源へ（役割2＝音源数非依存）。_arrivalDir に到来方向も受ける。
-                _scene.OcclusionReflectedMulti(listener.position, _srcPos, _sources.Length,
-                                               null, _bandsPerSource, _arrivalDir,
-                                               directLocalizeWeight, reflectionRays, reflectionBounces);
-            }
-            else
-            {
-                // 反射なし＝音源ごとに直接（透過⊕回折）。到来方向は真方向。
-                for (int i = 0; i < _sources.Length; i++)
-                {
-                    _scene.ComputeTransmissionBands(_srcPos[i], listener.position, _bands);
-                    _scene.ComputeDiffractionBands(_srcPos[i], listener.position, _diffBands);
-                    for (int b = 0; b < AcousticEngine.NumBands; b++)
-                        _bandsPerSource[i * AcousticEngine.NumBands + b] = Mathf.Max(_bands[b], _diffBands[b]);
-                    Vector3 td = (_srcPos[i] - listener.position).normalized;
-                    _arrivalDir[i * 3] = td.x; _arrivalDir[i * 3 + 1] = td.y; _arrivalDir[i * 3 + 2] = td.z;
-                }
+                int idx = _scene.SourceIndex(SourceId(i));
+                if (idx < 0) continue;
+                _scene.GetSourceOcclusion(idx, _bands);
+                for (int b = 0; b < AcousticEngine.NumBands; b++)
+                    _bandsPerSource[i * AcousticEngine.NumBands + b] = _bands[b];
+                Vector3 ad = _scene.GetSourceArrivalDir(idx);
+                _arrivalDir[i * 3] = ad.x; _arrivalDir[i * 3 + 1] = ad.y; _arrivalDir[i * 3 + 2] = ad.z;
             }
 
             // 見かけ方向：遮蔽量でゲート。クリア=直接最優先(音源方向)、遮蔽が混じった分だけステアへ。
@@ -975,24 +993,13 @@ namespace AcousticFlow
 
             // 4.5) 早期反射(A)：音源ごとに主要な初期反射を像源として抽出し Wwise Reflect へ。
             //      拡散残響(RoomVerb)と別に、壁からの鏡面反射が『方向つきの反射音』として鳴る。
-            if (enableEarlyReflections && _audioReady)
-            {
-                if (--_erCountdown <= 0)
-                {
-                    _erCountdown = Mathf.Max(1, earlyReflectUpdateEveryFrames);
-                    UpdateEarlyReflections(listener.position);
-                }
-            }
+            //      ※ 更新レートはエンジンが持つ（段2）。ここは毎フレーム結果を読んで反映するだけ。
+            //        エンジンが再計算していないフレームでは前回と同じ値が返るので、
+            //        音量スムージングが継続して働き、むしろ滑らかになる。
+            if (enableEarlyReflections && _audioReady) UpdateEarlyReflections(listener.position);
 
             // 4.6) 回折の二次音源（エッジ＝音源）：遮蔽時、開口の方向へ仮想音源を立て音量比を滑らかに。
-            if (enableDiffractionSources && _audioReady && _diffPoolReady)
-            {
-                if (--_diffCountdown <= 0)
-                {
-                    _diffCountdown = Mathf.Max(1, diffractionUpdateEveryFrames);
-                    UpdateDiffractionSources();
-                }
-            }
+            if (enableDiffractionSources && _audioReady && _diffPoolReady) UpdateDiffractionSources();
 
             // 4.7) 足音ループ：ワンショット素材のときだけ一定間隔で再トリガして歩行ループ化する。
             //   footstepEventLoops=ON（Wwise側でLoop済み）のときは再トリガ禁止。1回のPostで鳴り続けるので、
@@ -1035,36 +1042,26 @@ namespace AcousticFlow
             //    ※ Wwise 非依存の畳み込み経路もエコグラムを使うので、_audioReady では止めない。
             if (enableReverb && _echogram != null)
             {
-                if (--_echoCountdown <= 0)
+                // 段2: 計算はバッチ更新（内部レート）で済んでいるので、結果を受け取るだけ。
+                //   エンジン側が再計算していないフレームでは前回と同じ内容が返るので、
+                //   中身が変わったときだけ後段（IR再生成など）へ知らせる。
+                if (_scene.GetEchogramBands(_echogramBands, _echogram.Length) > 0)
                 {
-                    _echoCountdown = Mathf.Max(1, reverbUpdateEveryFrames);
-                    // まず帯域別を試す（実測された尾のIR用）。古いDLLなら広帯域版へフォールバック。
-                    bool haveBands = _scene.ComputeEchogramBands(
-                        listener.position, _srcPos, _sources.Length,
-                        _echogramBands, _echogram.Length, echogramBinMs * 0.001f, 343f,
-                        echogramRays, echogramBounces, distanceRef);
-                    if (haveBands)
+                    // 広帯域エコグラム（RT60/wet 用）は帯域平均として導出する。
+                    bool changed = false;
+                    for (int k = 0; k < _echogram.Length; k++)
                     {
-                        // 広帯域エコグラム（RT60/wet 用）は帯域平均として導出する。
-                        for (int k = 0; k < _echogram.Length; k++)
-                        {
-                            float e = 0f;
-                            for (int b = 0; b < nb; b++) e += _echogramBands[k * nb + b];
-                            _echogram[k] = e / nb;
-                        }
-                        Status.EchogramBands = _echogramBands;
+                        float e = 0f;
+                        for (int b = 0; b < nb; b++) e += _echogramBands[k * nb + b];
+                        e /= nb;
+                        if (!changed && !Mathf.Approximately(_echogram[k], e)) changed = true;
+                        _echogram[k] = e;
                     }
-                    else
-                    {
-                        _scene.ComputeEchogram(listener.position, _srcPos, _sources.Length,
-                            _echogram, _echogram.Length, echogramBinMs * 0.001f, 343f,
-                            echogramRays, echogramBounces);
-                        Status.EchogramBands = null;
-                    }
+                    Status.EchogramBands = _echogramBands;
                     Status.EchogramBinMs = echogramBinMs;
                     Status.DistanceRef = distanceRef;
                     Status.EchogramBinCount = _echogram.Length;
-                    Status.EchogramVersion++;
+                    if (changed) Status.EchogramVersion++;
                     UpdateReverbFromEchogram();
                     UpdateReverbTargetRatio();
                     // Reverb Monitor 窓へ。
@@ -1271,9 +1268,8 @@ namespace AcousticFlow
 
             for (int s = 0; s < _sources.Length; s++)
             {
-                int n = _scene.ComputeEarlyReflections(listenerPos, _srcPos[s],
-                                                       _erImagePos, _erGain,
-                                                       earlyReflectRays, earlyReflectBounces);
+                // 段2: 計算はバッチ更新で済んでいるので、結果を受け取るだけ。
+                int n = _scene.GetEarlyReflections(_scene.SourceIndex(SourceId(s)), _erImagePos, _erGain);
                 for (int t = 0; t < _erTapCap; t++)
                 {
                     ulong id = ReflectId(s, t);

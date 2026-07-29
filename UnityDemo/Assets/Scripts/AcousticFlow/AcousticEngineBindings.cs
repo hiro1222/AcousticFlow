@@ -222,6 +222,53 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneSourceCount(IntPtr scene);
 
+        // バッチ更新の設定（段2）。C 側 AF_UpdateConfig と同じ並び・型であること。
+        [StructLayout(LayoutKind.Sequential)]
+        public struct AFUpdateConfig
+        {
+            public int role1EveryN, role2EveryN, earlyEveryN, diffSrcEveryN, catalogEveryN;
+            public int reflectionRays, reflectionBounces;
+            public float directWeight;
+            public int useReflections;
+            public int useEdgeCatalog, edgeCatalogRes;
+            public float edgeCatalogMaxDist;
+            public int enableReverb, echogramBins;
+            public float echogramBinSeconds;
+            public int echogramRays, echogramBounces;
+            public float speedOfSound, distanceRef;
+            public int enableEarlyReflections, earlyTaps, earlyRays, earlyBounces;
+            public int enableDiffractionSources, diffSources;
+        }
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetUpdateConfig(IntPtr scene, ref AFUpdateConfig cfg);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneUpdate(IntPtr scene, float dt);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneSourceIndex(IntPtr scene, ulong id);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneGetSourceOcclusion(IntPtr scene, int index, [Out] float[] out6);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern float AF_SceneGetSourceOcclusionScalar(IntPtr scene, int index);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneGetSourceArrivalDir(IntPtr scene, int index, [Out] float[] out3);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneGetEarlyReflections(
+            IntPtr scene, int index, [In, Out] AFVector3[] outPos, [Out] float[] outGain6, int maxTaps);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneGetDiffractionSources(
+            IntPtr scene, int index, [In, Out] AFVector3[] outPos, [Out] float[] outGain, int maxSrc);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneGetEchogramBands(IntPtr scene, [Out] float[] outBins, int numBins);
+
         // 反射経路トレース：origin→dir を鏡面反射で maxBounces 回追い、通過点を outPoints に書く。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneTraceReflectionPath(

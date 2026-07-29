@@ -216,6 +216,86 @@ namespace AcousticFlow
             }
         }
 
+        // ── バッチ更新（API移行 段2）──
+        // 毎フレーム Update を1回呼び、結果を Get* で読む。「どの計算をいつ走らせるか」は
+        // エンジンが内部レートで管理するので、ホストはカウンタを持たない。
+        // 古いDLL対策は SourceRegistry と同じフラグに相乗り（同じ版で入った API のため）。
+
+        public void SetUpdateConfig(Native.AFUpdateConfig cfg)
+        {
+            if (_handle == IntPtr.Zero || _sourceRegistryMissing) return;
+            try { Native.AF_SceneSetUpdateConfig(_handle, ref cfg); }
+            catch (EntryPointNotFoundException) { _sourceRegistryMissing = true; }
+        }
+
+        public void Update(float dt)
+        {
+            if (_handle == IntPtr.Zero || _sourceRegistryMissing) return;
+            try { Native.AF_SceneUpdate(_handle, dt); }
+            catch (EntryPointNotFoundException) { _sourceRegistryMissing = true; }
+        }
+
+        public int SourceIndex(ulong id)
+        {
+            if (_handle == IntPtr.Zero || _sourceRegistryMissing) return -1;
+            try { return Native.AF_SceneSourceIndex(_handle, id); }
+            catch (EntryPointNotFoundException) { _sourceRegistryMissing = true; return -1; }
+        }
+
+        // 帯域別生存（透過⊕回折⊕反射）。out6 は6要素以上。
+        public void GetSourceOcclusion(int index, float[] out6)
+        {
+            if (_handle == IntPtr.Zero || _sourceRegistryMissing || out6 == null) return;
+            Native.AF_SceneGetSourceOcclusion(_handle, index, out6);
+        }
+
+        public float GetSourceOcclusionScalar(int index)
+        {
+            if (_handle == IntPtr.Zero || _sourceRegistryMissing) return 0f;
+            return Native.AF_SceneGetSourceOcclusionScalar(_handle, index);
+        }
+
+        // エネルギーが届く支配方向（単位ベクトル）。
+        public Vector3 GetSourceArrivalDir(int index)
+        {
+            if (_handle == IntPtr.Zero || _sourceRegistryMissing) return Vector3.zero;
+            if (_dir3 == null) _dir3 = new float[3];
+            Native.AF_SceneGetSourceArrivalDir(_handle, index, _dir3);
+            return new Vector3(_dir3[0], _dir3[1], _dir3[2]);
+        }
+        private float[] _dir3;
+
+        // 早期反射タップ。像源位置と6帯域ゲインを受け、本数を返す。
+        public int GetEarlyReflections(int index, Vector3[] outPos, float[] outGain6)
+        {
+            if (_handle == IntPtr.Zero || _sourceRegistryMissing || outPos == null || outGain6 == null) return 0;
+            int cap = outPos.Length;
+            if (cap <= 0) return 0;
+            if (_erBuf == null || _erBuf.Length < cap) _erBuf = new AFVector3[cap];
+            int n = Native.AF_SceneGetEarlyReflections(_handle, index, _erBuf, outGain6, cap);
+            for (int i = 0; i < n; i++) outPos[i] = new Vector3(_erBuf[i].x, _erBuf[i].y, _erBuf[i].z);
+            return n;
+        }
+
+        // 回折二次音源。位置とゲインを受け、本数を返す。
+        public int GetDiffractionSources(int index, Vector3[] outPos, float[] outGain)
+        {
+            if (_handle == IntPtr.Zero || _sourceRegistryMissing || outPos == null || outGain == null) return 0;
+            int cap = Mathf.Min(outPos.Length, outGain.Length);
+            if (cap <= 0) return 0;
+            if (_diffSrcBuf == null || _diffSrcBuf.Length < cap) _diffSrcBuf = new AFVector3[cap];
+            int n = Native.AF_SceneGetDiffractionSources(_handle, index, _diffSrcBuf, outGain, cap);
+            for (int i = 0; i < n; i++) outPos[i] = new Vector3(_diffSrcBuf[i].x, _diffSrcBuf[i].y, _diffSrcBuf[i].z);
+            return n;
+        }
+
+        // 帯域別エコグラム（outBins は numBins*6 要素）。書けたビン数を返す。
+        public int GetEchogramBands(float[] outBins, int numBins)
+        {
+            if (_handle == IntPtr.Zero || _sourceRegistryMissing || outBins == null) return 0;
+            return Native.AF_SceneGetEchogramBands(_handle, outBins, numBins);
+        }
+
         // 反射経路：origin→dir を鏡面反射で maxBounces 回追い、通過点を outPoints に書き点数を返す。
         // 内部バッファ(_pathBuf)を使い回して毎フレームの GC を避ける。
         private AFVector3[] _pathBuf;
