@@ -184,13 +184,21 @@ namespace AcousticFlow.EditorTools
                 early > 1e-6f ? $"尾 / 早期 = {tail / early:F2}（空間感の目安。小さいほど乾く）" : "尾 / 早期 = —",
                 EditorStyles.miniLabel);
 
-            // 物理目標 (r/r_c)² と、実際にレンダリングされた尾/直接パワー比を並べる。
+            // 目標比（知覚圧縮後）と、実際にレンダリングされた尾/直接パワー比を並べる。
             // 較正が正しければ「実測 尾/直接」≒「√目標」になるはず。
             float target = Mathf.Max(0f, IrConvolver.Scope.TailToDirectRatio);
             EditorGUILayout.LabelField(
                 dr > 1e-6f
-                    ? $"尾 / 直接 = {tail / dr:F2}（物理目標 (r/r_c)²={target:F2} → 目標 尾/直接 {Mathf.Sqrt(target):F2}）"
+                    ? $"尾 / 直接 = {tail / dr:F2}（目標比 {target:F2} → 目標 尾/直接 {Mathf.Sqrt(target):F2}）"
                     : "尾 / 直接 = —",
+                EditorStyles.miniLabel);
+
+            // 圧縮の効きを見る。物理そのままだと部屋間で振れ幅が大きすぎるので指数で寄せている。
+            float phys = Mathf.Max(0f, IrConvolver.Scope.PhysicalRatio);
+            EditorGUILayout.LabelField(
+                phys > 1e-6f
+                    ? $"物理比 (r/r_c)² = {phys:F2} → 知覚圧縮後 {target:F2}"
+                    : "物理比 (r/r_c)² = —",
                 EditorStyles.miniLabel);
         }
 

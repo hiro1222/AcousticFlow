@@ -83,6 +83,13 @@ namespace AcousticFlow
         public int reverbUpdateEveryFrames = 4;
         [Tooltip("拡散リバーブ(RoomVerb)の wet 倍率。反響が強すぎるなら下げる（0=残響なし）。")]
         [Range(0f, 2f)] public float reverbWetScale = 0.8f;
+        [Tooltip("残響/直接の物理エネルギー比を鳴らす前に圧縮する指数。\n"
+                 + "1.0=物理そのまま（部屋を変えたとき残響量が過剰に振れる）\n"
+                 + "0.5=平方根で圧縮（推奨。大小関係は残しつつ穏やかに）\n"
+                 + "0=常に一定（部屋差は減衰時間だけで出す。DEV_LOG C-2 の極）\n"
+                 + "人が感じる残響の多さはエネルギー比そのものではない（先行音効果で"
+                 + "直接音が重く聞こえる）ため、物理値を知覚側へ寄せる補正。")]
+        [Range(0f, 1f)] public float reverbRatioExponent = 0.5f;
 
         [Header("早期反射 (A: 仮想エミッタ)")]
         [Tooltip("ON: 各音源の主要な初期反射を像源として抽出し、像源位置に『普通の3Dボイス』を立てて"
@@ -295,6 +302,8 @@ namespace AcousticFlow
             // 残響/直接エネルギーの物理目標比 (r/r_c)²。尾の絶対レベルはこれで決める
             //   （エコグラムの尾/直接比は 2π 結合などで信用できないため、形だけ使い量はこれ）。
             public static float ReverbTargetRatio;
+            // 圧縮前の生の物理比（診断用。ReverbTargetRatio はこれを知覚圧縮したもの）。
+            public static float ReverbPhysicalRatio;
             // 早期↔後期の境目(mixing time)の目安 ≈ √V(ms)。広い部屋ほど遅い。
             //   これより前の反射は方向つき早期タップ、後は拡散尾として扱う。
             public static float MixingTimeMs;
@@ -1339,6 +1348,19 @@ namespace AcousticFlow
             // 臨界距離（メートル法, RT60[s], V[m³]）。
             float rc = 0.057f * Mathf.Sqrt(vol / rt);
             float t = (r * r) / Mathf.Max(rc * rc, 1e-4f);
+
+            // ── 知覚圧縮 ──
+            // 物理エネルギー比をそのまま鳴らすと、部屋を変えたとき残響の量が過剰に振れる。
+            // 人が「残響が多い」と感じる量はエネルギー比そのものではないため:
+            //   ・先行音効果(precedence)で、直接音とその直後は融合して直接音側に強く重み付けされる
+            //     → エネルギー的に残響が勝つ小部屋でも、耳は直接音を主として聞く（実際より乾く）
+            //   ・そもそも部屋の広さの手がかりは主に減衰時間で、音量比ではない（DEV_LOG C-2）
+            // そこで比を指数 exponent で圧縮する。1.0=物理そのまま / 0=常に一定（C-2の極）。
+            // r=r_c（比=1）を不動点にしているので、圧縮しても「臨界距離で直接=残響」は保たれ、
+            // そこから離れたときの振れ幅だけが穏やかになる。
+            Status.ReverbPhysicalRatio = t;                 // 圧縮前（診断用）
+            t = Mathf.Pow(t, reverbRatioExponent);
+
             // 暴走防止のクランプ（極端な V/RT60 推定の保険）。
             Status.ReverbTargetRatio = Mathf.Clamp(t, 0f, 50f);
 

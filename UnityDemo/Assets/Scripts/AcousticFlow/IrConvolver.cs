@@ -40,7 +40,8 @@ namespace AcousticFlow
             public static volatile float RmsTail;      // 後期尾（Measured / Fdn どちらでも）
             public static volatile float RmsOut;       // 最終出力
             public static volatile int TailPartitions; // 実測尾のパーティション数（0=尾IR未設定）
-            public static volatile float TailToDirectRatio; // エコグラム実測の 尾/直接 エネルギー比
+            public static volatile float TailToDirectRatio; // 尾の量に使った目標比（知覚圧縮後）
+            public static volatile float PhysicalRatio;     // 圧縮前の物理比 (r/r_c)²（診断用）
             public static volatile float SplitMs;      // 早期↔後期の境目(ms)。部屋の大きさで動く
             public static volatile int ActiveParts;    // 実際に計算しているパーティション数
         }
@@ -401,6 +402,7 @@ namespace AcousticFlow
             float target = AcousticFlowSceneDemo.Status.ReverbTargetRatio;
             _tailGain = ReverbTailIr.CalibrateGain(dg, target);
             Scope.TailToDirectRatio = target;   // スコープには使った目標比を出す
+            Scope.PhysicalRatio = AcousticFlowSceneDemo.Status.ReverbPhysicalRatio;
             _tailConv.SetIr(_tailIr.Ir);
         }
 
