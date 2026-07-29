@@ -238,6 +238,80 @@ ACOUSTIC_API void AF_SceneClearSources(AF_SceneHandle scene);
 /* 登録済み音源の数。 */
 ACOUSTIC_API int AF_SceneSourceCount(AF_SceneHandle scene);
 
+/* ============================================================================
+ * バッチ更新（API移行 段2: docs/API_MIGRATION_PLAN.md）
+ *
+ * SPEC §4 のフレーム内パイプライン。ホストは毎フレーム AF_SceneUpdate を 1 回呼び、
+ * 結果を AF_SceneGet* で読む。「どの計算をいつ走らせるか」はエンジンが内部レートで
+ * 管理する（ホストがカウンタを持たない＝移植時に書き直す部分が減る）。
+ *
+ * 結果は「直前の AF_SceneUpdate ぶん」。段5でワーカースレッド化すると 1 フレーム遅延になる。
+ * ============================================================================ */
+
+/* 更新設定。0 以下の間隔は 1 として扱う。 */
+typedef struct AF_UpdateConfig {
+    int   role1EveryN;          /* 遮蔽・回折の更新間隔(フレーム) */
+    int   role2EveryN;          /* 残響(エコグラム)の更新間隔 */
+    int   earlyEveryN;          /* 早期反射の更新間隔 */
+    int   diffSrcEveryN;        /* 回折二次音源の更新間隔 */
+    int   catalogEveryN;        /* エッジカタログの更新間隔 */
+
+    int   reflectionRays;       /* 役割1: 反射込み遮蔽のレイ数 */
+    int   reflectionBounces;
+    float directWeight;
+    int   useReflections;       /* 0/1 */
+
+    int   useEdgeCatalog;       /* 0/1 */
+    int   edgeCatalogRes;
+    float edgeCatalogMaxDist;
+
+    int   enableReverb;         /* 0/1 */
+    int   echogramBins;
+    float echogramBinSeconds;
+    int   echogramRays;
+    int   echogramBounces;
+    float speedOfSound;
+    float distanceRef;          /* 音源からの広がり損失の基準距離。0=無効 */
+
+    int   enableEarlyReflections; /* 0/1 */
+    int   earlyTaps;
+    int   earlyRays;
+    int   earlyBounces;
+    int   enableDiffractionSources; /* 0/1 */
+    int   diffSources;
+} AF_UpdateConfig;
+
+/* 設定を渡す（変わったときだけでよい）。 */
+ACOUSTIC_API void AF_SceneSetUpdateConfig(AF_SceneHandle scene, const AF_UpdateConfig* cfg);
+
+/* 毎フレーム 1 回。内部レートに従って各役割を実行し、結果を内部バッファへ書く。 */
+ACOUSTIC_API void AF_SceneUpdate(AF_SceneHandle scene, float dt);
+
+/* --- 結果取得（index は登録順。AF_SceneSourceIndex で id から引く）--- */
+
+/* 音源 id → index。見つからなければ -1。 */
+ACOUSTIC_API int AF_SceneSourceIndex(AF_SceneHandle scene, unsigned long long id);
+
+/* 帯域別の生存ゲイン(6要素)。透過⊕回折⊕反射の結果。 */
+ACOUSTIC_API void AF_SceneGetSourceOcclusion(AF_SceneHandle scene, int index, float* out6);
+
+/* 遮蔽スカラ(0..1)。1=完全遮蔽。 */
+ACOUSTIC_API float AF_SceneGetSourceOcclusionScalar(AF_SceneHandle scene, int index);
+
+/* エネルギーが届く支配方向(単位ベクトル・3要素)。 */
+ACOUSTIC_API void AF_SceneGetSourceArrivalDir(AF_SceneHandle scene, int index, float* out3);
+
+/* 早期反射タップ。像源位置と6帯域ゲインを書き、本数を返す。 */
+ACOUSTIC_API int AF_SceneGetEarlyReflections(AF_SceneHandle scene, int index,
+                                             AF_Vector3* outPos, float* outGain6, int maxTaps);
+
+/* 回折二次音源。位置とゲインを書き、本数を返す。 */
+ACOUSTIC_API int AF_SceneGetDiffractionSources(AF_SceneHandle scene, int index,
+                                               AF_Vector3* outPos, float* outGain, int maxSrc);
+
+/* 帯域別エコグラム。outBins[k*6 + b] に書き、書けたビン数を返す。 */
+ACOUSTIC_API int AF_SceneGetEchogramBands(AF_SceneHandle scene, float* outBins, int numBins);
+
 #ifdef __cplusplus
 }
 #endif

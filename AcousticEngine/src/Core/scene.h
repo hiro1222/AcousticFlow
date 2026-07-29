@@ -1069,11 +1069,280 @@ public:
         return -1;
     }
 
+    // ========================================================================
+    // バッチ更新（API移行 段2: docs/API_MIGRATION_PLAN.md）
+    //
+    // SPEC §4 のフレーム内パイプラインを 1 関数にまとめる。
+    //   役割1（中頻度）: 音源ごとの遮蔽・回折・透過・到来方向
+    //   役割2（低頻度）: エコグラム（残響）・早期反射・回折二次音源
+    //
+    // これまでホストが「どれをいつ呼ぶか」を _erCountdown 等のカウンタで管理していたが、
+    // それはエンジンの知識であってホストに置くべきものではない（移植のたびに書き直しになる）。
+    // ここで内部レートとして持つ。
+    //
+    // 結果は results_ に置き、getSource*/getEarly* 等で読む。
+    // 段5でワーカースレッド化するとき、この関数ごとワーカーへ移してダブルバッファ化する。
+    // ========================================================================
+
+    struct UpdateConfig {
+        // 役割ごとの更新間隔（フレーム）。1=毎フレーム。
+        int role1EveryN = 1;      // 遮蔽・回折
+        int role2EveryN = 4;      // 残響（重いので低レート）
+        int earlyEveryN = 3;      // 早期反射
+        int diffSrcEveryN = 2;    // 回折二次音源
+        int catalogEveryN = 3;    // エッジカタログ
+
+        // 役割1
+        int reflectionRays = 256;
+        int reflectionBounces = 3;
+        float directWeight = 1.0f;
+        bool useReflections = true;
+
+        // エッジカタログ
+        bool useEdgeCatalog = true;
+        int edgeCatalogRes = 16;
+        float edgeCatalogMaxDist = 40.0f;
+
+        // 役割2: エコグラム
+        bool enableReverb = true;
+        int echogramBins = 100;
+        float echogramBinSeconds = 0.01f;
+        int echogramRays = 512;
+        int echogramBounces = 24;
+        float speedOfSound = 343.0f;
+        float distanceRef = 0.0f;   // 0=広がり損失なし
+
+        // 役割2: 早期反射 / 回折二次音源
+        bool enableEarlyReflections = true;
+        int earlyTaps = 4;
+        int earlyRays = 512;
+        int earlyBounces = 2;
+        bool enableDiffractionSources = true;
+        int diffSources = 3;
+    };
+
+    void setUpdateConfig(const UpdateConfig& c) { cfg_ = c; }
+    const UpdateConfig& updateConfig() const { return cfg_; }
+
+    // 毎フレーム 1 発。内部レートに従って各役割を実行し、結果を results_ に置く。
+    void update(float /*dt*/) {
+        const int n = sourceCount();
+        results_.resize(n, cfg_);
+        if (n == 0) return;
+
+        // 音源位置を配列へ（既存の multi 系 API がポインタ配列を取るため）。
+        srcScratch_.resize(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) srcScratch_[static_cast<size_t>(i)] = sources_[static_cast<size_t>(i)].pos;
+
+        // a) エッジカタログ（リスナー中心・全音源共有）。回折が使う。
+        if (cfg_.useEdgeCatalog) {
+            if (--catalogCountdown_ <= 0) {
+                catalogCountdown_ = (cfg_.catalogEveryN > 0) ? cfg_.catalogEveryN : 1;
+                buildEdgeCatalog(listenerPos_, cfg_.edgeCatalogRes, cfg_.edgeCatalogMaxDist);
+            }
+        } else {
+            clearEdgeCatalog();
+        }
+
+        // b) 役割1: 遮蔽・回折・透過・到来方向（音源ごと）。
+        if (--role1Countdown_ <= 0) {
+            role1Countdown_ = (cfg_.role1EveryN > 0) ? cfg_.role1EveryN : 1;
+            runRole1(n);
+        }
+
+        // c) 役割2: 早期反射（音源ごと・低レート）。
+        if (cfg_.enableEarlyReflections) {
+            if (--earlyCountdown_ <= 0) {
+                earlyCountdown_ = (cfg_.earlyEveryN > 0) ? cfg_.earlyEveryN : 1;
+                runEarlyReflections(n);
+            }
+        }
+
+        // d) 役割2: 回折二次音源（音源ごと・低レート）。
+        if (cfg_.enableDiffractionSources) {
+            if (--diffSrcCountdown_ <= 0) {
+                diffSrcCountdown_ = (cfg_.diffSrcEveryN > 0) ? cfg_.diffSrcEveryN : 1;
+                runDiffractionSources(n);
+            }
+        }
+
+        // e) 役割2: エコグラム（全音源まとめて・最低レート）。
+        if (cfg_.enableReverb) {
+            if (--role2Countdown_ <= 0) {
+                role2Countdown_ = (cfg_.role2EveryN > 0) ? cfg_.role2EveryN : 1;
+                runEchogram(n);
+            }
+        }
+    }
+
+    // --- 結果取得（前回 update ぶん）---
+    // index は sourceIndexOf(id) で引く。範囲外は何もしない（呼び手のバッファは不変）。
+
+    void getSourceOcclusion(int index, float* out6) const {
+        if (!out6 || !validResult(index)) return;
+        const float* src = &results_.bands[static_cast<size_t>(index) * kNumBands];
+        for (int b = 0; b < kNumBands; ++b) out6[b] = src[b];
+    }
+
+    float getSourceOcclusionScalar(int index) const {
+        return validResult(index) ? results_.occ[static_cast<size_t>(index)] : 0.0f;
+    }
+
+    void getSourceArrivalDir(int index, float* out3) const {
+        if (!out3 || !validResult(index)) return;
+        const float* d = &results_.dir[static_cast<size_t>(index) * 3];
+        out3[0] = d[0]; out3[1] = d[1]; out3[2] = d[2];
+    }
+
+    // 早期反射タップ。書き込んだ本数を返す。
+    int getEarlyReflections(int index, Vec3* outPos, float* outGain6, int maxTaps) const {
+        if (!outPos || !outGain6 || maxTaps <= 0 || !validResult(index)) return 0;
+        const int cap = std::min(maxTaps, results_.earlyCap);
+        const int n = std::min(cap, results_.earlyCount[static_cast<size_t>(index)]);
+        const size_t base = static_cast<size_t>(index) * results_.earlyCap;
+        for (int t = 0; t < n; ++t) {
+            outPos[t] = results_.earlyPos[base + static_cast<size_t>(t)];
+            const float* g = &results_.earlyGain[(base + static_cast<size_t>(t)) * kNumBands];
+            for (int b = 0; b < kNumBands; ++b) outGain6[t * kNumBands + b] = g[b];
+        }
+        return n;
+    }
+
+    // 回折二次音源。書き込んだ本数を返す。
+    int getDiffractionSources(int index, Vec3* outPos, float* outGain, int maxSrc) const {
+        if (!outPos || !outGain || maxSrc <= 0 || !validResult(index)) return 0;
+        const int cap = std::min(maxSrc, results_.diffCap);
+        const int n = std::min(cap, results_.diffCount[static_cast<size_t>(index)]);
+        const size_t base = static_cast<size_t>(index) * results_.diffCap;
+        for (int t = 0; t < n; ++t) {
+            outPos[t] = results_.diffPos[base + static_cast<size_t>(t)];
+            outGain[t] = results_.diffGain[base + static_cast<size_t>(t)];
+        }
+        return n;
+    }
+
+    // 帯域別エコグラム。numBins*kNumBands 要素を書く。書けたビン数を返す。
+    int getEchogramBands(float* outBins, int numBins) const {
+        if (!outBins || numBins <= 0 || results_.echogramBins <= 0) return 0;
+        const int n = std::min(numBins, results_.echogramBins);
+        for (int i = 0; i < n * kNumBands; ++i) outBins[i] = results_.echogram[static_cast<size_t>(i)];
+        return n;
+    }
+
     // --- 参照 ---
     int instanceCount() const { return static_cast<int>(instances_.size()); }
     int materialCount() const { return static_cast<int>(materials_.size()); }
 
 private:
+    // update() が置く結果。段5でこれをダブルバッファ化する。
+    struct Results {
+        int count = 0;
+        std::vector<float> occ;     // [count] 遮蔽スカラ
+        std::vector<float> bands;   // [count*6] 帯域別生存
+        std::vector<float> dir;     // [count*3] 到来方向
+
+        int earlyCap = 0;
+        std::vector<Vec3> earlyPos;    // [count*earlyCap]
+        std::vector<float> earlyGain;  // [count*earlyCap*6]
+        std::vector<int> earlyCount;   // [count]
+
+        int diffCap = 0;
+        std::vector<Vec3> diffPos;     // [count*diffCap]
+        std::vector<float> diffGain;   // [count*diffCap]
+        std::vector<int> diffCount;    // [count]
+
+        int echogramBins = 0;
+        std::vector<float> echogram;   // [echogramBins*6]
+
+        void resize(int n, const UpdateConfig& c) {
+            const int eCap = (c.earlyTaps > 0) ? c.earlyTaps : 1;
+            const int dCap = (c.diffSources > 0) ? c.diffSources : 1;
+            if (count == n && earlyCap == eCap && diffCap == dCap &&
+                echogramBins == c.echogramBins) return;
+            count = n;
+            earlyCap = eCap;
+            diffCap = dCap;
+            echogramBins = c.echogramBins;
+            occ.assign(static_cast<size_t>(n), 0.0f);
+            bands.assign(static_cast<size_t>(n) * kNumBands, 1.0f);
+            dir.assign(static_cast<size_t>(n) * 3, 0.0f);
+            earlyPos.assign(static_cast<size_t>(n) * eCap, Vec3(0, 0, 0));
+            earlyGain.assign(static_cast<size_t>(n) * eCap * kNumBands, 0.0f);
+            earlyCount.assign(static_cast<size_t>(n), 0);
+            diffPos.assign(static_cast<size_t>(n) * dCap, Vec3(0, 0, 0));
+            diffGain.assign(static_cast<size_t>(n) * dCap, 0.0f);
+            diffCount.assign(static_cast<size_t>(n), 0);
+            echogram.assign(static_cast<size_t>(std::max(0, c.echogramBins)) * kNumBands, 0.0f);
+        }
+    };
+
+    bool validResult(int index) const {
+        return index >= 0 && index < results_.count;
+    }
+
+    void runRole1(int n) {
+        if (cfg_.useReflections) {
+            occlusionReflectedMulti(listenerPos_, srcScratch_.data(), n,
+                                    results_.occ.data(), results_.bands.data(),
+                                    results_.dir.data(), cfg_.directWeight,
+                                    cfg_.reflectionRays, cfg_.reflectionBounces);
+        } else {
+            // 反射を使わない場合は直接経路のみ（透過⊕回折）。
+            for (int i = 0; i < n; ++i) {
+                float t[kNumBands], d[kNumBands];
+                computeTransmission(srcScratch_[static_cast<size_t>(i)], listenerPos_, t);
+                computeDiffraction(srcScratch_[static_cast<size_t>(i)], listenerPos_, d);
+                float sum = 0.0f;
+                for (int b = 0; b < kNumBands; ++b) {
+                    const float g = std::max(t[b], d[b]);
+                    results_.bands[static_cast<size_t>(i) * kNumBands + b] = g;
+                    sum += g;
+                }
+                results_.occ[static_cast<size_t>(i)] = 1.0f - sum / kNumBands;
+            }
+        }
+    }
+
+    void runEarlyReflections(int n) {
+        const int cap = results_.earlyCap;
+        for (int i = 0; i < n; ++i) {
+            const size_t base = static_cast<size_t>(i) * cap;
+            const int got = computeEarlyReflections(
+                listenerPos_, srcScratch_[static_cast<size_t>(i)],
+                &results_.earlyPos[base], &results_.earlyGain[base * kNumBands],
+                cap, cfg_.earlyRays, cfg_.earlyBounces);
+            results_.earlyCount[static_cast<size_t>(i)] = got;
+        }
+    }
+
+    void runDiffractionSources(int n) {
+        const int cap = results_.diffCap;
+        for (int i = 0; i < n; ++i) {
+            const size_t base = static_cast<size_t>(i) * cap;
+            const int got = computeDiffractionSources(
+                listenerPos_, srcScratch_[static_cast<size_t>(i)],
+                &results_.diffPos[base], &results_.diffGain[base], cap);
+            results_.diffCount[static_cast<size_t>(i)] = got;
+        }
+    }
+
+    void runEchogram(int n) {
+        if (results_.echogramBins <= 0) return;
+        computeEchogramBands(listenerPos_, srcScratch_.data(), n,
+                             results_.echogram.data(), results_.echogramBins,
+                             cfg_.echogramBinSeconds, cfg_.speedOfSound,
+                             cfg_.echogramRays, cfg_.echogramBounces, cfg_.distanceRef);
+    }
+
+    UpdateConfig cfg_;
+    Results results_;
+    std::vector<Vec3> srcScratch_;
+    int role1Countdown_ = 1;
+    int role2Countdown_ = 1;
+    int earlyCountdown_ = 1;
+    int diffSrcCountdown_ = 1;
+    int catalogCountdown_ = 1;
+
     bool validInstance(int id) const { return id >= 0 && id < instanceCount(); }
 
     int clampMaterialId(int id) const {

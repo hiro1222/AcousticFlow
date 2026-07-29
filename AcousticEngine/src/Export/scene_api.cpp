@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <new>
+#include <vector>
 
 #include "Core/aabb.h"
 #include "Core/material.h"
@@ -23,6 +24,8 @@ using acoustic::Vec3;
 namespace {
 
 inline Vec3 toVec3(const AF_Vector3& v) { return Vec3(v.x, v.y, v.z); }
+
+inline AF_Vector3 fromVec3(const Vec3& v) { return AF_Vector3{ v.x, v.y, v.z }; }
 
 inline Scene* asScene(AF_SceneHandle h) { return static_cast<Scene*>(h); }
 
@@ -300,6 +303,90 @@ void AF_SceneClearSources(AF_SceneHandle scene) {
 int AF_SceneSourceCount(AF_SceneHandle scene) {
     Scene* s = asScene(scene);
     return s ? s->sourceCount() : 0;
+}
+
+// --- バッチ更新（段2）---
+
+void AF_SceneSetUpdateConfig(AF_SceneHandle scene, const AF_UpdateConfig* cfg) {
+    Scene* s = asScene(scene);
+    if (!s || !cfg) return;
+    Scene::UpdateConfig c;
+    c.role1EveryN = cfg->role1EveryN;
+    c.role2EveryN = cfg->role2EveryN;
+    c.earlyEveryN = cfg->earlyEveryN;
+    c.diffSrcEveryN = cfg->diffSrcEveryN;
+    c.catalogEveryN = cfg->catalogEveryN;
+    c.reflectionRays = cfg->reflectionRays;
+    c.reflectionBounces = cfg->reflectionBounces;
+    c.directWeight = cfg->directWeight;
+    c.useReflections = cfg->useReflections != 0;
+    c.useEdgeCatalog = cfg->useEdgeCatalog != 0;
+    c.edgeCatalogRes = cfg->edgeCatalogRes;
+    c.edgeCatalogMaxDist = cfg->edgeCatalogMaxDist;
+    c.enableReverb = cfg->enableReverb != 0;
+    c.echogramBins = cfg->echogramBins;
+    c.echogramBinSeconds = cfg->echogramBinSeconds;
+    c.echogramRays = cfg->echogramRays;
+    c.echogramBounces = cfg->echogramBounces;
+    c.speedOfSound = cfg->speedOfSound;
+    c.distanceRef = cfg->distanceRef;
+    c.enableEarlyReflections = cfg->enableEarlyReflections != 0;
+    c.earlyTaps = cfg->earlyTaps;
+    c.earlyRays = cfg->earlyRays;
+    c.earlyBounces = cfg->earlyBounces;
+    c.enableDiffractionSources = cfg->enableDiffractionSources != 0;
+    c.diffSources = cfg->diffSources;
+    s->setUpdateConfig(c);
+}
+
+void AF_SceneUpdate(AF_SceneHandle scene, float dt) {
+    Scene* s = asScene(scene);
+    if (s) s->update(dt);
+}
+
+int AF_SceneSourceIndex(AF_SceneHandle scene, unsigned long long id) {
+    Scene* s = asScene(scene);
+    return s ? s->sourceIndexOf(id) : -1;
+}
+
+void AF_SceneGetSourceOcclusion(AF_SceneHandle scene, int index, float* out6) {
+    Scene* s = asScene(scene);
+    if (s) s->getSourceOcclusion(index, out6);
+}
+
+float AF_SceneGetSourceOcclusionScalar(AF_SceneHandle scene, int index) {
+    Scene* s = asScene(scene);
+    return s ? s->getSourceOcclusionScalar(index) : 0.0f;
+}
+
+void AF_SceneGetSourceArrivalDir(AF_SceneHandle scene, int index, float* out3) {
+    Scene* s = asScene(scene);
+    if (s) s->getSourceArrivalDir(index, out3);
+}
+
+int AF_SceneGetEarlyReflections(AF_SceneHandle scene, int index,
+                                AF_Vector3* outPos, float* outGain6, int maxTaps) {
+    Scene* s = asScene(scene);
+    if (!s || !outPos || !outGain6 || maxTaps <= 0) return 0;
+    std::vector<Vec3> tmp(static_cast<size_t>(maxTaps));
+    const int n = s->getEarlyReflections(index, tmp.data(), outGain6, maxTaps);
+    for (int i = 0; i < n; ++i) outPos[i] = fromVec3(tmp[static_cast<size_t>(i)]);
+    return n;
+}
+
+int AF_SceneGetDiffractionSources(AF_SceneHandle scene, int index,
+                                  AF_Vector3* outPos, float* outGain, int maxSrc) {
+    Scene* s = asScene(scene);
+    if (!s || !outPos || !outGain || maxSrc <= 0) return 0;
+    std::vector<Vec3> tmp(static_cast<size_t>(maxSrc));
+    const int n = s->getDiffractionSources(index, tmp.data(), outGain, maxSrc);
+    for (int i = 0; i < n; ++i) outPos[i] = fromVec3(tmp[static_cast<size_t>(i)]);
+    return n;
+}
+
+int AF_SceneGetEchogramBands(AF_SceneHandle scene, float* outBins, int numBins) {
+    Scene* s = asScene(scene);
+    return s ? s->getEchogramBands(outBins, numBins) : 0;
 }
 
 }  // extern "C"

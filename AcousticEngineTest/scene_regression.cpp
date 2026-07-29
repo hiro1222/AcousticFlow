@@ -288,6 +288,175 @@ void testSourceRegistry() {
     AF_SceneDestroy(s);
 }
 
+// ---------------------------------------------------------------- バッチ更新
+// 段2: AF_SceneUpdate + AF_SceneGet* が、従来の引数版クエリと同じ結果を出すことを固定する。
+//      これが段2の核心。ここが合っていれば「音は変わらない」と言える。
+void testBatchUpdate() {
+    std::printf("\n[バッチ] AF_SceneUpdate / AF_SceneGet* (段2)\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    buildRoom(s, 10, 4, 8, 0.4f, mat);
+
+    const AF_Vector3 L = V(0, 1.6f, -1);
+    const AF_Vector3 S0 = V(0, 1.6f, 1);
+    const AF_Vector3 S1 = V(3, 1.6f, 2);
+
+    AF_SceneSetListener(s, L);
+    AF_SceneSetSource(s, 10, S0);
+    AF_SceneSetSource(s, 20, S1);
+
+    // 毎フレーム全部走るように間隔を 1 にする（レート分岐は別で確認）。
+    AF_UpdateConfig cfg = {};
+    cfg.role1EveryN = 1; cfg.role2EveryN = 1; cfg.earlyEveryN = 1;
+    cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 1;
+    cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+    cfg.directWeight = 1.0f; cfg.useReflections = 1;
+    cfg.useEdgeCatalog = 1; cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+    cfg.enableReverb = 1; cfg.echogramBins = 100; cfg.echogramBinSeconds = 0.01f;
+    cfg.echogramRays = 512; cfg.echogramBounces = 24; cfg.speedOfSound = 343.0f;
+    cfg.distanceRef = 0.0f;
+    cfg.enableEarlyReflections = 1; cfg.earlyTaps = 4; cfg.earlyRays = 512; cfg.earlyBounces = 2;
+    cfg.enableDiffractionSources = 1; cfg.diffSources = 3;
+    AF_SceneSetUpdateConfig(s, &cfg);
+
+    AF_SceneUpdate(s, 1.0f / 60.0f);
+
+    // id → index。
+    const int i0 = AF_SceneSourceIndex(s, 10);
+    const int i1 = AF_SceneSourceIndex(s, 20);
+    check("id→index が引ける", i0 == 0 && i1 == 1);
+    check("未登録idは -1", AF_SceneSourceIndex(s, 999) == -1);
+
+    // --- 遮蔽: バッチ結果 vs 従来クエリ ---
+    float batchBands[kBands] = {};
+    AF_SceneGetSourceOcclusion(s, i0, batchBands);
+
+    std::vector<float> occRef(2), bandsRef(2 * kBands), dirRef(2 * 3);
+    const AF_Vector3 srcs[2] = { S0, S1 };
+    AF_SceneOcclusionReflectedMulti(s, L, srcs, 2, occRef.data(), bandsRef.data(),
+                                    dirRef.data(), 1.0f, 256, 3);
+
+    // レイの乱数系列が同じなので一致するはず（許容は数値誤差ぶんのみ）。
+    bool bandsMatch = true;
+    for (int b = 0; b < kBands; ++b)
+        if (std::fabs(batchBands[b] - bandsRef[b]) > 1e-4f) bandsMatch = false;
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "(batch[0]=%.4f ref[0]=%.4f)", batchBands[0], bandsRef[0]);
+    check("遮蔽の帯域ゲインが従来クエリと一致(見通し)", bandsMatch, buf);
+
+    // 見通しが立つ配置だと両方 1.0 で自明に一致してしまう。
+    // 衝立を立てて「実際に遮蔽が起きている」状態でも一致することを確認する。
+    AF_SceneAddInstanceBox(s, V(0, 1.6f, 0), V(2, 1.5f, 0.2f), V(1, 0, 0), V(0, 1, 0), mat);
+    AF_SceneUpdate(s, 1.0f / 60.0f);
+    AF_SceneGetSourceOcclusion(s, i0, batchBands);
+    AF_SceneOcclusionReflectedMulti(s, L, srcs, 2, occRef.data(), bandsRef.data(),
+                                    dirRef.data(), 1.0f, 256, 3);
+    bool blockedMatch = true;
+    for (int b = 0; b < kBands; ++b)
+        if (std::fabs(batchBands[b] - bandsRef[b]) > 1e-4f) blockedMatch = false;
+    std::snprintf(buf, sizeof(buf), "(batch[0]=%.4f ref[0]=%.4f)", batchBands[0], bandsRef[0]);
+    check("遮蔽の帯域ゲインが従来クエリと一致(遮蔽あり)", blockedMatch, buf);
+    check("衝立で実際に遮蔽されている(<1.0)", batchBands[0] < 0.999f, buf);
+
+    const float occScalar = AF_SceneGetSourceOcclusionScalar(s, i0);
+    checkInRange("遮蔽スカラが0..1", occScalar, 0.0f, 1.0f);
+
+    float dir[3] = {};
+    AF_SceneGetSourceArrivalDir(s, i0, dir);
+    const float dirLen = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    check("到来方向が単位ベクトル相当", dirLen > 0.5f && dirLen < 1.5f);
+
+    // --- 早期反射: 本数と像源の妥当性 ---
+    AF_Vector3 erPos[4];
+    float erGain[4 * kBands] = {};
+    const int erN = AF_SceneGetEarlyReflections(s, i0, erPos, erGain, 4);
+    std::snprintf(buf, sizeof(buf), "(%d taps)", erN);
+    check("早期反射が取れる", erN > 0, buf);
+    check("早期反射が上限以内", erN <= 4);
+
+    // --- 回折二次音源: 遮蔽が無いので 0 本でも正常（クラッシュしないことを見る）---
+    AF_Vector3 dsPos[3];
+    float dsGain[3] = {};
+    const int dsN = AF_SceneGetDiffractionSources(s, i0, dsPos, dsGain, 3);
+    check("回折二次音源の取得が妥当", dsN >= 0 && dsN <= 3);
+
+    // --- エコグラム: バッチ結果が従来クエリと一致 ---
+    constexpr int kBins = 100;
+    std::vector<float> batchEcho(kBins * kBands, 0.0f);
+    const int gotBins = AF_SceneGetEchogramBands(s, batchEcho.data(), kBins);
+    check("エコグラムのビン数が一致", gotBins == kBins);
+
+    std::vector<float> refEcho(kBins * kBands, 0.0f);
+    AF_SceneComputeEchogramBands(s, L, srcs, 2, refEcho.data(), kBins, 0.01f, 343.0f, 512, 24, 0.0f);
+    float maxDiff = 0.0f, refTotal = 0.0f;
+    for (int i = 0; i < kBins * kBands; ++i) {
+        maxDiff = std::max(maxDiff, std::fabs(batchEcho[i] - refEcho[i]));
+        refTotal += refEcho[i];
+    }
+    std::snprintf(buf, sizeof(buf), "(maxDiff=%.6g, total=%.4g)", maxDiff, refTotal);
+    check("エコグラムが従来クエリと一致", maxDiff < 1e-3f, buf);
+
+    // --- 範囲外 index は何も壊さない ---
+    float guard[kBands] = { -1, -1, -1, -1, -1, -1 };
+    AF_SceneGetSourceOcclusion(s, 99, guard);
+    check("範囲外indexで出力バッファが変わらない", guard[0] == -1.0f);
+    check("範囲外indexの早期反射は0本", AF_SceneGetEarlyReflections(s, 99, erPos, erGain, 4) == 0);
+
+    AF_SceneDestroy(s);
+}
+
+// 更新レートが効いていること（間隔を空けた役割は毎フレーム走らない）。
+void testUpdateRates() {
+    std::printf("\n[バッチ] 更新レート (段2)\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    buildRoom(s, 10, 4, 8, 0.4f, mat);
+    AF_SceneSetListener(s, V(0, 1.6f, -1));
+    AF_SceneSetSource(s, 1, V(0, 1.6f, 1));
+
+    AF_UpdateConfig cfg = {};
+    cfg.role1EveryN = 1; cfg.role2EveryN = 4; cfg.earlyEveryN = 1;
+    cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 1;
+    cfg.reflectionRays = 64; cfg.reflectionBounces = 2;
+    cfg.directWeight = 1.0f; cfg.useReflections = 1;
+    cfg.useEdgeCatalog = 0;
+    cfg.enableReverb = 1; cfg.echogramBins = 50; cfg.echogramBinSeconds = 0.01f;
+    cfg.echogramRays = 128; cfg.echogramBounces = 8; cfg.speedOfSound = 343.0f;
+    cfg.enableEarlyReflections = 1; cfg.earlyTaps = 2; cfg.earlyRays = 64; cfg.earlyBounces = 2;
+    cfg.enableDiffractionSources = 0; cfg.diffSources = 1;
+    AF_SceneSetUpdateConfig(s, &cfg);
+
+    // 1 フレーム目: 全部走る（カウンタ初期値 1）。
+    AF_SceneUpdate(s, 0.016f);
+    std::vector<float> e1(50 * kBands, 0.0f);
+    AF_SceneGetEchogramBands(s, e1.data(), 50);
+    float sum1 = 0.0f;
+    for (float v : e1) sum1 += v;
+    check("初回updateでエコグラムが埋まる", sum1 > 0.0f);
+
+    // 音源を大きく動かしてから 1 フレームだけ回す。
+    // role2EveryN=4 なのでエコグラムはまだ更新されない＝前回値のままのはず。
+    AF_SceneSetSource(s, 1, V(4, 1.6f, 3));
+    AF_SceneUpdate(s, 0.016f);
+    std::vector<float> e2(50 * kBands, 0.0f);
+    AF_SceneGetEchogramBands(s, e2.data(), 50);
+    bool unchanged = true;
+    for (int i = 0; i < 50 * kBands; ++i) if (std::fabs(e1[i] - e2[i]) > 1e-9f) unchanged = false;
+    check("role2EveryN=4 なので次フレームでは再計算されない", unchanged);
+
+    // さらに 3 フレーム進めるとカウンタが 0 になり再計算される。
+    AF_SceneUpdate(s, 0.016f);
+    AF_SceneUpdate(s, 0.016f);
+    AF_SceneUpdate(s, 0.016f);
+    std::vector<float> e3(50 * kBands, 0.0f);
+    AF_SceneGetEchogramBands(s, e3.data(), 50);
+    bool changed = false;
+    for (int i = 0; i < 50 * kBands; ++i) if (std::fabs(e1[i] - e3[i]) > 1e-9f) changed = true;
+    check("4フレーム後には再計算される", changed);
+
+    AF_SceneDestroy(s);
+}
+
 // ---------------------------------------------------------------- 頑健性
 // 不正入力で落ちない（移行中に呼び出し規約を変えるので、境界は明示的に守る）。
 void testRobustness() {
@@ -320,6 +489,8 @@ int main() {
     testOcclusionAndDiffraction();
     testEarlyReflections();
     testEchogram();
+    testBatchUpdate();
+    testUpdateRates();
     testRobustness();
 
     std::printf("\n----\n");
