@@ -221,7 +221,7 @@ namespace AcousticFlow
         // エンジンが内部レートで管理するので、ホストはカウンタを持たない。
         // 古いDLL対策は SourceRegistry と同じフラグに相乗り（同じ版で入った API のため）。
 
-        public void SetUpdateConfig(Native.AFUpdateConfig cfg)
+        public void SetUpdateConfig(AcousticUpdateConfig cfg)
         {
             if (_handle == IntPtr.Zero || _sourceRegistryMissing) return;
             try { Native.AF_SceneSetUpdateConfig(_handle, ref cfg); }

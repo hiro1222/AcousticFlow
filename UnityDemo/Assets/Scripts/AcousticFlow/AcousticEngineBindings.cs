@@ -20,6 +20,37 @@ namespace AcousticFlow
         public AFVector3(Vector3 v) { x = v.x; y = v.y; z = v.z; }
     }
 
+    // バッチ更新（AF_SceneUpdate）の設定。C 側 AF_UpdateConfig と同じ並び・型であること。
+    //
+    // 他の interop 型（AFVector3 / Native）は internal で隠しているが、これは
+    // 「ホストがエンジンに何をどのレートで計算させるか」を指定する公開 API の一部なので public。
+    // ホストが持つべき設定であり、interop の実装詳細ではない。
+    [StructLayout(LayoutKind.Sequential)]
+    public struct AcousticUpdateConfig
+    {
+        // 役割ごとの更新間隔（フレーム）。1=毎フレーム。0以下はエンジン側で1に丸める。
+        public int role1EveryN, role2EveryN, earlyEveryN, diffSrcEveryN, catalogEveryN;
+
+        // 役割1: 反射込み遮蔽
+        public int reflectionRays, reflectionBounces;
+        public float directWeight;
+        public int useReflections;          // 0/1
+
+        // エッジカタログ（回折が使う）
+        public int useEdgeCatalog, edgeCatalogRes;
+        public float edgeCatalogMaxDist;
+
+        // 役割2: 残響（エコグラム）
+        public int enableReverb, echogramBins;
+        public float echogramBinSeconds;
+        public int echogramRays, echogramBounces;
+        public float speedOfSound, distanceRef;
+
+        // 役割2: 早期反射 / 回折二次音源
+        public int enableEarlyReflections, earlyTaps, earlyRays, earlyBounces;
+        public int enableDiffractionSources, diffSources;
+    }
+
     internal static class Native
     {
         // 拡張子なしの "AcousticEngine" にしておくと、Windows では
@@ -222,26 +253,8 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneSourceCount(IntPtr scene);
 
-        // バッチ更新の設定（段2）。C 側 AF_UpdateConfig と同じ並び・型であること。
-        [StructLayout(LayoutKind.Sequential)]
-        public struct AFUpdateConfig
-        {
-            public int role1EveryN, role2EveryN, earlyEveryN, diffSrcEveryN, catalogEveryN;
-            public int reflectionRays, reflectionBounces;
-            public float directWeight;
-            public int useReflections;
-            public int useEdgeCatalog, edgeCatalogRes;
-            public float edgeCatalogMaxDist;
-            public int enableReverb, echogramBins;
-            public float echogramBinSeconds;
-            public int echogramRays, echogramBounces;
-            public float speedOfSound, distanceRef;
-            public int enableEarlyReflections, earlyTaps, earlyRays, earlyBounces;
-            public int enableDiffractionSources, diffSources;
-        }
-
         [DllImport(Dll, CallingConvention = Cc)]
-        public static extern void AF_SceneSetUpdateConfig(IntPtr scene, ref AFUpdateConfig cfg);
+        public static extern void AF_SceneSetUpdateConfig(IntPtr scene, ref AcousticUpdateConfig cfg);
 
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneUpdate(IntPtr scene, float dt);

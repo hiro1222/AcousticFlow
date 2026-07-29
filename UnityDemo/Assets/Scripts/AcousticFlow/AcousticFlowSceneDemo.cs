@@ -447,9 +447,9 @@ namespace AcousticFlow
 
         // Inspector の設定をエンジンのバッチ更新設定へ写す（段2）。
         // 更新レートもここで渡すので、ホスト側のカウンタは持たない。
-        private Native.AFUpdateConfig BuildUpdateConfig()
+        private AcousticUpdateConfig BuildUpdateConfig()
         {
-            var c = new Native.AFUpdateConfig
+            var c = new AcousticUpdateConfig
             {
                 role1EveryN = 1,
                 role2EveryN = Mathf.Max(1, reverbUpdateEveryFrames),
@@ -475,11 +475,15 @@ namespace AcousticFlow
                 distanceRef = distanceRef,
 
                 enableEarlyReflections = enableEarlyReflections ? 1 : 0,
-                earlyTaps = Mathf.Max(1, earlyReflectTaps),
+                // タップ本数は「消費側の最大」を要求する。消費側は2つあり本数が違う:
+                //   Wwise像源エミッタ = earlyReflectTaps 本 / IR畳み込みタップ = _tapErPos.Length 本。
+                // 少ない方に合わせると IR のタップが減って音が変わるので、両者の max を計算させる
+                //（受け取り側はそれぞれ自分のバッファ長で頭打ちになるので、余分は無視される）。
+                earlyTaps = Mathf.Max(Mathf.Max(1, earlyReflectTaps), _tapErPos.Length),
                 earlyRays = earlyReflectRays,
                 earlyBounces = earlyReflectBounces,
                 enableDiffractionSources = enableDiffractionSources ? 1 : 0,
-                diffSources = Mathf.Max(1, diffractionSourceCount),
+                diffSources = Mathf.Max(Mathf.Max(1, diffractionSourceCount), _tapDiffPos.Length),
             };
             return c;
         }
@@ -1156,8 +1160,13 @@ namespace AcousticFlow
             // 直接タップ（基準 0ms）。6帯域透過×空気吸収 を low/mid/high にまとめる。
             WriteTapBands(n++, _bands, 0, directDist, sp, 'D', 0f);
 
-            // 反射タップ（像源位置から経路長→遅延、6帯域ゲイン×空気吸収→3バンド）。
-            int er = _scene.ComputeEarlyReflections(lp, sp, _tapErPos, _tapErGain, earlyReflectRays, earlyReflectBounces);
+            // 段3: 早期反射/回折二次音源はバッチ更新で計算済み。ここでは結果を受け取るだけ。
+            //   以前はここで独自にエンジンを再呼び出ししていたので、同じ計算を
+            //   UpdateEarlyReflections と二重に走らせていた（音源0だけとはいえ無駄）。
+            int mainIdx = _scene.SourceIndex(SourceId(0));
+
+            // 反射タップ（像源位置から経路長→遅延、6帯域ゲイン×空気吸収）。
+            int er = _scene.GetEarlyReflections(mainIdx, _tapErPos, _tapErGain);
             for (int t = 0; t < er && n < _tapDelayMs.Length; t++)
             {
                 float pl = Vector3.Distance(lp, _tapErPos[t]);  // 全経路長
@@ -1166,7 +1175,7 @@ namespace AcousticFlow
                 WriteTapBands(n++, _tapErGain, t * 6, pl, _tapErPos[t], 'R', rel);
             }
             // 回折タップ（遮蔽時のみ。ゲインはスカラ=v1で3バンド一律、6帯域化は後段。空気吸収は広帯域で乗算）。
-            int df = _scene.ComputeDiffractionSources(lp, sp, _tapDiffPos, _tapDiffGain);
+            int df = _scene.GetDiffractionSources(mainIdx, _tapDiffPos, _tapDiffGain);
             for (int t = 0; t < df && n < _tapDelayMs.Length; t++)
             {
                 float pl = Vector3.Distance(lp, _tapDiffPos[t]);
