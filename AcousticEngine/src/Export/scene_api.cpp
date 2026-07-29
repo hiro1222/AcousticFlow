@@ -275,4 +275,31 @@ int AF_SceneInstanceCount(AF_SceneHandle scene) {
     return s ? s->instanceCount() : 0;
 }
 
+// --- リスナー / 音源の保持（段1）---
+
+void AF_SceneSetListener(AF_SceneHandle scene, AF_Vector3 pos) {
+    Scene* s = asScene(scene);
+    if (s) s->setListener(toVec3(pos));
+}
+
+void AF_SceneSetSource(AF_SceneHandle scene, unsigned long long id, AF_Vector3 pos) {
+    Scene* s = asScene(scene);
+    if (s) s->setSource(id, toVec3(pos));
+}
+
+void AF_SceneRemoveSource(AF_SceneHandle scene, unsigned long long id) {
+    Scene* s = asScene(scene);
+    if (s) s->removeSource(id);
+}
+
+void AF_SceneClearSources(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    if (s) s->clearSources();
+}
+
+int AF_SceneSourceCount(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    return s ? s->sourceCount() : 0;
+}
+
 }  // extern "C"

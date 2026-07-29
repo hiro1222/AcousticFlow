@@ -170,6 +170,52 @@ namespace AcousticFlow
             }
         }
 
+        // ── リスナー / 音源の保持（API移行 段1）──
+        // これまで listener/source はクエリのたびに引数で渡していたが、SPEC §2 では
+        // エンジンが保持して内部で音源ループを回す。段1では保持するだけ（挙動は不変）。
+        // 古いDLLにはエクスポートが無いので、初回の EntryPointNotFound で以後スキップする。
+        private bool _sourceRegistryMissing;
+
+        public bool SourceRegistryAvailable => !_sourceRegistryMissing;
+
+        public void SetListener(Vector3 pos)
+        {
+            if (_handle == IntPtr.Zero || _sourceRegistryMissing) return;
+            try { Native.AF_SceneSetListener(_handle, new AFVector3(pos)); }
+            catch (EntryPointNotFoundException) { _sourceRegistryMissing = true; }
+        }
+
+        public void SetSource(ulong id, Vector3 pos)
+        {
+            if (_handle == IntPtr.Zero || _sourceRegistryMissing) return;
+            try { Native.AF_SceneSetSource(_handle, id, new AFVector3(pos)); }
+            catch (EntryPointNotFoundException) { _sourceRegistryMissing = true; }
+        }
+
+        public void RemoveSource(ulong id)
+        {
+            if (_handle == IntPtr.Zero || _sourceRegistryMissing) return;
+            try { Native.AF_SceneRemoveSource(_handle, id); }
+            catch (EntryPointNotFoundException) { _sourceRegistryMissing = true; }
+        }
+
+        public void ClearSources()
+        {
+            if (_handle == IntPtr.Zero || _sourceRegistryMissing) return;
+            try { Native.AF_SceneClearSources(_handle); }
+            catch (EntryPointNotFoundException) { _sourceRegistryMissing = true; }
+        }
+
+        public int SourceCount
+        {
+            get
+            {
+                if (_handle == IntPtr.Zero || _sourceRegistryMissing) return 0;
+                try { return Native.AF_SceneSourceCount(_handle); }
+                catch (EntryPointNotFoundException) { _sourceRegistryMissing = true; return 0; }
+            }
+        }
+
         // 反射経路：origin→dir を鏡面反射で maxBounces 回追い、通過点を outPoints に書き点数を返す。
         // 内部バッファ(_pathBuf)を使い回して毎フレームの GC を避ける。
         private AFVector3[] _pathBuf;

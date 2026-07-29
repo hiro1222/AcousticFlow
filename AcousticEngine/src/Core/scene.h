@@ -1008,6 +1008,67 @@ public:
         return n;
     }
 
+    // --- リスナー / 音源の保持（API移行 段1: docs/API_MIGRATION_PLAN.md）---
+    //
+    // これまで listener/source は「クエリのたびに引数で渡す」ものだった。
+    // ホストが音源配列を持ち、音源ぶんループするのもホストの仕事になっていたが、
+    // これは SPEC §2 の「エンジンが音源を登録で保持し、内部でループする」に反する。
+    //
+    // ここで保持するようにしておくと、後段の af_Update（1発で全音源を回す）と
+    // ワーカースレッド化（入力をスナップショットして投げる）が素直に乗る。
+    // 段1では保持するだけで、既存クエリは引数版のまま＝挙動は一切変わらない。
+    struct SourceEntry {
+        unsigned long long id = 0;
+        Vec3 pos{};
+        bool active = true;
+    };
+
+    void setListener(const Vec3& pos) { listenerPos_ = pos; }
+    const Vec3& listenerPos() const { return listenerPos_; }
+
+    // 音源を登録/更新する。同じ id なら位置だけ更新（毎フレーム呼ばれる想定）。
+    void setSource(unsigned long long id, const Vec3& pos) {
+        for (auto& s : sources_) {
+            if (s.id == id) { s.pos = pos; s.active = true; return; }
+        }
+        SourceEntry e;
+        e.id = id;
+        e.pos = pos;
+        sources_.push_back(e);
+    }
+
+    void removeSource(unsigned long long id) {
+        for (size_t i = 0; i < sources_.size(); ++i) {
+            if (sources_[i].id == id) {
+                sources_.erase(sources_.begin() + static_cast<long>(i));
+                return;
+            }
+        }
+    }
+
+    void clearSources() { sources_.clear(); }
+
+    int sourceCount() const { return static_cast<int>(sources_.size()); }
+
+    // index でのアクセス（内部ループ用）。範囲外は原点を返す。
+    const Vec3& sourcePos(int index) const {
+        if (index >= 0 && index < sourceCount()) return sources_[static_cast<size_t>(index)].pos;
+        static const Vec3 origin{};
+        return origin;
+    }
+
+    unsigned long long sourceId(int index) const {
+        if (index >= 0 && index < sourceCount()) return sources_[static_cast<size_t>(index)].id;
+        return 0;
+    }
+
+    // id → index。見つからなければ -1（af_Get* が id で引くときに使う）。
+    int sourceIndexOf(unsigned long long id) const {
+        for (size_t i = 0; i < sources_.size(); ++i)
+            if (sources_[i].id == id) return static_cast<int>(i);
+        return -1;
+    }
+
     // --- 参照 ---
     int instanceCount() const { return static_cast<int>(instances_.size()); }
     int materialCount() const { return static_cast<int>(materials_.size()); }
@@ -1150,6 +1211,8 @@ private:
 
     std::vector<AcousticMaterial> materials_;  // 材質テーブル（インスタンスが matId で参照）
     std::vector<Instance> instances_;          // 占有物（毎フレーム更新可能）
+    Vec3 listenerPos_{};                       // 保持リスナー（段1〜。af_Update が使う）
+    std::vector<SourceEntry> sources_;         // 保持音源（同上）
 
     mutable std::vector<BvhNode> bvhNodes_;    // BVH ノード列（lazy 構築）
     mutable std::vector<int> bvhOrder_;        // アクティブなインスタンス index の並び

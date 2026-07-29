@@ -210,6 +210,34 @@ ACOUSTIC_API int AF_SceneComputeEarlyReflections(AF_SceneHandle scene,
 /* 登録済みインスタンス数（デバッグ用）。 */
 ACOUSTIC_API int AF_SceneInstanceCount(AF_SceneHandle scene);
 
+/* ============================================================================
+ * リスナー / 音源の登録（API移行 段1: docs/API_MIGRATION_PLAN.md）
+ *
+ * これまで listener/source はクエリごとに引数で渡していたが、SPEC §2 では
+ * エンジンが保持し、内部で音源ループを回す。ここではまず「保持」だけを用意する。
+ * 既存クエリは引数版のまま動くので、段1では挙動は変わらない。
+ *
+ * 使い方: セットアップで音源を登録し、毎フレーム AF_SceneSetListener /
+ *         AF_SceneSetSource で位置だけ更新する（同じ id の再呼び出しは位置更新）。
+ * ============================================================================ */
+
+/* リスナー位置を設定する。 */
+ACOUSTIC_API void AF_SceneSetListener(AF_SceneHandle scene, AF_Vector3 pos);
+
+/* 音源を登録/更新する。既存の id なら位置を更新するだけ。
+ *   id : ホスト側の音源識別子。Wwise の GameObject ID と揃えておくと配線が楽。 */
+ACOUSTIC_API void AF_SceneSetSource(AF_SceneHandle scene,
+                                    unsigned long long id, AF_Vector3 pos);
+
+/* 音源を削除する。存在しない id は無視。 */
+ACOUSTIC_API void AF_SceneRemoveSource(AF_SceneHandle scene, unsigned long long id);
+
+/* 登録済み音源をすべて削除する。 */
+ACOUSTIC_API void AF_SceneClearSources(AF_SceneHandle scene);
+
+/* 登録済み音源の数。 */
+ACOUSTIC_API int AF_SceneSourceCount(AF_SceneHandle scene);
+
 #ifdef __cplusplus
 }
 #endif

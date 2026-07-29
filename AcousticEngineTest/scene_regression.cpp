@@ -254,6 +254,40 @@ void testInstanceLifecycle() {
     AF_SceneDestroy(s);
 }
 
+// ---------------------------------------------------------------- リスナー/音源の保持
+// 段1: エンジンが listener/source を保持する。まだ計算には使わないので、
+//      「登録した内容が正しく保持・更新・削除される」ことだけを固定する。
+void testSourceRegistry() {
+    std::printf("\n[登録] リスナー / 音源の保持 (段1)\n");
+    AF_SceneHandle s = AF_SceneCreate();
+
+    check("初期状態は音源0", AF_SceneSourceCount(s) == 0);
+
+    AF_SceneSetListener(s, V(0, 1.6f, -2));
+    AF_SceneSetSource(s, 100, V(0, 1.6f, 2));
+    AF_SceneSetSource(s, 200, V(3, 1.6f, 2));
+    check("2音源が登録される", AF_SceneSourceCount(s) == 2);
+
+    // 同じ id の再登録は「位置更新」であって増えない（毎フレーム呼ばれる想定）。
+    AF_SceneSetSource(s, 100, V(0, 1.6f, 5));
+    check("同一idの再登録は増えない(位置更新)", AF_SceneSourceCount(s) == 2);
+
+    AF_SceneRemoveSource(s, 100);
+    check("削除で1つ減る", AF_SceneSourceCount(s) == 1);
+    AF_SceneRemoveSource(s, 999);   // 存在しない id
+    check("存在しないidの削除は無視", AF_SceneSourceCount(s) == 1);
+
+    AF_SceneClearSources(s);
+    check("クリアで0", AF_SceneSourceCount(s) == 0);
+
+    // null 安全。
+    AF_SceneSetListener(nullptr, V(0, 0, 0));
+    AF_SceneSetSource(nullptr, 1, V(0, 0, 0));
+    check("null scene で落ちない", AF_SceneSourceCount(nullptr) == 0);
+
+    AF_SceneDestroy(s);
+}
+
 // ---------------------------------------------------------------- 頑健性
 // 不正入力で落ちない（移行中に呼び出し規約を変えるので、境界は明示的に守る）。
 void testRobustness() {
@@ -281,6 +315,7 @@ int main() {
     std::printf("（期待値は絶対値でなく「関係」で書いている。詳細は冒頭コメント参照）\n");
 
     testInstanceLifecycle();
+    testSourceRegistry();
     testTransmission();
     testOcclusionAndDiffraction();
     testEarlyReflections();

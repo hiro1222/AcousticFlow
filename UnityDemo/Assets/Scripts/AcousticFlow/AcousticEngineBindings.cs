@@ -206,6 +206,22 @@ namespace AcousticFlow
             [Out] float[] outBins, int numBins, float binSeconds, float speedOfSound,
             int numRays, int maxBounces, float distanceRef);
 
+        // リスナー/音源の保持（段1）。エンジンが内部で音源ループを回せるようにする。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetListener(IntPtr scene, AFVector3 pos);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetSource(IntPtr scene, ulong id, AFVector3 pos);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneRemoveSource(IntPtr scene, ulong id);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneClearSources(IntPtr scene);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneSourceCount(IntPtr scene);
+
         // 反射経路トレース：origin→dir を鏡面反射で maxBounces 回追い、通過点を outPoints に書く。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneTraceReflectionPath(

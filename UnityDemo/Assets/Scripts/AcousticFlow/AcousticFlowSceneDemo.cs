@@ -851,6 +851,15 @@ namespace AcousticFlow
             for (int i = 0; i < _sources.Length; i++)
                 _srcPos[i] = _sources[i] != null ? _sources[i].position : listener.position;
 
+            // 2-b) リスナー/音源をエンジンにも登録する（API移行 段1）。
+            //   これまで listener/source はクエリごとに引数で渡していたが、SPEC §2 では
+            //   エンジンが保持して内部で音源ループを回す。段1では登録するだけで、
+            //   計算はまだ引数版のクエリが行う＝音は変わらない。
+            //   ID は Wwise の GameObject ID と同じ SourceId(i) を使い、配線を揃えておく。
+            _scene.SetListener(listener.position);
+            for (int i = 0; i < _sources.Length; i++)
+                _scene.SetSource(SourceId(i), _srcPos[i]);
+
             // 3) 帯域別生存を音源ごとに求める（ここから音響計算の時間計測）。
             _acStopwatch.Restart();
             if (useReflections)
