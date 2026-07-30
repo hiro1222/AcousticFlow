@@ -1,12 +1,19 @@
 /* KemarImporter.cs (Editor 専用)
  * MIT KEMAR (Gardner & Martin, MIT Media Lab 1994) の compact データを .afhr へ変換する。
  *
- * データ形式（hrtfdoc.txt より）:
- *   ・16bit 符号付き整数
- *   ・ビッグエンディアン（"most significant byte stored in the low address"＝Motorola 68000）
- *   ・compact は 1 ファイルに 128 点のステレオペア、(左, 右) インターリーブ
- *   ・ファイル名 HEEeAAAa.dat （EE=仰角[度], AAA=方位角[度]）
- *   ・仰角 -40〜+90、合計 710 方向
+ * データ形式:
+ *   ・128 点のステレオペア、(左, 右) インターリーブ、16bit 符号付き
+ *   ・ファイル名 HEEeAAAa.* （EE=仰角[度], AAA=方位角[度]）、仰角ごとのフォルダに入る
+ *
+ *   配布物によって入れ物が違うので両方に対応する:
+ *     .wav … 標準 WAV（PCM/2ch/44.1kHz/16bit）。**リトルエンディアン**。
+ *             実際に配布されている compact.zip はこちら（368 ファイル）。
+ *     .dat … hrtfdoc.txt が説明する生バイナリ。**ビッグエンディアン**
+ *             （"most significant byte stored in the low address"＝Motorola 68000）。
+ *   → RIFF ヘッダの有無で判別する。仕様書の記述だけを信じると取り違える。
+ *
+ *   compact は左右対称性を利用して方位角 0〜180 のみを収録している（半球）。
+ *   反対側は L/R を入れ替えて生成する（下の MirrorHalfSphere）。
  *
  * SOFA(HDF5) ではなく生バイナリなので、Python を介さず C# で完結する。
  *
@@ -34,9 +41,9 @@ namespace AcousticFlow.EditorTools
             public float[] l, r;
         }
 
-        // ファイル名 H-10e005a.dat → 仰角 -10 / 方位角 5
+        // ファイル名 H-10e005a.wav / .dat → 仰角 -10 / 方位角 5
         private static readonly Regex kName =
-            new Regex(@"^H(-?\d+)e(\d+)a\.dat$", RegexOptions.IgnoreCase);
+            new Regex(@"^H(-?\d+)e(\d+)a\.(wav|dat)$", RegexOptions.IgnoreCase);
 
         /// compact フォルダ（.dat を含む階層）を読み、targetRate にリサンプルして .afhr を書く。
         ///
@@ -48,16 +55,20 @@ namespace AcousticFlow.EditorTools
             log = "";
             if (!Directory.Exists(rootDir)) { log = $"フォルダが見つかりません: {rootDir}"; return false; }
 
-            var files = Directory.GetFiles(rootDir, "*.dat", SearchOption.AllDirectories);
-            if (files.Length == 0) { log = $".dat が1つもありません: {rootDir}"; return false; }
+            var files = new List<string>();
+            files.AddRange(Directory.GetFiles(rootDir, "*.wav", SearchOption.AllDirectories));
+            files.AddRange(Directory.GetFiles(rootDir, "*.dat", SearchOption.AllDirectories));
+            if (files.Count == 0) { log = $".wav/.dat が1つもありません: {rootDir}"; return false; }
 
-            var list = new List<Entry>(files.Length);
+            var list = new List<Entry>(files.Count);
             int skipped = 0;
+            int srcRate = 0;
             foreach (var f in files)
             {
                 var m = kName.Match(Path.GetFileName(f));
                 if (!m.Success) { skipped++; continue; }
-                if (!ReadDat(f, out float[] l, out float[] r)) { skipped++; continue; }
+                if (!ReadHrir(f, out float[] l, out float[] r, out int rate)) { skipped++; continue; }
+                if (srcRate == 0) srcRate = rate;
                 list.Add(new Entry
                 {
                     el = int.Parse(m.Groups[1].Value),
@@ -66,6 +77,7 @@ namespace AcousticFlow.EditorTools
                     r = r,
                 });
             }
+            if (srcRate <= 0) srcRate = kKemarRate;
             if (list.Count == 0) { log = "読み込めた .dat がありません（ファイル名の規則が違う可能性）"; return false; }
             sb.AppendLine($"読み込み: {list.Count} 方向（スキップ {skipped}）");
 
@@ -96,16 +108,19 @@ namespace AcousticFlow.EditorTools
             // ── リサンプル ──
             float[][][] hrir = new float[list.Count][][];
             int outLen = kIrLen;
-            if (targetRate != kKemarRate)
+            bool needResample = targetRate != srcRate;
+            if (needResample)
             {
-                outLen = Mathf.Max(8, Mathf.RoundToInt(kIrLen * (float)targetRate / kKemarRate));
-                sb.AppendLine($"リサンプル: {kKemarRate} → {targetRate} Hz（{kIrLen} → {outLen} タップ）");
+                outLen = Mathf.Max(8, Mathf.RoundToInt(kIrLen * (float)targetRate / srcRate));
+                sb.AppendLine($"リサンプル: {srcRate} → {targetRate} Hz（{kIrLen} → {outLen} タップ）");
             }
+            else sb.AppendLine($"SR {srcRate} Hz（出力と一致、リサンプル不要）");
+
             for (int i = 0; i < list.Count; i++)
             {
                 hrir[i] = new float[2][];
-                hrir[i][0] = (targetRate == kKemarRate) ? list[i].l : Resample(list[i].l, kKemarRate, targetRate, outLen);
-                hrir[i][1] = (targetRate == kKemarRate) ? list[i].r : Resample(list[i].r, kKemarRate, targetRate, outLen);
+                hrir[i][0] = needResample ? Resample(list[i].l, srcRate, targetRate, outLen) : list[i].l;
+                hrir[i][1] = needResample ? Resample(list[i].r, srcRate, targetRate, outLen) : list[i].r;
             }
 
             // ── 正規化（全体のピークを 1 に）──
@@ -128,31 +143,87 @@ namespace AcousticFlow.EditorTools
             return ok;
         }
 
-        // 16bit BE ステレオインターリーブ 128点を読む。
-        private static bool ReadDat(string path, out float[] l, out float[] r)
+        // ステレオインターリーブ 16bit を読む。WAV(LE) と 生バイナリ(BE) の両方に対応。
+        //   判別は RIFF ヘッダの有無で行う。バイト順を取り違えると波形が完全に壊れるので、
+        //   仕様書の記述ではなく実ファイルの中身で決める。
+        private static bool ReadHrir(string path, out float[] l, out float[] r, out int sampleRate)
         {
-            l = null; r = null;
+            l = null; r = null; sampleRate = 0;
             try
             {
                 byte[] raw = File.ReadAllBytes(path);
-                int need = kIrLen * 2 * 2;   // 128点 × 2ch × 2byte
-                if (raw.Length < need) return false;
+                int dataOff, dataLen;
+                bool bigEndian;
+
+                if (raw.Length >= 12 && raw[0] == 'R' && raw[1] == 'I' && raw[2] == 'F' && raw[3] == 'F' &&
+                    raw[8] == 'W' && raw[9] == 'A' && raw[10] == 'V' && raw[11] == 'E')
+                {
+                    if (!ParseWav(raw, out dataOff, out dataLen, out sampleRate, out int ch, out int bits))
+                        return false;
+                    if (ch != 2 || bits != 16) return false;   // 想定外の構成は弾く
+                    bigEndian = false;                          // WAV は必ずリトルエンディアン
+                }
+                else
+                {
+                    dataOff = 0;
+                    dataLen = raw.Length;
+                    sampleRate = kKemarRate;                    // 生バイナリは仕様上 44.1kHz
+                    bigEndian = true;                           // Motorola 68000 形式
+                }
+
+                int frames = Mathf.Min(kIrLen, dataLen / 4);    // 4byte = 2ch × 16bit
+                if (frames <= 0) return false;
+
                 l = new float[kIrLen];
                 r = new float[kIrLen];
                 const float inv = 1f / 32768f;
-                for (int k = 0; k < kIrLen; k++)
+                for (int k = 0; k < frames; k++)
                 {
-                    int o = k * 4;
-                    l[k] = BE16(raw, o) * inv;
-                    r[k] = BE16(raw, o + 2) * inv;
+                    int o = dataOff + k * 4;
+                    l[k] = Read16(raw, o, bigEndian) * inv;
+                    r[k] = Read16(raw, o + 2, bigEndian) * inv;
                 }
                 return true;
             }
             catch { return false; }
         }
 
-        // ビッグエンディアン 16bit 符号付き。
-        private static short BE16(byte[] b, int off) => (short)((b[off] << 8) | b[off + 1]);
+        // WAV のチャンクを走査して fmt と data を取る（ヘッダ長は 44 とは限らない）。
+        private static bool ParseWav(byte[] b, out int dataOff, out int dataLen,
+                                     out int rate, out int channels, out int bits)
+        {
+            dataOff = 0; dataLen = 0; rate = 0; channels = 0; bits = 0;
+            int p = 12;   // "RIFF" + size + "WAVE"
+            bool haveFmt = false, haveData = false;
+            while (p + 8 <= b.Length)
+            {
+                string id = System.Text.Encoding.ASCII.GetString(b, p, 4);
+                int size = BitConverter.ToInt32(b, p + 4);
+                int body = p + 8;
+                if (size < 0 || body + size > b.Length) size = b.Length - body;
+
+                if (id == "fmt " && size >= 16)
+                {
+                    channels = BitConverter.ToUInt16(b, body + 2);
+                    rate = BitConverter.ToInt32(b, body + 4);
+                    bits = BitConverter.ToUInt16(b, body + 14);
+                    haveFmt = true;
+                }
+                else if (id == "data")
+                {
+                    dataOff = body;
+                    dataLen = size;
+                    haveData = true;
+                }
+                if (haveFmt && haveData) return true;
+                p = body + size + (size & 1);   // チャンクは偶数境界
+            }
+            return haveFmt && haveData;
+        }
+
+        private static short Read16(byte[] b, int off, bool bigEndian) =>
+            bigEndian ? (short)((b[off] << 8) | b[off + 1])
+                      : (short)((b[off + 1] << 8) | b[off]);
 
         // 立ち上がり位置（ピークの15%を最初に超えた位置）。
         private static int Onset(float[] h)
