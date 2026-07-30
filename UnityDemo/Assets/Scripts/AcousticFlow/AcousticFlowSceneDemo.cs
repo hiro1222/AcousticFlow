@@ -288,6 +288,9 @@ namespace AcousticFlow
             public static float[] TapPanL;          // 段3a: タップの左右パン（等パワー）
             public static float[] TapPanR;
             public static char[] TapType;           // 'D'/'R'/'F'
+            // 直接音の到来方向（リスナー座標系: +x=右, +y=上, +z=前）。HRTF の方向選択に使う。
+            // 遮蔽時は回折で回り込む方向になるので、単純な音源方向ではなく実測の到来方向を渡す。
+            public static Vector3 DirectDirLocal = Vector3.forward;
             // 後期残響尾（ハイブリッド）用：エコグラム由来のRT60/wet
             // 実測された尾のIR生成用。EchogramBands[k*6 + b] = 時間ビンk・帯域b のエネルギー。
             // 古いDLL（帯域別エクスポート無し）では null。
@@ -1141,6 +1144,18 @@ namespace AcousticFlow
             Status.RtSeconds = _reverbDecay;
             Status.Wet = _reverbWet;
             Status.SourceLevel = Mean6(_bands, 0);   // 主音源の直線透過(遮蔽)＝残響を遮蔽で絞る用
+
+            // HRTF 用：主音源の到来方向をリスナー座標系へ。
+            //   ワールドの音源方向ではなく実測の到来方向（_apparentDir）を使う。
+            //   遮蔽時は回折で回り込む方向になるので、その方が定位として正しい。
+            if (listener != null && _apparentDir != null && _apparentDir.Length > 0)
+            {
+                Vector3 w = _apparentDir[0];
+                if (w.sqrMagnitude < 1e-8f && _srcPos != null && _srcPos.Length > 0)
+                    w = _srcPos[0] - listener.position;
+                if (w.sqrMagnitude > 1e-8f)
+                    Status.DirectDirLocal = listener.InverseTransformDirection(w.normalized);
+            }
         }
 
         // #2: 主音源(0)の全経路を「タップ」に束ねる（直接/反射/回折）。IRの生材料＝時間軸。

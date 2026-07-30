@@ -66,6 +66,20 @@ namespace AcousticFlow
                  + "散乱スメア(enableScatter)が効いていれば櫛が立たないので、1.0 に近づけられる。")]
         [Range(0f, 1f)] public float reflectionLevel = 0.35f;
 
+        [Header("HRTF（バイノーラル）")]
+        [Tooltip("ON: 直接音を HRTF で両耳化する。OFF: 従来の左右パン。\n"
+                 + "早期反射と後期尾には適用しない。反射は先行音効果でほとんど定位に寄与せず、"
+                 + "尾は拡散音場なので方向を持たないため（コストの割に効果がない）。")]
+        public bool enableHrtf = true;
+        [Tooltip("聴取者の頭囲(cm)。ITD(両耳間時間差)はこれにほぼ比例する。\n"
+                 + "データセットの測定者と頭のサイズが違うと音像が頭内に入ったり幅が不自然になる。"
+                 + "個人最適化で最も効果が大きいので、まずここを自分の頭に合わせる。\n"
+                 + "成人平均は 55〜58cm 程度。")]
+        [Range(48f, 64f)] public float headCircumferenceCm = 57f;
+        [Tooltip("HRTF データ(.afhr)の StreamingAssets からの相対パス。空 or 見つからない場合は"
+                 + "球体頭モデルの合成HRTFを使う（実データが無くても動作を確認できる）。")]
+        public string hrtfFileName = "";
+
         [Header("反射の散乱スメア")]
         [Tooltip("ON: 反射タップを『鏡面デルタ + 拡散バースト』に分ける。"
                  + "粗い面の反射は時間方向にも滲むので、デルタのままだと持続音に櫛(コムフィルタ)が立つ。")]
@@ -206,6 +220,11 @@ namespace AcousticFlow
         private float[][] _tailOut;                 // 畳み込み出力 [ch][frames]
         private int _tailScratchFrames;
 
+        // HRTF（直接音のバイノーラル化）。
+        private HrtfProcessor _hrtf;
+        private HrtfSet _hrtfSet;
+        private float _hrtfDirTimer;
+
         // Awake が終わるまで audio thread を走らせないためのフラグ。
         //   OnAudioFilterRead は audio thread から呼ばれるので、Awake より先に来ることがある
         //   （AudioSource の playOnAwake がシーン側で有効なら特に）。バッファ確保前に触ると
@@ -286,6 +305,14 @@ namespace AcousticFlow
             _tailConv = new PartitionedConvolver(blk, parts, 2);
             _tailIr = new ReverbTailIr(_sampleRate, _tailConv.TailSamples, 2);
 
+            // HRTF：実データがあれば読み、無ければ合成HRTFで動かす。
+            //   実データを待たずにパイプライン全体を検証できるようにするための土台。
+            _hrtfSet = LoadHrtfSet();
+            _hrtf = new HrtfProcessor(_sampleRate);
+            _hrtf.SetHrtfSet(_hrtfSet);
+            Debug.Log($"[IrConvolver] HRTF: {_hrtfSet?.Name ?? "なし"} "
+                      + $"({_hrtfSet?.DirectionCount ?? 0} 方向 / IR {_hrtfSet?.IrLength ?? 0} タップ)");
+
             // ここまでで audio thread が触る配列は全て確保済み。以降 OnAudioFilterRead を通す。
             _ready = true;
 
@@ -296,6 +323,29 @@ namespace AcousticFlow
             _src.spatialBlend = 0f;   // 2D（空間化はIR側）
             _src.playOnAwake = false;
             _src.Play();
+        }
+
+        // HRTF データセットを用意する。StreamingAssets に .afhr があればそれを、
+        // 無ければ球体頭モデルの合成HRTFを返す（常に非 null）。
+        private HrtfSet LoadHrtfSet()
+        {
+            if (!string.IsNullOrEmpty(hrtfFileName))
+            {
+                string path = System.IO.Path.Combine(Application.streamingAssetsPath, hrtfFileName);
+                if (System.IO.File.Exists(path))
+                {
+                    var loaded = HrtfSet.LoadFromFile(path);
+                    if (loaded != null && loaded.IsValid)
+                    {
+                        if (loaded.SampleRate != _sampleRate)
+                            Debug.LogWarning($"[IrConvolver] HRTF の SR({loaded.SampleRate}Hz)が出力({_sampleRate}Hz)と違います。"
+                                             + "定位がずれるので、同じSRに変換したデータを使ってください。");
+                        return loaded;
+                    }
+                }
+                else Debug.LogWarning($"[IrConvolver] HRTF が見つかりません: {path}（合成HRTFで代用）");
+            }
+            return HrtfSet.CreateSynthetic(_sampleRate);
         }
 
         // ms 配列から allpass の遅延バッファ一式を確保する。
@@ -327,6 +377,14 @@ namespace AcousticFlow
 
         private void Update()
         {
+            // HRTF の方向は IR より速く追従させる（頭を振ったときの遅れが目立つため）。
+            _hrtfDirTimer += Time.deltaTime;
+            if (_hrtf != null && _hrtfDirTimer >= 0.02f)
+            {
+                _hrtfDirTimer = 0f;
+                _hrtf.SetDirection(AcousticFlowSceneDemo.Status.DirectDirLocal, headCircumferenceCm);
+            }
+
             _irTimer += Time.deltaTime;
             if (_irTimer >= irUpdateSec)
             {
@@ -489,6 +547,10 @@ namespace AcousticFlow
 
             EnsureTailScratch(frames);
 
+            // HRTF はブロック境界で HRIR を取り込む（方向変化のクロスフェード開始）。
+            bool hrtfActive = enableHrtf && _hrtf != null && _hrtf.IsReady;
+            if (hrtfActive) _hrtf.BeginBlock();
+
             // スコープ用の集計（このブロック分の二乗和）。
             float sumDirect = 0f, sumEarly = 0f, sumScatter = 0f, sumTail = 0f, sumOut = 0f;
             int scopeBase = Scope.WritePos;
@@ -553,21 +615,30 @@ namespace AcousticFlow
 
                 // 早期反射の畳み込み（クロスフェード）。
                 ConvOne(_ir, _writePos, out float aL, out float aR, out float aD,
-                        out float aDirL, out float aDirR);
-                float outL, outR, scatSend, dirL, dirR;
+                        out float aDirL, out float aDirR, out float aDirMono, hrtfActive);
+                float outL, outR, scatSend, dirL, dirR, directMono;
                 if (_fading)
                 {
                     ConvOne(_irNext, _writePos, out float bL, out float bR, out float bD,
-                            out float bDirL, out float bDirR);
+                            out float bDirL, out float bDirR, out float bDirMono, hrtfActive);
                     float t = (float)_xfadePos / _xfadeLen;
                     outL = aL * (1f - t) + bL * t;
                     outR = aR * (1f - t) + bR * t;
                     scatSend = aD * (1f - t) + bD * t;
                     dirL = aDirL * (1f - t) + bDirL * t;
                     dirR = aDirR * (1f - t) + bDirR * t;
+                    directMono = aDirMono * (1f - t) + bDirMono * t;
                     if (++_xfadePos >= _xfadeLen) { _fading = false; _ir = _irNext; }
                 }
-                else { outL = aL; outR = aR; scatSend = aD; dirL = aDirL; dirR = aDirR; }
+                else { outL = aL; outR = aR; scatSend = aD; dirL = aDirL; dirR = aDirR; directMono = aDirMono; }
+
+                // 直接音を HRTF で両耳化して足す（パンの代わり）。
+                if (hrtfActive)
+                {
+                    _hrtf.ProcessSample(directMono, out float hl, out float hr);
+                    outL += hl; outR += hr;
+                    dirL = hl; dirR = hr;   // 計測（段別RMS）は両耳化後の値で見る
+                }
 
                 // 計測：直接音と、早期反射の鏡面成分（直接音を除く。散乱・尾を足す前）。
                 sumDirect += (dirL * dirL + dirR * dirR) * 0.5f;
@@ -677,10 +748,10 @@ namespace AcousticFlow
         // dirL/dirR は「タップ0（直接音）だけの寄与」。L/R には含まれたまま返す。
         // 計測で 直接音 と 早期反射 を分けるために使う（混ざっていると内訳が読めない）。
         private void ConvOne(ConvTap[] ir, int wp, out float L, out float R, out float diffuse,
-                             out float dirL, out float dirR)
+                             out float dirL, out float dirR, out float directMono, bool hrtfActive)
         {
             float l = 0f, r = 0f, d = 0f;
-            dirL = 0f; dirR = 0f;
+            dirL = 0f; dirR = 0f; directMono = 0f;
             if (ir != null)
             {
                 float[] r0 = _ring[0], r1 = _ring[1], r2 = _ring[2];
@@ -692,8 +763,11 @@ namespace AcousticFlow
                              + ir[k].g3 * r3[rp] + ir[k].g4 * r4[rp] + ir[k].g5 * r5[rp];
                     d += tv * ir[k].gDiff;
                     float sp = tv * ir[k].gSpec;
+                    // タップ0は必ず直接音（RebuildIr の並び順）。
+                    // HRTF が有効なら、ここではパンせず「モノラルのまま」返して呼び出し側で両耳化する。
+                    if (k == 0) { directMono = sp; if (hrtfActive) continue; }
                     float cl = sp * ir[k].panL, cr = sp * ir[k].panR;
-                    if (k == 0) { dirL = cl; dirR = cr; }   // タップ0は必ず直接音（RebuildIr の並び順）
+                    if (k == 0) { dirL = cl; dirR = cr; }
                     l += cl; r += cr;
                 }
             }
