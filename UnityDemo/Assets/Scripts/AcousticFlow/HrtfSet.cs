@@ -173,6 +173,40 @@ namespace AcousticFlow
             return new Vector3(Mathf.Sin(a) * ce, Mathf.Sin(e), Mathf.Cos(a) * ce);
         }
 
+        /// 展開済みの配列から構築する（インポータ用）。
+        ///   hrir[dir][ear][sample]。ITD は読み込みと同様に分離して保持する。
+        public static HrtfSet CreateFromArrays(string name, int sampleRate, int irLength,
+                                               float[] az, float[] el, float[][][] hrir)
+        {
+            if (az == null || el == null || hrir == null) return null;
+            int n = Mathf.Min(az.Length, Mathf.Min(el.Length, hrir.Length));
+            if (n <= 0 || irLength <= 0) return null;
+
+            var set = new HrtfSet
+            {
+                Name = name,
+                SampleRate = sampleRate,
+                IrLength = irLength,
+                _az = new float[n],
+                _el = new float[n],
+                _hrir = new float[n][][],
+                _itdSec = new float[n],
+            };
+            for (int i = 0; i < n; i++)
+            {
+                set._az[i] = az[i];
+                set._el[i] = el[i];
+                var l = hrir[i][0];
+                var r = hrir[i][1];
+                // 実測 HRIR は ITD が波形に焼き込まれているので、ここで分離する
+                // （個人の頭囲でスケールし直せるようにするため。冒頭コメント参照）。
+                set._itdSec[i] = ExtractItdAndAlign(l, r, sampleRate);
+                set._hrir[i] = new[] { l, r };
+            }
+            set.PrepareLookup();
+            return set;
+        }
+
         // ── 合成HRTF（球体頭モデル）──
         // 実測データが無い環境でもパイプライン全体を動かすためのフォールバック。
         //   ITD: Woodworth の球体近似  ITD = (r/c)(θ + sinθ)
@@ -274,6 +308,14 @@ namespace AcousticFlow
                 if (dot > bestDot) { bestDot = dot; best = i; }
             }
             return best;
+        }
+
+        /// 測定点の方位角/仰角（度）を得る。
+        public void GetAngles(int index, out float azDeg, out float elDeg)
+        {
+            if (!IsValid || index < 0 || index >= DirectionCount) { azDeg = 0f; elDeg = 0f; return; }
+            azDeg = _az[index];
+            elDeg = _el[index];
         }
 
         public float[] GetHrir(int index, int ear)

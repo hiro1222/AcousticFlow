@@ -28,7 +28,36 @@ namespace AcousticFlow.EditorTools
         }
 
         private string _inspectPath = "";
+        private string _kemarDir = "";
         private string _report = "";
+
+        private void ImportKemar()
+        {
+            int sr = AudioSettings.outputSampleRate;
+            if (sr <= 0) sr = 48000;
+
+            string dir = Application.streamingAssetsPath;
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            string path = Path.Combine(dir, "kemar.afhr");
+
+            if (!KemarImporter.ImportToFile(_kemarDir, sr, path, out string importLog))
+            {
+                _report = "取り込み失敗:\n" + importLog;
+                return;
+            }
+            AssetDatabase.Refresh();
+
+            // 書いたものを読み直して点検まで通す（変換の妥当性をその場で確認する）。
+            _inspectPath = path;
+            var check = HrtfSet.LoadFromFile(path);
+            string verdict = (check != null && check.IsValid)
+                ? $"読み直し OK: {check.DirectionCount} 方向 / IR {check.IrLength} タップ / {check.SampleRate}Hz"
+                : "⚠ 読み直しに失敗しました。";
+
+            _report = importLog + "\n" + verdict + "\n\n" +
+                      "IrConvolver の Hrtf File Name に \"kemar.afhr\" を入れて Play してください。\n" +
+                      "下の「読み込んで点検」で ITD 範囲と左右の符号も確認できます。";
+        }
 
         private void OnGUI()
         {
@@ -41,6 +70,26 @@ namespace AcousticFlow.EditorTools
 
             if (GUILayout.Button("StreamingAssets へ synthetic.afhr を書き出す"))
                 ExportSynthetic();
+
+            EditorGUILayout.Space(12);
+            EditorGUILayout.LabelField("MIT KEMAR の取り込み", EditorStyles.boldLabel);
+            EditorGUILayout.HelpBox(
+                "compact.zip を展開したフォルダ（.dat を含む）を指定します。\n" +
+                "https://sound.media.mit.edu/resources/KEMAR/compact.zip\n" +
+                "※ページ内のリンクは http なのでブラウザにブロックされることがあります。https で直接開いてください。\n\n" +
+                "ライセンス: 著者クレジットを明記すれば自由に利用・再配布できます。\n" +
+                "  Bill Gardner and Keith Martin, MIT Media Lab (1994)",
+                MessageType.Info);
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                _kemarDir = EditorGUILayout.TextField(_kemarDir);
+                if (GUILayout.Button("選択", GUILayout.Width(60)))
+                {
+                    string p = EditorUtility.OpenFolderPanel("KEMAR compact フォルダを選択", "", "");
+                    if (!string.IsNullOrEmpty(p)) _kemarDir = p;
+                }
+            }
+            if (GUILayout.Button("変換して StreamingAssets へ書き出す")) ImportKemar();
 
             EditorGUILayout.Space(12);
             EditorGUILayout.LabelField(".afhr の点検", EditorStyles.boldLabel);
@@ -73,7 +122,9 @@ namespace AcousticFlow.EditorTools
             if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
             string path = Path.Combine(dir, "synthetic.afhr");
 
-            if (!WriteAfhr(path, set))
+            // 合成HRTFは ITD を別に持つので、遅延として付け直してから書く。
+            // そのまま書くと読み直したとき ITD=0 になり定位が消える（AfhrWriter 冒頭参照）。
+            if (!AfhrWriter.WriteWithItd(path, set))
             {
                 _report = "書き出しに失敗しました。";
                 return;
@@ -98,67 +149,6 @@ namespace AcousticFlow.EditorTools
                       $"  SR     {set.SampleRate} → {reloaded.SampleRate}\n\n" +
                       "IrConvolver の Hrtf File Name に \"synthetic.afhr\" を入れると、\n" +
                       "内蔵の合成HRTFではなくこのファイル経由で読み込まれます。";
-        }
-
-        // HrtfSet と同じ形式で書く。※ITDは書き出し時点で HRIR から分離済みなので、
-        // 読み直すと ITD=0 になる（形式は生の HRIR を持つ前提のため）。
-        // ここは「読み込み経路の検証」が目的なので、方向数/IR長/SR の一致で判定する。
-        private static bool WriteAfhr(string path, HrtfSet set)
-        {
-            try
-            {
-                using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
-                using (var bw = new BinaryWriter(fs))
-                {
-                    bw.Write(0x52484641u);          // magic 'AFHR'
-                    bw.Write(1);                    // version
-                    bw.Write(set.SampleRate);
-                    bw.Write(set.DirectionCount);
-                    bw.Write(set.IrLength);
-
-                    for (int i = 0; i < set.DirectionCount; i++)
-                    {
-                        Vector3 v = DirOf(set, i);
-                        // ベクトル → (az, el) 度。az: 0=正面, +90=右。
-                        float az = Mathf.Atan2(v.x, v.z) * Mathf.Rad2Deg;
-                        float el = Mathf.Asin(Mathf.Clamp(v.y, -1f, 1f)) * Mathf.Rad2Deg;
-                        bw.Write(az);
-                        bw.Write(el);
-                    }
-                    for (int i = 0; i < set.DirectionCount; i++)
-                    {
-                        var l = set.GetHrir(i, 0);
-                        var r = set.GetHrir(i, 1);
-                        for (int k = 0; k < set.IrLength; k++) bw.Write(l != null && k < l.Length ? l[k] : 0f);
-                        for (int k = 0; k < set.IrLength; k++) bw.Write(r != null && k < r.Length ? r[k] : 0f);
-                    }
-                }
-                return true;
-            }
-            catch (System.Exception e)
-            {
-                Debug.LogError($"[HRTF Tools] 書き出し失敗: {e.Message}");
-                return false;
-            }
-        }
-
-        // 方向 index の単位ベクトルを得る（NearestIndex を使った逆引き）。
-        private static Vector3 DirOf(HrtfSet set, int index)
-        {
-            // HrtfSet は方向配列を公開していないので、走査で index に一致する向きを探す。
-            // 書き出しは頻繁に行わないので、この程度のコストは許容する。
-            const int kAz = 72, kEl = 20;
-            for (int e = 0; e <= kEl; e++)
-            {
-                float el = -40f + e * 5f;
-                for (int a = 0; a < kAz; a++)
-                {
-                    float az = a * 5f; if (az > 180f) az -= 360f;
-                    Vector3 v = HrtfSet.AngleToVector(az, el);
-                    if (set.NearestIndex(v) == index) return v;
-                }
-            }
-            return Vector3.forward;
         }
 
         private void Inspect()
