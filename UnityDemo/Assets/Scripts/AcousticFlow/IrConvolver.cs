@@ -79,6 +79,13 @@ namespace AcousticFlow
         [Tooltip("HRTF データ(.afhr)の StreamingAssets からの相対パス。空 or 見つからない場合は"
                  + "球体頭モデルの合成HRTFを使う（実データが無くても動作を確認できる）。")]
         public string hrtfFileName = "";
+        [Tooltip("HRTF を適用する下限周波数(Hz)。これより下は HRIR を通さず ITD だけ掛ける。\n"
+                 + "実測 HRIR は 128タップ(2.9ms)しかなく約350Hz以下を表現できないうえ、"
+                 + "測定スピーカーの低域ロールオフも含むため、そのまま畳み込むと低音が痩せる"
+                 + "（実測で直流利得は約-16dB）。\n"
+                 + "物理的にも低域は波長が頭より遥かに長く頭を回り込むので減衰せず、"
+                 + "定位手がかりは ITD だけ。よって低域はHRTFを通さないのが正しい。")]
+        [Range(100f, 2000f)] public float hrtfCrossoverHz = 700f;
 
         [Header("反射の散乱スメア")]
         [Tooltip("ON: 反射タップを『鏡面デルタ + 拡散バースト』に分ける。"
@@ -308,7 +315,7 @@ namespace AcousticFlow
             // HRTF：実データがあれば読み、無ければ合成HRTFで動かす。
             //   実データを待たずにパイプライン全体を検証できるようにするための土台。
             _hrtfSet = LoadHrtfSet();
-            _hrtf = new HrtfProcessor(_sampleRate);
+            _hrtf = new HrtfProcessor(_sampleRate, 12f, hrtfCrossoverHz);
             _hrtf.SetHrtfSet(_hrtfSet);
             Debug.Log($"[IrConvolver] HRTF: {_hrtfSet?.Name ?? "なし"} "
                       + $"({_hrtfSet?.DirectionCount ?? 0} 方向 / IR {_hrtfSet?.IrLength ?? 0} タップ)");
@@ -382,6 +389,7 @@ namespace AcousticFlow
             if (_hrtf != null && _hrtfDirTimer >= 0.02f)
             {
                 _hrtfDirTimer = 0f;
+                _hrtf.SetCrossover(hrtfCrossoverHz);   // Inspector で動かしたら追従させる
                 _hrtf.SetDirection(AcousticFlowSceneDemo.Status.DirectDirLocal, headCircumferenceCm);
             }
 
