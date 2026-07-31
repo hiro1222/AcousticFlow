@@ -457,6 +457,72 @@ void testUpdateRates() {
     AF_SceneDestroy(s);
 }
 
+// ---------------------------------------------------------------- 診断: 尾のスペクトル傾斜
+// 「狭い部屋で高音がこもる」の原因切り分け用。部屋サイズごとに
+//   ・尾の帯域別エネルギー（低域基準の相対値）
+//   ・直接音に対する尾の比
+// を出す。合否判定ではなく観測が目的なので、明らかな異常だけを check する。
+void diagnoseTailSpectrum() {
+    std::printf("\n[診断] 部屋サイズ別の尾のスペクトル傾斜\n");
+    constexpr int kBins = 100;
+    constexpr float kBinSec = 0.01f;
+
+    struct Room { const char* name; float w, h, d; };
+    const Room rooms[] = {
+        { "小   4x3x2.5", 4.0f, 2.5f, 3.0f },
+        { "中  10x8x4",  10.0f, 4.0f, 8.0f },
+        { "大  30x24x12", 30.0f, 12.0f, 24.0f },
+    };
+
+    std::printf("      部屋            125Hz  250Hz  500Hz   1kHz   2kHz   4kHz   (低域=0dB)\n");
+    for (const Room& rm : rooms) {
+        AF_SceneHandle s = AF_SceneCreate();
+        // コンクリ相当（テストシーンと同じ材質）を明示的に作る。
+        const float t[kBands] = { 0.05f, 0.03f, 0.015f, 0.008f, 0.004f, 0.002f };
+        const float a[kBands] = { 0.02f, 0.02f, 0.03f,  0.04f,  0.05f,  0.07f };
+        const float sc[kBands] = { 0.05f, 0.08f, 0.12f, 0.18f, 0.25f, 0.35f };
+        const int mat = AF_SceneAddMaterial(s, t, a, sc, kBands);
+        buildRoom(s, rm.w, rm.h, rm.d, 0.4f, mat);
+
+        const AF_Vector3 L = V(0, 1.6f, -1);
+        const AF_Vector3 src[1] = { V(0, 1.6f, 1) };
+        std::vector<float> bands(kBins * kBands, 0.0f);
+        AF_SceneComputeEchogramBands(s, L, src, 1, bands.data(), kBins, kBinSec, 343.0f, 512, 24, 4.0f);
+
+        // 直接音ビン（先頭付近の最大）と、それ以降（尾）を帯域ごとに集計する。
+        float direct[kBands] = {}, tail[kBands] = {};
+        int directBin = 0;
+        float peak = 0.0f;
+        for (int k = 0; k < kBins; ++k) {
+            float e = 0.0f;
+            for (int b = 0; b < kBands; ++b) e += bands[static_cast<size_t>(k) * kBands + b];
+            if (e > peak) { peak = e; directBin = k; }
+        }
+        for (int b = 0; b < kBands; ++b) direct[b] = bands[static_cast<size_t>(directBin) * kBands + b];
+        for (int k = directBin + 1; k < kBins; ++k)
+            for (int b = 0; b < kBands; ++b) tail[b] += bands[static_cast<size_t>(k) * kBands + b];
+
+        // 低域を 0dB とした相対値で傾斜を見る。
+        std::printf("      %-14s", rm.name);
+        const float ref = std::max(tail[0], 1e-20f);
+        for (int b = 0; b < kBands; ++b) {
+            const float db = 10.0f * std::log10(std::max(tail[b], 1e-20f) / ref);
+            std::printf("%6.1f ", db);
+        }
+        float dsum = 0.0f, tsum = 0.0f;
+        for (int b = 0; b < kBands; ++b) { dsum += direct[b]; tsum += tail[b]; }
+        std::printf("  尾/直接=%.2f\n", (dsum > 1e-20f) ? tsum / dsum : 0.0f);
+
+        // 尾の高域が低域より 20dB 以上落ちていたら、こもりの原因として疑わしい。
+        const float tilt = 10.0f * std::log10(std::max(tail[5], 1e-20f) / ref);
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "(%s: 4kHz が %.1f dB)", rm.name, tilt);
+        check("尾の高域が極端に落ちていない(>-20dB)", tilt > -20.0f, buf);
+
+        AF_SceneDestroy(s);
+    }
+}
+
 // ---------------------------------------------------------------- 頑健性
 // 不正入力で落ちない（移行中に呼び出し規約を変えるので、境界は明示的に守る）。
 void testRobustness() {
@@ -491,6 +557,7 @@ int main() {
     testEchogram();
     testBatchUpdate();
     testUpdateRates();
+    diagnoseTailSpectrum();
     testRobustness();
 
     std::printf("\n----\n");
