@@ -144,14 +144,19 @@ namespace AcousticFlow.EditorTools
             demo.distanceRef = 4f;   // 全シーン統一：距離減衰ゆるめ（直接音を前に）
         }
 
-        // IR畳み込みのテスト機。全シーン統一：TokyoGeto.wav を畳み込み・tailLevel=0.3。
-        //   Play→M で Wwise 楽曲をミュートして、畳み込み音だけ聴く。
+        // IR畳み込みのテスト機。
+        //   音源は足音（過渡音）。持続音の楽曲より、早期反射のパターンや HRTF による
+        //   定位が聞き取りやすい（DEV_LOG E-3「テスト信号を目的で使い分ける」）。
+        //   楽曲で確かめたいとき（コムフィルタ・粒感）は TokyoGeto.wav に差し替える。
+        private const string kTestClipPath = "Assets/Audio/Footstep_Asphalt.mp3";
+
         private static void AddConvolver(Vector3 pos)
         {
             var go = new GameObject("IrConvolverTest");
             go.transform.position = pos;   // スピーカ(音源)と同じ位置に置く
             var src = go.AddComponent<AudioSource>();
-            var clip = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Audio/TokyoGeto.wav");
+            var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(kTestClipPath);
+            if (clip == null) clip = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Audio/TokyoGeto.wav");
             if (clip != null) src.clip = clip;
 
             var conv = go.AddComponent<IrConvolver>();
