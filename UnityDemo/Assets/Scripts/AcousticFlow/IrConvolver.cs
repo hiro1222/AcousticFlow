@@ -52,6 +52,18 @@ namespace AcousticFlow
         public bool testContinuousNoise = false;
         [Tooltip("テストクリックの間隔(秒)。")]
         public float clickIntervalSec = 0.6f;
+
+                [Header("検証用の音源")]
+        [Tooltip("畳み込む音源。ここに差し替えると再生中でも即座に切り替わる。\n"
+                 + "音源の性質で見えるものが変わる（DEV_LOG E-3）:\n"
+                 + "  過渡音(足音・クリック) … 反射パターン・定位・HRTF\n"
+                 + "  持続音(音楽・ノイズ)   … コムフィルタ・こもり・粒感\n"
+                 + "空なら AudioSource に元から入っているクリップを使う。\n"
+                 + "内蔵のクリック/ノイズを使うときは Generate Test Signal を ON。")]
+        public AudioClip testClip;
+        [Tooltip("差し替えたとき先頭から鳴らし直す。OFF なら再生位置を保つ。")]
+        public bool restartOnSwitch = true;
+        
         [Tooltip("早期反射IRの最大長(ms)＝方向つき早期タップを保持できる上限。"
                  + "広い部屋は最初の反射が遅く届く（壁が遠い）ので、ここが短いと早期反射が"
                  + "丸ごと尾に落ちて消える。mixing time(√V) がここまで伸びられる。")]
@@ -97,20 +109,39 @@ namespace AcousticFlow
         [Range(0f, 1f)] public float scatterAmount = 0.5f;
         [Tooltip("拡散バーストの撹拌の強さ(allpass係数)。0=滲まない / 0.5〜0.7が定番。")]
         [Range(0f, 0.8f)] public float scatterDiffusion = 0.62f;
-
+        [Tooltip("遅く届くタップほど散乱率を上げる度合い。0=一律(従来) / 1=mixing timeで完全拡散。\n"
+                 + "反射は1回バウンスするごとに散乱が加わるので、高次反射ほど鏡面成分が減る。\n"
+                 + "狭い部屋では反射が2〜7msに密集し、少数の離散タップだとコムフィルタが立って"
+                 + "『箱っぽく高い』音になる（間隔2msなら500Hz/1kHz/1.5kHzにピーク）。"
+                 + "遅いタップを拡散へ寄せると櫛が崩れて自然になる。")]
+        [Range(0f, 1f)] public float scatterTimeGrowth = 1f;
+        
         [Header("後期残響尾")]
         [Tooltip("後期尾の作り方。Measured=実測エコグラムをそのままIRにして畳み込む（本命）。"
                  + "Fdn=RT60スカラから合成する従来方式（比較用）。Off=尾なし。")]
         public TailMode tailMode = TailMode.Measured;
         [Tooltip("実測尾の長さ(秒)。エコグラム窓(ビン数×ビン長)を超える分は無音になる。")]
         [Range(0.2f, 3f)] public float measuredTailSec = 1.0f;
-        [Tooltip("実測尾の畳み込みブロック長(サンプル)。大きいほど軽いが、"
-                 + "尾の最早開始(minSplitMs)より長い遅延になると尾が遅れて聞こえる。")]
+        [Tooltip("ON: 非一様分割で畳み込む（既定）。遅延が最小ブロックだけで決まるので、"
+                 + "狭い部屋(mixing time が数ms)でも境目を後ろへずらさずに済む。\n"
+                 + "OFF: 従来の一様分割（比較用）。ブロック長ぶん遅れるので minSplitMs に下限が要る。")]
+        public bool useNonUniformPartition = true;
+        [Tooltip("非一様分割の最小ブロック(サンプル)。これが全体の遅延になる。\n"
+                 + "64 = 48kHz で 1.3ms。小さいほど低遅延だが段数が増えてわずかに重い。")]
+        public int nonUniformFirstBlock = 64;
+        [Tooltip("一様分割のときのブロック長(サンプル)。大きいほど軽いが、"
+                 + "尾の最早開始(minSplitMs)より長い遅延になると尾が遅れて聞こえる。"
+                 + "useNonUniformPartition=OFF のときだけ使う。")]
         public int measuredBlockSize = 2048;
         // 早期↔後期の境目は Status.MixingTimeMs(≈√V) を使い、下は minSplitMs・上は maxIrMs で挟む。
-        [Tooltip("境目の下限(ms)。畳み込みのブロック遅延をここに隠すので、"
-                 + "小さくするほどブロックが小さくなり負荷が上がる。")]
-        [Range(10f, 120f)] public float minSplitMs = 25f;
+        [Tooltip("早期↔後期の境目の下限(ms)。畳み込みの遅延をここに隠す。\n"
+                 + "非一様分割なら遅延は最小ブロック(既定64サンプル=1.3ms)だけなので、"
+                 + "3ms 程度まで下げられる＝ほぼ全ての部屋で真の mixing time(√V) が使える。\n"
+                 + "一様分割(useNonUniformPartition=OFF)では 25ms 以上が必要。"
+                 + "その場合 625m³(約8.5m立方)未満の部屋は境目が後ろへずれ、"
+                 + "本来拡散として扱うべき反射を少数の離散タップで表現することになる"
+                 + "（コムフィルタ＝箱っぽく高い音の原因）。")]
+        [Range(2f, 120f)] public float minSplitMs = 3f;
         [Tooltip("尾の包絡の平滑幅(ms)。0=平滑なし。"
                  + "レイが有限本数なのでエコグラムには平均自由行程ごとの塊が残り、"
                  + "そのままだと『なめらかな尾』でなく『山彦』に聞こえる。減衰カーブ自体は保たれる。")]
@@ -218,7 +249,9 @@ namespace AcousticFlow
         private int[] _scatLenL, _scatLenR, _scatPosL, _scatPosR;
 
         // 実測エコグラム由来の後期尾（partitioned convolution）
-        private PartitionedConvolver _tailConv;
+        private PartitionedConvolver _tailConv;      // 一様分割（比較用）
+        private NonUniformConvolver _tailConvNU;     // 非一様分割（既定）
+        private int _tailSamples;                    // 尾IRの長さ（どちらの方式でも共通）
         private ReverbTailIr _tailIr;
         private int _tailEchoVersion = -1;          // 最後に取り込んだエコグラムの版
         private volatile float _tailGain;           // D/R比から決めた尾の絶対ゲイン
@@ -231,6 +264,35 @@ namespace AcousticFlow
         private HrtfProcessor _hrtf;
         private HrtfSet _hrtfSet;
         private float _hrtfDirTimer;
+
+                // Inspector で testClip が差し替えられたら適用する。
+        private AudioClip _appliedClip;
+
+        /// 現在鳴らしている音源の名前（表示・ログ用）。
+        public static volatile string CurrentClipName = "-";
+
+        // testClip の変化を見て AudioSource へ反映する（Update から毎フレーム呼ばれる）。
+        private void SyncTestClip()
+        {
+            if (_src == null) return;
+
+            // 未指定なら AudioSource に元から入っているものを尊重する。
+            AudioClip want = (testClip != null) ? testClip : _src.clip;
+            if (want == _appliedClip) return;
+            _appliedClip = want;
+            if (want == null) return;
+
+            int keep = restartOnSwitch ? 0 : _src.timeSamples;
+            _src.Stop();
+            _src.clip = want;
+            // 切り替え先が短いと元の再生位置が範囲外になるので丸める。
+            _src.timeSamples = (want.samples > 0) ? Mathf.Clamp(keep, 0, want.samples - 1) : 0;
+            _src.Play();
+
+            CurrentClipName = want.name;
+            Debug.Log($"[IrConvolver] 音源: {want.name} "
+                      + $"({want.frequency}Hz / {want.channels}ch / {want.length:F2}s)");
+        }
 
         // Awake が終わるまで audio thread を走らせないためのフラグ。
         //   OnAudioFilterRead は audio thread から呼ばれるので、Awake より先に来ることがある
@@ -297,20 +359,37 @@ namespace AcousticFlow
             AllocAllpass(scatMsL, out _scatBufL, out _scatLenL, out _scatPosL);
             AllocAllpass(scatMsR, out _scatBufR, out _scatLenR, out _scatPosR);
 
-            // 実測尾：ブロック長は「尾の立ち上がりより短い」ことが条件（固有遅延を尾の中に隠す）。
+            // 実測尾の畳み込み器を用意する。
+            //   畳み込みは構造上ブロックぶん遅れ、その遅延は「尾の開始時刻(mixing time)」の
+            //   中に隠す必要がある。一様分割だと B < mixing time の制約が全ブロックに掛かるため、
+            //   狭い部屋(√V が数ms)では B を極端に小さくするしかなく現実的でなかった。
+            //   非一様分割なら遅延を決めるのは最小ブロックだけなので、その制約が外れる。
             int tailLen = Mathf.CeilToInt(measuredTailSec * _sampleRate);
-            int blk = Mathf.NextPowerOfTwo(Mathf.Max(64, measuredBlockSize));
-            // 遅延を隠せるのは「尾が最も早く始まるとき」＝ minSplitMs まで。
-            int maxBlk = Mathf.NextPowerOfTwo(Mathf.Max(64, Mathf.FloorToInt(minSplitMs * 0.001f * _sampleRate))) / 2;
-            if (blk > maxBlk)
+            if (useNonUniformPartition)
             {
-                Debug.LogWarning($"[IrConvolver] measuredBlockSize={blk} は尾の最早開始({minSplitMs}ms)より" +
-                                 $"長い遅延になるため {maxBlk} に下げました。");
-                blk = Mathf.Max(64, maxBlk);
+                _tailConvNU = new NonUniformConvolver(tailLen, 2, nonUniformFirstBlock);
+                _tailSamples = tailLen;
+                Debug.Log($"[IrConvolver] 尾の畳み込み(非一様): {_tailConvNU.DescribeSchedule()} "
+                          + $"= {_tailConvNU.Latency * 1000f / _sampleRate:F2}ms");
             }
-            int parts = Mathf.Max(1, Mathf.CeilToInt((float)tailLen / blk));
-            _tailConv = new PartitionedConvolver(blk, parts, 2);
-            _tailIr = new ReverbTailIr(_sampleRate, _tailConv.TailSamples, 2);
+            else
+            {
+                int blk = Mathf.NextPowerOfTwo(Mathf.Max(64, measuredBlockSize));
+                // 遅延を隠せるのは「尾が最も早く始まるとき」＝ minSplitMs まで。
+                int maxBlk = Mathf.NextPowerOfTwo(Mathf.Max(64, Mathf.FloorToInt(minSplitMs * 0.001f * _sampleRate))) / 2;
+                if (blk > maxBlk)
+                {
+                    Debug.LogWarning($"[IrConvolver] measuredBlockSize={blk} は尾の最早開始({minSplitMs}ms)より" +
+                                     $"長い遅延になるため {maxBlk} に下げました。");
+                    blk = Mathf.Max(64, maxBlk);
+                }
+                int parts = Mathf.Max(1, Mathf.CeilToInt((float)tailLen / blk));
+                _tailConv = new PartitionedConvolver(blk, parts, 2);
+                _tailSamples = _tailConv.TailSamples;
+                Debug.Log($"[IrConvolver] 尾の畳み込み(一様): {blk}x{parts} "
+                          + $"= 遅延 {blk * 1000f / _sampleRate:F1}ms");
+            }
+            _tailIr = new ReverbTailIr(_sampleRate, _tailSamples, 2);
 
             // HRTF：実データがあれば読み、無ければ合成HRTFで動かす。
             //   実データを待たずにパイプライン全体を検証できるようにするための土台。
@@ -384,6 +463,7 @@ namespace AcousticFlow
 
         private void Update()
         {
+            SyncTestClip();
             // HRTF の方向は IR より速く追従させる（頭を振ったときの遅れが目立つため）。
             _hrtfDirTimer += Time.deltaTime;
             if (_hrtf != null && _hrtfDirTimer >= 0.02f)
@@ -435,7 +515,8 @@ namespace AcousticFlow
         // エコグラムが更新されたときだけ作る。尾は緩変なので毎回作る必要はない。
         private void RebuildTailIr()
         {
-            if (tailMode != TailMode.Measured || _tailConv == null || _tailIr == null) return;
+            if (tailMode != TailMode.Measured || _tailIr == null) return;
+            if (_tailConv == null && _tailConvNU == null) return;
             var bands = AcousticFlowSceneDemo.Status.EchogramBands;
             if (bands == null) return;   // 古いDLL＝帯域別が取れない。Fdn へフォールバックすべき状態。
             int ver = AcousticFlowSceneDemo.Status.EchogramVersion;
@@ -469,7 +550,8 @@ namespace AcousticFlow
             _tailGain = ReverbTailIr.CalibrateGain(dg, target);
             Scope.TailToDirectRatio = target;   // スコープには使った目標比を出す
             Scope.PhysicalRatio = AcousticFlowSceneDemo.Status.ReverbPhysicalRatio;
-            _tailConv.SetIr(_tailIr.Ir);
+            if (_tailConvNU != null) _tailConvNU.SetIr(_tailIr.Ir);
+            else _tailConv.SetIr(_tailIr.Ir);
         }
 
         // 早期反射のタップ（Status）を {遅延サンプル・6帯域ゲイン・パン} に変換して参照swap。
@@ -511,7 +593,26 @@ namespace AcousticFlow
                 ir[n].panR = (pr != null && i < pr.Length) ? pr[i] : 0.70710678f;
                 // 直接音は滲ませない。反射/回折だけ散乱成分を持つ。
                 // ※本来はタップごとに当たった面の材質 scattering[6] を使うべき値。
-                float sc = (i == 0 || !enableScatter) ? 0f : Mathf.Clamp01(scatterAmount);
+                // 散乱率は遅延とともに上げる。反射は1回バウンスするごとに散乱が加わるので、
+                // 遅く届くタップ＝高次反射ほど鏡面成分が減って拡散へ溶ける。
+                // mixing time(_splitMs) は定義上「音場が拡散したとみなせる時刻」なので、
+                // そこで拡散率 1 に達するように補間する。
+                //   狭い部屋では mixing time が minSplitMs に頭打ちされ、本来拡散済みの
+                //   反射まで少数の離散タップで表現してしまう。それがコムフィルタになり
+                //   「箱っぽく高い」音の原因になっていた（DEV_LOG B-2 と同じ構造）。
+                float sc;
+                if (i == 0 || !enableScatter) sc = 0f;
+                else
+                {
+                                        // 正規化は _splitMs ではなく「頭打ち前の真の mixing time」を使う。
+                    //   _splitMs は畳み込みブロックの都合で minSplitMs(25ms) に下限が掛かっており、
+                    //   狭い部屋（√V≒5〜8ms）では実際の4倍以上に膨らむ。それで割ると
+                    //   2〜7ms に来る反射が「まだ全然拡散していない」と判定され、効果が消える。
+                    float mix = AcousticFlowSceneDemo.Status.MixingTimeMs;
+                    if (mix <= 0f) mix = _splitMs;
+                    float t = Mathf.Clamp01(d[i] / Mathf.Max(1e-3f, mix)) * scatterTimeGrowth;
+                    sc = Mathf.Clamp01(Mathf.Lerp(scatterAmount, 1f, t));
+                }
                 ir[n].gSpec = Mathf.Sqrt(1f - sc);
                 ir[n].gDiff = Mathf.Sqrt(sc);
                 n++;
@@ -601,8 +702,14 @@ namespace AcousticFlow
             //    tailLevel は好みの微調整（1.0 が物理どおり）。
             System.Array.Clear(_tailOut[0], 0, frames);
             System.Array.Clear(_tailOut[1], 0, frames);
-            if (tailMode == TailMode.Measured && _tailConv != null && _tailConv.HasIr)
-                _tailConv.ProcessAdd(_tailInMono, 0, frames, _tailOut, 0, _tailGain * tailLevel);
+            if (tailMode == TailMode.Measured)
+            {
+                float g = _tailGain * tailLevel;
+                if (_tailConvNU != null && _tailConvNU.HasIr)
+                    _tailConvNU.ProcessAdd(_tailInMono, 0, frames, _tailOut, 0, g);
+                else if (_tailConv != null && _tailConv.HasIr)
+                    _tailConv.ProcessAdd(_tailInMono, 0, frames, _tailOut, 0, g);
+            }
 
             for (int f = 0; f < frames; f++)
             {
@@ -734,9 +841,10 @@ namespace AcousticFlow
             float inv = 1f / Mathf.Max(1, frames);
             Scope.WritePos = (scopeBase + frames) % Scope.BufferLength;
             Scope.SampleRate = _sampleRate;
-            bool tailLive = tailMode == TailMode.Measured && _tailConv != null && _tailConv.HasIr;
-            Scope.TailPartitions = tailLive ? _tailConv.NumPartitions : 0;
-            Scope.ActiveParts = tailLive ? _tailConv.ActiveParts : 0;
+            bool nuLive = tailMode == TailMode.Measured && _tailConvNU != null && _tailConvNU.HasIr;
+            bool uniLive = tailMode == TailMode.Measured && _tailConv != null && _tailConv.HasIr;
+            Scope.TailPartitions = nuLive ? _tailConvNU.TotalPartitions : (uniLive ? _tailConv.NumPartitions : 0);
+            Scope.ActiveParts = nuLive ? _tailConvNU.TotalPartitions : (uniLive ? _tailConv.ActiveParts : 0);
             Scope.SplitMs = _splitMs;
             const float k = 0.3f;
             Scope.RmsDirect = Mathf.Lerp(Scope.RmsDirect, Mathf.Sqrt(sumDirect * inv), k);
