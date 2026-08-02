@@ -80,6 +80,92 @@ namespace AcousticFlow.EditorTools
                 "実行中に [ ] キーで部屋を拡縮できる（1/2/3=小/中/大プリセット）。");
         }
 
+        // ── 回折の連続性検証：右側だけ開いた仕切り壁 ──
+        // 開口の縁を回り込む回折を、影の中↔外を行き来しながら聴く。
+        // 影境界を跨ぐ瞬間に段差が出ないか（回折ゲインが 1.0 と UTD 値で飛ばないか）を確認する。
+        [MenuItem("AcousticFlow/Test Scenes/Diffraction Gap (回折・開口)")]
+        public static void DiffractionGap()
+        {
+            var scene = NewScene();
+            var listener = MakeListener(new Vector3(0f, 1.6f, -2f));   // 手前中央
+            var room = MakeRoom("Gap", new Vector3(12f, 4f, 8f), 0.4f);  // 12×8m・高4m
+            // 仕切り壁は部屋と連動しないので、拡縮すると位置関係が壊れる。無効にしておく。
+            room.enableHotkeys = false;
+            room.showGui = false;
+
+            // 中央(Z=0)に仕切り壁。右寄り(+X)に 2m の開口を1か所だけ空ける。
+            //   開口の左右に垂直な稜線ができ、そこが回折エッジになる。
+            const float wallZ = 0f, thick = 0.3f, height = 4f;
+            const float gapL = 3f, gapR = 5f;      // 開口の範囲（X）
+            const float roomHalf = 6f;
+            float leftW = gapL - (-roomHalf);      // -6 〜 3
+            MakeBox("Partition_L", new Vector3(-roomHalf + leftW * 0.5f, height * 0.5f, wallZ),
+                    new Vector3(leftW, height, thick));
+            float rightW = roomHalf - gapR;        // 5 〜 6
+            MakeBox("Partition_R", new Vector3(gapR + rightW * 0.5f, height * 0.5f, wallZ),
+                    new Vector3(rightW, height, thick));
+
+            // 音源は仕切りの奥・左寄り。開口の正面を外してあるので、必ず回折で回り込む必要がある。
+            var srcPos = new Vector3(-3f, 1.6f, 2f);
+            AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);
+            AddConvolver(srcPos);
+            Save(scene, "Test_DiffractionGap.unity",
+                "回折(開口): 仕切りの右に2mの開口。音源は奥の左側なので直接は必ず遮蔽される。" +
+                "A/Dで左右に動くと開口の縁を回り込む回折が変化する。" +
+                "影境界を跨ぐとき段差なく連続に変わるかを確認する。");
+        }
+
+        // ── 残響の検証：外から部屋に入る ──
+        // 音源はリスナーに追従（一定距離）。直接音が変わらないので、
+        // 「部屋に入ると残響が立ち上がる」だけを切り出して聴ける。
+        [MenuItem("AcousticFlow/Test Scenes/Room Entry (残響・出入り)")]
+        public static void RoomEntry()
+        {
+            var scene = NewScene();
+            var listener = MakeListener(new Vector3(0f, 1.6f, -12f));   // 部屋の外からスタート
+
+            // 外の地面（壁なし＝ほぼ無響）。部屋の床はこれで兼ねる。
+            MakeBox("Ground", new Vector3(0f, -0.5f, 0f), new Vector3(60f, 1f, 60f));
+
+            // 部屋。1/2/3 で拡縮、南壁(-Z)に出入り口。床は作らない（地面と二重になるため）。
+            var roomGo = new GameObject("Room");
+            var room = roomGo.AddComponent<ResizableRoom>();
+            room.innerSize = new Vector3(10f, 4f, 8f);
+            room.thickness = 0.4f;
+            room.makeFloor = false;        // 外の地面と二重計上しない
+            room.makeDoorway = true;       // 外から入れるように
+            room.doorwayWidth = 2f;
+            room.doorwayHeight = 2.2f;
+            room.keepListenerInside = false;   // 外にいるのに中へワープさせない
+            room.ApplyNow();
+
+            // 音源はリスナーの 1.5m 前方に追従。
+            //   完全に同一座標にすると 残響/直接=(r/r_c)² が 0 になり尾が消えるため
+            //   （無指向の点音源に耳を密着させた状態＝物理的に正しい帰結）。
+            //   現実に自分の声が響くのは声の指向性によるもので、それは未実装。
+            var followOffset = new Vector3(0f, 0f, 1.5f);
+            var srcPos = listener.position + followOffset;
+            var srcs = AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);
+            foreach (var s in srcs)
+            {
+                var f = s.gameObject.AddComponent<FollowTransform>();
+                f.target = listener;
+                f.offset = followOffset;
+            }
+            AddConvolver(srcPos);
+            // 畳み込み機も一緒に追従させる（音源と同じ位置に置く運用のため）。
+            var convGo = GameObject.Find("IrConvolverTest");
+            if (convGo != null)
+            {
+                var cf = convGo.AddComponent<FollowTransform>();
+                cf.target = listener;
+                cf.offset = followOffset;
+            }
+            Save(scene, "Test_RoomEntry.unity",
+                "残響(出入り): 音源がリスナーに1.5mで追従するので直接音は一定。" +
+                "外(無響)→部屋の中 と歩くと残響だけが立ち上がる。1/2/3 で部屋の広さを変更。");
+        }
+
         // ── 共有ヘルパ ──
         private static UnityEngine.SceneManagement.Scene NewScene()
             => EditorSceneManager.NewScene(NewSceneSetup.DefaultGameObjects, NewSceneMode.Single);
@@ -113,17 +199,19 @@ namespace AcousticFlow.EditorTools
 
         // 内寸 innerSize(幅x, 高y, 奥z) の囲まれた部屋（床y=0, 天井y=高）。
         // 壁6枚は ResizableRoom が持ち、実行中に [ ] キーや Inspector で内寸を変えられる。
-        private static void MakeRoom(string prefix, Vector3 innerSize, float thick)
+        private static ResizableRoom MakeRoom(string prefix, Vector3 innerSize, float thick)
         {
             var go = new GameObject(prefix + "_Room");
             var room = go.AddComponent<ResizableRoom>();
             room.innerSize = innerSize;
             room.thickness = thick;
             room.ApplyNow();   // 壁を生成して保存対象にする（Awake を待たない）
+            return room;
         }
 
         // 本編と同じ6ステム音源を srcPos に全部重ねて配置し、デモ制御を付ける（座標かぶりOK）。
-        private static void AddDemo(Transform listener, Vector3 srcPos, AcousticMaterialPreset material)
+        // 戻り値は生成した音源の Transform 群（追従などを後付けするため）。
+        private static Transform[] AddDemo(Transform listener, Vector3 srcPos, AcousticMaterialPreset material)
         {
             string[] events = { "Vocal", "Guitar", "Piano", "Bass", "Drums", "Other" };
             var srcs = new Transform[events.Length];
@@ -142,6 +230,7 @@ namespace AcousticFlow.EditorTools
             demo.occluderMaterial = material;
             demo.firstPersonCamera = true;
             demo.distanceRef = 4f;   // 全シーン統一：距離減衰ゆるめ（直接音を前に）
+            return srcs;
         }
 
         // IR畳み込みのテスト機。
