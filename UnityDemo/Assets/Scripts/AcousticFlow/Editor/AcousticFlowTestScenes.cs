@@ -115,28 +115,51 @@ namespace AcousticFlow.EditorTools
                 "影境界を跨ぐとき段差なく連続に変わるかを確認する。");
         }
 
-        // ── 残響の検証：外から部屋に入る ──
-        // 音源はリスナーに追従（一定距離）。直接音が変わらないので、
-        // 「部屋に入ると残響が立ち上がる」だけを切り出して聴ける。
-        [MenuItem("AcousticFlow/Test Scenes/Room Entry (残響・出入り)")]
+        // ── 残響の検証：外 → 廊下 → 部屋 ──
+        // 音響的に性格の違う3つのゾーンを歩いて通る。
+        //   外   … 壁なし＝ほぼ無響。反射も残響も立たない
+        //   廊下 … 狭くて長い。左右の壁が近く横方向の反射が強い＝独特の詰まった響き
+        //   部屋 … 広くて拡散的。滑らかな尾が立つ
+        // 音源はリスナーに一定距離で追従するので直接音は変わらない。
+        // ＝聞こえ方の違いは全部「空間の応答」だけに由来する。
+        [MenuItem("AcousticFlow/Test Scenes/Room Entry (外→廊下→部屋)")]
         public static void RoomEntry()
         {
             var scene = NewScene();
-            var listener = MakeListener(new Vector3(0f, 1.6f, -12f));   // 部屋の外からスタート
+            var listener = MakeListener(new Vector3(0f, 1.6f, -12f));   // 外からスタート
 
-            // 外の地面（壁なし＝ほぼ無響）。部屋の床はこれで兼ねる。
+            // 外の地面（壁なし＝ほぼ無響）。廊下と部屋の床もこれで兼ねる。
             MakeBox("Ground", new Vector3(0f, -0.5f, 0f), new Vector3(60f, 1f, 60f));
 
-            // 部屋。1/2/3 で拡縮、南壁(-Z)に出入り口。床は作らない（地面と二重になるため）。
+            // ── 廊下：幅2m・長さ8m・高2.5m（Z = -6 〜 +2）──
+            //   両側の壁が近いので横方向の反射が短間隔で返る。部屋との差が出る要。
+            const float corW = 2f, corH = 2.5f, corT = 0.3f;
+            const float corZ0 = -6f, corZ1 = 2f;
+            float corLen = corZ1 - corZ0;
+            float corMidZ = (corZ0 + corZ1) * 0.5f;
+            MakeBox("Corridor_W", new Vector3(-corW * 0.5f - corT * 0.5f, corH * 0.5f, corMidZ),
+                    new Vector3(corT, corH, corLen));
+            MakeBox("Corridor_E", new Vector3(corW * 0.5f + corT * 0.5f, corH * 0.5f, corMidZ),
+                    new Vector3(corT, corH, corLen));
+            MakeBox("Corridor_Ceil", new Vector3(0f, corH + corT * 0.5f, corMidZ),
+                    new Vector3(corW + corT * 2f, corT, corLen));
+
+            // ── 部屋：内寸 10×8m・高4m（Z = +2 〜 +10）──
+            //   南壁(-Z)が廊下の突き当たりに一致し、そこに廊下と同じ幅・高さの開口を空ける。
+            const float roomD = 8f;
+            float roomCz = corZ1 + roomD * 0.5f;    // 南壁が corZ1 に来るように置く
             var roomGo = new GameObject("Room");
+            roomGo.transform.position = new Vector3(0f, 0f, roomCz);
             var room = roomGo.AddComponent<ResizableRoom>();
-            room.innerSize = new Vector3(10f, 4f, 8f);
+            room.innerSize = new Vector3(10f, 4f, roomD);
             room.thickness = 0.4f;
-            room.makeFloor = false;        // 外の地面と二重計上しない
-            room.makeDoorway = true;       // 外から入れるように
-            room.doorwayWidth = 2f;
-            room.doorwayHeight = 2.2f;
-            room.keepListenerInside = false;   // 外にいるのに中へワープさせない
+            room.makeFloor = false;            // 地面と二重計上しない
+            room.makeDoorway = true;           // 廊下から入れるように
+            room.doorwayWidth = corW;          // 廊下と同じ幅
+            room.doorwayHeight = corH;         // 廊下と同じ高さ（上はまぐさになる）
+            room.keepListenerInside = false;   // 外や廊下にいるのに中へワープさせない
+            // 廊下は部屋と連動しないので、拡縮すると接続が壊れる。サイズは固定。
+            room.enableHotkeys = false;
             room.ApplyNow();
 
             // 音源はリスナーの 1.5m 前方に追従。
@@ -162,8 +185,10 @@ namespace AcousticFlow.EditorTools
                 cf.offset = followOffset;
             }
             Save(scene, "Test_RoomEntry.unity",
-                "残響(出入り): 音源がリスナーに1.5mで追従するので直接音は一定。" +
-                "外(無響)→部屋の中 と歩くと残響だけが立ち上がる。1/2/3 で部屋の広さを変更。");
+                "残響(外→廊下→部屋): 音源がリスナーに1.5mで追従するので直接音は一定。" +
+                "W で前進すると 外(ほぼ無響) → 廊下(幅2m・横方向の反射が強い) → 部屋(10×8m・拡散的) " +
+                "と響きが3段階で変わる。違いは全部『空間の応答』だけに由来する。" +
+                "部屋のサイズは固定（廊下と接続しているため）。");
         }
 
         // ── 共有ヘルパ ──
