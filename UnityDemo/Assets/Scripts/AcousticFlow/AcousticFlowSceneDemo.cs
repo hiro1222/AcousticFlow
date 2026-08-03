@@ -213,6 +213,8 @@ namespace AcousticFlow
         // 主音源(0番)の表示用。
         private readonly float[] _bands = new float[AcousticEngine.NumBands];
         private readonly float[] _diffBands = new float[AcousticEngine.NumBands];
+        // 直接タップ用の合成バッファ（透過⊕回折）。IRの直接音はこちらを使う。
+        private float[] _directBands;
         private float _diffDelta = -1f;
         private Vector3 _diffMid;
         // 遮蔽量の帯域加重（低域=大。低音は回り込んで残るため重い）。
@@ -1184,8 +1186,24 @@ namespace AcousticFlow
             float toMs = 1000f / kSpeedOfSound;  // 距離(m) → ms（÷c ×1000）
 
             int n = 0;
-            // 直接タップ（基準 0ms）。6帯域透過×空気吸収 を low/mid/high にまとめる。
-            WriteTapBands(n++, _bands, 0, directDist, sp, 'D', 0f);
+            // 直接タップ（基準 0ms）。
+            //   「壁を抜けてくる分(透過)」と「縁を回り込む分(回折)」の大きい方を採る。
+            //   以前は透過だけを使っていたため、影に入った瞬間に直接タップが
+            //   0.51 → 0.01（-34dB）と消えていた。実際には回折で 0.30 届いている。
+            //   回折は本来 'F' タップとして別に入る設計だが、GetDiffractionSources が
+            //   0本を返す配置ではどこにも入らず、直接音が丸ごと欠落していた。
+            //   なお見通し時は単純な max ではいけない。回折側は照らされた領域では
+            //   「直接音込みの総合値」を返す（境界近傍で 0.8 など、干渉で 1.0 を超えることも）。
+            //   透過は見通し時に必ず 1.0 なので、max を取ると境界近傍の減衰が 1.0 に戻って
+            //   しまい、せっかくの連続化が台無しになる。
+            //   → 見通し時は回折側をそのまま採用し、遮蔽時だけ「壁を抜ける分」と比べる。
+            int nb6 = AcousticEngine.NumBands;
+            if (_directBands == null) _directBands = new float[nb6];
+            bool lit = true;
+            for (int b = 0; b < nb6; b++) if (_bands[b] < 0.999f) { lit = false; break; }
+            for (int b = 0; b < nb6; b++)
+                _directBands[b] = lit ? _diffBands[b] : Mathf.Max(_bands[b], _diffBands[b]);
+            WriteTapBands(n++, _directBands, 0, directDist, sp, 'D', 0f);
 
             // 段3: 早期反射/回折二次音源はバッチ更新で計算済み。ここでは結果を受け取るだけ。
             //   以前はここで独自にエンジンを再呼び出ししていたので、同じ計算を
