@@ -554,7 +554,17 @@ public:
     //   物理的には照らされた領域にも回折場は存在し、直接音と足すと境界で連続になる
     //   ── それが UTD が GTD を「一様化」した目的そのもの（utd.h の utdTotalGain 参照）。
     void computeDiffraction(const Vec3& from, const Vec3& to, float outGain[kNumBands]) const {
-        const bool occ = isOccluded(from, to);
+        diffractionContinuous(from, to, isOccluded(from, to), outGain);
+    }
+
+    // 回折ゲイン（影境界で連続）。occ は呼び出し側が既に持っている遮蔽判定を渡す
+    // （computeDirectSoft は同じ判定を使い回すため、二重に raycast しない）。
+    //
+    //   照らされた領域: |直接 + Σw·D| … 直接音と回折場を複素で合成（フレネル縞で 1.0 を超えうる）
+    //   影の領域      : |Σw·D|
+    // 両側とも影境界で 0.5 付近に収束するので連続に繋がる。
+    void diffractionContinuous(const Vec3& from, const Vec3& to, bool occ,
+                               float outGain[kNumBands]) const {
 
         // 照らされた領域では直接線を塞ぐ箱が無いので、候補探索を近傍まで広げる必要がある。
         //
@@ -648,27 +658,30 @@ public:
         const float inv = 1.0f / static_cast<float>(N);
         const float occFrac = static_cast<float>(occCount) * inv;
 
-        // 回折フロア：中心が遮蔽なら δ から Maekawa、非遮蔽なら 1.0。δ も一緒に得る。
+        // 回折：影境界で連続になる版を使う（diffractionContinuous 参照）。
+        //   以前はここで「非遮蔽→全帯域1.0 / 遮蔽→UTD値」と二値で切り替えており、
+        //   影境界を跨ぐ瞬間に約12dBの段差が出ていた。occFrac で緩和を試みていたが、
+        //   dif 自体が跳ぶので効いていなかった。
+        //   ※音声経路は useReflections=ON のとき occlusionReflectedMulti 経由で
+        //     ここを通る。computeDiffraction を直しただけでは音に効かない。
         const bool centerOcc = isOccluded(listener, source);
         float dif[kNumBands];
-        float detourDelta = 0.0f;   // 迂回余剰長(m)。非遮蔽=0 / 完全遮蔽(迂回路なし)=大
-        if (!centerOcc) {
-            for (int b = 0; b < kNumBands; ++b) dif[b] = 1.0f;
-        } else {
-            Vec3 dp, edgeDir, refT;
-            const float delta = diffractionDetour(listener, source, dp, &edgeDir, &refT);
-            if (delta < 0.0f) {
-                for (int b = 0; b < kNumBands; ++b) dif[b] = 0.0f;  // 完全遮蔽
-                detourDelta = 1e9f;
-            } else {
-                utd::utdWedgeGain(source, dp, listener, edgeDir, refT, 1.5f, dif);  // UTD
-                detourDelta = delta;
-            }
+        diffractionContinuous(listener, source, centerOcc, dif);
+
+        // 迂回余剰長 δ（ステアの重み付けに使う）。非遮蔽=0 / 迂回路なし=大。
+        float detourDelta = 0.0f;
+        if (centerOcc) {
+            Vec3 dp;
+            const float delta = diffractionDetour(listener, source, dp);
+            detourDelta = (delta < 0.0f) ? 1e9f : delta;
         }
+
         for (int b = 0; b < kNumBands; ++b) {
-            const float soft = transAccum[b] * inv;                       // 滑らかな直接透過
-            const float diffFloor = centerOcc ? dif[b] * occFrac : 0.0f;  // 影で徐々に立つ回折
-            outGain[b] = clamp01(std::max(soft, diffFloor));
+            const float soft = transAccum[b] * inv;   // 滑らかな直接透過（壁を抜けてくる分）
+            // 壁を抜ける成分と回り込む成分の大きい方を採る。
+            //   回折側は既に「照らされていれば直接音込み」の総合値なので、
+            //   occFrac のような後付けのフェードは要らない。
+            outGain[b] = clamp01(std::max(soft, dif[b]));
         }
         if (outDetourDelta) *outDetourDelta = detourDelta;
     }

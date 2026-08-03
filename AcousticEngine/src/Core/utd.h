@@ -185,56 +185,6 @@ inline void utdWedgeGain(const Vec3& source, const Vec3& P, const Vec3& listener
     utdGain(n, beta0, phiPrime, phi, sPrime, s, outGain);
 }
 
-// 位置＋幾何版（複素）：1つのエッジの回折場を「自由音場に対する複素比」で返す。
-//   位相は直接経路を基準にする（回折経路は δ だけ長いので e^{-jkδ} を掛ける）。
-//   複数エッジを重ね合わせるときは、この値をそのまま足せばよい。
-inline void utdWedgeFieldComplex(const Vec3& source, const Vec3& P, const Vec3& listener,
-                                 const Vec3& edgeDir, const Vec3& refTangent, float n,
-                                 cf outD[kNumBands]) {
-    const Vec3 e = normalized(edgeDir);
-    const float sPrime = std::max(length(P - source), 1e-3f);
-    const float s = std::max(length(listener - P), 1e-3f);
-    const float direct = std::max(length(listener - source), 1e-3f);
-    const float detour = std::max(sPrime + s - direct, 0.0f);
-    const Vec3 sp = normalized(P - source);
-    const float sinB0 = length(cross(sp, e));
-    const float beta0 = std::asin(std::min(std::max(sinB0, 0.0f), 1.0f));
-    Vec3 t0 = refTangent - e * dot(refTangent, e);
-    t0 = normalized(t0);
-    const Vec3 t1 = cross(e, t0);
-    auto angleOf = [&](const Vec3& target) {
-        Vec3 d = target - P;
-        d = d - e * dot(d, e);
-        float a = std::atan2(dot(d, t1), dot(d, t0));
-        if (a < 0.0f) a += 2.0f * kPi;
-        return a;
-    };
-    utdFieldComplex(n, beta0, angleOf(source), angleOf(listener), sPrime, s, outD);
-
-    // 直接経路を位相の基準にする。
-    const float bandFreq[kNumBands] = {125.0f, 250.0f, 500.0f, 1000.0f, 2000.0f, 4000.0f};
-    for (int b = 0; b < kNumBands; ++b) {
-        const float k = 2.0f * kPi * bandFreq[b] / kSpeed;
-        outD[b] *= std::exp(cf(0.0f, -k * detour));
-    }
-}
-
-// 複数エッジぶんの回折場（既に位相を揃えて足したもの）と直接音を合成して総合ゲインにする。
-inline void combineDirectAndDiffraction(const cf sumD[kNumBands], bool lit,
-                                        const float directGain[kNumBands],
-                                        float outGain[kNumBands]) {
-    for (int b = 0; b < kNumBands; ++b) {
-        const float dg = lit ? (directGain ? directGain[b] : 1.0f) : 0.0f;
-        float g = std::abs(cf(dg, 0.0f) + sumD[b]);
-        // 照らされた側では 1.0 を超えるのが正しい（フレネル縞）。utdTotalGain のコメント参照。
-        const float hi = lit ? 2.0f : 1.0f;
-        if (g > hi) g = hi;
-        if (g < 0.0f) g = 0.0f;
-        outGain[b] = g;
-    }
-}
-
-// 位置＋幾何版の総合ゲイン。照らされた領域では直接音と複素で合成する（utdTotalGain 参照）。
 inline void utdWedgeTotal(const Vec3& source, const Vec3& P, const Vec3& listener,
                           const Vec3& edgeDir, const Vec3& refTangent, float n,
                           bool lit, const float directGain[kNumBands], float outGain[kNumBands]) {
