@@ -91,13 +91,20 @@ ACOUSTIC_API int AF_SceneIsOccluded(AF_SceneHandle scene,
 ACOUSTIC_API float AF_SceneRaycast(AF_SceneHandle scene,
                                    AF_Vector3 origin, AF_Vector3 dir, float maxDist);
 
-/* 【回折(Phase1.5 暫定)】from→to の帯域別回折ゲイン(0..1)を outGains(6要素以上)に書く。
- *   遮蔽なし → 全帯域 1.0 / 迂回路あり → Maekawa（低域ほど大きい）/ 迂回路なし → 0。
- * 直接が壁で塞がれても、稜線を回り込む成分を周波数別に与える。書き込んだ帯域数を返す。
- *   ※ 本実装 Phase4（エッジカタログ+UTD）で置き換える前味。 */
+/* 【回折】from→to の帯域別回折ゲイン(0..1)を outGains(6要素以上)に書く。書き込んだ帯域数を返す。
+ * モデルは前川の式。符号付き δ（影で正・境界で 0・照射側で負）だけの関数なので、
+ * 稜線が乗り換わってもゲインが飛ばない（δ の min は連続）。高域ほど強く減衰するので、
+ * 6帯域ゲインをそのまま適用すれば回折によるローパスになる。 */
 ACOUSTIC_API int AF_SceneComputeDiffractionBands(AF_SceneHandle scene,
                                                  AF_Vector3 from, AF_Vector3 to,
                                                  float* outGains, int count);
+
+/* 【回折・UTD版(比較検証用)】上と同じものを Kouyoumjian-Pathak の UTD で計算する。
+ * 厳密解だが回折点の 3D 幾何に依存するため、稜線が乗り換わる位置でゲインが不連続に飛ぶ。
+ * 音声経路には使わない。回帰テストで前川版と並べ、この選択の根拠を数値で残すためのもの。 */
+ACOUSTIC_API int AF_SceneComputeDiffractionBandsUtd(AF_SceneHandle scene,
+                                                    AF_Vector3 from, AF_Vector3 to,
+                                                    float* outGains, int count);
 
 /* 【回折の経路可視化】from→to が遮蔽されているとき、稜線を回る最短迂回の余剰経路長 δ(m)を
  * 返し、その迂回点(source→P→listener の P)を outMidPoint に書く。遮蔽なし/迂回路なしは -1。

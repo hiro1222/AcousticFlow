@@ -137,6 +137,19 @@ int AF_SceneComputeDiffractionBands(AF_SceneHandle scene,
     return n;
 }
 
+int AF_SceneComputeDiffractionBandsUtd(AF_SceneHandle scene,
+                                       AF_Vector3 from, AF_Vector3 to,
+                                       float* outGains, int count) {
+    Scene* s = asScene(scene);
+    if (!s || !outGains || count <= 0) return 0;
+    const Vec3 f = toVec3(from), t = toVec3(to);
+    float gain[kNumBands];
+    s->diffractionUtd(f, t, s->isOccluded(f, t), gain);
+    const int n = std::min(count, kNumBands);
+    for (int b = 0; b < n; ++b) outGains[b] = gain[b];
+    return n;
+}
+
 float AF_SceneDiffractionPath(AF_SceneHandle scene, AF_Vector3 from, AF_Vector3 to,
                               AF_Vector3* outMidPoint) {
     Scene* s = asScene(scene);

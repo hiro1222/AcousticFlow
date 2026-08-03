@@ -543,30 +543,43 @@ void diagnoseShadowBoundary() {
     const AF_Vector3 src = V(-2, 1.6f, 2);
     // 影境界: 音源(-2,2) からエッジ(0,0) を通る直線が z=-2 に達する x を求めると x=+2。
     //   x<2 が影 / x>2 が照らされた側。
-    std::printf("      リスナー x   125Hz   500Hz    4kHz   （x=2 が影境界）\n");
+    // 採用モデル(前川)と、比較用の UTD を並べて出す。
+    //   UTD は厳密解だが回折点の 3D 幾何に依存するため、どの稜線が最短かが入れ替わる位置で
+    //   ゲインが飛ぶ。前川は符号付き δ だけの関数で、δ の min は連続なので飛ばない。
+    //   この差がそのまま「音声経路に前川を採った理由」なので、数値で残しておく。
+    std::printf("      　　　　　  ┌─ 前川(採用) ─┐  ┌─ UTD(比較) ──┐\n");
+    std::printf("      リスナー x   125Hz    4kHz    125Hz    4kHz   （x=2 が影境界）\n");
 
-    float prevLow = -1.0f, maxJump = 0.0f;
-    float jumpAtX = 0.0f;
+    float prevLow = -1.0f, maxJump = 0.0f, jumpAtX = 0.0f;
+    float prevUtd = -1.0f, maxJumpUtd = 0.0f;
     for (float x = 0.0f; x <= 4.01f; x += 0.25f) {
-        float g[kBands] = {};
+        float g[kBands] = {}, u[kBands] = {};
         AF_SceneComputeDiffractionBands(s, V(x, 1.6f, -2), src, g, kBands);
-        std::printf("      %8.2f  %6.3f  %6.3f  %6.3f%s\n",
-                    x, g[0], g[2], g[5],
+        AF_SceneComputeDiffractionBandsUtd(s, V(x, 1.6f, -2), src, u, kBands);
+        std::printf("      %8.2f  %6.3f  %6.3f   %6.3f  %6.3f%s\n",
+                    x, g[0], g[5], u[0], u[5],
                     (std::fabs(x - 2.0f) < 0.13f) ? "  ← 影境界" : "");
         if (prevLow >= 0.0f) {
             const float jump = std::fabs(g[0] - prevLow);
             if (jump > maxJump) { maxJump = jump; jumpAtX = x; }
+            maxJumpUtd = std::max(maxJumpUtd, std::fabs(u[0] - prevUtd));
         }
         prevLow = g[0];
+        prevUtd = u[0];
     }
+    std::printf("      最大の隣接差: 前川 %.3f / UTD %.3f\n", maxJump, maxJumpUtd);
 
     // 0.25m 刻みで隣接する点の差。連続なら小さいはず。
-    // 二値切替だと 1.0→0.5 の跳びが出る（=0.5 前後）。
+    //   二値の遮蔽切替だと 1.0→0.5 の跳び（≒0.5）が出る。
+    //   前川の式は符号付き δ だけの関数で、δ は全候補稜線の min なので連続。
+    //   したがって稜線が入れ替わっても値は飛ばない ── ここが UTD との決定的な差。
+    //   （UTD は回折点の 3D 幾何に依存するため、同条件で最良 3.8dB / 最悪 17.6dB の
+    //     段差が残った。経緯は docs/DEV_LOG.md G章、実装比較は Core/maekawa.h 冒頭。）
     char buf[128];
     std::snprintf(buf, sizeof(buf), "(最大の隣接差 %.3f @ x=%.2f)", maxJump, jumpAtX);
     check("影境界で回折ゲインが跳ばない(隣接差<0.2)", maxJump < 0.2f, buf);
     if (maxJump >= 0.2f)
-        std::printf("      → %.1f dB の段差。照らされた側で回折場を捨てているのが原因。\n",
+        std::printf("      → %.1f dB の段差が残っている。\n",
                     20.0f * std::log10((1.0f - maxJump > 1e-3f) ? 1.0f / (1.0f - maxJump) : 1000.0f));
 
     AF_SceneDestroy(s);

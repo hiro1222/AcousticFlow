@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "Core/aabb.h"
+#include "Core/maekawa.h"
 #include "Core/material.h"
 #include "Core/utd.h"
 #include "Core/vec3.h"
@@ -344,7 +345,12 @@ public:
     void forEachDiffractionCandidate(const Vec3& from, const Vec3& to, Fn&& fn,
                                      float blockerMargin = 0.0f) const {
         const float direct = std::max(length(to - from), 1e-4f);
-        const float margin = 0.15f;  // 箱を少し膨らませた稜線上を候補に（視線を通しやすく）
+        // ★稜線は実形状の上に置く。以前は 0.15m 膨らませていたが、それだと UTD が見る影境界が
+        //   実際の影境界からずれる（この距離だけ回折点が動くので）。UTD は「直接音が消える点」と
+        //   「回折場が符号反転する点」が一致することで連続になる仕組みなので、両者がずれると
+        //   その区間だけ値が壊れる（実測で 3.8dB の段差が出ていた区間と一致）。
+        //   自己遮蔽は isOccludedExcept が当の箱を除外するので、膨らませなくても視線は通る。
+        const float margin = 1e-3f;
 
         // 稜線 A-B 上で from→P→to が最短になる点（＝直線が掠める角）＋端点から、両区間見通せる
         // 最短を1つ選んで fn に渡す。g(t)=|from-P|+|P-to| は単峰なので三分探索で最小点を得る。
@@ -360,17 +366,49 @@ public:
                 const float m2 = hi - (hi - lo) * (1.0f / 3.0f);
                 if (g(m1) < g(m2)) hi = m2; else lo = m1;
             }
-            const Vec3 cands[3] = {Pf(0.5f * (lo + hi)), A, B};  // 掠める角＋端点
-            bool any = false; float bd = 0.0f; Vec3 bp{0, 0, 0};
-            for (const Vec3& P : cands) {
-                // 当の箱を除外して「他の障害物だけ」で両区間を見通せる点だけ採用。
-                if (isOccludedExcept(from, P, exceptInst) || isOccludedExcept(P, to, exceptInst)) continue;
-                float d = length(P - from) + length(to - P) - direct;
-                if (d < 0.0f) d = 0.0f;
-                if (!any || d < bd) { any = true; bd = d; bp = P; }
+            // 当の箱を除外して「他の障害物だけ」で両区間を見通せるか。
+            auto vis = [&](float t) {
+                const Vec3 p = Pf(t);
+                return !isOccludedExcept(from, p, exceptInst) && !isOccludedExcept(p, to, exceptInst);
+            };
+
+            // ★回折点は「可視範囲に制約した g の最小点」。
+            //   以前は {最適点, 端点A, 端点B} の3点しか試さず、最適点が見通せないと P が端点へ
+            //   スナップしていた。端点は動かないので δ が変化せず踊り場になり、最適点が見通せた
+            //   瞬間に P が端から中央へワープして段差が出る（実測で 3.8dB の跳び）。
+            //   可視境界は幾何とともに連続に動くので、そこを二分で求めれば P も連続に動く。
+            const float tStar = 0.5f * (lo + hi);
+            float bestT = -1.0f;
+            if (vis(tStar)) {
+                bestT = tStar;
+            } else {
+                // 最適点から左右へ粗くスキャンし、最初に可視へ変わる区間を二分で詰める。
+                // g は単峰なので、可視領域内の最小は最適点に最も近い可視境界にある。
+                constexpr int kScan = 16, kBisect = 12;
+                for (int side = 0; side < 2; ++side) {
+                    const float span = side ? (1.0f - tStar) : tStar;
+                    if (span <= 1e-5f) continue;
+                    float prev = tStar;
+                    for (int k = 1; k <= kScan; ++k) {
+                        const float t = side ? (tStar + span * (k / float(kScan)))
+                                             : (tStar - span * (k / float(kScan)));
+                        if (!vis(t)) { prev = t; continue; }
+                        float bad = prev, good = t;            // bad:不可視, good:可視
+                        for (int it = 0; it < kBisect; ++it) {
+                            const float m = 0.5f * (bad + good);
+                            if (vis(m)) good = m; else bad = m;
+                        }
+                        if (bestT < 0.0f || g(good) < g(bestT)) bestT = good;
+                        break;
+                    }
+                }
             }
-            if (any) fn(bp, bd, edgeDir, refT);
-            return any;
+            if (bestT < 0.0f) return false;                    // 稜線全体が見通せない
+            const Vec3 bp = Pf(bestT);
+            float bd = length(bp - from) + length(to - bp) - direct;
+            if (bd < 0.0f) bd = 0.0f;
+            fn(bp, bd, edgeDir, refT);
+            return true;
         };
 
         // ★回折は「直接経路を実際に塞いでいる箱（ブロッカー）」の稜線だけを回る。部屋の床/天井/壁など
@@ -502,15 +540,18 @@ public:
             return ws > 0.0f ? gs / ws : 0.0f;
         };
 
-        // 開口＝方向クラスタ。掠める点は「クラスタ内エッジの UTD重み付き重心」で連続にスライドさせる
+        // 開口＝方向クラスタ。掠める点は「クラスタ内エッジの重み付き重心」で連続にスライドさせる
         // （手前稜線↔奥稜線の乗り換えが、重心が滑らかに移る＝飛ばない）。
+        //   重みは前川の式（δ のみに依存）。以前は UTD ゲインを重みにしていたが、UTD は
+        //   回折点の 3D 幾何に依存するため稜線の乗り換えで重みが飛び、重心も飛んでいた。
+        //   δ は候補間で連続なので、重みも重心も連続に動く。回折系のモデルを一本化する意味もある。
         struct Cl { Vec3 pAcc; Vec3 dir; float w; };  // pAcc=Σ w*P（重心用）, dir=平均方向, w=Σ
         Cl cl[24];
         int ncl = 0;
         const float cosThresh = 0.90f;  // ~25°以内は同じ開口として統合
-        forEachDiffractionCandidate(listener, source, [&](const Vec3& P, float, const Vec3& edgeDir, const Vec3& refT) {
+        forEachDiffractionCandidate(listener, source, [&](const Vec3& P, float d, const Vec3&, const Vec3&) {
             float g6[kNumBands];
-            utd::utdWedgeGain(source, P, listener, edgeDir, refT, 1.5f, g6);  // このエッジの UTD ゲイン
+            maekawa::gainBands(d, g6);   // この稜線を回ったときの減衰（δ>0＝影側として評価）
             const float w = bbGain(g6);
             if (w < 1e-4f) return;
             const Vec3 dir = normalized(P - listener);
@@ -560,55 +601,72 @@ public:
     // 回折ゲイン（影境界で連続）。occ は呼び出し側が既に持っている遮蔽判定を渡す
     // （computeDirectSoft は同じ判定を使い回すため、二重に raycast しない）。
     //
-    //   照らされた領域: |直接 + Σw·D| … 直接音と回折場を複素で合成（フレネル縞で 1.0 を超えうる）
-    //   影の領域      : |Σw·D|
-    // 両側とも影境界で 0.5 付近に収束するので連続に繋がる。
+    // モデルは前川の式（Core/maekawa.h）。符号付き δ だけで決まる:
+    //     影の側 δ>0 / 影境界 δ=0（両側 5dB）/ 照らされた側 δ<0
+    //
+    //   ★連続性が構造的に保証される理由:
+    //     δ は「全候補稜線の最小値」を取っても連続（min は連続関数を保つ。どの稜線が
+    //     最小かが入れ替わっても、値そのものは飛ばない）。したがってゲインも飛ばない。
+    //     影境界では直線が稜線を掠めるので δ→0 になり、符号だけが反転して滑らかに繋がる。
+    //
+    //   UTD(Core/utd.h) を音声経路に使わない理由は maekawa.h の冒頭に記載。
+    //   要点だけ: UTD は回折点の 3D 幾何（φ',φ,n,β0）に依存するので、稜線が入れ替わると
+    //   幾何が不連続に変わって飛ぶ。重み付き平均・複素和・エネルギー加算をいずれも試したが
+    //   解消できず、最良でも 3.8dB、最悪 17.6dB の段差が残った。
+    //   UTD は diffractionUtd() として比較・検証用に残してある。
     void diffractionContinuous(const Vec3& from, const Vec3& to, bool occ,
                                float outGain[kNumBands]) const {
-
-        // 照らされた領域では直接線を塞ぐ箱が無いので、候補探索を近傍まで広げる必要がある。
-        //
-        // マージンの決め方: UTD の遷移領域の幅は波長スケールで決まり、低域ほど広い。
-        //   最低域 125Hz の波長は約 2.7m あるので、それより狭いマージンで打ち切ると
-        //   「まだ回折場が効いている位置」で候補が消え、そこで 1.0 へ跳ぶ。
-        //   最低域の波長の数倍を取って、回折場が十分小さくなってから外れるようにする。
-        //   遠いエッジを拾っても総合ゲインは 1.0 に収束するので、広めでも害はない。
-        const float margin = occ ? 0.0f : 8.0f;   // ≒ 125Hz の波長 2.7m の3倍
-
-        // エッジは「δ が小さいもの」ほど支配的。ただし1本だけを選ぶと、
-        // どれが最小かが切り替わる瞬間に幾何が不連続に変わって値が飛ぶ（実測で低域 -7dB）。
-        //   全エッジの複素和も試したが、UTD は各エッジを孤立ウェッジとして評価するため
-        //   寄与の小さいはずのエッジまで無視できない値を返し、和が大幅に過大計上になった
-        //   （実測 17.6dB 悪化）。箱の12稜線すべてが「自分が回折源だ」と主張してしまう。
-        // → δ による軟らかい重み付けで上位を混ぜる。乗り換え時に重みが連続に移るので飛ばない。
-        constexpr int kMaxEdges = 8;
-        float wSum = 0.0f;
-        float acc[kNumBands] = {0, 0, 0, 0, 0, 0};
-        float bestDelta = -1.0f;
-        struct Cand { Vec3 P; Vec3 edgeDir; Vec3 refT; float delta; };
-        Cand cands[kMaxEdges];
-        int nc = 0;
-        forEachDiffractionCandidate(from, to,
-            [&](const Vec3& P, float d, const Vec3& edgeDir, const Vec3& refT) {
-                if (bestDelta < 0.0f || d < bestDelta) bestDelta = d;
-                if (nc < kMaxEdges) cands[nc++] = Cand{P, edgeDir, refT, d};
-            }, margin);
-
-        if (nc == 0) {
+        float delta;
+        if (!minDetour(from, to, occ, delta)) {
             // 回折の相手が無い。遮蔽なら完全に届かない、非遮蔽なら素通り。
             const float g = occ ? 0.0f : 1.0f;
             for (int b = 0; b < kNumBands; ++b) outGain[b] = g;
             return;
         }
+        maekawa::gainBands(occ ? delta : -delta, outGain);
+    }
 
-        // 直接音の相対振幅。遮蔽時は 0（回折だけが届く）、非遮蔽時は 1（素通り）。
-        //   ここでの「直接」は幾何的な見通しのこと。材質を透過する成分は
-        //   computeTransmission が別に持っており、呼び出し側で合成される。
+    // 全候補稜線を回る迂回の余剰長 δ(m, 非負) の最小値。候補が無ければ false。
+    //   照らされた領域では直接線を塞ぐ箱が無いので、候補探索を近傍まで広げる必要がある。
+    //   マージンは前川の式が効く範囲より広ければよい。効かなくなるのは N<-0.2、
+    //   すなわち δ > 0.1λ。最低域 125Hz の λ=2.7m でも δ 0.28m 程度なので 4m あれば十分。
+    bool minDetour(const Vec3& from, const Vec3& to, bool occ, float& outDelta) const {
+        const float margin = occ ? 0.0f : 4.0f;
+        bool any = false;
+        float best = 0.0f;
+        forEachDiffractionCandidate(from, to,
+            [&](const Vec3&, float d, const Vec3&, const Vec3&) {
+                if (!any || d < best) { any = true; best = d; }
+            }, margin);
+        outDelta = best;
+        return any;
+    }
+
+    // UTD 版の回折ゲイン（比較・検証用。音声経路では使わない）。
+    // 厳密解だが影境界で不連続になるため採用していない ── 回帰テストで両者を並べて出す。
+    void diffractionUtd(const Vec3& from, const Vec3& to, bool occ,
+                        float outGain[kNumBands]) const {
+        const float margin = occ ? 0.0f : 8.0f;
+        constexpr int kMaxEdges = 8;
+        struct Cand { Vec3 P; Vec3 edgeDir; Vec3 refT; float delta; };
+        Cand cands[kMaxEdges];
+        int nc = 0;
+        float bestDelta = -1.0f;
+        forEachDiffractionCandidate(from, to,
+            [&](const Vec3& P, float d, const Vec3& edgeDir, const Vec3& refT) {
+                if (bestDelta < 0.0f || d < bestDelta) bestDelta = d;
+                if (nc < kMaxEdges) cands[nc++] = Cand{P, edgeDir, refT, d};
+            }, margin);
+        if (nc == 0) {
+            const float g = occ ? 0.0f : 1.0f;
+            for (int b = 0; b < kNumBands; ++b) outGain[b] = g;
+            return;
+        }
         float direct[kNumBands];
         for (int b = 0; b < kNumBands; ++b) direct[b] = 1.0f;
-
-        // 重み exp(-(δ-δmin)/σ)。σ は最低域の波長スケール（そこが最も鈍いので）。
-        const float kSigma = 0.7f;
+        float acc[kNumBands] = {0, 0, 0, 0, 0, 0};
+        float wSum = 0.0f;
+        const float kSigma = 0.15f;   // δ による軟らかい重み付け（稜線の乗り換えを均す試み）
         for (int i = 0; i < nc; ++i) {
             const float w = std::exp(-(cands[i].delta - bestDelta) / kSigma);
             if (w < 1e-3f) continue;
