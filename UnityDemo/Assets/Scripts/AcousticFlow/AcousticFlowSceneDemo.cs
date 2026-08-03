@@ -213,8 +213,12 @@ namespace AcousticFlow
         // 主音源(0番)の表示用。
         private readonly float[] _bands = new float[AcousticEngine.NumBands];
         private readonly float[] _diffBands = new float[AcousticEngine.NumBands];
-        // 直接タップ用の合成バッファ（透過⊕回折）。IRの直接音はこちらを使う。
+        // 直接タップ用のバッファ。見通せていれば回折込みの総合値、遮蔽時は透過のみ。
         private float[] _directBands;
+        // 回折タップ用のバッファ。回り込む総量を開口ごとの重みで割ったもの。
+        private float[] _diffTapBands;
+        // 副音源(1以降)の透過/回折を引くための一時バッファ（主音源は _bands/_diffBands を流用）。
+        private float[] _srcTransmit, _srcDiffract;
         private float _diffDelta = -1f;
         private Vector3 _diffMid;
         // 遮蔽量の帯域加重（低域=大。低音は回り込んで残るため重い）。
@@ -281,7 +285,10 @@ namespace AcousticFlow
             public static float[] BandsDiffract;    // 主音源 6帯域 回折
             public static bool UseBandEq;           // 3バンドEQモードか
             public static float[] EqDb;             // 音源ごと×3(Low/Mid/High) の送出EQゲイン(dB)
-            // #2 伝搬遅延の検証（主音源のIRタップ）
+            // 音源ごとのタップ束。IrConvolver が sourceIndex で 1 つ選んで読む。
+            public static SourceTaps[] Taps;
+
+            // 以下は主音源(0)のエイリアス。モニタウィンドウ用に残してある。
             public static int TapCount;
             public static float ItdgMs;             // 最初の反射までの相対遅延=ITDG
             public static float[] TapDelayMs;       // タップ遅延(ms, 直接=0)
@@ -313,6 +320,36 @@ namespace AcousticFlow
             public static float Wet;                // 残響wet(0..1, tail/total)
             public static float SourceLevel;        // 主音源の直線透過(遮蔽)レベル(0..1)。残響を遮蔽で絞る用
         }
+
+        /// <summary>
+        /// 1 音源ぶんの IR タップ束。IrConvolver はこれを 1 つ見て畳み込む。
+        ///
+        /// 音源ごとに持つ理由: 遅延も到来方向も遮蔽も音源ごとに違うので、共有できない。
+        /// 空間音響エンジンが 1 音源しかレンダリングできないのはシステムとして欠落であり、
+        /// ホラーのように環境音・足音・物音が同時に鳴る用途では前提条件になる。
+        ///
+        /// 後期残響（尾）は音源ごとに畳み込む。拡散音場自体はリスナー位置でほぼ決まるが、
+        /// 送出量は音源ごとの遮蔽・距離で変わるため。音源数が増えたら共有バス化を検討する
+        /// （業界の定石。ただし現時点では最適化より完成を優先する）。
+        /// </summary>
+        public sealed class SourceTaps
+        {
+            public const int MaxTaps = 64;
+
+            public int Count;
+            public float ItdgMs;                    // 最初の反射までの相対遅延=ITDG
+            public float SourceLevel;               // 反射込みの生存(0..1)。残響の送出量に使う
+            public Vector3 DirectDirLocal = Vector3.forward;   // HRTF 用の到来方向
+
+            public readonly float[] DelayMs = new float[MaxTaps];
+            public readonly float[] Gain = new float[MaxTaps];
+            public readonly float[] BandGain = new float[MaxTaps * AcousticEngine.NumBands];
+            public readonly float[] PanL = new float[MaxTaps];
+            public readonly float[] PanR = new float[MaxTaps];
+            public readonly char[] Type = new char[MaxTaps];    // 'D'直接 / 'R'反射 / 'F'回折
+        }
+
+        private SourceTaps[] _taps;     // 音源ごと（_sources と同じ長さ）
         private string[] _statusNames;  // Status.SourceNames の使い回しバッファ
 
         private bool _audioReady;
@@ -334,15 +371,7 @@ namespace AcousticFlow
         private const float kSpeedOfSound = 343f;
         private int _tapUpdateEveryFrames = 3;
         private int _tapCountdown = 1;
-        private float[] _tapDelayMs = new float[64];  // 直接音基準の相対遅延(ms)
-        private float[] _tapGain = new float[64];      // 広帯域ゲイン(0..1, プロット/表示用)
-        // タップ×6帯域ゲイン（畳み込みの音色）。エンジン出力の6帯域を潰さずそのまま渡す。
-        private float[] _tapBandGain = new float[64 * AcousticEngine.NumBands];
-        private float[] _tapPanL = new float[64];       // 段3a: 到来方向→左右パン（等パワー）
-        private float[] _tapPanR = new float[64];
-        private char[] _tapType = new char[64];        // 'D'直接 / 'R'反射 / 'F'回折
-        private int _tapCount;
-        private float _itdgMs;                         // 最初の反射までの相対遅延=ITDG(広さの手がかり)
+        // タップ本体は音源ごとに SourceTaps が持つ（_taps / Status.Taps）。
         private Vector3[] _tapErPos = new Vector3[8];  // 早期反射 像源バッファ(主音源のタップ計算用)
         private float[] _tapErGain = new float[8 * 6];
         private Vector3[] _tapDiffPos = new Vector3[8];
@@ -1044,7 +1073,7 @@ namespace AcousticFlow
             if (--_tapCountdown <= 0)
             {
                 _tapCountdown = Mathf.Max(1, _tapUpdateEveryFrames);
-                BuildMainSourceTaps();
+                BuildAllSourceTaps();
             }
 
             // 6) 残響（低レートでエコグラム→RT60/wet→Wwise RoomVerb を RTPC 駆動）。
@@ -1135,107 +1164,141 @@ namespace AcousticFlow
             Status.BandsDiffract = _diffBands;
             Status.UseBandEq = useBandEq;
             Status.EqDb = _eqDbSmoothed;
-            Status.TapCount = _tapCount;
-            Status.ItdgMs = _itdgMs;
-            Status.TapDelayMs = _tapDelayMs;
-            Status.TapGain = _tapGain;
-            Status.TapBandGain = _tapBandGain;
-            Status.TapPanL = _tapPanL;
-            Status.TapPanR = _tapPanR;
-            Status.TapType = _tapType;
             Status.RtSeconds = _reverbDecay;
             Status.Wet = _reverbWet;
-            // 残響を絞る量。「その音源が部屋にエネルギーを注げているか」を表す。
-            //
-            //   以前は直線透過(_bands)だけを見ていたが、それは誤りだった。
-            //   衝立の裏に回っただけで透過は 0.02 まで落ち、残響が -35dB 消えていた。
-            //   実際には回折で 0.32 届いており、そもそも音源と自分が同じ部屋にいるなら
-            //   間に衝立があっても部屋の残響は落ちない（遮られるのは直接音だけ）。
-            //   残響を絞るべきなのは「音源が別の部屋にいて部屋に注げない」場合。
-            //
-            //   反射込みの生存(_bandsPerSource)はまさにその区別になっている。
-            //   衝立なら反射が回り込むので高いまま／別部屋なら反射も届かず下がる。
-            Status.SourceLevel = (_bandsPerSource != null && _bandsPerSource.Length >= AcousticEngine.NumBands)
-                ? Mean6(_bandsPerSource, 0)
-                : Mean6(_bands, 0);
-
-            // HRTF 用：主音源の到来方向をリスナー座標系へ。
-            //   ワールドの音源方向ではなく実測の到来方向（_apparentDir）を使う。
-            //   遮蔽時は回折で回り込む方向になるので、その方が定位として正しい。
-            if (listener != null && _apparentDir != null && _apparentDir.Length > 0)
-            {
-                Vector3 w = _apparentDir[0];
-                if (w.sqrMagnitude < 1e-8f && _srcPos != null && _srcPos.Length > 0)
-                    w = _srcPos[0] - listener.position;
-                if (w.sqrMagnitude > 1e-8f)
-                    Status.DirectDirLocal = listener.InverseTransformDirection(w.normalized);
-            }
+            // タップ・到来方向・遮蔽レベルは音源ごとに BuildAllSourceTaps が書く
+            // （Status.Taps）。Status.Tap* と SourceLevel はその音源0のエイリアス。
         }
 
-        // #2: 主音源(0)の全経路を「タップ」に束ねる（直接/反射/回折）。IRの生材料＝時間軸。
-        //   各タップ = {相対遅延(ms, 直接=0), 広帯域ゲイン, 種別}。
-        //   遅延 = (経路長 − 直接距離) ÷ 音速。まずは数値で妥当性を検証（小部屋=数ms / ホール=数十ms）。
-        private void BuildMainSourceTaps()
+        // 全音源ぶんのタップを組む。IR の生材料＝時間軸。
+        //   各タップ = {相対遅延(ms, 直接=0), 6帯域ゲイン, 到来方向のパン, 種別}。
+        //   遅延 = (経路長 − 直接距離) ÷ 音速。
+        private void BuildAllSourceTaps()
         {
-            _tapCount = 0;
-            _itdgMs = 0f;
             if (_scene == null || !_scene.IsValid || _srcPos == null || _srcPos.Length == 0) return;
+            if (_taps == null || _taps.Length != _srcPos.Length)
+            {
+                _taps = new SourceTaps[_srcPos.Length];
+                for (int i = 0; i < _taps.Length; i++) _taps[i] = new SourceTaps();
+                Status.Taps = _taps;
+            }
+            for (int i = 0; i < _srcPos.Length; i++) BuildTapsForSource(i, _taps[i]);
+
+            // 主音源(0)はモニタウィンドウ用にエイリアスしておく。
+            var t0 = _taps[0];
+            Status.TapCount = t0.Count;
+            Status.ItdgMs = t0.ItdgMs;
+            Status.TapDelayMs = t0.DelayMs;
+            Status.TapGain = t0.Gain;
+            Status.TapBandGain = t0.BandGain;
+            Status.TapPanL = t0.PanL;
+            Status.TapPanR = t0.PanR;
+            Status.TapType = t0.Type;
+            Status.DirectDirLocal = t0.DirectDirLocal;
+            Status.SourceLevel = t0.SourceLevel;
+        }
+
+        // #2: 音源 si の全経路を「タップ」に束ねる（直接/反射/回折）。
+        private void BuildTapsForSource(int si, SourceTaps ts)
+        {
+            ts.Count = 0;
+            ts.ItdgMs = 0f;
             Vector3 lp = listener.position;
-            Vector3 sp = _srcPos[0];
+            Vector3 sp = _srcPos[si];
             float directDist = Vector3.Distance(lp, sp);
             float toMs = 1000f / kSpeedOfSound;  // 距離(m) → ms（÷c ×1000）
 
             int n = 0;
-            // 直接タップ（基準 0ms）。
-            //   「壁を抜けてくる分(透過)」と「縁を回り込む分(回折)」の大きい方を採る。
-            //   以前は透過だけを使っていたため、影に入った瞬間に直接タップが
-            //   0.51 → 0.01（-34dB）と消えていた。実際には回折で 0.30 届いている。
-            //   回折は本来 'F' タップとして別に入る設計だが、GetDiffractionSources が
-            //   0本を返す配置ではどこにも入らず、直接音が丸ごと欠落していた。
-            //   なお見通し時は単純な max ではいけない。回折側は照らされた領域では
-            //   「直接音込みの総合値」を返す（境界近傍で 0.8 など、干渉で 1.0 を超えることも）。
-            //   透過は見通し時に必ず 1.0 なので、max を取ると境界近傍の減衰が 1.0 に戻って
-            //   しまい、せっかくの連続化が台無しになる。
-            //   → 見通し時は回折側をそのまま採用し、遮蔽時だけ「壁を抜ける分」と比べる。
             int nb6 = AcousticEngine.NumBands;
             if (_directBands == null) _directBands = new float[nb6];
-            bool lit = true;
-            for (int b = 0; b < nb6; b++) if (_bands[b] < 0.999f) { lit = false; break; }
-            for (int b = 0; b < nb6; b++)
-                _directBands[b] = lit ? _diffBands[b] : Mathf.Max(_bands[b], _diffBands[b]);
-            WriteTapBands(n++, _directBands, 0, directDist, sp, 'D', 0f);
+            if (_diffTapBands == null) _diffTapBands = new float[nb6];
+            if (_srcTransmit == null) _srcTransmit = new float[nb6];
+            if (_srcDiffract == null) _srcDiffract = new float[nb6];
+
+            // 透過と回折はこの音源ぶんを引く。主音源だけ Update で取った値を流用する
+            //   （表示用に _bands/_diffBands へ入っているので二度引かない）。
+            float[] tr, di;
+            if (si == 0) { tr = _bands; di = _diffBands; }
+            else
+            {
+                _scene.ComputeTransmissionBands(sp, lp, _srcTransmit);
+                _scene.ComputeDiffractionBands(sp, lp, _srcDiffract);
+                tr = _srcTransmit; di = _srcDiffract;
+            }
 
             // 段3: 早期反射/回折二次音源はバッチ更新で計算済み。ここでは結果を受け取るだけ。
-            //   以前はここで独自にエンジンを再呼び出ししていたので、同じ計算を
-            //   UpdateEarlyReflections と二重に走らせていた（音源0だけとはいえ無駄）。
-            int mainIdx = _scene.SourceIndex(SourceId(0));
+            int idx = _scene.SourceIndex(SourceId(si));
+
+            // 回折の開口は直接タップの決定に要る（下記）ので先に取る。
+            int df = _scene.GetDiffractionSources(idx, _tapDiffPos, _tapDiffGain);
+
+            // 直接タップ（基準 0ms）。
+            //   見通せている(lit)とき … 回折側が「直接音込みの総合値」を返す。開口が波長に対して
+            //     小さければ低域が落ちる（戸口のフレネル遮り）ので、その補正込みの値を採る。
+            //     透過は lit のとき必ず 1.0 なので、max を取ると補正が消えてしまう。
+            //   遮蔽されているとき … **透過だけ**を載せる。
+            //     回り込む成分は 'F' タップが開口の方向から鳴らすので、ここに混ぜてはいけない。
+            //     以前は max(透過, 回折) にしていたため、回り込みの一部が
+            //     「壁を突き抜ける方向」から鳴っていた（方向の矛盾＋二重計上）。
+            bool lit = true;
+            for (int b = 0; b < nb6; b++) if (tr[b] < 0.999f) { lit = false; break; }
+            bool diffHasSomewhereToGo = lit || df > 0;
+            for (int b = 0; b < nb6; b++)
+            {
+                if (lit) _directBands[b] = di[b];
+                else if (diffHasSomewhereToGo) _directBands[b] = tr[b];
+                // 遮蔽されているのに開口が 0 本＝回折の行き先が無い。捨てると直接音が
+                // 丸ごと欠落する（実測 -34dB）。エンジンの探索が2箇所で条件不一致な間の保険で、
+                // findDiffractionPaths への一本化（docs/DIFFRACTION_DESIGN.md §2）で不要になる。
+                else _directBands[b] = Mathf.Max(tr[b], di[b]);
+            }
+            WriteTapBands(ts, n++, _directBands, 0, directDist, sp, 'D', 0f);
 
             // 反射タップ（像源位置から経路長→遅延、6帯域ゲイン×空気吸収）。
-            int er = _scene.GetEarlyReflections(mainIdx, _tapErPos, _tapErGain);
-            for (int t = 0; t < er && n < _tapDelayMs.Length; t++)
+            int er = _scene.GetEarlyReflections(idx, _tapErPos, _tapErGain);
+            for (int t = 0; t < er && n < SourceTaps.MaxTaps; t++)
             {
                 float pl = Vector3.Distance(lp, _tapErPos[t]);  // 全経路長
                 float rel = (pl - directDist) * toMs;
                 if (rel < 0f) rel = 0f;
-                WriteTapBands(n++, _tapErGain, t * 6, pl, _tapErPos[t], 'R', rel);
+                WriteTapBands(ts, n++, _tapErGain, t * 6, pl, _tapErPos[t], 'R', rel);
             }
-            // 回折タップ（遮蔽時のみ。ゲインはスカラ=v1で3バンド一律、6帯域化は後段。空気吸収は広帯域で乗算）。
-            int df = _scene.GetDiffractionSources(mainIdx, _tapDiffPos, _tapDiffGain);
-            for (int t = 0; t < df && n < _tapDelayMs.Length; t++)
+            // 回折タップ。開口の方向から、開口までの経路長ぶん遅れて鳴る。
+            //   ★ゲインは6帯域。以前はスカラ(WriteTapFlat)だったので、回折の周波数依存
+            //     ——低域ほど回り込む＝高域から落ちる——が音に乗っていなかった。
+            //     遮蔽感の正体はこのハイ落ちなので、エンジンが計算した情報を捨てていたことになる。
+            //   配分: エンジンの6帯域回折ゲイン(_diffBands = 回り込む総量) を、
+            //     開口ごとの相対重み(_tapDiffGain, 合計1に正規化済み) で割り振る。
+            for (int t = 0; t < df && n < SourceTaps.MaxTaps; t++)
             {
                 float pl = Vector3.Distance(lp, _tapDiffPos[t]);
                 float rel = (pl - directDist) * toMs;
                 if (rel < 0f) rel = 0f;
-                AirAbsorptionBands(pl, _airTmp);
-                WriteTapFlat(n++, _tapDiffGain[t] * Mean6(_airTmp, 0), pl, _tapDiffPos[t], 'F', rel);
+                for (int b = 0; b < nb6; b++) _diffTapBands[b] = di[b] * _tapDiffGain[t];
+                WriteTapBands(ts, n++, _diffTapBands, 0, pl, _tapDiffPos[t], 'F', rel);
             }
-            _tapCount = n;
+            ts.Count = n;
 
             // ITDG = 直接以外の最小遅延（＝広さの主要な手がかり）。
             float best = float.MaxValue;
             for (int i = 0; i < n; i++)
-                if (_tapType[i] != 'D' && _tapDelayMs[i] < best) best = _tapDelayMs[i];
-            _itdgMs = (best == float.MaxValue) ? 0f : best;
+                if (ts.Type[i] != 'D' && ts.DelayMs[i] < best) best = ts.DelayMs[i];
+            ts.ItdgMs = (best == float.MaxValue) ? 0f : best;
+
+            // 残響の送出量。「その音源が部屋にエネルギーを注げているか」＝反射込みの生存。
+            //   直線透過だけで測ると、衝立の裏に回っただけで残響が -35dB 消える（DEV_LOG D章）。
+            int bo = si * nb6;
+            ts.SourceLevel = (_bandsPerSource != null && bo + nb6 <= _bandsPerSource.Length)
+                ? Mean6(_bandsPerSource, bo) : Mean6(tr, 0);
+
+            // HRTF 用の到来方向。実測の見かけ方向（遮蔽時は回り込む向き）をリスナー座標系へ。
+            if (listener != null && _apparentDir != null && si < _apparentDir.Length)
+            {
+                Vector3 w = _apparentDir[si];
+                if (w.sqrMagnitude < 1e-8f) w = sp - lp;
+                if (w.sqrMagnitude > 1e-8f)
+                    ts.DirectDirLocal = listener.InverseTransformDirection(w.normalized);
+            }
         }
 
         // 6帯域の単純平均（広帯域ゲイン表示用）。
@@ -1257,8 +1320,9 @@ namespace AcousticFlow
             }
         }
 
-        // 6帯域(gOff..)×空気吸収(pathLen) を low/mid/high にまとめてタップnに書く（段2）＋到来方向パン（段3a）＋距離減衰（③）。
-        private void WriteTapBands(int n, float[] g, int gOff, float pathLen, Vector3 arrival, char type, float delayMs)
+        // 6帯域(gOff..)×空気吸収(pathLen)×距離減衰 をタップnに書く＋到来方向のパン。
+        private void WriteTapBands(SourceTaps ts, int n, float[] g, int gOff, float pathLen,
+                                   Vector3 arrival, char type, float delayMs)
         {
             AirAbsorptionBands(pathLen, _airTmp);
             float da = DistAtten(pathLen);   // ③ 絶対距離減衰（1/r）
@@ -1268,25 +1332,14 @@ namespace AcousticFlow
             for (int b = 0; b < nb; b++)
             {
                 float v = g[gOff + b] * _airTmp[b] * da;
-                _tapBandGain[o + b] = v;
+                ts.BandGain[o + b] = v;
                 sum += v;
             }
-            _tapGain[n] = sum / nb;                 // 広帯域（プロット/表示用）
-            ComputePan(arrival, out _tapPanL[n], out _tapPanR[n]);
-            _tapType[n] = type; _tapDelayMs[n] = delayMs;
+            ts.Gain[n] = sum / nb;                  // 広帯域（プロット/表示用）
+            ComputePan(arrival, out ts.PanL[n], out ts.PanR[n]);
+            ts.Type[n] = type; ts.DelayMs[n] = delayMs;
         }
 
-        // スカラゲインを3バンド一律で書く（回折タップ用・v1）＋到来方向パン（段3a）＋距離減衰（③）。
-        private void WriteTapFlat(int n, float g, float pathLen, Vector3 arrival, char type, float delayMs)
-        {
-            g *= DistAtten(pathLen);   // ③ 絶対距離減衰（1/r）
-            int nb = AcousticEngine.NumBands;
-            int o = n * nb;
-            for (int b = 0; b < nb; b++) _tapBandGain[o + b] = g;
-            _tapGain[n] = g;
-            ComputePan(arrival, out _tapPanL[n], out _tapPanR[n]);
-            _tapType[n] = type; _tapDelayMs[n] = delayMs;
-        }
 
         // ③ 絶対距離減衰（1/r・振幅）。distanceRef でゲイン1、以遠は refDist/pathLen。0で無効(=1)。
         private float DistAtten(float pathLen)

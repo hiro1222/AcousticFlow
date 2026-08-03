@@ -53,7 +53,13 @@ namespace AcousticFlow
         [Tooltip("テストクリックの間隔(秒)。")]
         public float clickIntervalSec = 0.6f;
 
-                [Header("検証用の音源")]
+        [Header("対象の音源")]
+        [Tooltip("この畳み込み器が担当する音源の番号（AcousticFlowSceneDemo の source=0, "
+                 + "extraSources が 1 以降）。\n"
+                 + "遅延も到来方向も遮蔽も音源ごとに違うので、音源 1 つにつき 1 つ置く。")]
+        public int sourceIndex = 0;
+
+        [Header("検証用の音源")]
         [Tooltip("畳み込む音源。ここに差し替えると再生中でも即座に切り替わる。\n"
                  + "音源の性質で見えるものが変わる（DEV_LOG E-3）:\n"
                  + "  過渡音(足音・クリック) … 反射パターン・定位・HRTF\n"
@@ -470,8 +476,14 @@ namespace AcousticFlow
             {
                 _hrtfDirTimer = 0f;
                 _hrtf.SetCrossover(hrtfCrossoverHz);   // Inspector で動かしたら追従させる
-                _hrtf.SetDirection(AcousticFlowSceneDemo.Status.DirectDirLocal, headCircumferenceCm);
+                var tsDir = MyTaps();
+                _hrtf.SetDirection(tsDir != null ? tsDir.DirectDirLocal
+                                                 : AcousticFlowSceneDemo.Status.DirectDirLocal,
+                                   headCircumferenceCm);
             }
+
+            var tsLv = MyTaps();
+            if (tsLv != null) _mySourceLevel = tsLv.SourceLevel;
 
             _irTimer += Time.deltaTime;
             if (_irTimer >= irUpdateSec)
@@ -539,7 +551,8 @@ namespace AcousticFlow
             //   ・直接音タップの広帯域ゲイン dg = 距離減衰・透過を含む絶対レベルの基準。
             //   尾IRはエネルギー1に正規化済みなので、tailGain = dg × √target で
             //   出力の 尾/直接 パワー比がちょうど target になる。
-            var bg = AcousticFlowSceneDemo.Status.TapBandGain;
+            var tsCal = MyTaps();
+            var bg = tsCal != null ? tsCal.BandGain : AcousticFlowSceneDemo.Status.TapBandGain;
             float dg = 0f;
             if (bg != null && bg.Length >= kNumBands)
             {
@@ -554,15 +567,28 @@ namespace AcousticFlow
             else _tailConv.SetIr(_tailIr.Ir);
         }
 
+        // 担当音源の遮蔽レベル。オーディオスレッドはこれを読む（配列を辿らせない）。
+        private volatile float _mySourceLevel = 1f;
+
+        // 担当音源のタップ束。未初期化・範囲外なら null。
+        private AcousticFlowSceneDemo.SourceTaps MyTaps()
+        {
+            var all = AcousticFlowSceneDemo.Status.Taps;
+            if (all == null || sourceIndex < 0 || sourceIndex >= all.Length) return null;
+            return all[sourceIndex];
+        }
+
         // 早期反射のタップ（Status）を {遅延サンプル・6帯域ゲイン・パン} に変換して参照swap。
         private void RebuildIr()
         {
-            var d = AcousticFlowSceneDemo.Status.TapDelayMs;
-            var bg = AcousticFlowSceneDemo.Status.TapBandGain;
-            var bb = AcousticFlowSceneDemo.Status.TapGain;
-            var pl = AcousticFlowSceneDemo.Status.TapPanL;
-            var pr = AcousticFlowSceneDemo.Status.TapPanR;
-            int tc = AcousticFlowSceneDemo.Status.TapCount;
+            var ts = MyTaps();
+            if (ts == null) return;
+            var d = ts.DelayMs;
+            var bg = ts.BandGain;
+            var bb = ts.Gain;
+            var pl = ts.PanL;
+            var pr = ts.PanR;
+            int tc = ts.Count;
             if (d == null || tc <= 0) return;
 
             // 打ち切りは「早期↔後期の境目」。ここから先は尾の畳み込みが担当するので、
@@ -649,7 +675,9 @@ namespace AcousticFlow
             int frames = data.Length / channels;
             double clickPeriod = clickIntervalSec * _sampleRate;
             float wet = Mathf.Clamp01(AcousticFlowSceneDemo.Status.Wet);   // 開けた場所は wet≈0 = 残響ほぼ無し（尊重）
-            float srcLv = AcousticFlowSceneDemo.Status.SourceLevel;        // 遮蔽レベル(0..1)。壁裏では残響も絞る
+            // 遮蔽レベル(0..1)。壁裏では残響も絞る。音源ごとに違うのでメインスレッドで写しておく
+            // （オーディオスレッドから配列を辿らない）。
+            float srcLv = _mySourceLevel;
             if (srcLv <= 0f) srcLv = 1f;
             bool useFdn = (tailMode == TailMode.Fdn) && enableReverbTail;
             float fdnWet = useFdn ? tailLevel * wet * srcLv : 0f;

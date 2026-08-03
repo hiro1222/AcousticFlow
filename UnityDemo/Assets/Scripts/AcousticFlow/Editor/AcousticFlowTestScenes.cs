@@ -160,20 +160,23 @@ namespace AcousticFlow.EditorTools
             door.angleDeg = 0f;
             door.Apply();
 
-            // 音源は戸口の正面（回帰テスト diagnoseSwingDoor と同じ配置）。
-            //   この幾何だと直線が通るのは 0.5/cos θ <= 1、すなわち θ > 60° から。
-            //   60°付近で「回折のみ」→「直接見通せる」へ移る。ここが段差にならないかが要点。
-            //   ※音源を Inspector で左右にずらすと「開く方向の音源ほど早く抜けてくる」が確かめられる。
-            //     ただし戸口が幅1mなので、直線が戸口を通るのは音源の X が概ね ±1m 以内のとき。
-            var srcPos = new Vector3(0f, 1.6f, 3f);
-            AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);
-            AddConvolver(srcPos);
+            // 音源2つ。扉が振れる向きに対して左右に置き、聞こえ始める順序の違いを出す。
+            //   音源0（右・+X 側）… 隙間が開く方向。早い角度からダイレクトになる
+            //   音源1（左・-X 側）… 振れた扉の板が覆う方向。最後まで透過のまま
+            //   ※戸口が幅1mなので、直線が戸口を通るのは音源の X が概ね ±1m 以内のとき。
+            //     それを超えると壁側で遮られるため、左右とも ±0.8m に置く。
+            var srcRight = new Vector3(0.8f, 1.6f, 3f);
+            var srcLeft = new Vector3(-0.8f, 1.6f, 3f);
+            var srcs = AddDemo(listener, srcRight, AcousticMaterialPreset.Concrete);
+            if (srcs.Length > 1) srcs[1].position = srcLeft;   // 音源1だけ左へ
+
+            AddConvolver(srcRight, 0, name: "IrConvolver_Right");
+            AddConvolver(srcLeft, 1, name: "IrConvolver_Left");
 
             Save(scene, "Test_SwingDoor.unity",
                 "扉の開き角: 5/6 キーで扉を開閉（Inspector の SwingDoor.angleDeg でも可）。" +
-                "60°付近で直線が通り始める。開閉の2状態ではなく、途中の角度すべてで" +
-                "連続に変わることを確認する。音源を左右にずらすと、開く方向の音源ほど" +
-                "早く抜けてくる挙動が確かめられる。");
+                "右(+X)の音源が先に抜けてきて、左(-X)は扉の板に覆われて最後まで透過のまま。" +
+                "開閉の2状態ではなく、途中の角度すべてで連続に変わることを確認する。");
         }
 
         // ── 残響の検証：外 → 廊下 → 部屋 ──
@@ -329,18 +332,23 @@ namespace AcousticFlow.EditorTools
         //   楽曲で確かめたいとき（コムフィルタ・粒感）は TokyoGeto.wav に差し替える。
         private const string kTestClipPath = "Assets/Audio/Footstep_Asphalt.mp3";
 
-        private static void AddConvolver(Vector3 pos)
+        // 音源 sourceIndex ぶんの畳み込み器。遅延も到来方向も遮蔽も音源ごとに違うので、
+        // 鳴らしたい音源 1 つにつき 1 つ置く。clip を渡さなければ既定の足音を使う。
+        private static IrConvolver AddConvolver(Vector3 pos, int sourceIndex = 0,
+                                                string clipPath = null, string name = null)
         {
-            var go = new GameObject("IrConvolverTest");
+            var go = new GameObject(name ?? ("IrConvolver_" + sourceIndex));
             go.transform.position = pos;   // スピーカ(音源)と同じ位置に置く
             var src = go.AddComponent<AudioSource>();
-            var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(kTestClipPath);
+            var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(clipPath ?? kTestClipPath);
             if (clip == null) clip = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Audio/TokyoGeto.wav");
             if (clip != null) src.clip = clip;
 
             var conv = go.AddComponent<IrConvolver>();
+            conv.sourceIndex = sourceIndex;
             conv.tailLevel = 0.3f;                       // 全シーン統一
             conv.generateTestSignal = (clip == null);    // clipがあれば実音源を畳み込み / 無ければテスト信号
+            return conv;
         }
 
         private static void Tint(Transform t, Color c)
