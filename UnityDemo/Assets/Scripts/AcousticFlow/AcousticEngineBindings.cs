@@ -18,6 +18,7 @@ namespace AcousticFlow
         public float z;
 
         public AFVector3(Vector3 v) { x = v.x; y = v.y; z = v.z; }
+        public Vector3 ToVector3() { return new Vector3(x, y, z); }
     }
 
     // バッチ更新（AF_SceneUpdate）の設定。C 側 AF_UpdateConfig と同じ並び・型であること。
