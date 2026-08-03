@@ -82,7 +82,8 @@ namespace AcousticFlow.EditorTools
 
         // ── 回折の連続性検証：右側だけ開いた仕切り壁 ──
         // 開口の縁を回り込む回折を、影の中↔外を行き来しながら聴く。
-        // 影境界を跨ぐ瞬間に段差が出ないか（回折ゲインが 1.0 と UTD 値で飛ばないか）を確認する。
+        // 影境界を跨ぐ瞬間に段差が出ないかを確認する。回折は前川の式（符号付き δ のみに依存）
+        // なので、影の中↔外で連続に繋がり、高域ほど強く落ちる（＝回折によるローパス）はず。
         [MenuItem("AcousticFlow/Test Scenes/Diffraction Gap (回折・開口)")]
         public static void DiffractionGap()
         {

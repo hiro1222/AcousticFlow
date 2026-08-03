@@ -259,7 +259,7 @@ namespace AcousticFlow.EditorTools
             else
             {
                 EditorGUILayout.HelpBox(
-                    "迂回路はあるのに鳴動 0 本＝エッジのクラスタ化で棄却されている（UTD重み/自己除外）。\n" +
+                    "迂回路はあるのに鳴動 0 本＝エッジのクラスタ化で棄却されている（前川の重み/自己除外）。\n" +
                     "エンジン側の閾値を見る必要あり。", MessageType.Warning);
             }
         }
