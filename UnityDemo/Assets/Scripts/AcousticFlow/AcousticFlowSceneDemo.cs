@@ -25,10 +25,13 @@ namespace AcousticFlow
         public string[] sourceEvents = { "Vocal", "Guitar", "Piano", "Bass", "Drums", "Other" };
 
         [Header("occluder")]
-        [Tooltip("ON: シーン内の BoxCollider を自動収集して壁にする（listener/source 配下は除外）。")]
-        public bool autoCollectBoxColliders = true;
-        [Tooltip("手動指定の occluder（autoCollect と併用可）。")]
-        public BoxCollider[] extraOccluders;
+        [Tooltip("ON: シーン内の BoxCollider と MeshCollider を自動収集して壁にする"
+                 + "（listener/source 配下は除外）。\n"
+                 + "MeshCollider は実形状で扱われるので、穴の空いた壁のように箱で表せない"
+                 + "形もそのまま occluder にできる。")]
+        public bool autoCollectBoxColliders = true;   // 名前は歴史的。MeshCollider も拾う
+        [Tooltip("手動指定の occluder（autoCollect と併用可）。Box / Mesh どちらでもよい。")]
+        public Collider[] extraOccluders;
         [Tooltip("occluder の材質プリセット（全 occluder 共通・最小デモ用）。")]
         public AcousticMaterialPreset occluderMaterial = AcousticMaterialPreset.Concrete;
 
@@ -190,8 +193,22 @@ namespace AcousticFlow
 
         private AcousticScene _scene;
         private int _materialId;
-        private readonly List<BoxCollider> _occluders = new List<BoxCollider>();
-        private readonly List<int> _instanceIds = new List<int>();
+        // occluder は箱かメッシュ。geomId < 0 が箱で、その場合 local* は使わない。
+        //   メッシュはローカルAABBが単位箱になるよう正規化されて登録されるので、
+        //   ホスト側は「そのローカルAABB＋Transform」から毎フレーム OBB を組み直す。
+        private struct Occluder
+        {
+            public Collider col;          // BoxCollider または MeshCollider
+            public int instanceId;
+            public int geomId;            // -1 = 箱
+            public Vector3 localCenter;   // メッシュのみ
+            public Vector3 localHalf;     // メッシュのみ
+        }
+        private readonly List<Occluder> _occluders = new List<Occluder>();
+        // 同じ Mesh アセットは 1 回だけアップロードする（形状は共有し、配置だけ増やす）。
+        private readonly Dictionary<int, int> _meshGeomCache = new Dictionary<int, int>();
+        private readonly Dictionary<int, Vector3> _meshLocalCenter = new Dictionary<int, Vector3>();
+        private readonly Dictionary<int, Vector3> _meshLocalHalf = new Dictionary<int, Vector3>();
 
         private Transform[] _sources;   // source + extraSources
         private Vector3[] _srcPos;      // 音源位置バッファ
@@ -531,12 +548,25 @@ namespace AcousticFlow
                 {
                     if (col == null || !col.enabled) continue;
                     if (IsExcluded(col.transform)) continue;
-                    _occluders.Add(col);
+                    AddOccluder(col);
+                }
+                // MeshCollider も同じ扱いで拾う。箱で表せない形（穴の空いた壁など）はこちら。
+                foreach (var col in FindObjectsOfType<MeshCollider>())
+                {
+                    if (col == null || !col.enabled || col.sharedMesh == null) continue;
+                    if (IsExcluded(col.transform)) continue;
+                    AddOccluder(col);
                 }
             }
             if (extraOccluders != null)
                 foreach (var col in extraOccluders)
-                    if (col != null && !_occluders.Contains(col)) _occluders.Add(col);
+                    if (col != null) AddOccluder(col);
+        }
+
+        private void AddOccluder(Collider col)
+        {
+            foreach (var o in _occluders) if (o.col == col) return;   // 重複登録を防ぐ
+            _occluders.Add(new Occluder { col = col, instanceId = -1, geomId = -1 });
         }
 
         // listener / 各音源の階層下（本人含む）は occluder から除外する。
@@ -553,24 +583,75 @@ namespace AcousticFlow
 
         private void RegisterInstances()
         {
-            _instanceIds.Clear();
-            foreach (var col in _occluders)
+            _meshGeomCache.Clear();
+            _meshLocalCenter.Clear();
+            _meshLocalHalf.Clear();
+
+            for (int i = 0; i < _occluders.Count; i++)
             {
-                GetObb(col, out Vector3 c, out Vector3 half, out Vector3 right, out Vector3 up);
-                _instanceIds.Add(_scene.AddInstanceBox(c, half, right, up, _materialId));
+                var o = _occluders[i];
+                var mc = o.col as MeshCollider;
+                if (mc != null && mc.sharedMesh != null)
+                {
+                    // 形状は Mesh アセット単位で 1 回だけ登録し、配置だけ増やす（インスタンシング）。
+                    int key = mc.sharedMesh.GetInstanceID();
+                    if (!_meshGeomCache.TryGetValue(key, out int geom))
+                    {
+                        geom = _scene.AddMesh(mc.sharedMesh, out Vector3 lc, out Vector3 lh);
+                        _meshGeomCache[key] = geom;
+                        _meshLocalCenter[key] = lc;
+                        _meshLocalHalf[key] = lh;
+                    }
+                    if (geom >= 0)
+                    {
+                        o.geomId = geom;
+                        o.localCenter = _meshLocalCenter[key];
+                        o.localHalf = _meshLocalHalf[key];
+                        GetObb(o, out Vector3 c, out Vector3 half, out Vector3 r, out Vector3 u);
+                        o.instanceId = _scene.AddInstanceMesh(geom, c, half, r, u, _materialId);
+                        _occluders[i] = o;
+                        continue;
+                    }
+                    // 登録に失敗したら境界ボックスで代用する（音が消えるよりまし）。
+                }
+
+                GetObb(o, out Vector3 bc, out Vector3 bhalf, out Vector3 br, out Vector3 bu);
+                o.instanceId = _scene.AddInstanceBox(bc, bhalf, br, bu, _materialId);
+                _occluders[i] = o;
             }
         }
 
-        private static void GetObb(BoxCollider col, out Vector3 center, out Vector3 half,
+        // occluder の現在の transform から OBB を組む。
+        //   箱   … BoxCollider の center/size × lossyScale
+        //   メッシュ … 登録時のローカルAABB × lossyScale（正規化ローカル[-1,1]^3 → ワールドの写像）
+        private static void GetObb(Occluder o, out Vector3 center, out Vector3 half,
                                    out Vector3 right, out Vector3 up)
         {
-            Transform t = col.transform;
-            center = t.TransformPoint(col.center);
+            Transform t = o.col.transform;
             Vector3 s = t.lossyScale;
-            half = new Vector3(
-                Mathf.Abs(col.size.x * 0.5f * s.x),
-                Mathf.Abs(col.size.y * 0.5f * s.y),
-                Mathf.Abs(col.size.z * 0.5f * s.z));
+            if (o.geomId >= 0)
+            {
+                center = t.TransformPoint(o.localCenter);
+                half = new Vector3(o.localHalf.x * Mathf.Abs(s.x),
+                                   o.localHalf.y * Mathf.Abs(s.y),
+                                   o.localHalf.z * Mathf.Abs(s.z));
+            }
+            else if (o.col is BoxCollider bc)
+            {
+                center = t.TransformPoint(bc.center);
+                half = new Vector3(Mathf.Abs(bc.size.x * 0.5f * s.x),
+                                   Mathf.Abs(bc.size.y * 0.5f * s.y),
+                                   Mathf.Abs(bc.size.z * 0.5f * s.z));
+            }
+            else
+            {
+                // メッシュ登録に失敗した場合などのフォールバック。ワールド境界で代用する。
+                Bounds b = o.col.bounds;
+                center = b.center;
+                half = b.extents;
+                right = Vector3.right; up = Vector3.up;
+                return;
+            }
             right = t.right;
             up = t.up;
         }
@@ -901,12 +982,14 @@ namespace AcousticFlow
             if (enableMovement) HandleMovement();
 
             // 1) 動的ジオメトリ更新（動いた分だけ）。
+            //    メッシュも transform を送るだけ。形状の再構築は起きない
+            //    （移動・回転・スケール変化＝配置の操作なので）。
             for (int i = 0; i < _occluders.Count; i++)
             {
-                var col = _occluders[i];
-                if (col == null || _instanceIds[i] < 0) continue;
-                GetObb(col, out Vector3 c, out Vector3 half, out Vector3 right, out Vector3 up);
-                _scene.UpdateInstance(_instanceIds[i], c, half, right, up);
+                var o = _occluders[i];
+                if (o.col == null || o.instanceId < 0) continue;
+                GetObb(o, out Vector3 c, out Vector3 half, out Vector3 right, out Vector3 up);
+                _scene.UpdateInstance(o.instanceId, c, half, right, up);
             }
 
             // 2) 音源位置バッファ。
@@ -1445,11 +1528,11 @@ namespace AcousticFlow
             // 部屋の体積を occluder の合成 AABB から推定。
             bool has = false;
             Bounds b = default;
-            foreach (var col in _occluders)
+            foreach (var o in _occluders)
             {
-                if (col == null) continue;
-                if (!has) { b = col.bounds; has = true; }
-                else b.Encapsulate(col.bounds);
+                if (o.col == null) continue;
+                if (!has) { b = o.col.bounds; has = true; }
+                else b.Encapsulate(o.col.bounds);
             }
             if (!has) { Status.ReverbTargetRatio = 0f; return; }
             Vector3 sz = b.size;

@@ -4,6 +4,7 @@
 //   IrConvolver（クリックで反射パターンを聞く）を入れる。Play → M で楽曲ミュート →
 //   ヘッドホン＋Status Monitor（IRタップのプロット）で確認する。
 //   ※音源は本編と同じ6ステム。座標は全部同じ場所に重ねる（検証用なので分散不要）。
+using System.Collections.Generic;
 using System.IO;
 using UnityEditor;
 using UnityEditor.SceneManagement;
@@ -177,6 +178,86 @@ namespace AcousticFlow.EditorTools
                 "扉の開き角: 5/6 キーで扉を開閉（Inspector の SwingDoor.angleDeg でも可）。" +
                 "右(+X)の音源が先に抜けてきて、左(-X)は扉の板に覆われて最後まで透過のまま。" +
                 "開閉の2状態ではなく、途中の角度すべてで連続に変わることを確認する。");
+        }
+
+        // ── メッシュ形状の検証：穴の空いた壁（箱では表せない形）──
+        // 壁と戸口を「1枚のメッシュ」で作る。境界ボックスで判定していれば戸口も塞がるので、
+        // 戸口の正面で音が通ることが、実形状を見ている証拠になる。
+        // 左右に歩くと「戸口ごし → 壁ごし」に切り替わる。
+        [MenuItem("AcousticFlow/Test Scenes/Mesh Wall (穴の空いた壁)")]
+        public static void MeshWall()
+        {
+            var scene = NewScene();
+            var listener = MakeListener(new Vector3(0f, 1.6f, -4f));
+
+            var room = MakeRoom("Mesh", new Vector3(16f, 4f, 16f), 0.4f);
+            room.enableHotkeys = false;   // 仕切りが連動しないので拡縮させない
+            room.showGui = false;
+
+            // Z=0 の仕切り壁。幅16m・高4m・厚み0.3m、中央に 1.2m×2.2m の戸口を抜く。
+            //   ★BoxCollider ではなく MeshCollider で入れる。ここが検証の要点。
+            var wall = new GameObject("Wall_WithDoorway");
+            wall.transform.position = new Vector3(0f, 0f, 0f);
+            var mf = wall.AddComponent<MeshFilter>();
+            mf.sharedMesh = BuildDoorwayWall(16f, 4f, 0.3f, 1.2f, 2.2f);
+            wall.AddComponent<MeshRenderer>();
+            var mcol = wall.AddComponent<MeshCollider>();
+            mcol.sharedMesh = mf.sharedMesh;
+            Tint(wall.transform, new Color(0.75f, 0.75f, 0.8f));
+
+            // 音源は戸口の真正面・壁の向こう。
+            var srcPos = new Vector3(0f, 1.6f, 4f);
+            AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);
+            AddConvolver(srcPos);
+
+            Save(scene, "Test_MeshWall.unity",
+                "メッシュ形状: 壁と戸口が1枚の MeshCollider。戸口の正面(X=0)では音が素通りし、" +
+                "左右へ歩いて壁の裏に入ると遮蔽される。境界ボックスで判定していれば戸口でも" +
+                "遮蔽されるので、この差が実形状を見ている証拠になる。" +
+                "※メッシュは現時点で回折の対象外（設計 §5-5。回折の作り直しと同時に対応）。");
+        }
+
+        // 壁＋戸口のメッシュを作る。厚みのある板を「左・右・まぐさ」の3ブロックで構成する。
+        //   戸口は下端まで抜けている（床から高さ doorH まで、幅 doorW）。
+        private static Mesh BuildDoorwayWall(float width, float height, float thick,
+                                             float doorW, float doorH)
+        {
+            var verts = new List<Vector3>();
+            var tris = new List<int>();
+
+            void AddBox(Vector3 min, Vector3 max)
+            {
+                int b = verts.Count;
+                verts.Add(new Vector3(min.x, min.y, min.z)); // 0
+                verts.Add(new Vector3(max.x, min.y, min.z)); // 1
+                verts.Add(new Vector3(max.x, max.y, min.z)); // 2
+                verts.Add(new Vector3(min.x, max.y, min.z)); // 3
+                verts.Add(new Vector3(min.x, min.y, max.z)); // 4
+                verts.Add(new Vector3(max.x, min.y, max.z)); // 5
+                verts.Add(new Vector3(max.x, max.y, max.z)); // 6
+                verts.Add(new Vector3(min.x, max.y, max.z)); // 7
+                int[] f = {
+                    0,2,1, 0,3,2,   // -Z
+                    4,5,6, 4,6,7,   // +Z
+                    0,4,7, 0,7,3,   // -X
+                    1,2,6, 1,6,5,   // +X
+                    3,7,6, 3,6,2,   // +Y
+                    0,1,5, 0,5,4,   // -Y
+                };
+                foreach (int i in f) tris.Add(b + i);
+            }
+
+            float hw = width * 0.5f, ht = thick * 0.5f, hd = doorW * 0.5f;
+            AddBox(new Vector3(-hw, 0f, -ht), new Vector3(-hd, height, ht));      // 左
+            AddBox(new Vector3(hd, 0f, -ht), new Vector3(hw, height, ht));        // 右
+            AddBox(new Vector3(-hd, doorH, -ht), new Vector3(hd, height, ht));    // まぐさ
+
+            var m = new Mesh { name = "DoorwayWall" };
+            m.SetVertices(verts);
+            m.SetTriangles(tris, 0);
+            m.RecalculateNormals();
+            m.RecalculateBounds();
+            return m;
         }
 
         // ── 残響の検証：外 → 廊下 → 部屋 ──

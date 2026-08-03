@@ -42,6 +42,66 @@ namespace AcousticFlow
                 new AFVector3(right), new AFVector3(up), materialId);
         }
 
+        // 三角形メッシュを形状(BLAS)として登録し geomId を返す（失敗 -1）。
+        //   形状はローカルAABBが単位箱になるよう正規化して保持されるので、
+        //   インスタンスの OBB がそのまま local→world の変換になる。
+        //   その OBB を組むためのローカルAABBを out で受け取る（MeshInstanceObb を使うと楽）。
+        public int AddMesh(Mesh mesh, out Vector3 localCenter, out Vector3 localHalfExtents)
+        {
+            localCenter = Vector3.zero;
+            localHalfExtents = Vector3.one;
+            if (_handle == IntPtr.Zero || mesh == null) return -1;
+
+            var verts = mesh.vertices;
+            var tris = mesh.triangles;
+            if (verts == null || tris == null || verts.Length == 0 || tris.Length < 3) return -1;
+
+            var flat = new float[verts.Length * 3];
+            for (int i = 0; i < verts.Length; i++)
+            {
+                flat[i * 3] = verts[i].x;
+                flat[i * 3 + 1] = verts[i].y;
+                flat[i * 3 + 2] = verts[i].z;
+            }
+            int id = Native.AF_SceneAddMesh(_handle, flat, verts.Length, tris, tris.Length,
+                                            out var c, out var h);
+            if (id < 0) return -1;
+            localCenter = c.ToVector3();
+            localHalfExtents = h.ToVector3();
+            return id;
+        }
+
+        public void RemoveMesh(int geomId)
+        {
+            if (_handle != IntPtr.Zero) Native.AF_SceneRemoveMesh(_handle, geomId);
+        }
+
+        // メッシュ形状のインスタンスを追加し instanceId を返す（失敗 -1）。
+        public int AddInstanceMesh(int geomId, Vector3 center, Vector3 halfExtents,
+                                   Vector3 right, Vector3 up, int materialId)
+        {
+            if (_handle == IntPtr.Zero) return -1;
+            return Native.AF_SceneAddInstanceMesh(
+                _handle, geomId, new AFVector3(center), new AFVector3(halfExtents),
+                new AFVector3(right), new AFVector3(up), materialId);
+        }
+
+        // ローカルAABB(AddMesh の戻り) と Transform から、インスタンスの OBB を組む。
+        //   正規化ローカル [-1,1]^3 → ワールド の写像がこれで一意に決まる。
+        //   非一様スケールを許す（部屋の内寸変更＝壁を非一様に伸ばす、が要件のため）。
+        public static void MeshInstanceObb(Transform t, Vector3 localCenter, Vector3 localHalfExtents,
+                                           out Vector3 center, out Vector3 halfExtents,
+                                           out Vector3 right, out Vector3 up)
+        {
+            center = t.TransformPoint(localCenter);
+            Vector3 s = t.lossyScale;
+            halfExtents = new Vector3(localHalfExtents.x * Mathf.Abs(s.x),
+                                      localHalfExtents.y * Mathf.Abs(s.y),
+                                      localHalfExtents.z * Mathf.Abs(s.z));
+            right = t.right;
+            up = t.up;
+        }
+
         // 既存インスタンスの transform を更新（動いた分だけ）。
         public void UpdateInstance(int instanceId, Vector3 center, Vector3 halfExtents,
                                    Vector3 right, Vector3 up)

@@ -175,6 +175,24 @@ namespace AcousticFlow
             IntPtr scene, AFVector3 center, AFVector3 halfExtents,
             AFVector3 right, AFVector3 up, int materialId);
 
+        // 三角形メッシュを形状(BLAS)として登録し geomId を返す（失敗 -1）。
+        //   outLocalCenter / outLocalHalfExtents に、正規化に使ったローカルAABBが返る。
+        //   ホストはこれを使ってインスタンスの OBB（＝変換）を組む。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneAddMesh(
+            IntPtr scene, float[] verticesXYZ, int vertexCount, int[] indices, int indexCount,
+            out AFVector3 outLocalCenter, out AFVector3 outLocalHalfExtents);
+
+        // 形状を解放。参照していたインスタンスは箱（境界ボックス）扱いに落ちる。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneRemoveMesh(IntPtr scene, int geomId);
+
+        // メッシュ形状のインスタンスを追加し instanceId を返す（失敗 -1）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneAddInstanceMesh(
+            IntPtr scene, int geomId, AFVector3 center, AFVector3 halfExtents,
+            AFVector3 right, AFVector3 up, int materialId);
+
         // 既存インスタンスの transform を更新（動いた分だけ）。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneUpdateInstance(
