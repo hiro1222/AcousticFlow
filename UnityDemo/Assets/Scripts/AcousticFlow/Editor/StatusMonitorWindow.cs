@@ -126,6 +126,23 @@ namespace AcousticFlow.EditorTools
                                            EditorStyles.miniLabel);
             }
 
+            // プローブが測った方向分布そのもの（125Hz・リスナー座標系）。
+            //   L/R が均等でも前後や上下に差があれば「場は測れているが鳴らし方が捉えていない」。
+            //   全軸が同じなら場自体が平坦（部屋の中央など）。
+            var ax = AcousticFlowSceneDemo.Status.ProbeAxisEnergy;
+            if (ax != null && ax.Length >= 6)
+            {
+                EditorGUILayout.LabelField("  プローブ分布 125Hz 右/左",
+                    $"{ax[0]:F2} / {ax[1]:F2}      上/下  {ax[2]:F2} / {ax[3]:F2}");
+                EditorGUILayout.LabelField("                   前/後",
+                    $"{ax[4]:F2} / {ax[5]:F2}");
+                float mn = ax[0], mx = ax[0];
+                for (int i = 1; i < 6; i++) { if (ax[i] < mn) mn = ax[i]; if (ax[i] > mx) mx = ax[i]; }
+                float spread = (mx > 1e-6f) ? mn / mx : 1f;
+                EditorGUILayout.LabelField("  → 分布の偏り(最小/最大)",
+                    $"{spread:F2}  （1に近い=平坦 / 小さい=方向がある）");
+            }
+
             // --- 帯域（主音源） ---
             EditorGUILayout.Space(8f);
             EditorGUILayout.LabelField("主音源 帯域ゲイン (1=素通り / 0=遮断)", EditorStyles.boldLabel);

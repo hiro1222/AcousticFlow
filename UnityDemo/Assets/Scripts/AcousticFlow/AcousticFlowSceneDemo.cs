@@ -85,12 +85,19 @@ namespace AcousticFlow
         [Tooltip("残響の更新間隔（フレーム）。重いので数フレームに1回で十分（部屋は緩変）。")]
         public int reverbUpdateEveryFrames = 4;
 
-        [Header("後期残響の方向づけ（方向プローブ）")]
-        [Tooltip("ON: リスナー位置から全方向へレイを撒き、『どちらから残響が返るか』を測って"
-                 + "尾の左右バランスに反映する。\n"
-                 + "後期残響は拡散なので時間構造はエコーグラムが持てばよく、足りないのは方向分布だけ。"
-                 + "音源に依存しないので、音源が増えてもコストは増えない。")]
-        public bool enableDirectionalTail = true;
+        [Header("後期残響の方向づけ（方向プローブ）※既定オフ・下記参照")]
+        [Tooltip("リスナー位置から全方向へレイを撒き、『どちらから残響が返るか』を測って"
+                 + "尾の左右バランスに反映する。\n\n"
+                 + "【既定オフの理由】測定は正しく効いているが、鳴らし方が非対称を運べない。\n"
+                 + "  廊下での実測(125Hz): 前/後 6.43/3.55（1.8倍）, 右/左 6.18/5.07（1.2倍）\n"
+                 + "  → 場には明確な方向がある。しかし L/R バランスは左右軸しか表現できず、\n"
+                 + "     最終的に 0.9dB しか動かないので聞こえない。\n"
+                 + "  ちゃんと鳴らすには尾IRにHRTFを焼き込む必要があるが、拡散音場の前後定位は\n"
+                 + "  完璧に鳴らしても知覚されにくい（前後判別は耳介のスペクトル手がかり依存）。\n"
+                 + "  空間の印象を作る『両耳間の無相関』『早期反射の方向』は既に入っている。\n\n"
+                 + "測定そのものは安価で正確なので、将来『どれだけ囲まれているか』の指標として"
+                 + "転用しうる（残響の量は方向と違って明確に知覚される）。詳細は DEV_LOG I章。")]
+        public bool enableDirectionalTail = false;
         [Tooltip("プローブが撒くレイの本数。方向分布は滑らかなので少なくてよい。")]
         [Range(8, 256)] public int probeRays = 64;
         [Tooltip("プローブのバウンス数。残響の『返り』を捉える深さ。")]
@@ -259,6 +266,7 @@ namespace AcousticFlow
         private Vector3[] _probeDirs;        // 球面上の等分布方向（ワールド固定）
         private float[] _probeEnergy;        // dirCount*6
         private float[] _tailEarBandGain;    // [0..5]=左 / [6..11]=右。平均1に正規化
+        private float[] _probeAxis;          // 診断用: 6軸へ投影した分布
         private int _probeCountdown = 1;
         private float _diffDelta = -1f;
         private Vector3 _diffMid;
@@ -366,6 +374,11 @@ namespace AcousticFlow
             //   [0..5]=左耳 / [6..11]=右耳。null なら方向づけなし（従来どおり均一）。
             public static float[] TailEarBandGain;
             public static float TailDirBalance;     // 診断用: 低域の右/左 比（1=均等）
+
+            // 診断用: プローブが測った方向分布そのもの（リスナー座標系の6方向・125Hz）。
+            //   前後/上下の非対称は L/R バランスでは表現できないので、生の分布を見る必要がある。
+            //   [0]=右 [1]=左 [2]=上 [3]=下 [4]=前 [5]=後
+            public static float[] ProbeAxisEnergy;
         }
 
         /// <summary>
@@ -1353,6 +1366,28 @@ namespace AcousticFlow
             Status.TailEarBandGain = _tailEarBandGain;
             Status.TailDirBalance = (_tailEarBandGain[0] > 1e-4f)
                 ? _tailEarBandGain[nb] / _tailEarBandGain[0] : 1f;
+
+            // 診断: 場そのものに構造があるかを見る。リスナー座標系の6軸へ投影（125Hz）。
+            //   L/R バランスが 1.00/1.00 でも、前後や上下に差があれば「場は測れているが
+            //   鳴らし方が捉えていない」と分かる。逆に全軸が同じなら場自体が平坦。
+            if (_probeAxis == null) _probeAxis = new float[6];
+            Vector3[] axes = {
+                listener.right, -listener.right, Vector3.up, Vector3.down,
+                listener.forward, -listener.forward,
+            };
+            for (int a = 0; a < 6; a++)
+            {
+                float sum = 0f, wsum = 0f;
+                for (int i = 0; i < nd; i++)
+                {
+                    float w = Vector3.Dot(_probeDirs[i], axes[a]);
+                    if (w <= 0f) continue;                 // その軸の半球だけ、cos 重みで
+                    sum += _probeEnergy[i * nb] * w;
+                    wsum += w;
+                }
+                _probeAxis[a] = (wsum > 1e-6f) ? sum / wsum : 0f;
+            }
+            Status.ProbeAxisEnergy = _probeAxis;
         }
 
         // 球面上のほぼ等分布な方向（フィボナッチ格子）。エンジン側と同じ考え方。
