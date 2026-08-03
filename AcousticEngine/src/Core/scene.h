@@ -349,8 +349,12 @@ public:
         //   実際の影境界からずれる（この距離だけ回折点が動くので）。UTD は「直接音が消える点」と
         //   「回折場が符号反転する点」が一致することで連続になる仕組みなので、両者がずれると
         //   その区間だけ値が壊れる（実測で 3.8dB の段差が出ていた区間と一致）。
-        //   自己遮蔽は isOccludedExcept が当の箱を除外するので、膨らませなくても視線は通る。
-        const float margin = 1e-3f;
+        //   一方で 0 にもできない。回折点を通る経路は箱の面を「掠める」ので、面に沿って走る。
+        //   稜線が表面ぴったりだと、その経路が自分の箱と接触したと判定されてしまう
+        //   （接触は回折点の近傍ではなく経路全体に分布するので、端点を引くだけでは避けられない）。
+        //   → 面から確実に離れる最小限だけ外へ出す。前川の式は δ のみに依存するので、
+        //     この程度のずれでは連続性は壊れない（UTD は影境界の位置がずれて壊れていた）。
+        const float margin = 0.02f;   // 2cm
 
         // 稜線 A-B 上で from→P→to が最短になる点（＝直線が掠める角）＋端点から、両区間見通せる
         // 最短を1つ選んで fn に渡す。g(t)=|from-P|+|P-to| は単峰なので三分探索で最小点を得る。
@@ -366,10 +370,28 @@ public:
                 const float m2 = hi - (hi - lo) * (1.0f / 3.0f);
                 if (g(m1) < g(m2)) hi = m2; else lo = m1;
             }
-            // 当の箱を除外して「他の障害物だけ」で両区間を見通せるか。
+            // 回折点 P から from / to の両方を見通せるか。
+            //
+            //   ★当の箱(exceptInst)は「除外」ではなく「貫通長で判定」する。
+            //     以前は当の箱を判定から丸ごと外していた。厚みのある壁の稜線を回る経路は、
+            //     幾何的に必ずその壁の厚みぶんを貫くので、単純に「交差＝無効」にすると
+            //     正しい回折経路まで消えてしまうからである。
+            //     しかし丸ごと除外は乱暴すぎた。大きな壁では「その壁を何メートルも突き抜けて
+            //     遠い稜線に達する経路」まで見通せると判定され、音が通らない場所が開口として
+            //     認識される（実機で、壁の裏の見当違いな方向に回折経路が生えていた）。
+            //     → 両者を分けるのは「通るか否か」ではなく「どれだけ通るか」。
+            //       箱のいちばん薄い方向を通り抜けるぶんまでは「回り込み」として許し、
+            //       それを超える貫通は「壁を突っ切っている」として棄却する。
+            const Obb& selfObb = instances_[exceptInst].obb;
+            const float thinnest = 2.0f * std::min(selfObb.halfExtents.x,
+                                        std::min(selfObb.halfExtents.y, selfObb.halfExtents.z));
+            const float maxPen = thinnest + 0.05f;   // 厚み＋数値誤差ぶんの余裕
             auto vis = [&](float t) {
                 const Vec3 p = Pf(t);
-                return !isOccludedExcept(from, p, exceptInst) && !isOccludedExcept(p, to, exceptInst);
+                if (isOccludedExcept(from, p, exceptInst)) return false;   // 他の障害物
+                if (isOccludedExcept(p, to, exceptInst)) return false;
+                return segmentObbPenetration(from, p, selfObb) <= maxPen
+                    && segmentObbPenetration(p, to, selfObb) <= maxPen;
             };
 
             // ★回折点は「可視範囲に制約した g の最小点」。

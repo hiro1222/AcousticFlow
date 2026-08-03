@@ -162,6 +162,35 @@ inline bool segmentIntersectsObb(const Vec3& p0, const Vec3& p1, const Obb& b) {
     return segmentIntersectsAabb(obbToLocalPoint(p0, b), obbToLocalPoint(p1, b), local);
 }
 
+// 線分が OBB の内部を通る「長さ」(m)。交差しなければ 0。
+//   交差の有無だけでは足りない場面がある。厚みのある壁の稜線を回る回折経路は、
+//   幾何的に必ずその壁の厚みぶんを貫くので「交差する＝無効」にすると正しい経路まで消える。
+//   一方、大きな壁の遠い稜線へ向かう経路は壁を何メートルも貫く。両者を分けるのは
+//   「どれだけ通るか」であって「通るか否か」ではない。
+inline float segmentObbPenetration(const Vec3& p0, const Vec3& p1, const Obb& b) {
+    const Vec3 lp0 = obbToLocalPoint(p0, b), lp1 = obbToLocalPoint(p1, b);
+    const float dir[3] = { lp1.x - lp0.x, lp1.y - lp0.y, lp1.z - lp0.z };
+    const float org[3] = { lp0.x, lp0.y, lp0.z };
+    const float h[3] = { b.halfExtents.x, b.halfExtents.y, b.halfExtents.z };
+
+    float tmin = 0.0f, tmax = 1.0f;
+    const float kEps = 1e-8f;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (std::fabs(dir[axis]) < kEps) {
+            if (org[axis] < -h[axis] || org[axis] > h[axis]) return 0.0f;
+        } else {
+            const float ood = 1.0f / dir[axis];
+            float t1 = (-h[axis] - org[axis]) * ood;
+            float t2 = ( h[axis] - org[axis]) * ood;
+            if (t1 > t2) std::swap(t1, t2);
+            tmin = std::max(tmin, t1);
+            tmax = std::min(tmax, t2);
+            if (tmin > tmax) return 0.0f;
+        }
+    }
+    return (tmax - tmin) * length(p1 - p0);
+}
+
 // レイと OBB の交差。ローカルでAABB判定し、出てきた法線を基底でワールドへ戻す。
 // dir は呼び出し側で正規化済みを前提（outT がそのまま距離になる）。
 inline bool rayIntersectsObb(const Vec3& origin, const Vec3& dir, const Obb& b,

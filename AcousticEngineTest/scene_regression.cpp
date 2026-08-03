@@ -585,6 +585,53 @@ void diagnoseShadowBoundary() {
     AF_SceneDestroy(s);
 }
 
+// 回折二次音源は「音が実際に抜けてくる場所」を指していなければならない。
+//   大きな壁の場合、壁の反対端の稜線は「壁を何メートルも貫く経路」でしか到達できないので
+//   開口ではない。にもかかわらず候補に入ると、壁の裏の見当違いな方向から音が鳴る。
+//   （実機で観測された症状。原因は当の箱を遮蔽判定から丸ごと除外していたこと。）
+void diagnoseApertureDirection() {
+    std::printf("\n[診断] 回折二次音源が「抜けてくる側」を指しているか\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+
+    // 大きな壁。x∈[-10,2] が壁、x>2 が唯一の開口。上下も十分に伸ばしてある。
+    //   このとき二次音源は「x=+2 の縁」に強く集中すべきである。
+    //   当の箱を遮蔽判定から丸ごと除外していると、壁を貫いて到達する稜線まで候補に通るため、
+    //   重みが分散して「どこから抜けてくるか」がぼやける（実測 0.31 まで低下）。
+    AF_SceneAddInstanceBox(s, V(-4, 2, 0), V(6, 4, 0.2f), V(1, 0, 0), V(0, 1, 0), mat);
+
+    const AF_Vector3 L = V(0, 1.6f, -4), S = V(0, 1.6f, 4);
+    check("大きな壁の裏は遮蔽される", AF_SceneIsOccluded(s, L, S) != 0);
+
+    // 音源を登録してバッチ更新（二次音源はこの経路でしか取れない）。
+    AF_SceneSetListener(s, L);
+    AF_SceneSetSource(s, 1, S);
+    AF_SceneUpdate(s, 1.0f / 60.0f);
+
+    AF_Vector3 pos[8]; float gain[8];
+    const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+    std::printf("      二次音源 %d 本（開口は x=+2 側の縁ひとつ）\n", n);
+    bool allNearSide = (n > 0);
+    float top = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        std::printf("        [%d] (%7.2f,%7.2f,%7.2f)  gain %.3f%s\n",
+                    i, pos[i].x, pos[i].y, pos[i].z, gain[i],
+                    (pos[i].x < 0.0f) ? "   ← 壁の反対側！" : "");
+        if (pos[i].x < 0.0f) allNearSide = false;
+        if (gain[i] > top) top = gain[i];
+    }
+    check("二次音源がすべて開口側(x>0)を指す", allNearSide);
+
+    // 開口が1つしかないのだから、重みはそこに集中していなければならない。
+    //   分散していると「どの方向から抜けてくるか」が伝わらず、定位がぼやける。
+    //   壁を貫く経路を候補に通していた頃はここが 0.31 だった。
+    char b2[96];
+    std::snprintf(b2, sizeof(b2), "(最大 %.3f)", top);
+    check("重みが唯一の開口に集中している(最大>0.5)", top > 0.5f, b2);
+
+    AF_SceneDestroy(s);
+}
+
 // ---------------------------------------------------------------- 頑健性
 // 不正入力で落ちない（移行中に呼び出し規約を変えるので、境界は明示的に守る）。
 void testRobustness() {
@@ -621,6 +668,7 @@ int main() {
     testUpdateRates();
     diagnoseTailSpectrum();
     diagnoseShadowBoundary();
+    diagnoseApertureDirection();
     testRobustness();
 
     std::printf("\n----\n");
