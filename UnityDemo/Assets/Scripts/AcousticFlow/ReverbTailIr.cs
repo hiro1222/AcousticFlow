@@ -164,8 +164,14 @@ namespace AcousticFlow
         //   IR は「エネルギー1」に正規化して返すので、絶対レベルは呼び手がこの比から決める
         //   （CalibrateGain 参照）。エコグラムは 1/r を含まない“相対の形”だが、
         //   直接ビンと尾ビンは同じ単位なので、両者の比は意味を持つ。
+        // earBandGain: チャンネル(耳)ごと×6帯域のゲイン [c*6+b]。null なら均一。
+        //   後期残響の「どちらから響いてくるか」をここで入れる。方向プローブが測った
+        //   左右バランスを渡す想定で、平均1に正規化されているので全体の音量は変わらない。
+        //   尾IRはチャンネルごとに独立ノイズを持つ（＝L/Rが無相関）ので、
+        //   帯域ゲインを掛けるだけで方向がつき、畳み込みのコストは増えない。
         public float Build(float[] echoBands, int binCount, float binMs, float startMs, float fadeMs,
-                           float smoothMs, float smoothGrowth, float envAlpha)
+                           float smoothMs, float smoothGrowth, float envAlpha,
+                           float[] earBandGain = null)
         {
             for (int c = 0; c < _channels; c++) System.Array.Clear(_ir[c], 0, _length);
             if (echoBands == null || binCount <= 0 || binMs <= 0f) return 0f;
@@ -205,6 +211,10 @@ namespace AcousticFlow
                 for (int b = 0; b < kNumBands; b++)
                 {
                     var nb = bn[b];
+                    // 耳ごと×帯域の方向ゲイン（エネルギー比で渡ってくるので振幅は √）。
+                    float dirAmp = 1f;
+                    if (earBandGain != null && c * kNumBands + b < earBandGain.Length)
+                        dirAmp = Mathf.Sqrt(Mathf.Max(0f, earBandGain[c * kNumBands + b]));
                     for (int i = startSample; i < _length; i++)
                     {
                         // ビン境界で段差が出ないよう、包絡はビン間を線形補間する。
@@ -218,7 +228,7 @@ namespace AcousticFlow
                         if (e <= 0f) continue;
 
                         // エネルギー→振幅は √。ビン内に散らばる分の正規化も掛ける。
-                        float amp = Mathf.Sqrt(e / samplesPerBin);
+                        float amp = Mathf.Sqrt(e / samplesPerBin) * dirAmp;
                         // 早期部との継ぎ目をなめらかに。
                         int d = i - startSample;
                         if (d < fadeSamples) amp *= (float)d / fadeSamples;

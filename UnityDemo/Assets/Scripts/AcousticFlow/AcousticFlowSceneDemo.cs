@@ -84,6 +84,24 @@ namespace AcousticFlow
         public int echogramBounces = 24;
         [Tooltip("残響の更新間隔（フレーム）。重いので数フレームに1回で十分（部屋は緩変）。")]
         public int reverbUpdateEveryFrames = 4;
+
+        [Header("後期残響の方向づけ（方向プローブ）")]
+        [Tooltip("ON: リスナー位置から全方向へレイを撒き、『どちらから残響が返るか』を測って"
+                 + "尾の左右バランスに反映する。\n"
+                 + "後期残響は拡散なので時間構造はエコーグラムが持てばよく、足りないのは方向分布だけ。"
+                 + "音源に依存しないので、音源が増えてもコストは増えない。")]
+        public bool enableDirectionalTail = true;
+        [Tooltip("プローブが撒くレイの本数。方向分布は滑らかなので少なくてよい。")]
+        [Range(8, 256)] public int probeRays = 64;
+        [Tooltip("プローブのバウンス数。残響の『返り』を捉える深さ。")]
+        [Range(2, 24)] public int probeBounces = 10;
+        [Tooltip("プローブの更新間隔（フレーム）。")]
+        public int probeUpdateEveryFrames = 8;
+        [Tooltip("左右バランスの効き。0=方向づけなし / 1=測定どおり / >1=誇張。\n"
+                 + "実際の左右差は控えめなので、聞き取りやすさのために少し上げてよい。")]
+        [Range(0f, 3f)] public float directionalTailStrength = 1.0f;
+        [Tooltip("左右バランスの追従の速さ(秒)。急に変わるとリバーブが揺れて不自然になる。")]
+        [Range(0.05f, 2f)] public float directionalTailSmoothSec = 0.35f;
         [Tooltip("拡散リバーブ(RoomVerb)の wet 倍率。反響が強すぎるなら下げる（0=残響なし）。")]
         [Range(0f, 2f)] public float reverbWetScale = 0.8f;
         [Tooltip("残響/直接の物理エネルギー比を鳴らす前に圧縮する指数。\n"
@@ -236,6 +254,12 @@ namespace AcousticFlow
         private float[] _diffTapBands;
         // 副音源(1以降)の透過/回折を引くための一時バッファ（主音源は _bands/_diffBands を流用）。
         private float[] _srcTransmit, _srcDiffract;
+
+        // ── 方向プローブ（後期残響の方向分布）──
+        private Vector3[] _probeDirs;        // 球面上の等分布方向（ワールド固定）
+        private float[] _probeEnergy;        // dirCount*6
+        private float[] _tailEarBandGain;    // [0..5]=左 / [6..11]=右。平均1に正規化
+        private int _probeCountdown = 1;
         private float _diffDelta = -1f;
         private Vector3 _diffMid;
         // 遮蔽量の帯域加重（低域=大。低音は回り込んで残るため重い）。
@@ -336,6 +360,12 @@ namespace AcousticFlow
             public static float RtSeconds;          // 残響RT60(秒)
             public static float Wet;                // 残響wet(0..1, tail/total)
             public static float SourceLevel;        // 主音源の直線透過(遮蔽)レベル(0..1)。残響を遮蔽で絞る用
+
+            // 後期残響の左右バランス（耳ごと×6帯域）。平均が 1 になるよう正規化してある
+            //   ＝全体の音量は変えず、どちらから響いてくるかだけを変える。
+            //   [0..5]=左耳 / [6..11]=右耳。null なら方向づけなし（従来どおり均一）。
+            public static float[] TailEarBandGain;
+            public static float TailDirBalance;     // 診断用: 低域の右/左 比（1=均等）
         }
 
         /// <summary>
@@ -1157,6 +1187,7 @@ namespace AcousticFlow
             {
                 _tapCountdown = Mathf.Max(1, _tapUpdateEveryFrames);
                 BuildAllSourceTaps();
+                UpdateDirectionalTail();
             }
 
             // 6) 残響（低レートでエコグラム→RT60/wet→Wwise RoomVerb を RTPC 駆動）。
@@ -1251,6 +1282,92 @@ namespace AcousticFlow
             Status.Wet = _reverbWet;
             // タップ・到来方向・遮蔽レベルは音源ごとに BuildAllSourceTaps が書く
             // （Status.Taps）。Status.Tap* と SourceLevel はその音源0のエイリアス。
+        }
+
+        // 後期残響の方向分布を測り、尾の左右バランス（耳ごと×6帯域）に落とす。
+        //
+        //   後期残響は拡散音場なので「いつ届くか」はエコーグラムが持てばよく、足りないのは
+        //   「どちらから届くか」だけ。それは音源に依存せずリスナー位置だけで決まるので、
+        //   音源が何個あってもこの計算は 1 回で済む。
+        //
+        //   尾IRはチャンネルごとに独立ノイズを持つ（＝L/R が無相関で広がる）ので、
+        //   耳ごとの帯域ゲインを掛けるだけで方向がつく。畳み込みのコストは増えない。
+        //
+        //   平均が 1 になるよう正規化する。全体の音量は変えず、左右の比だけを動かす
+        //   ── 音量まで動くと「部屋差は減衰時間で出す」という C-2 の結論を壊すため。
+        private void UpdateDirectionalTail()
+        {
+            if (!enableDirectionalTail || _scene == null || !_scene.IsValid || listener == null)
+            {
+                Status.TailEarBandGain = null;
+                return;
+            }
+            if (--_probeCountdown > 0) return;
+            _probeCountdown = Mathf.Max(1, probeUpdateEveryFrames);
+
+            int nd = Mathf.Clamp(probeRays, 8, 256);
+            int nb = AcousticEngine.NumBands;
+            if (_probeDirs == null || _probeDirs.Length != nd) _probeDirs = FibonacciSphere(nd);
+            if (_probeEnergy == null || _probeEnergy.Length < nd * nb) _probeEnergy = new float[nd * nb];
+            if (_tailEarBandGain == null)
+            {
+                _tailEarBandGain = new float[nb * 2];
+                for (int i = 0; i < _tailEarBandGain.Length; i++) _tailEarBandGain[i] = 1f;
+            }
+
+            _scene.ProbeDirectionalEnergy(listener.position, _probeDirs, nd,
+                                          Mathf.Clamp(probeBounces, 2, 24), _probeEnergy);
+
+            // 各方向を「左耳寄り／右耳寄り」に重み付けして帯域ごとに集める。
+            //   カーディオイド 0.5+0.5*cos は、真横で 1/0、正面と後方で 0.5/0.5。
+            //   ＝正中面の音は左右均等に配られ、横方向だけが偏る。
+            Vector3 earAxis = listener.right;   // +X が右耳側
+            for (int b = 0; b < nb; b++)
+            {
+                float sumL = 0f, sumR = 0f;
+                for (int i = 0; i < nd; i++)
+                {
+                    float e = _probeEnergy[i * nb + b];
+                    if (e <= 0f) continue;
+                    float c = Vector3.Dot(_probeDirs[i], earAxis);   // +1=右 / -1=左
+                    sumR += e * (0.5f + 0.5f * c);
+                    sumL += e * (0.5f - 0.5f * c);
+                }
+                float mean = 0.5f * (sumL + sumR);
+                float gl = 1f, gr = 1f;
+                if (mean > 1e-6f)
+                {
+                    // 平均1に正規化 → 強度で誇張／減衰 → 極端な値を抑える。
+                    gl = Mathf.Lerp(1f, sumL / mean, directionalTailStrength);
+                    gr = Mathf.Lerp(1f, sumR / mean, directionalTailStrength);
+                    gl = Mathf.Clamp(gl, 0.25f, 2f);
+                    gr = Mathf.Clamp(gr, 0.25f, 2f);
+                }
+                // 急に変わるとリバーブが揺れるので追従を鈍らせる。
+                float k = 1f - Mathf.Exp(-Time.deltaTime * Mathf.Max(1, probeUpdateEveryFrames)
+                                          / Mathf.Max(0.05f, directionalTailSmoothSec));
+                _tailEarBandGain[b] = Mathf.Lerp(_tailEarBandGain[b], gl, k);
+                _tailEarBandGain[nb + b] = Mathf.Lerp(_tailEarBandGain[nb + b], gr, k);
+            }
+
+            Status.TailEarBandGain = _tailEarBandGain;
+            Status.TailDirBalance = (_tailEarBandGain[0] > 1e-4f)
+                ? _tailEarBandGain[nb] / _tailEarBandGain[0] : 1f;
+        }
+
+        // 球面上のほぼ等分布な方向（フィボナッチ格子）。エンジン側と同じ考え方。
+        private static Vector3[] FibonacciSphere(int n)
+        {
+            var d = new Vector3[n];
+            const float ga = 2.39996323f;   // 黄金角
+            for (int i = 0; i < n; i++)
+            {
+                float y = 1f - 2f * (i + 0.5f) / n;
+                float r = Mathf.Sqrt(Mathf.Max(0f, 1f - y * y));
+                float th = ga * i;
+                d[i] = new Vector3(Mathf.Cos(th) * r, y, Mathf.Sin(th) * r);
+            }
+            return d;
         }
 
         // 全音源ぶんのタップを組む。IR の生材料＝時間軸。

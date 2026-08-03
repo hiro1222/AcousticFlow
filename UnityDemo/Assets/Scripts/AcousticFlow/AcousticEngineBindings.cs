@@ -176,6 +176,12 @@ namespace AcousticFlow
             IntPtr scene, AFVector3 center, AFVector3 halfExtents,
             AFVector3 right, AFVector3 up, int materialId);
 
+        // 各方向から「どれだけ残響が返るか」を帯域別に得る。outEnergy は dirCount*6 要素。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneProbeDirectionalEnergy(
+            IntPtr scene, AFVector3 origin, AFVector3[] dirs, int dirCount,
+            int maxBounces, float[] outEnergy);
+
         // 三角形メッシュを形状(BLAS)として登録し geomId を返す（失敗 -1）。
         //   outLocalCenter / outLocalHalfExtents に、正規化に使ったローカルAABBが返る。
         //   ホストはこれを使ってインスタンスの OBB（＝変換）を組む。

@@ -113,6 +113,19 @@ namespace AcousticFlow.EditorTools
             EditorGUILayout.LabelField("  → 残響の効き ≈ Wet×遮蔽", $"{wet * slv:F3}  （小さいほど残響ほぼ無し）");
             EditorGUILayout.LabelField("  ※開けた場所は Wet≈0 か 遮蔽小 で残響が消えるべき", EditorStyles.miniLabel);
 
+            // 尾の方向づけ（方向プローブ）。平均1に正規化してあるので、音量ではなく左右の比。
+            var ear = AcousticFlowSceneDemo.Status.TailEarBandGain;
+            if (ear != null && ear.Length >= 12)
+            {
+                EditorGUILayout.LabelField("  尾の左右バランス L/R (平均1)",
+                    $"125Hz {ear[0]:F2}/{ear[6]:F2}   1kHz {ear[3]:F2}/{ear[9]:F2}   4kHz {ear[5]:F2}/{ear[11]:F2}");
+                float bal = AcousticFlowSceneDemo.Status.TailDirBalance;
+                string side = bal > 1.08f ? "右から響く" : (bal < 0.93f ? "左から響く" : "ほぼ均等");
+                EditorGUILayout.LabelField("  → 低域の R/L", $"{bal:F2}  （{side}）");
+                EditorGUILayout.LabelField("  ※壁際に立つと壁と反対側（開けている側）から響くはず",
+                                           EditorStyles.miniLabel);
+            }
+
             // --- 帯域（主音源） ---
             EditorGUILayout.Space(8f);
             EditorGUILayout.LabelField("主音源 帯域ゲイン (1=素通り / 0=遮断)", EditorStyles.boldLabel);

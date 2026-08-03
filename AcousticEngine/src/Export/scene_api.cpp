@@ -80,6 +80,16 @@ int AF_SceneAddInstanceBox(AF_SceneHandle scene,
     return s->addInstance(makeObb(center, halfExtents, right, up), materialId);
 }
 
+void AF_SceneProbeDirectionalEnergy(AF_SceneHandle scene, AF_Vector3 origin,
+                                    const AF_Vector3* dirs, int dirCount,
+                                    int maxBounces, float* outEnergy) {
+    Scene* s = asScene(scene);
+    if (!s || !dirs || !outEnergy || dirCount <= 0) return;
+    std::vector<Vec3> d(static_cast<size_t>(dirCount));
+    for (int i = 0; i < dirCount; ++i) d[static_cast<size_t>(i)] = toVec3(dirs[i]);
+    s->probeDirectionalEnergy(toVec3(origin), d.data(), dirCount, maxBounces, outEnergy);
+}
+
 int AF_SceneAddMesh(AF_SceneHandle scene,
                     const float* verticesXYZ, int vertexCount,
                     const int* indices, int indexCount,

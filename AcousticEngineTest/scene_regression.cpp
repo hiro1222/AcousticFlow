@@ -841,6 +841,49 @@ void testMesh() {
     AF_SceneDestroy(s);
 }
 
+// ================================================================ 方向プローブ
+// 後期残響の方向分布。「どちらに空間が開けているか」が出ていることを確かめる。
+void testDirectionalProbe() {
+    std::printf("\n[方向プローブ] 残響がどちらから返るか\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+
+    // +X 側だけを箱で囲った空間。-X 側は開けている。
+    //   → +X 方向からは残響が返り、-X 方向からは返らないはず。
+    const float t = 0.3f;
+    AF_SceneAddInstanceBox(s, V(0, -t, 0), V(10, t, 10), V(1, 0, 0), V(0, 1, 0), mat);
+    AF_SceneAddInstanceBox(s, V(0, 4 + t, 0), V(10, t, 10), V(1, 0, 0), V(0, 1, 0), mat);
+    AF_SceneAddInstanceBox(s, V(10, 2, 0), V(t, 2, 10), V(1, 0, 0), V(0, 1, 0), mat);
+    AF_SceneAddInstanceBox(s, V(0, 2, -10), V(10, 2, t), V(1, 0, 0), V(0, 1, 0), mat);
+    AF_SceneAddInstanceBox(s, V(0, 2, 10), V(10, 2, t), V(1, 0, 0), V(0, 1, 0), mat);
+    // -X 壁は置かない（開けている）
+
+    const AF_Vector3 dirs[6] = {
+        V(1, 0, 0), V(-1, 0, 0), V(0, 1, 0), V(0, -1, 0), V(0, 0, 1), V(0, 0, -1),
+    };
+    float e[6 * kBands] = {};
+    AF_SceneProbeDirectionalEnergy(s, V(0, 1.6f, 0), dirs, 6, 12, e);
+
+    const char* names[6] = {"+X(壁)", "-X(開)", "+Y(天)", "-Y(床)", "+Z(壁)", "-Z(壁)"};
+    for (int i = 0; i < 6; ++i)
+        std::printf("      %-10s 125Hz %6.2f   4kHz %6.2f\n",
+                    names[i], e[i * kBands], e[i * kBands + 5]);
+
+    checkGreater("囲われた方向(+X)の方が開けた方向(-X)より残響が返る",
+                 e[0 * kBands], e[1 * kBands]);
+    check("開けた方向(-X)は明確に小さい", e[1 * kBands] < e[0 * kBands] * 0.5f);
+    checkGreater("床方向からも残響が返る", e[3 * kBands], e[1 * kBands]);
+
+    // 開口を塞ぐと -X からも返るようになる（実行時の形状変化に追従する）。
+    AF_SceneAddInstanceBox(s, V(-10, 2, 0), V(t, 2, 10), V(1, 0, 0), V(0, 1, 0), mat);
+    float e2[6 * kBands] = {};
+    AF_SceneProbeDirectionalEnergy(s, V(0, 1.6f, 0), dirs, 6, 12, e2);
+    std::printf("      -X を塞ぐと 125Hz: %.2f → %.2f\n", e[1 * kBands], e2[1 * kBands]);
+    checkGreater("壁を足すとその方向から残響が返るようになる", e2[1 * kBands], e[1 * kBands]);
+
+    AF_SceneDestroy(s);
+}
+
 // ---------------------------------------------------------------- 頑健性
 // 不正入力で落ちない（移行中に呼び出し規約を変えるので、境界は明示的に守る）。
 void testRobustness() {
@@ -880,6 +923,7 @@ int main() {
     diagnoseApertureDirection();
     diagnoseSwingDoor();
     testMesh();
+    testDirectionalProbe();
     testRobustness();
 
     std::printf("\n----\n");

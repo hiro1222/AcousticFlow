@@ -218,6 +218,20 @@ ACOUSTIC_API void AF_SceneComputeEchogramBands(AF_SceneHandle scene,
                                                int numRays, int maxBounces,
                                                float distanceRef);
 
+/* 【方向プローブ】origin から各方向へレイを飛ばし、「その方向からどれだけ残響が返るか」を
+ * 帯域別に返す。outEnergy は dirCount*6 要素（方向ごとに 6 帯域が連続）。
+ *
+ * 後期残響は拡散なので時間構造はエコーグラムが持てばよく、足りないのは方向分布だけ。
+ * これは音源に依存せずリスナー位置だけで決まるので、音源数が増えてもコストが増えない。
+ *
+ * 値は方向間の相対分布として使うこと（絶対値に意味は無い）。
+ * 何にも当たらない方向は 0 になる（開けている＝残響を返さない）。 */
+ACOUSTIC_API void AF_SceneProbeDirectionalEnergy(AF_SceneHandle scene,
+                                                 AF_Vector3 origin,
+                                                 const AF_Vector3* dirs, int dirCount,
+                                                 int maxBounces,
+                                                 float* outEnergy);
+
 /* 【可視化】origin から dir 方向へ鏡面反射で maxBounces 回まで追った経路（通過点）を
  * outPoints に書き、その点数を返す。outPoints[0]=origin/以降=反射点/最後=終端。
  * outPoints は maxPoints 個以上（最低 maxBounces+2）。反響経路の線描画用。 */

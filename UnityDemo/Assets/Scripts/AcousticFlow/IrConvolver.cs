@@ -532,7 +532,29 @@ namespace AcousticFlow
             var bands = AcousticFlowSceneDemo.Status.EchogramBands;
             if (bands == null) return;   // 古いDLL＝帯域別が取れない。Fdn へフォールバックすべき状態。
             int ver = AcousticFlowSceneDemo.Status.EchogramVersion;
-            if (ver == _tailEchoVersion) return;
+
+            // 尾の左右バランス（方向プローブ）。エコーグラムより速く変わるので、
+            // これが有意に動いたときも作り直す。ただし作り直しは重い（長さ×帯域×2ch）ので、
+            // わずかな変化では回さない。ホスト側で既に時間平滑してあるぶん、閾値で足りる。
+            var ear = AcousticFlowSceneDemo.Status.TailEarBandGain;
+            bool dirChanged = false;
+            if (ear != null)
+            {
+                if (_lastEarGain == null || _lastEarGain.Length != ear.Length)
+                {
+                    _lastEarGain = new float[ear.Length];
+                    dirChanged = true;
+                }
+                else
+                {
+                    for (int i = 0; i < ear.Length; i++)
+                        if (Mathf.Abs(ear[i] - _lastEarGain[i]) > 0.05f) { dirChanged = true; break; }
+                }
+                if (dirChanged) System.Array.Copy(ear, _lastEarGain, ear.Length);
+            }
+            else if (_lastEarGain != null) { _lastEarGain = null; dirChanged = true; }
+
+            if (ver == _tailEchoVersion && !dirChanged) return;
             _tailEchoVersion = ver;
 
             float ratio = _tailIr.Build(bands,
@@ -542,7 +564,8 @@ namespace AcousticFlow
                                         20f,
                                         tailSmoothMs,
                                         tailSmoothGrowth,
-                                        tailEnvSmoothing);
+                                        tailEnvSmoothing,
+                                        ear);
             if (ratio <= 0f) { _tailGain = 0f; return; }   // 尾のエネルギーが無い＝尾なし
 
             // 尾の絶対レベルは「残響/直接の物理目標比 (r/r_c)²」から決める。
@@ -569,6 +592,8 @@ namespace AcousticFlow
 
         // 担当音源の遮蔽レベル。オーディオスレッドはこれを読む（配列を辿らせない）。
         private volatile float _mySourceLevel = 1f;
+        // 最後に尾IRへ焼き込んだ左右バランス。閾値以上ずれたら作り直す。
+        private float[] _lastEarGain;
 
         // 担当音源のタップ束。未初期化・範囲外なら null。
         private AcousticFlowSceneDemo.SourceTaps MyTaps()

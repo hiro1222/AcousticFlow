@@ -42,6 +42,24 @@ namespace AcousticFlow
                 new AFVector3(right), new AFVector3(up), materialId);
         }
 
+        // 各方向から「どれだけ残響が返るか」を帯域別に得る。
+        //   outEnergy[i*6 + b] = 方向 dirs[i] の帯域 b。方向間の相対分布として使う。
+        //   何にも当たらない方向は 0（開けている＝残響を返さない）。
+        private AFVector3[] _probeDirBuf;   // interop 用の変換バッファ（毎フレーム確保しない）
+
+        public void ProbeDirectionalEnergy(Vector3 origin, Vector3[] dirs, int dirCount,
+                                           int maxBounces, float[] outEnergy)
+        {
+            if (_handle == IntPtr.Zero || dirs == null || outEnergy == null) return;
+            if (dirCount > dirs.Length) dirCount = dirs.Length;
+            if (dirCount <= 0) return;
+            if (_probeDirBuf == null || _probeDirBuf.Length < dirCount)
+                _probeDirBuf = new AFVector3[dirCount];
+            for (int i = 0; i < dirCount; i++) _probeDirBuf[i] = new AFVector3(dirs[i]);
+            Native.AF_SceneProbeDirectionalEnergy(_handle, new AFVector3(origin), _probeDirBuf,
+                                                  dirCount, maxBounces, outEnergy);
+        }
+
         // 三角形メッシュを形状(BLAS)として登録し geomId を返す（失敗 -1）。
         //   形状はローカルAABBが単位箱になるよう正規化して保持されるので、
         //   インスタンスの OBB がそのまま local→world の変換になる。

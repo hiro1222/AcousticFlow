@@ -1161,6 +1161,53 @@ public:
         }
     }
 
+    // 【方向プローブ】origin から各方向へレイを飛ばし、「その方向からどれだけ残響が返るか」を
+    // 帯域別に返す。outEnergy は dirCount*kNumBands 要素。
+    //
+    //   後期残響は拡散なので時間構造はエコーグラムが持てばよく、**方向分布**だけが足りない。
+    //   音源に依存しない量なので音源ごとに計算する必要がなく、リスナー位置だけで決まる
+    //   ＝ 音源数が増えてもコストが増えない（業界が後期残響を共有バスにしているのと同じ理屈）。
+    //
+    //   量の定義: 各方向へ撃ったレイが、反射のたびに残るエネルギー carry を積算したもの。
+    //     ・生きた部屋へ向かう方向 … 何度も反射して積算が大きい
+    //     ・吸音の強い面／開けた空へ向かう方向 … すぐ尽きる、または何にも当たらず 0
+    //   絶対値ではなく方向間の相対分布として使う（呼び出し側で正規化する）。
+    void probeDirectionalEnergy(const Vec3& origin, const Vec3* dirs, int dirCount,
+                                int maxBounces, float* outEnergy) const {
+        using namespace scene_detail;
+        if (!dirs || !outEnergy || dirCount <= 0) return;
+        for (int k = 0; k < dirCount * kNumBands; ++k) outEnergy[k] = 0.0f;
+        if (maxBounces <= 0 || instanceCount() == 0) return;
+
+        const float kEps = 1e-3f;
+        const float kMaxDist = 500.0f;   // これ以上先の反射は残響として意味を持たない
+        for (int i = 0; i < dirCount; ++i) {
+            Vec3 o = origin;
+            Vec3 d = dirs[i];
+            const float dl = length(d);
+            if (dl < 1e-6f) continue;
+            d = d * (1.0f / dl);
+            uint32_t rng = static_cast<uint32_t>(i) * 2654435761u + 9781u;
+            float carry[kNumBands] = {1, 1, 1, 1, 1, 1};
+            float remaining = kMaxDist;
+            float* dst = outEnergy + static_cast<size_t>(i) * kNumBands;
+
+            for (int bounce = 0; bounce < maxBounces; ++bounce) {
+                const SceneHit hit = raycastClosest(o, d, remaining);
+                if (!hit.hit) break;             // 何にも当たらない＝開けている＝残響を返さない
+                remaining -= hit.t;
+                if (remaining <= kEps) break;
+                const AcousticMaterial& mat = materialOf(hit.materialId);
+                for (int b = 0; b < kNumBands; ++b) {
+                    carry[b] *= clamp01(1.0f - mat.absorption[b] - mat.transmission[b]);
+                    dst[b] += carry[b];
+                }
+                d = scatteredDir(d, hit.normal, scatteringMean(mat), rng);
+                o = hit.point + hit.normal * 0.02f;
+            }
+        }
+    }
+
     // 【早期反射タップ(A)】source→…→listener の主要な初期反射を最大 maxTaps 本抽出する。
     //   出力タップ = imageSourcePos（= listener + 到来方向×経路長。定位/距離減衰用）＋6帯域ゲイン。
     //   リスナー起点レイ×next-event で各反射の {到来方向 d0, 経路長, 帯域ゲイン} を集め、
