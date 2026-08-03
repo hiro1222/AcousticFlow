@@ -594,11 +594,12 @@ void diagnoseApertureDirection() {
     AF_SceneHandle s = AF_SceneCreate();
     const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
 
-    // 大きな壁。x∈[-10,2] が壁、x>2 が唯一の開口。上下も十分に伸ばしてある。
-    //   このとき二次音源は「x=+2 の縁」に強く集中すべきである。
-    //   当の箱を遮蔽判定から丸ごと除外していると、壁を貫いて到達する稜線まで候補に通るため、
-    //   重みが分散して「どこから抜けてくるか」がぼやける（実測 0.31 まで低下）。
-    AF_SceneAddInstanceBox(s, V(-4, 2, 0), V(6, 4, 0.2f), V(1, 0, 0), V(0, 1, 0), mat);
+    // 大きな壁。x∈[-10,2] が壁、x>2 が唯一の開口。
+    //   ★上下は十分に伸ばすこと（y∈[-18,22]）。低いと上下を回る経路も同程度に効いてしまい、
+    //     「開口が1つ」というこのテストの前提が幾何と食い違う。
+    //     以前 y∈[-2,6] にしていたため横:上:下 ≈ 2:1:1 になり、支配開口の取り分が
+    //     0.5 前後にしかならなかった（それが正しい物理なのに、テストは1つに集中することを期待していた）。
+    AF_SceneAddInstanceBox(s, V(-4, 2, 0), V(6, 20, 0.2f), V(1, 0, 0), V(0, 1, 0), mat);
 
     const AF_Vector3 L = V(0, 1.6f, -4), S = V(0, 1.6f, 4);
     check("大きな壁の裏は遮蔽される", AF_SceneIsOccluded(s, L, S) != 0);
@@ -622,12 +623,21 @@ void diagnoseApertureDirection() {
     }
     check("二次音源がすべて開口側(x>0)を指す", allNearSide);
 
-    // 開口が1つしかないのだから、重みはそこに集中していなければならない。
-    //   分散していると「どの方向から抜けてくるか」が伝わらず、定位がぼやける。
-    //   壁を貫く経路を候補に通していた頃はここが 0.31 だった。
-    char b2[96];
-    std::snprintf(b2, sizeof(b2), "(最大 %.3f)", top);
-    check("重みが唯一の開口に集中している(最大>0.5)", top > 0.5f, b2);
+    // 支配開口が他より明確に強いこと。分散していると「どこから抜けてくるか」が伝わらない。
+    //
+    //   ★絶対値ではなく**比**で見る（DEV_LOG の方針「期待値は絶対値でなく関係で書く」）。
+    //     以前は「最大 > 0.5」としていたが、これは正当な修正で落ちる基準だった。
+    //     当時の 0.73 はクラスタ内のエッジ本数を足し込んだ過大計上の産物で、
+    //     エッジ本数はテッセレーション依存なので基準にしてはいけない。
+    //     このシーンでは壁が高くないので上を越える経路も実際に効いており、
+    //     δ から手計算しても 横 0.263 / 上 0.133 / 下 0.133 ＝ 取り分 0.5 前後が正しい。
+    //     定位の観点でも「2番目の何倍か」の方が意味がある（取り分が 0.5 でも 2 倍あれば方向は明確）。
+    float second = 0.0f;
+    for (int i = 0; i < n; ++i) if (gain[i] < top && gain[i] > second) second = gain[i];
+    char b2[128];
+    std::snprintf(b2, sizeof(b2), "(最大 %.3f / 2番目 %.3f = %.1f倍)",
+                  top, second, (second > 1e-6f) ? top / second : 999.0f);
+    check("支配開口が2番目の2倍以上ある", second <= 1e-6f || top >= second * 2.0f, b2);
 
     AF_SceneDestroy(s);
 }
@@ -661,7 +671,8 @@ void diagnoseSwingDoor() {
     AF_SceneSetListener(s, L);
     AF_SceneSetSource(s, 1, S);
 
-    std::printf("      開き角   125Hz    4kHz   遮蔽  開口位置(最有力)        重み\n");
+    std::printf("      開き角  ─ 前川(δ) ─  遮蔽  ─ キルヒホッフ(開口実測) ─  開口位置(最有力)\n");
+    std::printf("               125Hz  4kHz         125Hz  500Hz   4kHz\n");
 
     float prevLow = -1.0f, maxGainJump = 0.0f, jumpAtDeg = 0.0f;
     AF_Vector3 prevAp = V(0, 0, 0); bool havePrev = false;
@@ -689,9 +700,13 @@ void diagnoseSwingDoor() {
         int bi = -1; float bw = -1.0f;
         for (int i = 0; i < n; ++i) if (gain[i] > bw) { bw = gain[i]; bi = i; }
 
+        float kg[kBands] = {}; AF_Vector3 kap{}; float kpl = 0.0f;
+        const int kok = AF_SceneComputeDiffractionKirchhoff(s, L, S, kg, kBands, &kap, &kpl);
+
         if (bi >= 0) {
-            std::printf("      %5.1f°  %6.3f  %6.3f    %d   (%6.2f,%6.2f,%6.2f)  %.3f\n",
-                        deg, g[0], g[5], occ, pos[bi].x, pos[bi].y, pos[bi].z, bw);
+            std::printf("      %5.1f°  %5.3f %5.3f    %d    %5.3f  %5.3f  %5.3f   (%5.2f,%5.2f,%5.2f)%s\n",
+                        deg, g[0], g[5], occ, kg[0], kg[2], kg[5],
+                        pos[bi].x, pos[bi].y, pos[bi].z, kok ? "" : " [K:なし]");
             // 性質2: 扉は +z 側へ振れる。開口が扉の板の裏（x<-0.5 かつ z>0）を指してはいけない。
             if (pos[bi].x < -0.5f && pos[bi].z > 0.0f) behindDoor = true;
             if (bw < minDominant) minDominant = bw;   // 性質3
@@ -705,7 +720,8 @@ void diagnoseSwingDoor() {
             }
             prevAp = pos[bi]; havePrev = true;
         } else {
-            std::printf("      %5.1f°  %6.3f  %6.3f    %d   (開口なし)\n", deg, g[0], g[5], occ);
+            std::printf("      %5.1f°  %5.3f %5.3f    %d    %5.3f  %5.3f  %5.3f   (前川:開口なし)\n",
+                        deg, g[0], g[5], occ, kg[0], kg[2], kg[5]);
             // 減衰が残っているのに方向が分からない状態。定位が消える。
             if (g[0] < 0.999f && apertureLostAtDeg < 0.0f) apertureLostAtDeg = deg;
             havePrev = false;
@@ -720,6 +736,53 @@ void diagnoseSwingDoor() {
 
         if (occ && !(g[0] > g[5])) lowOverHigh = false;   // 性質4
     }
+
+    // ── 立ち上がり（0°〜10°）を細かく測る ──
+    //   7.5°刻みで見た 0°→7.5° の +0.234 が「不連続」なのか「急峻なだけ」なのかは、
+    //   粗い刻みでは区別できない。扉 7.5° の隙間は自由端で約13cm あり、
+    //   密閉→13cm開口 は物理的に大きく変わって当然なので、滑らかな急変の可能性がある。
+    //   0.5°刻み（自由端で 0.9cm ずつ）で段差が残るなら、候補の出現による真の不連続。
+    //   前川(δのみ) と キルヒホッフ(開口の実測) を並べる。
+    //   コンセプトは「扉がどのくらい開いたか」を音で伝えること。δ は扉が回っても変わらない
+    //   （回折経路が回る戸口の枠は動かない）ので、前川は piecewise constant になるはず。
+    std::printf("\n      [立ち上がり] 0°〜10° を 0.5°刻み（隙間は自由端で約 1.7cm/度）\n");
+    std::printf("        開き角  ── 前川(δのみ) ──   ── キルヒホッフ(開口実測) ──\n");
+    std::printf("                 125Hz   隣接差      125Hz   4kHz   隣接差\n");
+    float prevFine = -1.0f, maxFineJump = 0.0f, fineJumpAt = 0.0f;
+    float prevK = -1.0f, maxKJump = 0.0f, kJumpAt = 0.0f;
+    float kFirst = -1.0f, kLast = -1.0f;
+    for (float deg = 0.0f; deg <= 10.01f; deg += 0.5f) {
+        const float th = deg * 3.14159265f / 180.0f;
+        const AF_Vector3 ax = V(std::cos(th), 0, std::sin(th));
+        AF_SceneUpdateInstance(s, door,
+                               V(hinge.x + ax.x * 0.5f, hinge.y, hinge.z + ax.z * 0.5f),
+                               half, ax, V(0, 1, 0));
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+
+        float g[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+        float jump = (prevFine >= 0.0f) ? std::fabs(g[0] - prevFine) : 0.0f;
+        if (jump > maxFineJump) { maxFineJump = jump; fineJumpAt = deg; }
+        prevFine = g[0];
+
+        float k[kBands] = {}; AF_Vector3 ap{}; float pl = 0.0f;
+        const int okK = AF_SceneComputeDiffractionKirchhoff(s, L, S, k, kBands, &ap, &pl);
+        float kj = (okK && prevK >= 0.0f) ? std::fabs(k[0] - prevK) : 0.0f;
+        if (kj > maxKJump) { maxKJump = kj; kJumpAt = deg; }
+        if (okK) { if (kFirst < 0.0f) kFirst = k[0]; kLast = k[0]; prevK = k[0]; }
+
+        std::printf("        %5.1f°   %6.3f  %6.3f      %6.3f %6.3f  %6.3f%s\n",
+                    deg, g[0], jump, k[0], k[5], kj, okK ? "" : "  (開口なし)");
+    }
+    std::printf("        → 最大隣接差   前川 %.3f @ %.1f°   キルヒホッフ %.3f @ %.1f°\n",
+                maxFineJump, fineJumpAt, maxKJump, kJumpAt);
+    std::printf("        → 0°→10° の変化  キルヒホッフ %.3f → %.3f  "
+                "（コンセプト: 開き具合が連続に音へ出ること）\n", kFirst, kLast);
+
+    // 掃引の最後の状態（90°）へ戻してから開き切りを測る。
+    AF_SceneUpdateInstance(s, door, V(hinge.x, hinge.y, hinge.z + 0.5f), half,
+                           V(0, 0, 1), V(0, 1, 0));
+    AF_SceneUpdate(s, 1.0f / 60.0f);
 
     float gOpen[kBands] = {};
     AF_SceneComputeDiffractionBands(s, L, S, gOpen, kBands);

@@ -218,6 +218,19 @@ ACOUSTIC_API void AF_SceneComputeEchogramBands(AF_SceneHandle scene,
                                                int numRays, int maxBounces,
                                                float distanceRef);
 
+/* 【回折・キルヒホッフ版】開口の「大きさ」を実測してフレネル・キルヒホッフの解析解に渡す。
+ * outGains(6要素以上) に帯域別ゲイン、outAperture に開口中心、outPathLength に実経路長。
+ * 開口が見つかれば 1、面全体が塞がっていれば 0（呼び出し側で透過のみとする）。
+ *
+ * 前川の式は δ だけの関数なので開口の幅に反応できない（扉が回っても戸口の枠は動かないため
+ * δ が変わらず、開き具合が piecewise constant になる）。こちらは面上の開いている範囲を
+ * 直接測るので、開口幅・扉の開き具合・周波数依存がすべて同じ式から出る。 */
+ACOUSTIC_API int AF_SceneComputeDiffractionKirchhoff(AF_SceneHandle scene,
+                                                     AF_Vector3 listener, AF_Vector3 source,
+                                                     float* outGains, int count,
+                                                     AF_Vector3* outAperture,
+                                                     float* outPathLength);
+
 /* 【方向プローブ】origin から各方向へレイを飛ばし、「その方向からどれだけ残響が返るか」を
  * 帯域別に返す。outEnergy は dirCount*6 要素（方向ごとに 6 帯域が連続）。
  *

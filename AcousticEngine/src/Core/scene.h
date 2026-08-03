@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "Core/aabb.h"
+#include "Core/kirchhoff.h"
 #include "Core/maekawa.h"
 #include "Core/material.h"
 #include "Core/mesh_geom.h"
@@ -634,68 +635,284 @@ public:
         return n;
     }
 
+    // ================================================================ 回折（キルヒホッフ）
+    // 開口の「大きさ」を測り、フレネル・キルヒホッフの解析解に渡す。
+    //
+    //   前川の式は δ（迂回の余剰長）だけの関数なので、**開口の幅に反応できない**。
+    //   扉が回っても回折経路が回る戸口の枠は動かないため δ が変わらず、
+    //   「扉がどのくらい開いたか」が piecewise constant になっていた（実測: 0〜6°で完全に平坦、
+    //   6.5°で 0.234 跳ぶ）。作品のコンセプトの中核がモデルの構造で表現できていない状態だった。
+    //
+    //   ここでは元の法則に戻る。音源と受音点の間に面を置き、**その面のうち塞がれていない範囲**を
+    //   実測して、矩形開口の解析解（kirchhoff.h）に渡す。開口の幅・扉の開き具合・周波数依存が
+    //   すべて同じ式から出る。閾値も場合分けも要らない。
+    //
+    //   戻り値 = 開口が見つかれば true。outAperture に開口中心（定位に使う）。
+    bool diffractionKirchhoff(const Vec3& listener, const Vec3& source,
+                              float outGain[kNumBands], Vec3& outAperture,
+                              float& outPathLength) const {
+        const Vec3 axis = source - listener;
+        const float dist = length(axis);
+        if (dist < 1e-4f) return false;
+        const Vec3 n = axis * (1.0f / dist);
+
+        // ── 面の位置 ──
+        //   遮蔽されているなら最初に当たった所（そこが音を止めている面）。
+        //   遮蔽が無いなら中点（第1フレネルゾーンが最も広く、遮蔽の影響が最も大きい位置）。
+        float d1 = dist * 0.5f;
+        const SceneHit hit = raycastClosest(listener, n, dist);
+        if (hit.hit) d1 = hit.t;
+        d1 = std::max(std::min(d1, dist - 0.05f), 0.05f);
+        const float d2 = dist - d1;
+        const Vec3 planeOrigin = listener + n * d1;
+
+        // 面上の直交基底。
+        Vec3 u = cross(n, Vec3(0, 1, 0));
+        if (length(u) < 1e-3f) u = cross(n, Vec3(1, 0, 0));
+        u = normalized(u);
+        const Vec3 v = normalized(cross(n, u));
+
+        // 面上の点が「開いている」か＝音源と受音点の双方から見通せるか。
+        auto openAt = [&](float su, float sv) {
+            const Vec3 P = planeOrigin + u * su + v * sv;
+            return !isOccluded(listener, P) && !isOccluded(P, source);
+        };
+
+        // 探索範囲は第1フレネルゾーンの数倍（最低域基準）。そこから外は寄与が打ち消し合う。
+        const float D = (d1 * d2) / std::max(d1 + d2, 1e-6f);
+        const float lambdaLow = kirchhoff::kSpeed / kirchhoff::kBandFreq[0];
+        const float searchR = 3.0f * std::sqrt(lambdaLow * D);
+
+        // ── 開口の種を集める ──
+        //   ★等間隔に探すと小さな隙間を見逃す。扉が 6° 開いたときの隙間は 6mm しかなく、
+        //     フレネルゾーン数メートルを 6mm 刻みで探すのは非現実的（1万点規模）。
+        //     そこで**稜線探索を種に使う** ── 稜線は開口の縁そのものなので、その近傍を見れば
+        //     どんなに細い隙間でも捉えられる。「稜線がどこかを教え、積分がどれだけかを決める」。
+        constexpr int kMaxSeed = 24;
+        float seedU[kMaxSeed], seedV[kMaxSeed];
+        int nseed = 0;
+        auto pushSeed = [&](float a, float b) {
+            if (nseed < kMaxSeed) { seedU[nseed] = a; seedV[nseed] = b; ++nseed; }
+        };
+        pushSeed(0.0f, 0.0f);                       // 軸上（見通せているならここが開口）
+        forEachDiffractionCandidate(listener, source,
+            [&](const Vec3& P, float, const Vec3&, const Vec3&) {
+                const Vec3 rel = P - planeOrigin;
+                pushSeed(dot(rel, u), dot(rel, v));  // 稜線上の点を面へ射影
+            }, 4.0f);
+
+        // 近すぎる種はまとめる（同じ開口を何度も測らない）。
+        for (int i = 0; i < nseed; ++i)
+            for (int j = i + 1; j < nseed; ) {
+                const float du2 = seedU[i] - seedU[j], dv2 = seedV[i] - seedV[j];
+                if (du2 * du2 + dv2 * dv2 < 0.04f) {   // 20cm 以内は同じ開口とみなす
+                    seedU[j] = seedU[nseed - 1]; seedV[j] = seedV[nseed - 1]; --nseed;
+                } else ++j;
+            }
+
+        // 稜線上の点は境界そのものなので、少しずらして開いている側を探す。
+        //   ★**最初に開いた種で決めてはいけない**。順序依存になり、扉の隙間ではなく
+        //     壁の外側や上を拾ってしまう（実際にそうなった）。全部の種で開口を測り、
+        //     いちばんよく通る開口を採る。
+        auto seedOpen = [&](float bu, float bv, float& ou, float& ov) {
+            const float nudge[3] = {0.0f, 0.02f, 0.10f};
+            const float dirU[5] = {0.0f, 1.0f, -1.0f, 0.0f, 0.0f};
+            const float dirV[5] = {0.0f, 0.0f, 0.0f, 1.0f, -1.0f};
+            for (int e = 0; e < 3; ++e)
+                for (int d = 0; d < 5; ++d) {
+                    const float cu = bu + dirU[d] * nudge[e];
+                    const float cv = bv + dirV[d] * nudge[e];
+                    if (openAt(cu, cv)) { ou = cu; ov = cv; return true; }
+                }
+            return false;
+        };
+
+        // ── 開口の広がりを測る ──
+        //   種から4方向へ進み、塞がれる位置を二分で詰める。開口の縁が連続に動くので、
+        //   扉が回れば範囲も連続に動く ── ここが「どのくらい開いたか」の実体。
+        //   ★刻んで進み、**最初に塞がれた所**で止める。
+        //     「端が開いていれば全開」と早期判定してはいけない ── 開いた領域は非凸で、
+        //     壁の上から下へ進むと壁を貫通して反対側の開いた領域に出てしまう。
+        //     それを全開と誤判定すると、閉じた扉でもゲインが 1.0 になる（実際にそうなった）。
+        auto extent = [&](float su, float sv, float du, float dv) {
+            constexpr int kStep = 16;
+            float lastOpen = 0.0f;
+            for (int i = 1; i <= kStep; ++i) {
+                const float r = searchR * (i / float(kStep));
+                if (!openAt(su + du * r, sv + dv * r)) {
+                    // lastOpen(開) と r(閉) の間に縁がある。二分で詰める。
+                    float lo = lastOpen, hi = r;
+                    for (int j = 0; j < 10; ++j) {
+                        const float m = 0.5f * (lo + hi);
+                        if (openAt(su + du * m, sv + dv * m)) lo = m; else hi = m;
+                    }
+                    return lo;
+                }
+                lastOpen = r;
+            }
+            return searchR;   // 探索範囲の端まで開いている
+        };
+
+        // 種ごとに開口を測り、いちばんよく通るものを採る。
+        //   ※複数開口の複素合成は初版では行わない（支配開口の近似）。
+        bool any = false;
+        float bestScore = -1.0f;
+        for (int s = 0; s < nseed; ++s) {
+            float su, sv;
+            if (!seedOpen(seedU[s], seedV[s], su, sv)) continue;
+            const float u2 = su + extent(su, sv, 1, 0), u1 = su - extent(su, sv, -1, 0);
+            const float v2 = sv + extent(su, sv, 0, 1), v1 = sv - extent(su, sv, 0, -1);
+            float g[kNumBands];
+            kirchhoff::apertureGain(u1, u2, v1, v2, d1, d2, g);
+            // 低域加重で「どれだけ通るか」を1スカラに（回折は低域が回り込む）。
+            const float wgt[kNumBands] = {3.0f, 2.5f, 2.0f, 1.3f, 1.0f, 0.8f};
+            float gs = 0.0f, ws = 0.0f;
+            for (int b = 0; b < kNumBands; ++b) { gs += wgt[b] * g[b]; ws += wgt[b]; }
+            const float score = gs / ws;
+            if (score > bestScore) {
+                bestScore = score;
+                for (int b = 0; b < kNumBands; ++b) outGain[b] = g[b];
+                const float cu = 0.5f * (u1 + u2), cv = 0.5f * (v1 + v2);
+                outAperture = planeOrigin + u * cu + v * cv;
+                outPathLength = length(outAperture - listener) + length(source - outAperture);
+                any = true;
+            }
+        }
+        return any;
+    }
+
+    // ================================================================ 回折（一本化）
+    // docs/DIFFRACTION_DESIGN.md §2。**回折の探索はここ 1 箇所だけ**。
+    //
+    //   以前は「ゲイン用」と「方向用」が別々に稜線を歩き、別々の重み・別々の候補条件を
+    //   持っていた。そのせいで「ゲインは回折を見ているのに開口は 0 本」という不整合が起き、
+    //   見通しが開通した瞬間に定位が消えていた（設計 §7-1 の実測）。
+    //
+    //   遮蔽時   : 開口ごとの経路。回り込んで届く成分を、開口の方向から鳴らす。
+    //   見通し時 : 1 本だけ返す。aperture = 音源位置、gain = 開口によるフレネル補正。
+    //              直接音は音源方向から来るので、方向は音源そのもの。補正だけが意味を持つ。
+    struct DiffractionPath {
+        Vec3  aperture{0, 0, 0};    // 音が抜けてくる点（定位に使う）
+        float pathLength = 0.0f;    // listener → aperture → source の実長（遅延・距離減衰）
+        float gain[kNumBands] = {0, 0, 0, 0, 0, 0};
+    };
+
+    int findDiffractionPaths(const Vec3& listener, const Vec3& source,
+                             DiffractionPath* out, int maxPaths) const {
+        if (!out || maxPaths <= 0) return 0;
+        const bool occ = isOccluded(listener, source);
+        const float directDist = std::max(length(source - listener), 1e-4f);
+
+        // 候補の探索条件は遮蔽の有無にかかわらずここ 1 箇所で決める。
+        //   見通し時に margin>0 で近傍まで広げるのは、開口の縁がまだ効く領域
+        //   （フレネル遮り）を捉えるため。前川の式が効くのは δ < 0.1λ 程度なので、
+        //   最低域 125Hz(λ=2.7m) でも 0.3m 程度。4m あれば十分。
+        const float margin = occ ? 0.0f : 4.0f;
+
+        // 開口＝方向クラスタ。掠める点はクラスタ内の重み付き重心にして連続にスライドさせる
+        // （手前稜線↔奥稜線の乗り換えで重心が滑らかに移る＝飛ばない）。
+        //
+        //   重みは**上限で頭打ちにしない**前川値（maekawa::apertureWeight）。
+        //   出力ゲインには 24dB の上限があるが、重みに上限をかけると遠い開口が全部同点になり、
+        //   支配開口が薄まって**定位がぼやける**。本作で優先するのは遮蔽量の精度ではなく
+        //   回折点への定位なので、優劣がはっきり付く方を採る。
+        constexpr int kMaxCl = 24;
+        struct Cl { Vec3 pAcc; Vec3 dir; float w; float minDelta; };
+        Cl cl[kMaxCl];
+        int ncl = 0;
+        const float cosThresh = 0.90f;   // ~25°以内は同じ開口とみなす（設計 §6-1）
+        float globalMinDelta = -1.0f;
+
+        forEachDiffractionCandidate(listener, source,
+            [&](const Vec3& P, float d, const Vec3&, const Vec3&) {
+                if (globalMinDelta < 0.0f || d < globalMinDelta) globalMinDelta = d;
+                const float w = maekawa::apertureWeight(occ ? d : -d);
+                if (w < 1e-6f) return;
+                const Vec3 dir = normalized(P - listener);
+                int best = -1; float bestDot = cosThresh;
+                for (int i = 0; i < ncl; ++i) {
+                    const float dt = dot(dir, cl[i].dir);
+                    if (dt > bestDot) { bestDot = dt; best = i; }
+                }
+                if (best >= 0) {
+                    cl[best].pAcc = cl[best].pAcc + P * w;
+                    cl[best].dir = normalized(cl[best].dir * cl[best].w + dir * w);
+                    cl[best].w += w;
+                    if (d < cl[best].minDelta) cl[best].minDelta = d;
+                } else if (ncl < kMaxCl) {
+                    cl[ncl].pAcc = P * w; cl[ncl].dir = dir; cl[ncl].w = w; cl[ncl].minDelta = d;
+                    ++ncl;
+                }
+            }, margin);
+
+        if (ncl == 0) return 0;   // 回折の相手が無い。呼び出し側で「遮蔽なら0/見通しなら1.0」を決める
+
+        // 見通しているときは、回折は「直接経路への補正」であって別経路ではない。
+        //   別経路として複数返してエネルギー加算すると 1.0 を超えて過大計上になる（設計 §5-6）。
+        //   方向も音源そのものなので、1 本にまとめて返す。
+        if (!occ) {
+            out[0] = DiffractionPath{};
+            out[0].aperture = source;
+            out[0].pathLength = directDist;
+            maekawa::gainBands(-globalMinDelta, out[0].gain);
+            return 1;
+        }
+
+        // 遮蔽時は開口ごとに独立した経路。重み上位から maxPaths 本。
+        bool used[kMaxCl] = {false};
+        int n = 0;
+        while (n < maxPaths && n < ncl) {
+            int bi = -1; float bw = -1.0f;
+            for (int i = 0; i < ncl; ++i) if (!used[i] && cl[i].w > bw) { bw = cl[i].w; bi = i; }
+            if (bi < 0) break;
+            used[bi] = true;
+            const Vec3 Pc = cl[bi].pAcc * (1.0f / std::max(cl[bi].w, 1e-6f));
+            out[n].aperture = Pc;
+            out[n].pathLength = length(Pc - listener) + length(source - Pc);
+            maekawa::gainBands(cl[bi].minDelta, out[n].gain);
+            ++n;
+        }
+        return n;
+    }
+
     // 【回折を二次音源として鳴らす（GTD/ホイヘンス）】遮蔽時、回り込みエッジを「エッジ＝二次音源」として
     // 最大 maxN 個の仮想音源（方向つき）に束ねて返す。近い方向のエッジはクラスタ統合するので、両側に
     // 開口があれば左右2音源…のように分かれ、リスナー移動で各ゲインが滑らかに変わる（＝1点合成の飛びを排除）。
     //   outPos[k]  : 二次音源のワールド位置（= listener + 方向 × 音源距離。Wwise がこの方向へ定位）
     //   outGain[k] : 相対ゲイン（全クラスタ合計で正規化, 短い迂回ほど大）。総和 ≤ 1
     // 戻り値 = 書き込んだ音源数。遮蔽なし/迂回なしは 0。
+    //   ※ findDiffractionPaths への薄いラッパ。探索は 1 箇所に一本化してある。
+    //     見通し時に返る「直接経路への補正」は二次音源ではないので、ここでは 0 本にする
+    //     （方向は音源そのものなので、呼び出し側は直接音として鳴らせばよい）。
     int computeDiffractionSources(const Vec3& listener, const Vec3& source,
                                   Vec3* outPos, float* outGain, int maxN) const {
         if (!outPos || !outGain || maxN <= 0) return 0;
         if (!isOccluded(listener, source)) return 0;
 
-        // 低域加重（回折は低域が回り込む）で UTD 6帯域を1スカラに畳む＝各エッジの広帯域ゲイン重み。
+        constexpr int kMaxOut = 24;
+        DiffractionPath paths[kMaxOut];
+        const int np = findDiffractionPaths(listener, source, paths, std::min(maxN, kMaxOut));
+        if (np <= 0) return 0;
+
+        // 低域加重で 6 帯域を 1 スカラへ（回折は低域が回り込むので低域を重く見る）。
         auto bbGain = [](const float g[kNumBands]) {
             const float w[kNumBands] = {3.0f, 2.5f, 2.0f, 1.3f, 1.0f, 0.8f};
             float gs = 0.0f, ws = 0.0f;
             for (int b = 0; b < kNumBands; ++b) { gs += w[b] * g[b]; ws += w[b]; }
             return ws > 0.0f ? gs / ws : 0.0f;
         };
-
-        // 開口＝方向クラスタ。掠める点は「クラスタ内エッジの重み付き重心」で連続にスライドさせる
-        // （手前稜線↔奥稜線の乗り換えが、重心が滑らかに移る＝飛ばない）。
-        //   重みは前川の式（δ のみに依存）。以前は UTD ゲインを重みにしていたが、UTD は
-        //   回折点の 3D 幾何に依存するため稜線の乗り換えで重みが飛び、重心も飛んでいた。
-        //   δ は候補間で連続なので、重みも重心も連続に動く。回折系のモデルを一本化する意味もある。
-        struct Cl { Vec3 pAcc; Vec3 dir; float w; };  // pAcc=Σ w*P（重心用）, dir=平均方向, w=Σ
-        Cl cl[24];
-        int ncl = 0;
-        const float cosThresh = 0.90f;  // ~25°以内は同じ開口として統合
-        forEachDiffractionCandidate(listener, source, [&](const Vec3& P, float d, const Vec3&, const Vec3&) {
-            float g6[kNumBands];
-            maekawa::gainBands(d, g6);   // この稜線を回ったときの減衰（δ>0＝影側として評価）
-            const float w = bbGain(g6);
-            if (w < 1e-4f) return;
-            const Vec3 dir = normalized(P - listener);
-            int best = -1; float bestDot = cosThresh;
-            for (int i = 0; i < ncl; ++i) { const float dt = dot(dir, cl[i].dir); if (dt > bestDot) { bestDot = dt; best = i; } }
-            if (best >= 0) {
-                cl[best].pAcc = cl[best].pAcc + P * w;
-                cl[best].dir = normalized(cl[best].dir * cl[best].w + dir * w);
-                cl[best].w += w;
-            } else if (ncl < 24) {
-                cl[ncl].pAcc = P * w; cl[ncl].dir = dir; cl[ncl].w = w; ++ncl;
-            }
-        });
-        if (ncl == 0) return 0;
-
-        float sum = 0.0f; for (int i = 0; i < ncl; ++i) sum += cl[i].w;
-        bool used[24] = {false};
-        int n = 0;
-        while (n < maxN && n < ncl) {  // 重み上位から maxN 本を採用
-            int bi = -1; float bw = -1.0f;
-            for (int i = 0; i < ncl; ++i) if (!used[i] && cl[i].w > bw) { bw = cl[i].w; bi = i; }
-            if (bi < 0) break;
-            used[bi] = true;
-            const Vec3 Pc = cl[bi].pAcc * (1.0f / std::max(cl[bi].w, 1e-6f));  // UTD重み付き重心（連続）
-            const Vec3 dir = normalized(Pc - listener);
-            const float pathLen = length(Pc - listener) + length(source - Pc);  // 実経路長
-            outPos[n] = listener + dir * std::max(pathLen, 0.5f);  // 方向＝重心 / 距離＝実経路長
-            outGain[n] = cl[bi].w / std::max(sum, 1e-6f);
-            ++n;
+        // 重みは頭打ちしない前川値（定位をぼやけさせないため。findDiffractionPaths と同じ理由）。
+        const float directDist = std::max(length(source - listener), 1e-4f);
+        float sum = 0.0f;
+        for (int i = 0; i < np; ++i) sum += maekawa::apertureWeight(paths[i].pathLength - directDist);
+        for (int i = 0; i < np; ++i) {
+            // 方向＝開口 / 距離＝実経路長。呼び出し側は位置から両方を取り出す。
+            const Vec3 dir = normalized(paths[i].aperture - listener);
+            outPos[i] = listener + dir * std::max(paths[i].pathLength, 0.5f);
+            const float w = maekawa::apertureWeight(paths[i].pathLength - directDist);
+            outGain[i] = (sum > 1e-6f) ? w / sum : 0.0f;
         }
-        return n;
+        return np;
     }
 
     // 【回折(Phase 1.5)】from->to の帯域別回折ゲイン(0..1)。
@@ -727,6 +944,13 @@ public:
     //   幾何が不連続に変わって飛ぶ。重み付き平均・複素和・エネルギー加算をいずれも試したが
     //   解消できず、最良でも 3.8dB、最悪 17.6dB の段差が残った。
     //   UTD は diffractionUtd() として比較・検証用に残してある。
+    //   ゲインは**最小 δ から**出す。
+    //     設計 §5-6 では開口ごとのエネルギー加算としていたが、実測すると連続性が悪化した
+    //     （影境界 0.033 → 0.093 / ドア 0.191 → 0.234）。理由は、加算の前提である
+    //     「同じ物理経路を重複して数えない」がクラスタリングの離散性で満たせないため。
+    //     クラスタが分裂・統合する瞬間に和が飛ぶ。
+    //     min は連続なので飛ばない。本作の優先順位（遮蔽量の精度より定位）からも、
+    //     ゲインは連続でありさえすればよい。**方向は開口ごとに出るので情報は失われない。**
     void diffractionContinuous(const Vec3& from, const Vec3& to, bool occ,
                                float outGain[kNumBands]) const {
         float delta;

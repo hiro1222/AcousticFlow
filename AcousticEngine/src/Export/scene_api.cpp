@@ -80,6 +80,22 @@ int AF_SceneAddInstanceBox(AF_SceneHandle scene,
     return s->addInstance(makeObb(center, halfExtents, right, up), materialId);
 }
 
+int AF_SceneComputeDiffractionKirchhoff(AF_SceneHandle scene,
+                                        AF_Vector3 listener, AF_Vector3 source,
+                                        float* outGains, int count,
+                                        AF_Vector3* outAperture, float* outPathLength) {
+    Scene* s = asScene(scene);
+    if (!s || !outGains || count <= 0) return 0;
+    float gain[kNumBands];
+    Vec3 ap; float pl = 0.0f;
+    if (!s->diffractionKirchhoff(toVec3(listener), toVec3(source), gain, ap, pl)) return 0;
+    const int n = std::min(count, kNumBands);
+    for (int b = 0; b < n; ++b) outGains[b] = gain[b];
+    if (outAperture) *outAperture = AF_Vector3{ap.x, ap.y, ap.z};
+    if (outPathLength) *outPathLength = pl;
+    return 1;
+}
+
 void AF_SceneProbeDirectionalEnergy(AF_SceneHandle scene, AF_Vector3 origin,
                                     const AF_Vector3* dirs, int dirCount,
                                     int maxBounces, float* outEnergy) {
