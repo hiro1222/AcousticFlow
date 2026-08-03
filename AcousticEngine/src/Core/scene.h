@@ -26,6 +26,7 @@
 #include "Core/aabb.h"
 #include "Core/maekawa.h"
 #include "Core/material.h"
+#include "Core/mesh_geom.h"
 #include "Core/utd.h"
 #include "Core/vec3.h"
 
@@ -101,11 +102,15 @@ inline void knifeEdgeGain(float delta, float outGain[kNumBands]) {
 
 }  // namespace scene_detail
 
-// シーン内の1つの占有物。Phase 0 では形状=OBB 固定（geomId は BLAS 導入時に使う予約）。
+// シーン内の1つの占有物。形状は geomId で選ぶ（-1=箱 / >=0=メッシュ）。
 struct Instance {
     Obb obb;              // ワールド空間の有向境界ボックス（transform 相当）
     int materialId = 0;   // materials_ テーブルへの参照
-    int geomId = 0;       // 将来の BLAS(メッシュ)識別用。Phase 0 では未使用(0=単位ボックス)
+    // 形状(BLAS)の指定。-1 = 箱（obb そのもの）／>=0 = meshes_ の添字。
+    //   メッシュの場合、obb は「変換行列」と「ワールド境界ボックス」を兼ねる。
+    //   メッシュは正規化ローカル空間（AABB=[-1,1]^3）で持つので、obb がそのまま
+    //   local→world の写像になる（mesh_geom.h 参照）。
+    int geomId = -1;
     bool active = true;   // false のとき全走査からスキップ（LOD ストリーミング用）
 };
 
@@ -131,13 +136,53 @@ public:
 
     // インスタンスを追加し instanceId を返す。materialId は addMaterial の戻り値。
     // 範囲外 materialId は 0 に丸める（材質未登録なら既定壁を1つ入れておくこと）。
-    int addInstance(const Obb& obb, int materialId) {
+    // geomId: -1 = 箱（obb そのもの）／>=0 = addMesh の戻り値。
+    int addInstance(const Obb& obb, int materialId, int geomId = -1) {
         Instance inst;
         inst.obb = obb;
         inst.materialId = clampMaterialId(materialId);
+        inst.geomId = validMesh(geomId) ? geomId : -1;
         instances_.push_back(inst);
         bvhDirty_ = true;
         return static_cast<int>(instances_.size()) - 1;
+    }
+
+    // ── 形状(BLAS) ────────────────────────────────────────────────
+    // 三角形メッシュを登録し geomId を返す。失敗は -1。
+    //   実行時に呼べる。破壊やプロシージャル生成で形状が増えるのは配置の操作であり、
+    //   構築が要るのはこの 1 個ぶんだけ（レベル全体の再計算は決して起きない）。
+    //   outLocalCenter / outLocalHalfExtents には、正規化に使ったローカル AABB を返す。
+    //   ホストはこれを使ってインスタンスの OBB（＝変換）を作ること。
+    int addMesh(const float* verticesXYZ, int vertexCount, const int* indices, int indexCount,
+                Vec3* outLocalCenter = nullptr, Vec3* outLocalHalfExtents = nullptr) {
+        // 空きスロットを再利用する。詰め直すと既存の geomId が壊れるので絶対にしない。
+        int slot = -1;
+        for (size_t i = 0; i < meshes_.size(); ++i)
+            if (!meshes_[i].used) { slot = static_cast<int>(i); break; }
+        if (slot < 0) { meshes_.emplace_back(); slot = static_cast<int>(meshes_.size()) - 1; }
+
+        if (!meshes_[static_cast<size_t>(slot)].build(verticesXYZ, vertexCount, indices, indexCount)) {
+            meshes_[static_cast<size_t>(slot)].clear();
+            return -1;
+        }
+        if (outLocalCenter) *outLocalCenter = meshes_[static_cast<size_t>(slot)].localCenter;
+        if (outLocalHalfExtents) *outLocalHalfExtents = meshes_[static_cast<size_t>(slot)].localHalfExtents;
+        return slot;
+    }
+
+    // 形状を解放する。参照していたインスタンスは箱扱いに落ちる（境界ボックスとして残る）。
+    void removeMesh(int geomId) {
+        if (!validMesh(geomId)) return;
+        meshes_[static_cast<size_t>(geomId)].clear();
+        for (Instance& inst : instances_)
+            if (inst.geomId == geomId) inst.geomId = -1;
+        bvhDirty_ = true;
+    }
+
+    int meshCount() const { return static_cast<int>(meshes_.size()); }
+    bool validMesh(int geomId) const {
+        return geomId >= 0 && geomId < static_cast<int>(meshes_.size())
+            && meshes_[static_cast<size_t>(geomId)].used;
     }
 
     // 既存インスタンスの transform を更新する（動いた分だけ＝O(moved) の土台）。
@@ -158,8 +203,13 @@ public:
     // 全インスタンスを消す（材質テーブルは保持）。毎フレーム作り直す用途。
     void clearInstances() { instances_.clear(); bvhDirty_ = true; }
 
-    // 材質もインスタンスも全消し。
-    void clearAll() { instances_.clear(); materials_.clear(); bvhDirty_ = true; }
+    // 材質もインスタンスも形状も全消し。
+    void clearAll() {
+        instances_.clear();
+        materials_.clear();
+        meshes_.clear();
+        bvhDirty_ = true;
+    }
 
     // --- クエリ ---
 
@@ -184,7 +234,7 @@ public:
                     const Instance& inst = instances_[i];
                     float t;
                     Vec3 n;
-                    if (rayIntersectsObb(origin, d, inst.obb, closest, t, n) && t < closest) {
+                    if (instanceRaycast(inst, origin, d, closest, t, n) && t < closest) {
                         closest = t;
                         best.hit = true;
                         best.t = t;
@@ -202,6 +252,40 @@ public:
         return best;
     }
 
+    // ── インスタンス単位の幾何判定（箱／メッシュを吸収する）───────────────
+    //   TLAS の葉ではこの2つだけを呼ぶ。形状の種類はここに閉じ込める。
+
+    // レイ最近ヒット。maxT/outT はワールド距離。
+    //   メッシュはローカルへ移してから BVH に問う。**方向を正規化しない**ので
+    //   ローカル側の t がワールド距離と一致し、他インスタンスとの比較がそのまま通る。
+    bool instanceRaycast(const Instance& inst, const Vec3& origin, const Vec3& dir,
+                         float maxT, float& outT, Vec3& outNormal) const {
+        if (inst.geomId < 0) return rayIntersectsObb(origin, dir, inst.obb, maxT, outT, outNormal);
+        if (inst.geomId >= static_cast<int>(meshes_.size())) return false;
+        const MeshGeometry& g = meshes_[static_cast<size_t>(inst.geomId)];
+        if (!g.used) return false;
+        // 先にワールド境界ボックスで弾く（obb はメッシュの境界も兼ねている）。
+        float bt; Vec3 bn;
+        if (!rayIntersectsObb(origin, dir, inst.obb, maxT, bt, bn)) return false;
+        const Vec3 lo = meshWorldToLocalPoint(origin, inst.obb);
+        const Vec3 ld = meshWorldToLocalDir(dir, inst.obb);
+        Vec3 ln;
+        if (!g.bvh.raycast(lo, ld, maxT, outT, ln)) return false;
+        outNormal = meshLocalNormalToWorld(ln, inst.obb);
+        return true;
+    }
+
+    // 線分がこのインスタンスに遮られるか。
+    bool instanceOccludes(const Instance& inst, const Vec3& from, const Vec3& to) const {
+        if (inst.geomId < 0) return segmentIntersectsObb(from, to, inst.obb);
+        if (inst.geomId >= static_cast<int>(meshes_.size())) return false;
+        const MeshGeometry& g = meshes_[static_cast<size_t>(inst.geomId)];
+        if (!g.used) return false;
+        if (!segmentIntersectsObb(from, to, inst.obb)) return false;   // 境界ボックスで先に棄却
+        return g.bvh.occludes(meshWorldToLocalPoint(from, inst.obb),
+                              meshWorldToLocalPoint(to, inst.obb));
+    }
+
     // 2点間が何かに遮られているか（二値）。1本でも当たれば遮蔽。BVH で加速。
     bool isOccluded(const Vec3& from, const Vec3& to) const {
         ensureBvh();
@@ -215,7 +299,7 @@ public:
             if (node.count > 0) {
                 for (int k = 0; k < node.count; ++k) {
                     const int i = bvhOrder_[node.leftFirst + k];
-                    if (segmentIntersectsObb(from, to, instances_[i].obb)) return true;
+                    if (instanceOccludes(instances_[i], from, to)) return true;
                 }
             } else if (sp + 2 <= 64) {
                 stack[sp++] = node.leftFirst;
@@ -241,7 +325,7 @@ public:
                 for (int k = 0; k < node.count; ++k) {
                     const int i = bvhOrder_[node.leftFirst + k];
                     if (i == except) continue;
-                    if (segmentIntersectsObb(from, to, instances_[i].obb)) return true;
+                    if (instanceOccludes(instances_[i], from, to)) return true;
                 }
             } else if (sp + 2 <= 64) {
                 stack[sp++] = node.leftFirst;
@@ -268,7 +352,7 @@ public:
                 for (int k = 0; k < node.count; ++k) {
                     const int i = bvhOrder_[node.leftFirst + k];
                     const Instance& inst = instances_[i];
-                    if (!segmentIntersectsObb(from, to, inst.obb)) continue;
+                    if (!instanceOccludes(inst, from, to)) continue;
                     const AcousticMaterial& m = materialOf(inst.materialId);
                     for (int b = 0; b < kNumBands; ++b) outGain[b] *= m.transmission[b];
                 }
@@ -438,6 +522,13 @@ public:
         //   直接 from→to の線分が OBB と交差する箱＝ブロッカー、だけを対象にする。
         auto isBlocker = [&](int inst) {
             if (inst < 0 || inst >= instanceCount() || !instances_[inst].active) return false;
+            // ★メッシュは回折候補にしない（現時点）。
+            //   OBB の 12 稜線は「メッシュの稜線」ではないので、そのまま回すと
+            //   遮蔽判定（メッシュ）と回折判定（境界ボックス）が矛盾した幾何を見ることになる。
+            //   壁と戸口が 1 メッシュなら、遮蔽は「戸口を通る」、回折は「壁の外周を回れ」
+            //   と言う。正しくはメッシュから二面角でフィルタした稜線を抽出する
+            //   （docs/DIFFRACTION_DESIGN.md §5-5）。回折の作り直しと同時に入れる。
+            if (instances_[inst].geomId >= 0) return false;
             if (blockerMargin <= 0.0f) return segmentIntersectsObb(from, to, instances_[inst].obb);
             // 膨らませた OBB で判定する（半径方向に margin だけ拡大）。
             Obb fat = instances_[inst].obb;
@@ -1635,6 +1726,7 @@ private:
     }
 
     std::vector<AcousticMaterial> materials_;  // 材質テーブル（インスタンスが matId で参照）
+    std::vector<MeshGeometry> meshes_;         // 形状(BLAS)。添字が geomId。詰め直さない
     std::vector<Instance> instances_;          // 占有物（毎フレーム更新可能）
     Vec3 listenerPos_{};                       // 保持リスナー（段1〜。af_Update が使う）
     std::vector<SourceEntry> sources_;         // 保持音源（同上）

@@ -763,6 +763,84 @@ void diagnoseSwingDoor() {
     AF_SceneDestroy(s);
 }
 
+// ================================================================ メッシュ形状
+// 箱では表せない形（穴の空いた壁）を扱えることを確かめる。
+//   遮蔽判定が境界ボックスではなく実形状を見ていれば、戸口の正面は通り、脇は遮られる。
+//   あわせて「形状(BLAS)と配置(インスタンス)の分離」が効いていることも見る:
+//   同じ geomId を 2 箇所に置く／動かす／消す、が形状の再構築なしにできる。
+void testMesh() {
+    std::printf("\n[メッシュ] 穴の空いた壁\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+
+    // ローカル空間で z=0 の板。x∈[-3,3], y∈[0,3]。中央 x∈[-0.5,0.5] を戸口として抜く。
+    //   板を「左・右・上」の3枚の矩形（各2三角形）で作る。下は戸口なので塞がない。
+    const float vx[] = {
+        // 左パネル x∈[-3,-0.5], y∈[0,3]
+        -3.0f, 0.0f, 0.0f,  -0.5f, 0.0f, 0.0f,  -0.5f, 3.0f, 0.0f,  -3.0f, 3.0f, 0.0f,
+        // 右パネル x∈[0.5,3]
+         0.5f, 0.0f, 0.0f,   3.0f, 0.0f, 0.0f,   3.0f, 3.0f, 0.0f,   0.5f, 3.0f, 0.0f,
+        // 上まぐさ x∈[-0.5,0.5], y∈[2.2,3]
+        -0.5f, 2.2f, 0.0f,   0.5f, 2.2f, 0.0f,   0.5f, 3.0f, 0.0f,  -0.5f, 3.0f, 0.0f,
+    };
+    const int ix[] = {
+        0, 1, 2,  0, 2, 3,
+        4, 5, 6,  4, 6, 7,
+        8, 9, 10, 8, 10, 11,
+    };
+    AF_Vector3 lc{}, lh{};
+    const int geom = AF_SceneAddMesh(s, vx, 12, ix, 18, &lc, &lh);
+    check("メッシュが登録できる", geom >= 0);
+    std::printf("      ローカルAABB 中心(%.2f,%.2f,%.2f) 半径(%.2f,%.2f,%.2f)\n",
+                lc.x, lc.y, lc.z, lh.x, lh.y, lh.z);
+
+    // 正規化ローカル([-1,1]^3)→ワールドの変換。ここでは等倍・回転なしで置く。
+    const int inst = AF_SceneAddInstanceMesh(s, geom, lc, lh, V(1, 0, 0), V(0, 1, 0), mat);
+    check("メッシュインスタンスが追加できる", inst >= 0);
+
+    // 戸口の正面(x=0, y=1.6)は通る。脇(x=2)は板に遮られる。
+    check("戸口の正面は通る", AF_SceneIsOccluded(s, V(0, 1.6f, -3), V(0, 1.6f, 3)) == 0);
+    check("板の部分は遮られる", AF_SceneIsOccluded(s, V(2, 1.6f, -3), V(2, 1.6f, 3)) != 0);
+    check("まぐさの高さも遮られる", AF_SceneIsOccluded(s, V(0, 2.6f, -3), V(0, 2.6f, 3)) != 0);
+
+    // 境界ボックスなら「戸口の正面」も遮られてしまう。実形状を見ている証拠として、
+    // 同じ配置の箱インスタンスと比べる。
+    AF_SceneHandle s2 = AF_SceneCreate();
+    const int mat2 = AF_SceneAddMaterial(s2, nullptr, nullptr, nullptr, 0);
+    AF_SceneAddInstanceBox(s2, lc, lh, V(1, 0, 0), V(0, 1, 0), mat2);
+    check("同形の箱なら戸口の正面も遮られる（＝実形状を見ている証拠）",
+          AF_SceneIsOccluded(s2, V(0, 1.6f, -3), V(0, 1.6f, 3)) != 0);
+    AF_SceneDestroy(s2);
+
+    // 透過も実形状で効く（戸口は素通り＝1.0 / 板は材質ぶん減衰）。
+    float gOpen[kBands] = {}, gWall[kBands] = {};
+    AF_SceneComputeTransmissionBands(s, V(0, 1.6f, -3), V(0, 1.6f, 3), gOpen, kBands);
+    AF_SceneComputeTransmissionBands(s, V(2, 1.6f, -3), V(2, 1.6f, 3), gWall, kBands);
+    check("戸口ごしは透過1.0", gOpen[0] > 0.999f);
+    checkGreater("板ごしは減衰する", gOpen[0], gWall[0]);
+
+    // ── 配置の操作だけで形状変化を表せること ──
+    // 同じ形状を2つ目のインスタンスとして置く（BLAS は共有＝再構築なし）。
+    const AF_Vector3 c2 = V(lc.x + 8.0f, lc.y, lc.z);
+    const int inst2 = AF_SceneAddInstanceMesh(s, geom, c2, lh, V(1, 0, 0), V(0, 1, 0), mat);
+    check("同じ形状を別位置にも置ける(インスタンシング)", inst2 >= 0);
+    check("2つ目の板も遮る", AF_SceneIsOccluded(s, V(10, 1.6f, -3), V(10, 1.6f, 3)) != 0);
+    check("2つ目の戸口も通る", AF_SceneIsOccluded(s, V(8, 1.6f, -3), V(8, 1.6f, 3)) == 0);
+
+    // 動かす（transform 更新のみ。形状の再構築は起きない）。
+    AF_SceneUpdateInstance(s, inst2, V(lc.x + 20.0f, lc.y, lc.z), lh, V(1, 0, 0), V(0, 1, 0));
+    check("動かすと元の位置では遮らない", AF_SceneIsOccluded(s, V(10, 1.6f, -3), V(10, 1.6f, 3)) == 0);
+    check("動かした先で遮る", AF_SceneIsOccluded(s, V(22, 1.6f, -3), V(22, 1.6f, 3)) != 0);
+
+    // 非一様スケール（部屋の内寸を変える＝壁を伸ばす、に相当）。
+    //   x 方向だけ 2 倍にすると、元は素通りだった x=4 が板に入る。
+    AF_SceneUpdateInstance(s, inst, lc, V(lh.x * 2.0f, lh.y, lh.z), V(1, 0, 0), V(0, 1, 0));
+    check("非一様スケールで板が伸びる", AF_SceneIsOccluded(s, V(4, 1.6f, -3), V(4, 1.6f, 3)) != 0);
+    check("伸ばしても戸口は通る", AF_SceneIsOccluded(s, V(0, 1.6f, -3), V(0, 1.6f, 3)) == 0);
+
+    AF_SceneDestroy(s);
+}
+
 // ---------------------------------------------------------------- 頑健性
 // 不正入力で落ちない（移行中に呼び出し規約を変えるので、境界は明示的に守る）。
 void testRobustness() {
@@ -801,6 +879,7 @@ int main() {
     diagnoseShadowBoundary();
     diagnoseApertureDirection();
     diagnoseSwingDoor();
+    testMesh();
     testRobustness();
 
     std::printf("\n----\n");

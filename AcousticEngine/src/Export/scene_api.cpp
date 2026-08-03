@@ -80,6 +80,34 @@ int AF_SceneAddInstanceBox(AF_SceneHandle scene,
     return s->addInstance(makeObb(center, halfExtents, right, up), materialId);
 }
 
+int AF_SceneAddMesh(AF_SceneHandle scene,
+                    const float* verticesXYZ, int vertexCount,
+                    const int* indices, int indexCount,
+                    AF_Vector3* outLocalCenter, AF_Vector3* outLocalHalfExtents) {
+    Scene* s = asScene(scene);
+    if (!s) return -1;
+    Vec3 c, h;
+    const int id = s->addMesh(verticesXYZ, vertexCount, indices, indexCount, &c, &h);
+    if (id < 0) return -1;
+    if (outLocalCenter) *outLocalCenter = AF_Vector3{c.x, c.y, c.z};
+    if (outLocalHalfExtents) *outLocalHalfExtents = AF_Vector3{h.x, h.y, h.z};
+    return id;
+}
+
+void AF_SceneRemoveMesh(AF_SceneHandle scene, int geomId) {
+    Scene* s = asScene(scene);
+    if (!s) return;
+    s->removeMesh(geomId);
+}
+
+int AF_SceneAddInstanceMesh(AF_SceneHandle scene, int geomId,
+                            AF_Vector3 center, AF_Vector3 halfExtents,
+                            AF_Vector3 right, AF_Vector3 up, int materialId) {
+    Scene* s = asScene(scene);
+    if (!s) return -1;
+    return s->addInstance(makeObb(center, halfExtents, right, up), materialId, geomId);
+}
+
 void AF_SceneUpdateInstance(AF_SceneHandle scene, int instanceId,
                             AF_Vector3 center, AF_Vector3 halfExtents,
                             AF_Vector3 right, AF_Vector3 up) {

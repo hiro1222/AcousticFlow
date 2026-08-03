@@ -55,6 +55,42 @@ ACOUSTIC_API int AF_SceneAddInstanceBox(AF_SceneHandle scene,
                                         AF_Vector3 up,
                                         int materialId);
 
+/* 【形状(BLAS)】三角形メッシュを登録し geomId を返す。失敗は -1。
+ *   verticesXYZ: 頂点 x,y,z の連続配列（vertexCount 個ぶん = 3*vertexCount 要素）
+ *   indices    : 三角形インデックス（indexCount 要素、3つで1三角形）。範囲外の三角形は捨てる。
+ *   outLocalCenter / outLocalHalfExtents: 正規化に使ったローカル AABB（null 可）。
+ *
+ * 形状は「ローカル AABB が単位箱 [-1,1]^3」になるよう正規化して保持する。したがって
+ * インスタンスの OBB がそのまま local→world の変換になり、同時にワールド境界ボックスも兼ねる。
+ * ホストは outLocal* を使って OBB を作ること:
+ *     center      = transform.TransformPoint(outLocalCenter)
+ *     halfExtents = outLocalHalfExtents * lossyScale   （成分ごと。非一様スケール可）
+ *     right/up    = transform の軸
+ *
+ * 実行時に呼べる。破壊やプロシージャル生成で形状が増えても、構築はこの1個ぶんだけで、
+ * レベル全体の再計算は発生しない。 */
+ACOUSTIC_API int AF_SceneAddMesh(AF_SceneHandle scene,
+                                 const float* verticesXYZ, int vertexCount,
+                                 const int* indices, int indexCount,
+                                 AF_Vector3* outLocalCenter,
+                                 AF_Vector3* outLocalHalfExtents);
+
+/* 形状を解放する。参照していたインスタンスは箱（境界ボックス）扱いに落ちる。
+ * 他の geomId は無効化されない（スロットを詰め直さないため）。 */
+ACOUSTIC_API void AF_SceneRemoveMesh(AF_SceneHandle scene, int geomId);
+
+/* メッシュ形状のインスタンスを追加し instanceId を返す。geomId は AF_SceneAddMesh の戻り値。
+ * center/halfExtents/right/up は AF_SceneAddInstanceBox と同じ意味で、
+ * メッシュではこれが変換行列と境界ボックスを兼ねる（上記の作り方に従うこと）。
+ * geomId が無効なら箱として追加される。 */
+ACOUSTIC_API int AF_SceneAddInstanceMesh(AF_SceneHandle scene,
+                                         int geomId,
+                                         AF_Vector3 center,
+                                         AF_Vector3 halfExtents,
+                                         AF_Vector3 right,
+                                         AF_Vector3 up,
+                                         int materialId);
+
 /* 既存インスタンスの transform を更新する（動いた分だけ）。範囲外 id は無視。 */
 ACOUSTIC_API void AF_SceneUpdateInstance(AF_SceneHandle scene,
                                          int instanceId,
