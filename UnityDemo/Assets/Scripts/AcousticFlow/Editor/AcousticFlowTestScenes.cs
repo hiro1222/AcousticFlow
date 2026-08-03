@@ -116,6 +116,66 @@ namespace AcousticFlow.EditorTools
                 "影境界を跨ぐとき段差なく連続に変わるかを確認する。");
         }
 
+        // ── スイングドア：開き角で「直接聞こえる範囲」が連続的に変わる ──
+        // docs/DIFFRACTION_DESIGN.md §7 の検証シーン。要件の5性質を一度に確かめられる。
+        //
+        // 開閉の2状態ではなく、途中のどの角度でも成立していることが要点。
+        //   ・隙間が開き始めた方向(+X 側)の音源 … 早い段階からダイレクトに聞こえる
+        //   ・振れた扉の板が覆う側(-X 側)の音源 … 扉が振り切るまで透過のまま
+        // 事前計算では扱えない領域（角度ごとに焼き直せない）＝作品の主張そのもの。
+        //
+        // 5/6 キーで開閉。Inspector の SwingDoor.angleDeg を直接動かしてもよい。
+        [MenuItem("AcousticFlow/Test Scenes/Swing Door (扉の開き角)")]
+        public static void SwingDoorScene()
+        {
+            var scene = NewScene();
+            var listener = MakeListener(new Vector3(0f, 1.6f, -3f));   // 戸口の手前
+
+            var room = MakeRoom("Swing", new Vector3(14f, 3f, 14f), 0.4f);
+            room.enableHotkeys = false;   // 仕切りと扉が連動しないので拡縮させない
+            room.showGui = false;
+
+            // Z=0 の仕切り壁。中央に幅 1m の戸口を空ける（X = -0.5 〜 +0.5）。
+            const float wallZ = 0f, thick = 0.2f, height = 3f, half = 7f;
+            const float gapL = -0.5f, gapR = 0.5f;
+            float leftW = gapL - (-half);
+            MakeBox("Partition_L", new Vector3(-half + leftW * 0.5f, height * 0.5f, wallZ),
+                    new Vector3(leftW, height, thick));
+            float rightW = half - gapR;
+            MakeBox("Partition_R", new Vector3(gapR + rightW * 0.5f, height * 0.5f, wallZ),
+                    new Vector3(rightW, height, thick));
+
+            // 扉。左枠(X=-0.5)を蝶番にして +Z 側（音源のある奥）へ振れる。
+            //   高さは戸口と同じにすること。低いと上に隙間が残り「扉を回り込む」検証にならない。
+            var hinge = new GameObject("Door_Hinge").transform;
+            hinge.position = new Vector3(gapL, height * 0.5f, wallZ);
+            var doorGo = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            doorGo.name = "Door";
+            var door = doorGo.AddComponent<SwingDoor>();
+            door.hinge = hinge;
+            door.width = gapR - gapL;
+            door.height = height;
+            door.thickness = 0.06f;
+            door.swingTowardPositiveZ = true;
+            door.angleDeg = 0f;
+            door.Apply();
+
+            // 音源は戸口の正面（回帰テスト diagnoseSwingDoor と同じ配置）。
+            //   この幾何だと直線が通るのは 0.5/cos θ <= 1、すなわち θ > 60° から。
+            //   60°付近で「回折のみ」→「直接見通せる」へ移る。ここが段差にならないかが要点。
+            //   ※音源を Inspector で左右にずらすと「開く方向の音源ほど早く抜けてくる」が確かめられる。
+            //     ただし戸口が幅1mなので、直線が戸口を通るのは音源の X が概ね ±1m 以内のとき。
+            var srcPos = new Vector3(0f, 1.6f, 3f);
+            AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);
+            AddConvolver(srcPos);
+
+            Save(scene, "Test_SwingDoor.unity",
+                "扉の開き角: 5/6 キーで扉を開閉（Inspector の SwingDoor.angleDeg でも可）。" +
+                "60°付近で直線が通り始める。開閉の2状態ではなく、途中の角度すべてで" +
+                "連続に変わることを確認する。音源を左右にずらすと、開く方向の音源ほど" +
+                "早く抜けてくる挙動が確かめられる。");
+        }
+
         // ── 残響の検証：外 → 廊下 → 部屋 ──
         // 音響的に性格の違う3つのゾーンを歩いて通る。
         //   外   … 壁なし＝ほぼ無響。反射も残響も立たない

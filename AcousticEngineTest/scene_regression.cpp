@@ -632,6 +632,137 @@ void diagnoseApertureDirection() {
     AF_SceneDestroy(s);
 }
 
+// ================================================================ スイングドア
+// docs/DIFFRACTION_DESIGN.md §7。要件の5性質を一度に検証できる唯一のシーン。
+//
+// 押して開くドア。蝶番で回転し、開くにつれて直接聞こえる角度範囲が広がる。
+// 扉の角度を 0°→90° に振り、各角度で回折を測る。
+//   幾何: 壁 z=0 に幅1mの戸口。扉は左枠(x=-0.5)を軸に +z 側へ振れる。
+//         リスナー(0,1.6,-3) / 音源(0,1.6,+3) の直線は x=0。
+//         扉が塞ぐのは 0.5/cosθ <= 1 のとき、すなわち θ <= 60°。
+//         → 60°付近で「回折のみ」から「直接見通せる」へ移る。ここが段差になってはいけない。
+void diagnoseSwingDoor() {
+    std::printf("\n[診断] スイングドア: 開き角と回折の連続性\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+
+    // 壁（戸口 x∈[-0.5,0.5] を空けた2枚）
+    AF_SceneAddInstanceBox(s, V(-2.75f, 1.5f, 0), V(2.25f, 1.5f, 0.1f), V(1, 0, 0), V(0, 1, 0), mat);
+    AF_SceneAddInstanceBox(s, V( 2.75f, 1.5f, 0), V(2.25f, 1.5f, 0.1f), V(1, 0, 0), V(0, 1, 0), mat);
+
+    // 扉。蝶番 H=(-0.5,1.5,0)、幅1m・厚み0.05m。
+    //   高さは戸口と同じ y∈[0,3] にすること。低いと扉の上に隙間が残り、
+    //   「扉を回り込む」ではなく「扉の上を越える」を測ってしまう。
+    const AF_Vector3 hinge = V(-0.5f, 1.5f, 0.0f);
+    const AF_Vector3 half  = V(0.5f, 1.5f, 0.025f);
+    const int door = AF_SceneAddInstanceBox(s, V(0, 1.5f, 0), half, V(1, 0, 0), V(0, 1, 0), mat);
+
+    const AF_Vector3 L = V(0, 1.6f, -3), S = V(0, 1.6f, 3);
+    AF_SceneSetListener(s, L);
+    AF_SceneSetSource(s, 1, S);
+
+    std::printf("      開き角   125Hz    4kHz   遮蔽  開口位置(最有力)        重み\n");
+
+    float prevLow = -1.0f, maxGainJump = 0.0f, jumpAtDeg = 0.0f;
+    AF_Vector3 prevAp = V(0, 0, 0); bool havePrev = false;
+    float maxPosJump = 0.0f, posJumpAtDeg = 0.0f;
+    bool behindDoor = false, lowOverHigh = true;
+    float minDominant = 1.0f;
+    float apertureLostAtDeg = -1.0f;   // 減衰が残っているのに開口が0本になった角度
+
+    for (float deg = 0.0f; deg <= 90.01f; deg += 7.5f) {
+        const float th = deg * 3.14159265f / 180.0f;
+        const float c = std::cos(th), sn = std::sin(th);
+        // 蝶番まわりに回す。axisX は蝶番→自由端。中心は蝶番から半幅ぶん。
+        const AF_Vector3 ax = V(c, 0, sn);
+        AF_SceneUpdateInstance(s, door,
+                               V(hinge.x + ax.x * 0.5f, hinge.y, hinge.z + ax.z * 0.5f),
+                               half, ax, V(0, 1, 0));
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+
+        float g[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+        const int occ = AF_SceneIsOccluded(s, L, S);
+
+        AF_Vector3 pos[8]; float gain[8];
+        const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+        int bi = -1; float bw = -1.0f;
+        for (int i = 0; i < n; ++i) if (gain[i] > bw) { bw = gain[i]; bi = i; }
+
+        if (bi >= 0) {
+            std::printf("      %5.1f°  %6.3f  %6.3f    %d   (%6.2f,%6.2f,%6.2f)  %.3f\n",
+                        deg, g[0], g[5], occ, pos[bi].x, pos[bi].y, pos[bi].z, bw);
+            // 性質2: 扉は +z 側へ振れる。開口が扉の板の裏（x<-0.5 かつ z>0）を指してはいけない。
+            if (pos[bi].x < -0.5f && pos[bi].z > 0.0f) behindDoor = true;
+            if (bw < minDominant) minDominant = bw;   // 性質3
+            // 性質1(方向): 隣接角度で開口が飛ばない。3次元で測ること
+            //   （x,z だけで測ると「扉の上を越える経路」への乗り換えを見逃す）。
+            if (havePrev) {
+                const float dx = pos[bi].x - prevAp.x, dy = pos[bi].y - prevAp.y,
+                            dz = pos[bi].z - prevAp.z;
+                const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (d > maxPosJump) { maxPosJump = d; posJumpAtDeg = deg; }
+            }
+            prevAp = pos[bi]; havePrev = true;
+        } else {
+            std::printf("      %5.1f°  %6.3f  %6.3f    %d   (開口なし)\n", deg, g[0], g[5], occ);
+            // 減衰が残っているのに方向が分からない状態。定位が消える。
+            if (g[0] < 0.999f && apertureLostAtDeg < 0.0f) apertureLostAtDeg = deg;
+            havePrev = false;
+        }
+
+        // 性質1(ゲイン): 隣接角度でゲインが飛ばない。60°の見通し開通も段差にしない。
+        if (prevLow >= 0.0f) {
+            const float j = std::fabs(g[0] - prevLow);
+            if (j > maxGainJump) { maxGainJump = j; jumpAtDeg = deg; }
+        }
+        prevLow = g[0];
+
+        if (occ && !(g[0] > g[5])) lowOverHigh = false;   // 性質4
+    }
+
+    float gOpen[kBands] = {};
+    AF_SceneComputeDiffractionBands(s, L, S, gOpen, kBands);
+
+    // ── 要件の達成状況（docs/DIFFRACTION_DESIGN.md §3）──
+    //   ここは「壊れた／壊れていない」ではなく「まだ作っていない」の一覧。
+    //   赤いままのスイートは信用されなくなるので、未達は check() にせず数値だけ出す。
+    //   回折を作り直すときに、ここの目標値をそのまま合格基準として check() へ格上げする。
+    auto row = [](const char* name, bool ok, const char* detail) {
+        std::printf("        %-22s %-26s %s\n", name, detail, ok ? "達成" : "未達 ←");
+    };
+    char d1[64], d2[64], d3[64], d4[64], d5[64];
+    std::snprintf(d1, sizeof(d1), "最大隣接差 %.3f @ %.1f°", maxGainJump, jumpAtDeg);
+    std::snprintf(d2, sizeof(d2), "最大隣接差 %.2fm @ %.1f°", maxPosJump, posJumpAtDeg);
+    std::snprintf(d3, sizeof(d3), "支配重みの最小 %.3f", minDominant);
+    std::snprintf(d4, sizeof(d4), "%.1f° 以降 開口0本", apertureLostAtDeg);
+    std::snprintf(d5, sizeof(d5), "125Hz %.3f", gOpen[0]);
+    std::printf("\n      ── 要件の達成状況（目標は作り直しの合格基準）──\n");
+    row("性質1 ゲイン連続",   maxGainJump < 0.05f,        d1);
+    row("性質1 開口位置連続", maxPosJump < 0.5f,          d2);
+    row("性質2 到達可能性",   !behindDoor,                "扉の裏を指さない");
+    row("性質3 集中",         minDominant > 0.6f,         d3);
+    row("性質4 低域>高域",    lowOverHigh,                "全角度で成立");
+    row("性質5 定位の維持",   apertureLostAtDeg < 0.0f,   d4);
+    row("性質5 開き切り1.0",  gOpen[0] > 0.9f,            d5);
+    std::printf("      目標: ゲイン<0.05 / 位置<0.5m / 集中>0.6 / 開口が消えない / 開き切り>0.9\n");
+
+    // 現状すでに満たしているものだけ check する（回帰の検出用）。
+    check("[扉] 到達可能性: 開口が扉の板の裏を指さない", !behindDoor);
+    check("[扉] 遮蔽中は低域>高域", lowOverHigh);
+    check("[扉] 開き切ると見通せる", AF_SceneIsOccluded(s, L, S) == 0);
+
+    // 構造的欠陥の実例も記録する。ゲイン用と方向用で候補の探索条件が違うため、
+    // 「ゲインは回折を見ているのに開口は0本」という不整合が起きる（設計 §2 で解消）。
+    AF_Vector3 po[8]; float go[8];
+    const int nOpen = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), po, go, 8);
+    if (nOpen == 0 && gOpen[0] < 0.999f)
+        std::printf("      [不整合・既知] 回折ゲインは %.3f なのに開口は 0 本。"
+                    "探索が2箇所に重複していることの実例（設計 §2）。\n", gOpen[0]);
+
+    AF_SceneDestroy(s);
+}
+
 // ---------------------------------------------------------------- 頑健性
 // 不正入力で落ちない（移行中に呼び出し規約を変えるので、境界は明示的に守る）。
 void testRobustness() {
@@ -669,6 +800,7 @@ int main() {
     diagnoseTailSpectrum();
     diagnoseShadowBoundary();
     diagnoseApertureDirection();
+    diagnoseSwingDoor();
     testRobustness();
 
     std::printf("\n----\n");
