@@ -1143,7 +1143,19 @@ namespace AcousticFlow
             Status.TapType = _tapType;
             Status.RtSeconds = _reverbDecay;
             Status.Wet = _reverbWet;
-            Status.SourceLevel = Mean6(_bands, 0);   // 主音源の直線透過(遮蔽)＝残響を遮蔽で絞る用
+            // 残響を絞る量。「その音源が部屋にエネルギーを注げているか」を表す。
+            //
+            //   以前は直線透過(_bands)だけを見ていたが、それは誤りだった。
+            //   衝立の裏に回っただけで透過は 0.02 まで落ち、残響が -35dB 消えていた。
+            //   実際には回折で 0.32 届いており、そもそも音源と自分が同じ部屋にいるなら
+            //   間に衝立があっても部屋の残響は落ちない（遮られるのは直接音だけ）。
+            //   残響を絞るべきなのは「音源が別の部屋にいて部屋に注げない」場合。
+            //
+            //   反射込みの生存(_bandsPerSource)はまさにその区別になっている。
+            //   衝立なら反射が回り込むので高いまま／別部屋なら反射も届かず下がる。
+            Status.SourceLevel = (_bandsPerSource != null && _bandsPerSource.Length >= AcousticEngine.NumBands)
+                ? Mean6(_bandsPerSource, 0)
+                : Mean6(_bands, 0);
 
             // HRTF 用：主音源の到来方向をリスナー座標系へ。
             //   ワールドの音源方向ではなく実測の到来方向（_apparentDir）を使う。

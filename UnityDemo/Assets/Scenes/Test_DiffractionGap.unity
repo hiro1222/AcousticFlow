@@ -260,7 +260,7 @@ MonoBehaviour:
   generateTestSignal: 0
   testContinuousNoise: 0
   clickIntervalSec: 0.6
-  testClip: {fileID: 0}
+  testClip: {fileID: 8300000, guid: 2a949de8ae7bb824a83136bff2a6bc66, type: 3}
   restartOnSwitch: 1
   maxIrMs: 400
   irUpdateSec: 0.05

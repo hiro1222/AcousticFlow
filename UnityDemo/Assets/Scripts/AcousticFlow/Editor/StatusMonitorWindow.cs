@@ -77,8 +77,12 @@ namespace AcousticFlow.EditorTools
             EditorGUILayout.Space(8f);
             EditorGUILayout.LabelField("回折", EditorStyles.boldLabel);
             float dd = AcousticFlowSceneDemo.Status.DiffDelta;
-            EditorGUILayout.LabelField("主音源の回折",
-                dd >= 0f ? $"迂回路あり  δ={dd:F2} m" : "なし（迂回路が見つからない）");
+            // δ は「遮蔽時の最短迂回路」しか探さない（探索マージン0）。
+            // 一方いま鳴っている回折ゲインは、照らされた領域でも近傍エッジを拾って計算している。
+            // なので「δ=なし」でも下の回折ゲインが 1.0 未満になることがある＝矛盾ではない。
+            EditorGUILayout.LabelField("主音源の回折δ",
+                dd >= 0f ? $"迂回路あり  δ={dd:F2} m"
+                         : "遮蔽なし（δは遮蔽時のみ算出。回折ゲインは下段を見る）");
 
             int dAct = AcousticFlowSceneDemo.Status.DiffActive;
             int dCap = AcousticFlowSceneDemo.Status.DiffCap;
