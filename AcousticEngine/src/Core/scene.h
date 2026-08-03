@@ -337,7 +337,12 @@ public:
     //   （カタログで有効候補が 0 なら箱へフォールバック）。単一最短(diffractionDetour)も
     //   多重合成(diffractionComposite)もこれを土台にする。
     template <class Fn>
-    void forEachDiffractionCandidate(const Vec3& from, const Vec3& to, Fn&& fn) const {
+    // blockerMargin: ブロッカー判定を膨らませる量(m)。0 なら「実際に直接線を塞ぐ箱」だけ。
+    //   影境界の外側（照らされた領域）でも回折場を求めたい場合に > 0 を渡す。
+    //   そこでは直接線が箱の脇をかすめて通るだけなので、膨らませないと候補が0本になる。
+    //   遠いエッジを拾っても UTD の総合ゲインは 1.0 に収束するので、多めでも害はない。
+    void forEachDiffractionCandidate(const Vec3& from, const Vec3& to, Fn&& fn,
+                                     float blockerMargin = 0.0f) const {
         const float direct = std::max(length(to - from), 1e-4f);
         const float margin = 0.15f;  // 箱を少し膨らませた稜線上を候補に（視線を通しやすく）
 
@@ -372,8 +377,12 @@ public:
         //   直接線と交差しない箱の稜線まで候補にすると、無関係な遠い方向へ候補が飛んで合成を濁す。
         //   直接 from→to の線分が OBB と交差する箱＝ブロッカー、だけを対象にする。
         auto isBlocker = [&](int inst) {
-            return inst >= 0 && inst < instanceCount() && instances_[inst].active &&
-                   segmentIntersectsObb(from, to, instances_[inst].obb);
+            if (inst < 0 || inst >= instanceCount() || !instances_[inst].active) return false;
+            if (blockerMargin <= 0.0f) return segmentIntersectsObb(from, to, instances_[inst].obb);
+            // 膨らませた OBB で判定する（半径方向に margin だけ拡大）。
+            Obb fat = instances_[inst].obb;
+            fat.halfExtents = fat.halfExtents + Vec3(blockerMargin, blockerMargin, blockerMargin);
+            return segmentIntersectsObb(from, to, fat);
         };
 
         // エッジカタログ（B: キューブマップ由来のシルエット稜線）と箱の実稜線の両方を候補にする（和集合）。
@@ -390,7 +399,7 @@ public:
             const Instance& inst = instances_[i];
             if (!inst.active) continue;
             const Obb& b = inst.obb;
-            if (!segmentIntersectsObb(from, to, b)) continue;  // ブロッカーだけ回折対象
+            if (!isBlocker(i)) continue;  // ブロッカーだけ回折対象（margin>0 なら近傍も含む）
             const Vec3 ax[3] = {b.axisX, b.axisY, b.axisZ};
             const float h[3] = {b.halfExtents.x + margin, b.halfExtents.y + margin,
                                 b.halfExtents.z + margin};
@@ -416,14 +425,17 @@ public:
     // 【回折(Phase 1.5 暫定・可視化用)】直接 from->to が遮蔽されているとき、稜線を回る「最短迂回」の
     // 余剰経路長 δ(= 迂回長 − 直線長, m)を返し、最良の迂回点を outPoint に書く。遮蔽なし or 迂回路なしは
     // -1（outPoint 不定）。outEdgeDir/outRefTangent : null でなければ最良稜線の「エッジ方向」「0面接線」を書く。
+    //   blockerMargin > 0 なら、遮蔽されていなくても近傍のエッジを探す（影境界の外側で
+    //   回折場を求めるため）。既定 0 では従来どおり「遮蔽時のみ」。
     float diffractionDetour(const Vec3& from, const Vec3& to, Vec3& outPoint,
-                            Vec3* outEdgeDir = nullptr, Vec3* outRefTangent = nullptr) const {
-        if (!isOccluded(from, to)) return -1.0f;
+                            Vec3* outEdgeDir = nullptr, Vec3* outRefTangent = nullptr,
+                            float blockerMargin = 0.0f) const {
+        if (blockerMargin <= 0.0f && !isOccluded(from, to)) return -1.0f;
         float best = -1.0f;
         Vec3 bestP{0, 0, 0}, bestEdge{1, 0, 0}, bestRefT{0, 1, 0};
         forEachDiffractionCandidate(from, to, [&](const Vec3& P, float d, const Vec3& e, const Vec3& r) {
             if (best < 0.0f || d < best) { best = d; bestP = P; bestEdge = e; bestRefT = r; }
-        });
+        }, blockerMargin);
         if (best >= 0.0f) {
             outPoint = bestP;
             if (outEdgeDir) *outEdgeDir = bestEdge;
@@ -534,19 +546,70 @@ public:
 
     // 【回折(Phase 1.5)】from->to の帯域別回折ゲイン(0..1)。
     //   遮蔽なし → 全帯域 1.0 / 迂回路あり → Maekawa（低域ほど回り込む）/ 迂回路なし → 0。
+    // 影境界を跨いでも連続になるよう、照らされた領域でも回折場を計算して直接音と合成する。
+    //
+    //   以前は isOccluded の二値判定で「非遮蔽 → 全帯域 1.0 / 遮蔽 → UTD値」と切り替えていた。
+    //   UTD は影境界で約 0.5(-6dB) を返すので、境界を跨いだ瞬間に 0.5 ⇄ 1.0 の段差
+    //   （実測で最大 12.5dB）が出ていた。
+    //   物理的には照らされた領域にも回折場は存在し、直接音と足すと境界で連続になる
+    //   ── それが UTD が GTD を「一様化」した目的そのもの（utd.h の utdTotalGain 参照）。
     void computeDiffraction(const Vec3& from, const Vec3& to, float outGain[kNumBands]) const {
-        if (!isOccluded(from, to)) {
-            for (int b = 0; b < kNumBands; ++b) outGain[b] = 1.0f;
+        const bool occ = isOccluded(from, to);
+
+        // 照らされた領域では直接線を塞ぐ箱が無いので、候補探索を近傍まで広げる必要がある。
+        //
+        // マージンの決め方: UTD の遷移領域の幅は波長スケールで決まり、低域ほど広い。
+        //   最低域 125Hz の波長は約 2.7m あるので、それより狭いマージンで打ち切ると
+        //   「まだ回折場が効いている位置」で候補が消え、そこで 1.0 へ跳ぶ。
+        //   最低域の波長の数倍を取って、回折場が十分小さくなってから外れるようにする。
+        //   遠いエッジを拾っても総合ゲインは 1.0 に収束するので、広めでも害はない。
+        const float margin = occ ? 0.0f : 8.0f;   // ≒ 125Hz の波長 2.7m の3倍
+
+        // エッジは「δ が小さいもの」ほど支配的。ただし1本だけを選ぶと、
+        // どれが最小かが切り替わる瞬間に幾何が不連続に変わって値が飛ぶ（実測で低域 -7dB）。
+        //   全エッジの複素和も試したが、UTD は各エッジを孤立ウェッジとして評価するため
+        //   寄与の小さいはずのエッジまで無視できない値を返し、和が大幅に過大計上になった
+        //   （実測 17.6dB 悪化）。箱の12稜線すべてが「自分が回折源だ」と主張してしまう。
+        // → δ による軟らかい重み付けで上位を混ぜる。乗り換え時に重みが連続に移るので飛ばない。
+        constexpr int kMaxEdges = 8;
+        float wSum = 0.0f;
+        float acc[kNumBands] = {0, 0, 0, 0, 0, 0};
+        float bestDelta = -1.0f;
+        struct Cand { Vec3 P; Vec3 edgeDir; Vec3 refT; float delta; };
+        Cand cands[kMaxEdges];
+        int nc = 0;
+        forEachDiffractionCandidate(from, to,
+            [&](const Vec3& P, float d, const Vec3& edgeDir, const Vec3& refT) {
+                if (bestDelta < 0.0f || d < bestDelta) bestDelta = d;
+                if (nc < kMaxEdges) cands[nc++] = Cand{P, edgeDir, refT, d};
+            }, margin);
+
+        if (nc == 0) {
+            // 回折の相手が無い。遮蔽なら完全に届かない、非遮蔽なら素通り。
+            const float g = occ ? 0.0f : 1.0f;
+            for (int b = 0; b < kNumBands; ++b) outGain[b] = g;
             return;
         }
-        Vec3 p, edgeDir, refT;
-        const float delta = diffractionDetour(from, to, p, &edgeDir, &refT);
-        if (delta < 0.0f) {
-            for (int b = 0; b < kNumBands; ++b) outGain[b] = 0.0f;
-            return;
+
+        // 直接音の相対振幅。遮蔽時は 0（回折だけが届く）、非遮蔽時は 1（素通り）。
+        //   ここでの「直接」は幾何的な見通しのこと。材質を透過する成分は
+        //   computeTransmission が別に持っており、呼び出し側で合成される。
+        float direct[kNumBands];
+        for (int b = 0; b < kNumBands; ++b) direct[b] = 1.0f;
+
+        // 重み exp(-(δ-δmin)/σ)。σ は最低域の波長スケール（そこが最も鈍いので）。
+        const float kSigma = 0.7f;
+        for (int i = 0; i < nc; ++i) {
+            const float w = std::exp(-(cands[i].delta - bestDelta) / kSigma);
+            if (w < 1e-3f) continue;
+            float g[kNumBands];
+            utd::utdWedgeTotal(to, cands[i].P, from, cands[i].edgeDir, cands[i].refT,
+                               1.5f, !occ, direct, g);
+            for (int b = 0; b < kNumBands; ++b) acc[b] += w * g[b];
+            wSum += w;
         }
-        // UTD（複素ウェッジ回折）。from=リスナー/to=音源 の想定 → utd(source,P,listener)。
-        utd::utdWedgeGain(to, p, from, edgeDir, refT, 1.5f, outGain);
+        const float inv = (wSum > 1e-6f) ? 1.0f / wSum : 0.0f;
+        for (int b = 0; b < kNumBands; ++b) outGain[b] = acc[b] * inv;
     }
 
     // 【役割1(Phase 2)：ソフト遮蔽】直接音を「音源周りの複数サンプル」で測り、遮られた割合を

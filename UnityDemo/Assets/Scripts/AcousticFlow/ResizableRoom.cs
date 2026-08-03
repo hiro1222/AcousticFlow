@@ -61,6 +61,13 @@ namespace AcousticFlow
         [Range(1.5f, 6f)] public float doorwayHeight = 2.2f;
         [Tooltip("出入り口の中心の X 位置(m, 部屋中心が0)。")]
         public float doorwayCenterX = 0f;
+        [Tooltip("ON: ドアが閉まっている＝開口が塞がれ、完全に密閉された空間になる。\n"
+                 + "開いた状態との比較で「開口があると残響がどれだけ抜けるか」が分かる。")]
+        public bool doorClosed = false;
+        [Tooltip("ドアを開閉するキー。部屋の拡縮キー(enableHotkeys)とは独立して効く。")]
+        public KeyCode doorToggleKey = KeyCode.Alpha4;
+        [Tooltip("ON: 上記キーでドアを開閉できる。")]
+        public bool enableDoorKey = true;
 
         [Header("プリセット (1/2/3 キー)")]
         public Vector3 presetSmall = new Vector3(4f, 2.5f, 3f);
@@ -74,11 +81,13 @@ namespace AcousticFlow
                 "Floor", "Ceiling", "Wall_E", "Wall_W", "Wall_N",
                 "Wall_S",        // 開口なしのときの南壁（1枚）
                 "Wall_S_L", "Wall_S_R", "Wall_S_Top",  // 開口ありのときの南壁（3分割）
+                "Wall_S_Door",   // 開口を塞ぐドア（doorClosed のとき有効）
             };
 
         // 直前に反映した値。Inspector を実行中にドラッグした場合の検知に使う。
         private Vector3 _appliedSize;
         private float _appliedThickness;
+        private bool _appliedDoorClosed;
 
         private void Awake()
         {
@@ -106,10 +115,16 @@ namespace AcousticFlow
 
         private void Update()
         {
+            // ドアの開閉は拡縮キーとは独立。廊下と接続していて拡縮できないシーンでも使えるように。
+            if (enableDoorKey && makeDoorway && Input.GetKeyDown(doorToggleKey))
+                doorClosed = !doorClosed;
+
             if (enableHotkeys) HandleHotkeys();
 
             // Inspector 直接編集にも追従する（実行中にドラッグして聞き比べる用）。
-            if (innerSize != _appliedSize || !Mathf.Approximately(thickness, _appliedThickness))
+            if (innerSize != _appliedSize
+                || !Mathf.Approximately(thickness, _appliedThickness)
+                || doorClosed != _appliedDoorClosed)
                 ApplyNow();
         }
 
@@ -162,6 +177,7 @@ namespace AcousticFlow
 
             _appliedSize = innerSize;
             _appliedThickness = thickness;
+            _appliedDoorClosed = doorClosed;
 
             if (keepListenerInside && Application.isPlaying) ClampListener();
         }
@@ -176,7 +192,7 @@ namespace AcousticFlow
             {
                 SetActive(5, true);
                 Set(5, new Vector3(0f, h * 0.5f, z), new Vector3(w, h, t));
-                SetActive(6, false); SetActive(7, false); SetActive(8, false);
+                SetActive(6, false); SetActive(7, false); SetActive(8, false); SetActive(9, false);
                 return;
             }
 
@@ -206,6 +222,11 @@ namespace AcousticFlow
             SetActive(8, lintel > 1e-3f);
             if (lintel > 1e-3f)
                 Set(8, new Vector3(cx, dh + lintel * 0.5f, z), new Vector3(dw, lintel, t));
+
+            // ドア本体。閉じると開口が完全に塞がり、密閉空間になる。
+            SetActive(9, doorClosed);
+            if (doorClosed)
+                Set(9, new Vector3(cx, dh * 0.5f, z), new Vector3(dw, dh, t));
         }
 
         private void Set(int i, Vector3 localPos, Vector3 localScale)
@@ -269,6 +290,8 @@ namespace AcousticFlow
                                 $"2=中({presetMedium.x:F0}×{presetMedium.z:F0})  " +
                                 $"3=大({presetLarge.x:F0}×{presetLarge.z:F0})", style);
             }
+            if (makeDoorway && enableDoorKey)
+                GUILayout.Label($"ドア: {(doorClosed ? "閉（密閉）" : "開")}  ({doorToggleKey} で開閉)", style);
             GUILayout.EndArea();
         }
     }

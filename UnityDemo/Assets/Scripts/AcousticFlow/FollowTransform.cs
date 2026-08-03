@@ -27,7 +27,7 @@ namespace AcousticFlow
 
         [Tooltip("対象からのオフセット(m, ワールド座標)。\n"
                  + "0 にすると音源とリスナーが重なり、残響が計算上ゼロになるので注意。")]
-        public Vector3 offset = new Vector3(0f, 0f, 1.5f);
+        public Vector3 offset = new Vector3(0f, 0f, 0.3f);
 
         [Tooltip("ON: オフセットを対象の向きに合わせて回す（相対的な位置関係が保たれる）。\n"
                  + "OFF: ワールド座標でずらす（振り向くと音源が周囲を回るので定位の確認に向く）。")]

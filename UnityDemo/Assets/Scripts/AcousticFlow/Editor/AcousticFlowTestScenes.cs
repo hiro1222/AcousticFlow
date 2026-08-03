@@ -144,14 +144,14 @@ namespace AcousticFlow.EditorTools
             MakeBox("Corridor_Ceil", new Vector3(0f, corH + corT * 0.5f, corMidZ),
                     new Vector3(corW + corT * 2f, corT, corLen));
 
-            // ── 部屋：内寸 10×8m・高4m（Z = +2 〜 +10）──
+            // ── 部屋：内寸 14×12m・高5m（Z = +2 〜 +14）──
             //   南壁(-Z)が廊下の突き当たりに一致し、そこに廊下と同じ幅・高さの開口を空ける。
-            const float roomD = 8f;
+            const float roomD = 12f;
             float roomCz = corZ1 + roomD * 0.5f;    // 南壁が corZ1 に来るように置く
             var roomGo = new GameObject("Room");
             roomGo.transform.position = new Vector3(0f, 0f, roomCz);
             var room = roomGo.AddComponent<ResizableRoom>();
-            room.innerSize = new Vector3(10f, 4f, roomD);
+            room.innerSize = new Vector3(14f, 5f, roomD);
             room.thickness = 0.4f;
             room.makeFloor = false;            // 地面と二重計上しない
             room.makeDoorway = true;           // 廊下から入れるように
@@ -160,6 +160,9 @@ namespace AcousticFlow.EditorTools
             room.keepListenerInside = false;   // 外や廊下にいるのに中へワープさせない
             // 廊下は部屋と連動しないので、拡縮すると接続が壊れる。サイズは固定。
             room.enableHotkeys = false;
+            // 4キーでドアを開閉（開口を塞いで密閉空間にできる）。拡縮キーとは独立に効く。
+            room.enableDoorKey = true;
+            room.doorToggleKey = KeyCode.Alpha4;
             room.ApplyNow();
 
             // 音源はリスナーの 1.5m 前方に追従。
@@ -186,8 +189,9 @@ namespace AcousticFlow.EditorTools
             }
             Save(scene, "Test_RoomEntry.unity",
                 "残響(外→廊下→部屋): 音源がリスナーに1.5mで追従するので直接音は一定。" +
-                "W で前進すると 外(ほぼ無響) → 廊下(幅2m・横方向の反射が強い) → 部屋(10×8m・拡散的) " +
+                "W で前進すると 外(ほぼ無響) → 廊下(幅2m・横方向の反射が強い) → 部屋(14×12m・拡散的) " +
                 "と響きが3段階で変わる。違いは全部『空間の応答』だけに由来する。" +
+                "4キーでドアを開閉でき、閉じると完全密閉になる（開口から抜ける分が消えて残響が伸びる）。" +
                 "部屋のサイズは固定（廊下と接続しているため）。");
         }
 

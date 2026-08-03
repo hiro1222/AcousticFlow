@@ -523,6 +523,55 @@ void diagnoseTailSpectrum() {
     }
 }
 
+// ---------------------------------------------------------------- 診断: 影境界の連続性
+// 回折ゲインが影境界を跨ぐときに跳ばないかを、リスナーを横に動かしながら測る。
+//
+// なぜ跳ぶか（現状の実装）:
+//   computeDiffraction は isOccluded の二値判定で
+//     非遮蔽 → 全帯域 1.0 / 遮蔽 → UTD値（影境界で約0.5）
+//   と切り替える。物理的には照らされた領域にも回折場は存在し、
+//   直接音と足すと影境界で連続になるのが UTD の設計思想（GTD を「一様化」した目的そのもの）。
+//   照らされた側で回折場を捨てているので、その連続性が壊れている。
+void diagnoseShadowBoundary() {
+    std::printf("\n[診断] 影境界を横切るときの回折ゲインの連続性\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+
+    // z=0 に半無限に近い壁。x<=0 が壁、x>0 が開口（エッジは x=0）。
+    AF_SceneAddInstanceBox(s, V(-5, 2, 0), V(5, 2, 0.15f), V(1, 0, 0), V(0, 1, 0), mat);
+
+    const AF_Vector3 src = V(-2, 1.6f, 2);
+    // 影境界: 音源(-2,2) からエッジ(0,0) を通る直線が z=-2 に達する x を求めると x=+2。
+    //   x<2 が影 / x>2 が照らされた側。
+    std::printf("      リスナー x   125Hz   500Hz    4kHz   （x=2 が影境界）\n");
+
+    float prevLow = -1.0f, maxJump = 0.0f;
+    float jumpAtX = 0.0f;
+    for (float x = 0.0f; x <= 4.01f; x += 0.25f) {
+        float g[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, V(x, 1.6f, -2), src, g, kBands);
+        std::printf("      %8.2f  %6.3f  %6.3f  %6.3f%s\n",
+                    x, g[0], g[2], g[5],
+                    (std::fabs(x - 2.0f) < 0.13f) ? "  ← 影境界" : "");
+        if (prevLow >= 0.0f) {
+            const float jump = std::fabs(g[0] - prevLow);
+            if (jump > maxJump) { maxJump = jump; jumpAtX = x; }
+        }
+        prevLow = g[0];
+    }
+
+    // 0.25m 刻みで隣接する点の差。連続なら小さいはず。
+    // 二値切替だと 1.0→0.5 の跳びが出る（=0.5 前後）。
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "(最大の隣接差 %.3f @ x=%.2f)", maxJump, jumpAtX);
+    check("影境界で回折ゲインが跳ばない(隣接差<0.2)", maxJump < 0.2f, buf);
+    if (maxJump >= 0.2f)
+        std::printf("      → %.1f dB の段差。照らされた側で回折場を捨てているのが原因。\n",
+                    20.0f * std::log10((1.0f - maxJump > 1e-3f) ? 1.0f / (1.0f - maxJump) : 1000.0f));
+
+    AF_SceneDestroy(s);
+}
+
 // ---------------------------------------------------------------- 頑健性
 // 不正入力で落ちない（移行中に呼び出し規約を変えるので、境界は明示的に守る）。
 void testRobustness() {
@@ -558,6 +607,7 @@ int main() {
     testBatchUpdate();
     testUpdateRates();
     diagnoseTailSpectrum();
+    diagnoseShadowBoundary();
     testRobustness();
 
     std::printf("\n----\n");
