@@ -1033,6 +1033,74 @@ void testDirectionalProbe() {
     AF_SceneDestroy(s);
 }
 
+// ================================================================ 2次回折（食い違いの2戸口）
+// **1次では原理的に届かない**配置。曲がりが2回必要。
+//
+//   ★L字（曲がり1回）は 2次のテストにならない。角の稜線がリスナーからも音源からも
+//     見通せるので、1次で届いてしまう（実測: order=1 でも同じ値が出た）。
+//     設計書に「L字廊下の角」を2次の例として書いていたが誤りだった。
+//
+//   ここでは戸口を2枚、x 方向にずらして置く。どちらの戸口の稜線も、
+//   もう一方の壁に遮られて「リスナーと音源の両方」からは見通せない。
+//   → listener → 戸口1 → 戸口2 → source の2段でしか届かない。
+//   鳴らす位置は**手前の戸口**であるべき（人は手前の角から聞こえると感じる）。
+void testSecondOrderDiffraction() {
+    std::printf("\n[2次回折] 食い違いに置いた2つの戸口\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+
+    const float t = 0.15f, hy = 1.5f;
+    // 壁1（z=0）: 戸口 x∈[-1,0]
+    AF_SceneAddInstanceBox(s, V(-3.5f, hy, 0), V(2.5f, hy, t), V(1, 0, 0), V(0, 1, 0), mat);
+    AF_SceneAddInstanceBox(s, V( 3.0f, hy, 0), V(3.0f, hy, t), V(1, 0, 0), V(0, 1, 0), mat);
+    // 壁2（z=4）: 戸口 x∈[2,3]（壁1の戸口とずらす）
+    AF_SceneAddInstanceBox(s, V(-2.0f, hy, 4), V(4.0f, hy, t), V(1, 0, 0), V(0, 1, 0), mat);
+    AF_SceneAddInstanceBox(s, V( 4.5f, hy, 4), V(1.5f, hy, t), V(1, 0, 0), V(0, 1, 0), mat);
+    // 間の空間を閉じる（壁の端を回る1次経路を塞ぐため）
+    AF_SceneAddInstanceBox(s, V(-6, hy, 2), V(t, hy, 2), V(1, 0, 0), V(0, 1, 0), mat);
+    AF_SceneAddInstanceBox(s, V( 6, hy, 2), V(t, hy, 2), V(1, 0, 0), V(0, 1, 0), mat);
+    // 床と天井
+    AF_SceneAddInstanceBox(s, V(0, -t, 2), V(8, t, 12), V(1, 0, 0), V(0, 1, 0), mat);
+    AF_SceneAddInstanceBox(s, V(0, 3 + t, 2), V(8, t, 12), V(1, 0, 0), V(0, 1, 0), mat);
+
+    const AF_Vector3 L = V(-0.5f, 1.6f, -3), S = V(2.5f, 1.6f, 7);
+    check("2枚の壁の先は遮蔽される", AF_SceneIsOccluded(s, L, S) != 0);
+    // どちらの戸口の縁も「両方から」は見通せない＝1次では届かない、ことを確認する。
+    check("戸口1の縁は音源から見通せない", AF_SceneIsOccluded(s, V(0, 1.6f, 0), S) != 0);
+    check("戸口2の縁はリスナーから見通せない", AF_SceneIsOccluded(s, L, V(2, 1.6f, 4)) != 0);
+
+    AF_SceneSetListener(s, L);
+    AF_SceneSetSource(s, 1, S);
+    AF_SceneUpdate(s, 1.0f / 60.0f);
+
+    float g[kBands] = {};
+    AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+    AF_Vector3 pos[8]; float gain[8];
+    const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+
+    std::printf("      回折ゲイン 125Hz %.3f / 4kHz %.3f   二次音源 %d 本\n", g[0], g[5], n);
+    for (int i = 0; i < n && i < 3; ++i)
+        std::printf("        [%d] 方向(%6.2f,%6.2f,%6.2f)  重み %.3f\n",
+                    i, pos[i].x, pos[i].y, pos[i].z, gain[i]);
+
+    check("2次回折で音が届く(ゲイン>0)", g[0] > 0.001f);
+    check("二次音源が出る", n > 0);
+
+    // 鳴らす位置は「手前の戸口」＝リスナーの正面やや左（戸口1は x∈[-1,0]、リスナーは x=-0.5）。
+    //   音源は +X 寄りにあるが、手前の戸口を回るので到来方向はほぼ真正面になるはず。
+    if (n > 0) {
+        const AF_Vector3 d = V(pos[0].x - L.x, pos[0].y - L.y, pos[0].z - L.z);
+        const float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+        const float fwd = (len > 1e-4f) ? d.z / len : 0.0f;   // +Z 成分
+        const float side = (len > 1e-4f) ? d.x / len : 0.0f;  // +X 成分
+        char b[96];
+        std::snprintf(b, sizeof(b), "(前方 %.2f / 横 %.2f)", fwd, side);
+        check("到来方向が手前の戸口(ほぼ正面)を指す", fwd > 0.8f, b);
+    }
+
+    AF_SceneDestroy(s);
+}
+
 // ---------------------------------------------------------------- 頑健性
 // 不正入力で落ちない（移行中に呼び出し規約を変えるので、境界は明示的に守る）。
 void testRobustness() {
@@ -1073,6 +1141,7 @@ int main() {
     diagnoseSwingDoor();
     testMesh();
     testDirectionalProbe();
+    testSecondOrderDiffraction();
     testRobustness();
 
     std::printf("\n----\n");

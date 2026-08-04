@@ -433,8 +433,13 @@ public:
     //   影境界の外側（照らされた領域）でも回折場を求めたい場合に > 0 を渡す。
     //   そこでは直接線が箱の脇をかすめて通るだけなので、膨らませないと候補が0本になる。
     //   遠いエッジを拾っても UTD の総合ゲインは 1.0 に収束するので、多めでも害はない。
+    // requireBothEnds: false なら「from から見通せる」だけを条件にする（to 側は問わない）。
+    //   2次回折の 1 段目で使う。真の2次回折では、どの稜線も from と to の**両方**からは
+    //   見通せない ── それがまさに「2次でしか届かない」ということなので、両方を要求すると
+    //   候補が 0 本になり、再帰に入る前にループが空になる。
     void forEachDiffractionCandidate(const Vec3& from, const Vec3& to, Fn&& fn,
-                                     float blockerMargin = 0.0f) const {
+                                     float blockerMargin = 0.0f,
+                                     bool requireBothEnds = true) const {
         const float direct = std::max(length(to - from), 1e-4f);
         // ★稜線は実形状の上に置く。以前は 0.15m 膨らませていたが、それだと UTD が見る影境界が
         //   実際の影境界からずれる（この距離だけ回折点が動くので）。UTD は「直接音が消える点」と
@@ -480,9 +485,10 @@ public:
             auto vis = [&](float t) {
                 const Vec3 p = Pf(t);
                 if (isOccludedExcept(from, p, exceptInst)) return false;   // 他の障害物
+                if (segmentObbPenetration(from, p, selfObb) > maxPen) return false;
+                if (!requireBothEnds) return true;
                 if (isOccludedExcept(p, to, exceptInst)) return false;
-                return segmentObbPenetration(from, p, selfObb) <= maxPen
-                    && segmentObbPenetration(p, to, selfObb) <= maxPen;
+                return segmentObbPenetration(p, to, selfObb) <= maxPen;
             };
 
             // ★回折点は「可視範囲に制約した g の最小点」。
@@ -818,8 +824,11 @@ public:
         float gain[kNumBands] = {0, 0, 0, 0, 0, 0};
     };
 
+    //   order: 探索する回折の次数。1=1次のみ / 2=1次で届かなければ開口を新しい始点に再帰。
+    //     L 字の廊下や、壁が消えてできた新しい通路が 2 次に当たる。
+    //     1 次で届けば 2 次は探索しないので、開けた場所ではコストが増えない。
     int findDiffractionPaths(const Vec3& listener, const Vec3& source,
-                             DiffractionPath* out, int maxPaths) const {
+                             DiffractionPath* out, int maxPaths, int order = 2) const {
         if (!out || maxPaths <= 0) return 0;
         const bool occ = isOccluded(listener, source);
         const float directDist = std::max(length(source - listener), 1e-4f);
@@ -844,27 +853,46 @@ public:
         const float cosThresh = 0.90f;   // ~25°以内は同じ開口とみなす（設計 §6-1）
         float globalMinDelta = -1.0f;
 
-        forEachDiffractionCandidate(listener, source,
-            [&](const Vec3& P, float d, const Vec3&, const Vec3&) {
-                if (globalMinDelta < 0.0f || d < globalMinDelta) globalMinDelta = d;
-                const float w = maekawa::apertureWeight(occ ? d : -d);
-                if (w < 1e-6f) return;
-                const Vec3 dir = normalized(P - listener);
-                int best = -1; float bestDot = cosThresh;
-                for (int i = 0; i < ncl; ++i) {
-                    const float dt = dot(dir, cl[i].dir);
-                    if (dt > bestDot) { bestDot = dt; best = i; }
-                }
-                if (best >= 0) {
-                    cl[best].pAcc = cl[best].pAcc + P * w;
-                    cl[best].dir = normalized(cl[best].dir * cl[best].w + dir * w);
-                    cl[best].w += w;
-                    if (d < cl[best].minDelta) cl[best].minDelta = d;
-                } else if (ncl < kMaxCl) {
-                    cl[ncl].pAcc = P * w; cl[ncl].dir = dir; cl[ncl].w = w; cl[ncl].minDelta = d;
-                    ++ncl;
-                }
-            }, margin);
+        auto gather = [&](bool bothEnds) {
+            ncl = 0;
+            globalMinDelta = -1.0f;
+            forEachDiffractionCandidate(listener, source,
+                [&](const Vec3& P, float d, const Vec3&, const Vec3&) {
+                    if (globalMinDelta < 0.0f || d < globalMinDelta) globalMinDelta = d;
+                    const float w = maekawa::apertureWeight(occ ? d : -d);
+                    if (w < 1e-6f) return;
+                    const Vec3 dir = normalized(P - listener);
+                    int best = -1; float bestDot = cosThresh;
+                    for (int i = 0; i < ncl; ++i) {
+                        const float dt = dot(dir, cl[i].dir);
+                        if (dt > bestDot) { bestDot = dt; best = i; }
+                    }
+                    if (best >= 0) {
+                        cl[best].pAcc = cl[best].pAcc + P * w;
+                        cl[best].dir = normalized(cl[best].dir * cl[best].w + dir * w);
+                        cl[best].w += w;
+                        if (d < cl[best].minDelta) cl[best].minDelta = d;
+                    } else if (ncl < kMaxCl) {
+                        cl[ncl].pAcc = P * w; cl[ncl].dir = dir; cl[ncl].w = w; cl[ncl].minDelta = d;
+                        ++ncl;
+                    }
+                }, margin, bothEnds);
+        };
+
+        // まずは 1 次として探す（回折点が listener と source の両方から見通せるもの）。
+        gather(true);
+
+        // ★1 本も無いときだけ、2 次を試す。
+        //   このとき「source からも見通せる」条件を外す ── 真の 2 次回折では、どの稜線も
+        //   両方からは見通せない（それがまさに 2 次でしか届かないということ）ので、
+        //   条件を付けたままだと候補が 0 本になり、再帰に入る前にループが空になる。
+        //   一方、1 次が見つかっているときに緩めてはいけない。source 側の貫通判定が外れ、
+        //   壁を突き抜ける経路が開口として混ざる（実測で「開口側を指す」テストが落ちた）。
+        bool secondOrder = false;
+        if (ncl == 0 && order > 1 && occ) {
+            gather(false);
+            secondOrder = true;
+        }
 
         if (ncl == 0) return 0;   // 回折の相手が無い。呼び出し側で「遮蔽なら0/見通しなら1.0」を決める
 
@@ -888,6 +916,48 @@ public:
             if (bi < 0) break;
             used[bi] = true;
             const Vec3 Pc = cl[bi].pAcc * (1.0f / std::max(cl[bi].w, 1e-6f));
+
+            // ★2次回折。開口から音源が見通せないなら、その開口を新しい始点にしてもう一段探す。
+            //   L 字の廊下や、手続き生成された曲がり角がこれに当たる。
+            //   **鳴らす位置は 1 段目の開口のまま**（人は「手前の角から聞こえる」と感じるため。設計 ⑥）。
+            //   経路長とゲインだけを 2 段目のぶん延長する。
+            //   1 次で届けば探索しないので、開けた場所ではコストゼロ。
+            if (secondOrder && isOccluded(Pc, source)) {
+                // ★2段目の起点は開口の**向こう側**に置く。
+                //   開口の重心は稜線をならした点なので、壁の手前の面に乗ることがある。
+                //   そこから音源へ向かうと**すぐ同じ壁に再突入**し、2段目の候補が全部棄却される
+                //   （実測で 2 段目のクラスタが 0 本になっていた）。
+                //   少し先へ送って壁を抜けた位置から探す。どれだけ送れば抜けるかは壁の厚み次第
+                //   なので、いくつか試して最初に経路が見つかった距離を採る。
+                DiffractionPath sub[4];
+                int ns = 0;
+                const Vec3 dirS = normalized(source - Pc);
+                const float steps[4] = {0.0f, 0.25f, 0.75f, 1.5f};
+                Vec3 start = Pc;
+                for (float e : steps) {
+                    start = Pc + dirS * e;
+                    ns = findDiffractionPaths(start, source, sub, 4, order - 1);
+                    if (ns > 0) break;
+                }
+                if (ns <= 0) continue;              // その開口の先は行き止まり。経路として採らない
+                int bs = 0;                          // 2段目は最も通るものを1本だけ採る
+                for (int k = 1; k < ns; ++k)
+                    if (maekawa::apertureWeight(sub[k].pathLength) >
+                        maekawa::apertureWeight(sub[bs].pathLength)) bs = k;
+                out[n].aperture = Pc;                                     // 定位は手前の角
+                // 経路長は listener→Pc→(送った分)→2段目 の総和。
+                //   送った分を足し忘れると経路長が直線距離より短くなり、δ が 0 にクランプされて
+                //   全帯域が境界値(0.562)に張り付く（実測でそうなった）。
+                out[n].pathLength = length(Pc - listener) + length(start - Pc)
+                                  + sub[bs].pathLength;
+                // 2 段の減衰を掛け合わせる（それぞれの稜線で回り込む）。
+                float g1[kNumBands];
+                maekawa::gainBands(cl[bi].minDelta, g1);
+                for (int b = 0; b < kNumBands; ++b) out[n].gain[b] = g1[b] * sub[bs].gain[b];
+                ++n;
+                continue;
+            }
+
             out[n].aperture = Pc;
             out[n].pathLength = length(Pc - listener) + length(source - Pc);
             maekawa::gainBands(cl[bi].minDelta, out[n].gain);
@@ -974,13 +1044,21 @@ public:
     //     ゲインは連続でありさえすればよい。**方向は開口ごとに出るので情報は失われない。**
     void diffractionContinuous(const Vec3& from, const Vec3& to, bool occ,
                                float outGain[kNumBands]) const {
-        float delta;
-        if (!minDetour(from, to, occ, delta)) {
+        constexpr int kMaxOut = 8;
+        DiffractionPath paths[kMaxOut];
+        const int np = findDiffractionPaths(from, to, paths, kMaxOut);
+        if (np <= 0) {
             // 回折の相手が無い。遮蔽なら完全に届かない、非遮蔽なら素通り。
             const float g = occ ? 0.0f : 1.0f;
             for (int b = 0; b < kNumBands; ++b) outGain[b] = g;
             return;
         }
+        // 最短経路の δ から。**探索を通すのが要点** ── minDetour を直接呼ぶと 2 次回折を
+        // 通らないので、L 字の先のような「2 段でしか届かない場所」でゲインが 0 のままになる。
+        const float directDist = std::max(length(to - from), 1e-4f);
+        float best = paths[0].pathLength;
+        for (int i = 1; i < np; ++i) best = std::min(best, paths[i].pathLength);
+        const float delta = std::max(best - directDist, 0.0f);
         maekawa::gainBands(occ ? delta : -delta, outGain);
     }
 
