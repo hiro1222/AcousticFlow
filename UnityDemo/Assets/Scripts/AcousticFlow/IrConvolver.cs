@@ -32,6 +32,9 @@ namespace AcousticFlow
             public static volatile int WritePos;
             public static volatile int TriggerPos = -1;   // テストクリックを出した位置（同期表示用）
             public static volatile int SampleRate;
+            // 実際に読み込まれた HRTF データ名。「HRTF と表示されているのに中身は合成だった」を
+            // 見えるようにするため（実測 kemar を取り込んだのに使われていない状態が続いていた）。
+            public static string HrtfName = "";
 
             // 段ごとの RMS（どこが鳴っていて、どこが鳴っていないかの切り分け用）。
             public static volatile float RmsDirect;    // 直接タップ
@@ -94,8 +97,10 @@ namespace AcousticFlow
                  + "個人最適化で最も効果が大きいので、まずここを自分の頭に合わせる。\n"
                  + "成人平均は 55〜58cm 程度。")]
         [Range(48f, 64f)] public float headCircumferenceCm = 57f;
-        [Tooltip("HRTF データ(.afhr)の StreamingAssets からの相対パス。空 or 見つからない場合は"
-                 + "球体頭モデルの合成HRTFを使う（実データが無くても動作を確認できる）。")]
+        [Tooltip("HRTF データ(.afhr)の StreamingAssets からの相対パス。\n"
+                 + "**空欄＝自動**（取り込み済みの実測データ kemar.afhr を使う）。\n"
+                 + "球体頭モデルの合成HRTFを使いたいときは synthetic.afhr を指定する。\n"
+                 + "見つからない・壊れている場合は合成HRTFへフォールバックし、Console に警告を出す。")]
         public string hrtfFileName = "";
         [Tooltip("HRTF を適用する下限周波数(Hz)。これより下は HRIR を通さず ITD だけ掛ける。\n"
                  + "実測 HRIR は 128タップ(2.9ms)しかなく約350Hz以下を表現できないうえ、"
@@ -402,8 +407,9 @@ namespace AcousticFlow
             _hrtfSet = LoadHrtfSet();
             _hrtf = new HrtfProcessor(_sampleRate, 12f, hrtfCrossoverHz);
             _hrtf.SetHrtfSet(_hrtfSet);
-            Debug.Log($"[IrConvolver] HRTF: {_hrtfSet?.Name ?? "なし"} "
-                      + $"({_hrtfSet?.DirectionCount ?? 0} 方向 / IR {_hrtfSet?.IrLength ?? 0} タップ)");
+            Scope.HrtfName = $"{_hrtfSet?.Name ?? "なし"}"
+                           + $" ({_hrtfSet?.DirectionCount ?? 0}方向 / {_hrtfSet?.IrLength ?? 0}タップ)";
+            Debug.Log($"[IrConvolver] HRTF: {Scope.HrtfName}");
 
             // ここまでで audio thread が触る配列は全て確保済み。以降 OnAudioFilterRead を通す。
             _ready = true;
@@ -419,24 +425,30 @@ namespace AcousticFlow
 
         // HRTF データセットを用意する。StreamingAssets に .afhr があればそれを、
         // 無ければ球体頭モデルの合成HRTFを返す（常に非 null）。
+        // 既定で読む実測データ。hrtfFileName が空のときはこれを試す。
+        //   ★空を「合成HRTFを使う」ではなく「自動」の意味にしている。
+        //     既存シーンには hrtfFileName="" が保存済みなので、フィールドの既定値を変えるだけでは
+        //     効かない（Unity は保存値を優先する）。空＝自動にしておけば、シーンを作り直さなくても
+        //     実測データが使われる。合成を明示したいときは "synthetic.afhr" を指定する。
+        private const string kDefaultHrtfFile = "kemar.afhr";
+
         private HrtfSet LoadHrtfSet()
         {
-            if (!string.IsNullOrEmpty(hrtfFileName))
+            string name = string.IsNullOrEmpty(hrtfFileName) ? kDefaultHrtfFile : hrtfFileName;
+            string path = System.IO.Path.Combine(Application.streamingAssetsPath, name);
+            if (System.IO.File.Exists(path))
             {
-                string path = System.IO.Path.Combine(Application.streamingAssetsPath, hrtfFileName);
-                if (System.IO.File.Exists(path))
+                var loaded = HrtfSet.LoadFromFile(path);
+                if (loaded != null && loaded.IsValid)
                 {
-                    var loaded = HrtfSet.LoadFromFile(path);
-                    if (loaded != null && loaded.IsValid)
-                    {
-                        if (loaded.SampleRate != _sampleRate)
-                            Debug.LogWarning($"[IrConvolver] HRTF の SR({loaded.SampleRate}Hz)が出力({_sampleRate}Hz)と違います。"
-                                             + "定位がずれるので、同じSRに変換したデータを使ってください。");
-                        return loaded;
-                    }
+                    if (loaded.SampleRate != _sampleRate)
+                        Debug.LogWarning($"[IrConvolver] HRTF の SR({loaded.SampleRate}Hz)が出力({_sampleRate}Hz)と違います。"
+                                         + "定位がずれるので、同じSRに変換したデータを使ってください。");
+                    return loaded;
                 }
-                else Debug.LogWarning($"[IrConvolver] HRTF が見つかりません: {path}（合成HRTFで代用）");
+                Debug.LogWarning($"[IrConvolver] HRTF の読み込みに失敗: {path}（合成HRTFで代用）");
             }
+            else Debug.LogWarning($"[IrConvolver] HRTF が見つかりません: {path}（合成HRTFで代用）");
             return HrtfSet.CreateSynthetic(_sampleRate);
         }
 

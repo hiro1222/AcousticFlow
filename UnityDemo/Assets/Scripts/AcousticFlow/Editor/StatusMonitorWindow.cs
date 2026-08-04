@@ -51,6 +51,10 @@ namespace AcousticFlow.EditorTools
                 $"{(AcousticFlowSceneDemo.Status.UseHrtf ? "HRTF" : "パン")}(H)    " +
                 $"ステア {(AcousticFlowSceneDemo.Status.UseSteer ? "ON" : "OFF")}(G)",
                 EditorStyles.miniBoldLabel);
+            // 実際に読み込まれた HRTF データ。「HRTF と出ているのに中身は合成」を見えるようにする。
+            if (!string.IsNullOrEmpty(IrConvolver.Scope.HrtfName))
+                EditorGUILayout.LabelField($"  HRTFデータ: {IrConvolver.Scope.HrtfName}",
+                                           EditorStyles.miniLabel);
 
             // --- 遮蔽（音源ごと） ---
             EditorGUILayout.Space(6f);
