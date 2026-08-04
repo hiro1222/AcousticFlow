@@ -902,6 +902,92 @@ void testMesh() {
     check("伸ばしても戸口は通る", AF_SceneIsOccluded(s, V(0, 1.6f, -3), V(0, 1.6f, 3)) == 0);
 
     AF_SceneDestroy(s);
+
+    // ── メッシュでも回折する（二面角でフィルタした稜線を使う）──
+    //   境界ボックスの12稜線ではなく実形状の稜線を回るので、遮蔽判定と矛盾しない。
+    //   検証は「同形の箱と同じくらい回折するか」。箱は実形状と外形が同じ配置にする。
+    std::printf("\n[メッシュ] 回折（実形状の稜線）\n");
+    {
+        // 単純な板（穴なし）。x∈[-3,3], y∈[0,3], z∈[-0.15,0.15]。
+        const float bx[] = {
+            -3, 0, -0.15f,   3, 0, -0.15f,   3, 3, -0.15f,  -3, 3, -0.15f,
+            -3, 0,  0.15f,   3, 0,  0.15f,   3, 3,  0.15f,  -3, 3,  0.15f,
+        };
+        const int bi[] = {
+            0,2,1, 0,3,2,  4,5,6, 4,6,7,  0,4,7, 0,7,3,
+            1,2,6, 1,6,5,  3,7,6, 3,6,2,  0,1,5, 0,5,4,
+        };
+        const AF_Vector3 L2 = V(0, 1.6f, -3), S2 = V(0, 1.6f, 3);
+
+        AF_SceneHandle sm = AF_SceneCreate();
+        const int mm = AF_SceneAddMaterial(sm, nullptr, nullptr, nullptr, 0);
+        AF_Vector3 c2{}, h2{};
+        const int gm = AF_SceneAddMesh(sm, bx, 8, bi, 36, &c2, &h2);
+        AF_SceneAddInstanceMesh(sm, gm, c2, h2, V(1, 0, 0), V(0, 1, 0), mm);
+        float gMesh[kBands] = {};
+        AF_SceneComputeDiffractionBands(sm, L2, S2, gMesh, kBands);
+
+        AF_SceneHandle sb = AF_SceneCreate();
+        const int mb = AF_SceneAddMaterial(sb, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(sb, c2, h2, V(1, 0, 0), V(0, 1, 0), mb);
+        float gBox[kBands] = {};
+        AF_SceneComputeDiffractionBands(sb, L2, S2, gBox, kBands);
+
+        std::printf("      同形の板   メッシュ 125Hz %.3f / 4kHz %.3f     箱 125Hz %.3f / 4kHz %.3f\n",
+                    gMesh[0], gMesh[5], gBox[0], gBox[5]);
+        check("メッシュでも回折が効く(0でない)", gMesh[0] > 0.01f);
+        checkGreater("メッシュ回折も低域>高域", gMesh[0], gMesh[5]);
+        // 同じ外形なので、箱と同程度になるはず（稜線の取り方が違うので厳密一致はしない）。
+        const float ratio = (gBox[0] > 1e-6f) ? gMesh[0] / gBox[0] : 0.0f;
+        char mb2[96];
+        std::snprintf(mb2, sizeof(mb2), "(メッシュ/箱 = %.2f)", ratio);
+        check("同形の箱と同程度の回折になる(0.5〜2倍)", ratio > 0.5f && ratio < 2.0f, mb2);
+
+        std::printf("      稜線本数   %d 本（板1枚＝12稜線。二面角が平坦な面内は候補にならない）\n",
+                    AF_SceneGetMeshEdgeCount(sm, gm));
+        AF_SceneDestroy(sm);
+        AF_SceneDestroy(sb);
+    }
+
+    // ── 候補数がテッセレーションに依存しないこと ──
+    //   これがこの設計の要点。細分しても「形状の複雑さ」が変わらなければ稜線は増えない。
+    {
+        std::printf("      細分しても稜線が増えないか（同じ板を n×n に分割）\n");
+        int firstEdges = -1;
+        for (int sub : {1, 4, 16}) {
+            std::vector<float> vx;
+            std::vector<int> ix;
+            // 前後の面だけを n×n に細分した板（面内は平坦なので稜線に数えられないはず）。
+            for (int side = 0; side < 2; ++side) {
+                const float z = side ? 0.15f : -0.15f;
+                const int base = static_cast<int>(vx.size() / 3);
+                for (int i = 0; i <= sub; ++i)
+                    for (int j = 0; j <= sub; ++j) {
+                        vx.push_back(-3.0f + 6.0f * i / sub);
+                        vx.push_back(3.0f * j / sub);
+                        vx.push_back(z);
+                    }
+                const int w = sub + 1;
+                for (int i = 0; i < sub; ++i)
+                    for (int j = 0; j < sub; ++j) {
+                        const int a = base + i * w + j, b = a + 1, c = a + w, d = c + 1;
+                        ix.push_back(a); ix.push_back(c); ix.push_back(b);
+                        ix.push_back(b); ix.push_back(c); ix.push_back(d);
+                    }
+            }
+            AF_SceneHandle st = AF_SceneCreate();
+            AF_SceneAddMaterial(st, nullptr, nullptr, nullptr, 0);
+            AF_Vector3 c3{}, h3{};
+            const int gt = AF_SceneAddMesh(st, vx.data(), static_cast<int>(vx.size() / 3),
+                                           ix.data(), static_cast<int>(ix.size()), &c3, &h3);
+            const int ec = AF_SceneGetMeshEdgeCount(st, gt);
+            std::printf("        %5d 三角形 → 稜線 %d 本\n",
+                        static_cast<int>(ix.size() / 3), ec);
+            if (firstEdges < 0) firstEdges = ec;
+            else check("細分しても回折稜線は増えない", ec == firstEdges);
+            AF_SceneDestroy(st);
+        }
+    }
 }
 
 // ================================================================ 方向プローブ

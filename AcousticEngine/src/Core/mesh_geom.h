@@ -28,6 +28,9 @@
 #define ACOUSTICFLOW_CORE_MESH_GEOM_H
 
 #include <algorithm>
+#include <cstdint>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "Core/aabb.h"
@@ -41,8 +44,17 @@ namespace acoustic {
 // 板を置いたときに名目上の厚みとして働き、実際の厚みはインスタンスの halfExtents が決める。
 constexpr float kMeshMinHalfExtent = 1e-3f;
 
+// 回折しうる稜線（正規化ローカル空間）。
+//   隣り合う 2 三角形が平面（二面角 ≈ 180°）なら、その稜線では回折が起きない。
+//   候補になるのは「二面角が有意に折れている稜線」と「境界稜線（三角形が片側にしかない）」だけ。
+//   これで**候補数がテッセレーションに依存しなくなる**（壁を 10 倍細分しても稜線本数は変わらない）。
+struct DiffractionEdgeLocal {
+    Vec3 a, b;   // 稜線の両端（正規化ローカル）
+};
+
 struct MeshGeometry {
     TriangleBvh bvh;        // 正規化ローカル空間（AABB = [-1,1]^3）で構築
+    std::vector<DiffractionEdgeLocal> edges;  // 回折稜線（同上）
     Vec3 localCenter{0, 0, 0};       // 正規化前のローカル AABB 中心
     Vec3 localHalfExtents{1, 1, 1};  // 同 half extents（潰れた軸は floor 済み）
     bool used = false;      // フリーリストのスロット状態
@@ -85,6 +97,7 @@ struct MeshGeometry {
         }
         if (tris.empty()) return false;
 
+        buildDiffractionEdges(tris);
         bvh.build(std::move(tris));
         used = true;
         return true;
@@ -92,10 +105,129 @@ struct MeshGeometry {
 
     void clear() {
         bvh.build({});
+        edges.clear();
         used = false;
         localCenter = Vec3(0, 0, 0);
         localHalfExtents = Vec3(1, 1, 1);
     }
+
+private:
+    // 二面角でフィルタした回折稜線を抽出する。
+    //
+    //   ★頂点は**位置で溶接**する。インデックスで隣接を取ってはいけない。
+    //     DCC やエンジンが出すメッシュは、ハードエッジや UV 継ぎ目で頂点を分割している。
+    //     つまり**まさに回折したい稜線ほど、インデックスが別物になっている**。
+    //     位置で溶接しないと、箱の角のような最も重要な稜線が 1 本も見つからない。
+    void buildDiffractionEdges(const std::vector<Triangle>& tris) {
+        edges.clear();
+        const size_t nt = tris.size();
+        if (nt == 0 || nt > 200000) return;   // 病的なメッシュは諦める（回折はプロキシに任せる）
+
+        // 位置 → 溶接インデックス。正規化ローカルなので座標は [-1,1]、1e-4 で量子化すれば十分。
+        //   線形探索だと O(n²) で実メッシュが固まるのでハッシュを使う。
+        std::unordered_map<uint64_t, int> weldMap;
+        std::vector<Vec3> pos;
+        auto weld = [&](const Vec3& p) {
+            const int64_t qx = std::lround(p.x * 10000.0f);
+            const int64_t qy = std::lround(p.y * 10000.0f);
+            const int64_t qz = std::lround(p.z * 10000.0f);
+            const uint64_t key = (static_cast<uint64_t>(qx + 100000) * 1000003ull
+                                + static_cast<uint64_t>(qy + 100000)) * 1000033ull
+                                + static_cast<uint64_t>(qz + 100000);
+            auto it = weldMap.find(key);
+            if (it != weldMap.end()) return it->second;
+            const int id = static_cast<int>(pos.size());
+            weldMap.emplace(key, id);
+            pos.push_back(p);
+            return id;
+        };
+
+        // 溶接インデックスの対 → 隣接する三角形の法線（最大2枚ぶん）。
+        struct EdgeRec { int v0, v1; Vec3 n0, n1; int count; };
+        std::vector<EdgeRec> recs;
+        std::unordered_map<uint64_t, int> edgeMap;
+        auto addEdge = [&](int a, int b, const Vec3& n) {
+            if (a > b) std::swap(a, b);
+            const uint64_t key = static_cast<uint64_t>(a) * 4294967311ull + static_cast<uint64_t>(b);
+            auto it = edgeMap.find(key);
+            if (it != edgeMap.end()) {
+                EdgeRec& e = recs[static_cast<size_t>(it->second)];
+                if (e.count == 1) e.n1 = n;
+                ++e.count;
+                return;
+            }
+            edgeMap.emplace(key, static_cast<int>(recs.size()));
+            recs.push_back(EdgeRec{a, b, n, Vec3(0, 0, 0), 1});
+        };
+
+        for (const Triangle& t : tris) {
+            const int i0 = weld(t.v0), i1 = weld(t.v1), i2 = weld(t.v2);
+            if (i0 == i1 || i1 == i2 || i2 == i0) continue;   // 退化三角形
+            const Vec3 n = normalized(cross(t.v1 - t.v0, t.v2 - t.v0));
+            addEdge(i0, i1, n);
+            addEdge(i1, i2, n);
+            addEdge(i2, i0, n);
+        }
+
+        // 二面角が平坦なものを捨てる。境界稜線（片側にしか三角形が無い＝穴の縁・板の縁）は残す。
+        constexpr float kFlatCos = 0.985f;   // ≒10°。これ未満の折れは回折に効かない
+        std::vector<std::pair<int, int>> kept;
+        for (const EdgeRec& e : recs) {
+            bool keep = (e.count == 1);                       // 境界稜線
+            if (!keep && e.count >= 2)
+                keep = (dot(e.n0, e.n1) < kFlatCos);          // 有意に折れている
+            if (keep) kept.emplace_back(e.v0, e.v1);
+        }
+
+        // ★共線の隣接セグメントを併合する。
+        //   これをやらないと「テッセレーション非依存」が成り立たない ── 面を細分すると
+        //   長い稜線が細切れになり、本数が分割数に比例して増えてしまう（実測 8→32→128）。
+        //   物理的には 1 本の稜線なので、繋いで最長の線分にする。
+        std::vector<std::vector<int>> incident(pos.size());
+        for (size_t i = 0; i < kept.size(); ++i) {
+            incident[static_cast<size_t>(kept[i].first)].push_back(static_cast<int>(i));
+            incident[static_cast<size_t>(kept[i].second)].push_back(static_cast<int>(i));
+        }
+        auto dirOf = [&](int ei) { return normalized(pos[kept[ei].second] - pos[kept[ei].first]); };
+        constexpr float kColinearCos = 0.9995f;   // ≒1.8°
+
+        // 頂点 v から、稜線 ei と共線に続く唯一の稜線を返す（無ければ -1）。
+        //   分岐している頂点（3本以上）では繋がない ── そこは形状の変わり目なので。
+        auto nextAt = [&](int v, int ei) {
+            if (incident[static_cast<size_t>(v)].size() != 2) return -1;
+            const int other = (incident[static_cast<size_t>(v)][0] == ei)
+                            ? incident[static_cast<size_t>(v)][1]
+                            : incident[static_cast<size_t>(v)][0];
+            if (std::fabs(dot(dirOf(ei), dirOf(other))) < kColinearCos) return -1;
+            return other;
+        };
+
+        std::vector<bool> visited(kept.size(), false);
+        for (size_t i = 0; i < kept.size(); ++i) {
+            if (visited[i]) continue;
+            visited[i] = true;
+            int endA = kept[i].first, endB = kept[i].second;
+            // 両端へ伸ばせるだけ伸ばす。
+            for (int side = 0; side < 2; ++side) {
+                int cur = static_cast<int>(i);
+                int tip = side ? endB : endA;
+                for (;;) {
+                    const int nxt = nextAt(tip, cur);
+                    if (nxt < 0 || visited[static_cast<size_t>(nxt)]) break;
+                    visited[static_cast<size_t>(nxt)] = true;
+                    tip = (kept[static_cast<size_t>(nxt)].first == tip)
+                        ? kept[static_cast<size_t>(nxt)].second
+                        : kept[static_cast<size_t>(nxt)].first;
+                    cur = nxt;
+                }
+                if (side) endB = tip; else endA = tip;
+            }
+            edges.push_back(DiffractionEdgeLocal{pos[static_cast<size_t>(endA)],
+                                                 pos[static_cast<size_t>(endB)]});
+        }
+    }
+
+public:
 };
 
 // ── ワールド ⇄ 正規化ローカル ────────────────────────────────
@@ -112,6 +244,13 @@ inline Vec3 meshWorldToLocalPoint(const Vec3& p, const Obb& b) {
 inline Vec3 meshWorldToLocalDir(const Vec3& v, const Obb& b) {
     const Vec3 l = obbToLocalDir(v, b);
     return Vec3(l.x / b.halfExtents.x, l.y / b.halfExtents.y, l.z / b.halfExtents.z);
+}
+
+// 正規化ローカル → ワールド（obb がそのまま写像になっている）。
+inline Vec3 meshLocalToWorldPoint(const Vec3& l, const Obb& b) {
+    return b.center + b.axisX * (l.x * b.halfExtents.x)
+                    + b.axisY * (l.y * b.halfExtents.y)
+                    + b.axisZ * (l.z * b.halfExtents.z);
 }
 
 // 法線は逆転置で戻す。M = R·S（S は halfExtents の対角）なので (M^-1)^T = R·S^-1。

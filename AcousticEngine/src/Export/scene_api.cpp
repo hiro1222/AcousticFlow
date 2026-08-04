@@ -120,6 +120,12 @@ int AF_SceneAddMesh(AF_SceneHandle scene,
     return id;
 }
 
+int AF_SceneGetMeshEdgeCount(AF_SceneHandle scene, int geomId) {
+    Scene* s = asScene(scene);
+    if (!s) return -1;
+    return s->meshEdgeCount(geomId);
+}
+
 void AF_SceneRemoveMesh(AF_SceneHandle scene, int geomId) {
     Scene* s = asScene(scene);
     if (!s) return;

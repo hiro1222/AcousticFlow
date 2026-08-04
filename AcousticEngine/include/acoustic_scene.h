@@ -75,6 +75,11 @@ ACOUSTIC_API int AF_SceneAddMesh(AF_SceneHandle scene,
                                  AF_Vector3* outLocalCenter,
                                  AF_Vector3* outLocalHalfExtents);
 
+/* 形状から抽出された回折稜線の本数（診断用）。無効な geomId は -1。
+ * 二面角が平坦な稜線は候補にならないので、この本数は**テッセレーションに依存しない**
+ * （壁を10倍細分しても本数は変わらない）。その確認に使う。 */
+ACOUSTIC_API int AF_SceneGetMeshEdgeCount(AF_SceneHandle scene, int geomId);
+
 /* 形状を解放する。参照していたインスタンスは箱（境界ボックス）扱いに落ちる。
  * 他の geomId は無効化されない（スロットを詰め直さないため）。 */
 ACOUSTIC_API void AF_SceneRemoveMesh(AF_SceneHandle scene, int geomId);

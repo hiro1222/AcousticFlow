@@ -180,6 +180,12 @@ public:
         bvhDirty_ = true;
     }
 
+    // 抽出された回折稜線の本数（診断用）。テッセレーションに依存しないことの確認に使う。
+    int meshEdgeCount(int geomId) const {
+        if (!validMesh(geomId)) return -1;
+        return static_cast<int>(meshes_[static_cast<size_t>(geomId)].edges.size());
+    }
+
     int meshCount() const { return static_cast<int>(meshes_.size()); }
     bool validMesh(int geomId) const {
         return geomId >= 0 && geomId < static_cast<int>(meshes_.size())
@@ -523,13 +529,6 @@ public:
         //   直接 from→to の線分が OBB と交差する箱＝ブロッカー、だけを対象にする。
         auto isBlocker = [&](int inst) {
             if (inst < 0 || inst >= instanceCount() || !instances_[inst].active) return false;
-            // ★メッシュは回折候補にしない（現時点）。
-            //   OBB の 12 稜線は「メッシュの稜線」ではないので、そのまま回すと
-            //   遮蔽判定（メッシュ）と回折判定（境界ボックス）が矛盾した幾何を見ることになる。
-            //   壁と戸口が 1 メッシュなら、遮蔽は「戸口を通る」、回折は「壁の外周を回れ」
-            //   と言う。正しくはメッシュから二面角でフィルタした稜線を抽出する
-            //   （docs/DIFFRACTION_DESIGN.md §5-5）。回折の作り直しと同時に入れる。
-            if (instances_[inst].geomId >= 0) return false;
             if (blockerMargin <= 0.0f) return segmentIntersectsObb(from, to, instances_[inst].obb);
             // 膨らませた OBB で判定する（半径方向に margin だけ拡大）。
             Obb fat = instances_[inst].obb;
@@ -546,12 +545,34 @@ public:
                     tryEdge(e.p0, e.p1, e.edgeDir, e.refTangent, e.instance);
 
         // 箱(OBB)の 12 稜線それぞれで掠める角を探索（角のみだと薄い壁で失敗するので稜線全体）。
+        //   メッシュインスタンスは箱の 12 稜線ではなく、**形状から抽出した回折稜線**を使う。
+        //   OBB の稜線は「メッシュの稜線」ではないので、そのまま回すと遮蔽判定（実形状）と
+        //   回折判定（境界ボックス）が矛盾した幾何を見ることになる ── 壁と戸口が 1 メッシュなら、
+        //   遮蔽は「戸口を通る」、回折は「壁の外周を回れ」と言う（設計 §5-5）。
         const int fixed2[4][2] = {{-1, -1}, {-1, 1}, {1, -1}, {1, 1}};
         for (int i = 0; i < instanceCount(); ++i) {
             const Instance& inst = instances_[i];
             if (!inst.active) continue;
             const Obb& b = inst.obb;
             if (!isBlocker(i)) continue;  // ブロッカーだけ回折対象（margin>0 なら近傍も含む）
+
+            if (inst.geomId >= 0 && inst.geomId < static_cast<int>(meshes_.size())) {
+                const MeshGeometry& g = meshes_[static_cast<size_t>(inst.geomId)];
+                if (!g.used) continue;
+                for (const DiffractionEdgeLocal& e : g.edges) {
+                    const Vec3 A = meshLocalToWorldPoint(e.a, b);
+                    const Vec3 B = meshLocalToWorldPoint(e.b, b);
+                    const Vec3 dir = B - A;
+                    if (length(dir) < 1e-5f) continue;
+                    const Vec3 ed = normalized(dir);
+                    // refT は UTD 用（比較実装のみが使う）。稜線に直交する適当な接線でよい。
+                    Vec3 t0 = cross(ed, Vec3(0, 1, 0));
+                    if (length(t0) < 1e-3f) t0 = cross(ed, Vec3(1, 0, 0));
+                    tryEdge(A, B, ed, normalized(t0), i);
+                }
+                continue;
+            }
+
             const Vec3 ax[3] = {b.axisX, b.axisY, b.axisZ};
             const float h[3] = {b.halfExtents.x + margin, b.halfExtents.y + margin,
                                 b.halfExtents.z + margin};
