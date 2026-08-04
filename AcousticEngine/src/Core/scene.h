@@ -821,6 +821,12 @@ public:
     struct DiffractionPath {
         Vec3  aperture{0, 0, 0};    // 音が抜けてくる点（定位に使う）
         float pathLength = 0.0f;    // listener → aperture → source の実長（遅延・距離減衰）
+        // 符号付きの迂回余剰長（影で正・境界で 0・照射側で負）。**ゲインはこれから出す。**
+        //   aperture はクラスタの重心なので、経路長から δ を逆算してはいけない
+        //   ── 重心はクラスタの構成が変わると跳ぶので、ゲインが不連続になる（実測で
+        //   扉の掃引が 4kHz で 0.474→0.132→0.495 とジグザグした）。
+        //   δ 自体は候補の min なので連続。
+        float delta = 0.0f;
         float gain[kNumBands] = {0, 0, 0, 0, 0, 0};
     };
 
@@ -903,7 +909,8 @@ public:
             out[0] = DiffractionPath{};
             out[0].aperture = source;
             out[0].pathLength = directDist;
-            maekawa::gainBands(-globalMinDelta, out[0].gain);
+            out[0].delta = -globalMinDelta;
+            maekawa::gainBands(out[0].delta, out[0].gain);
             return 1;
         }
 
@@ -950,6 +957,8 @@ public:
                 //   全帯域が境界値(0.562)に張り付く（実測でそうなった）。
                 out[n].pathLength = length(Pc - listener) + length(start - Pc)
                                   + sub[bs].pathLength;
+                // 2 段ぶんの迂回。δ は「段ごとの迂回量の和」として持つ。
+                out[n].delta = cl[bi].minDelta + std::max(sub[bs].delta, 0.0f);
                 // 2 段の減衰を掛け合わせる（それぞれの稜線で回り込む）。
                 float g1[kNumBands];
                 maekawa::gainBands(cl[bi].minDelta, g1);
@@ -960,7 +969,8 @@ public:
 
             out[n].aperture = Pc;
             out[n].pathLength = length(Pc - listener) + length(source - Pc);
-            maekawa::gainBands(cl[bi].minDelta, out[n].gain);
+            out[n].delta = cl[bi].minDelta;
+            maekawa::gainBands(out[n].delta, out[n].gain);
             ++n;
         }
         return n;
@@ -1053,13 +1063,13 @@ public:
             for (int b = 0; b < kNumBands; ++b) outGain[b] = g;
             return;
         }
-        // 最短経路の δ から。**探索を通すのが要点** ── minDetour を直接呼ぶと 2 次回折を
-        // 通らないので、L 字の先のような「2 段でしか届かない場所」でゲインが 0 のままになる。
-        const float directDist = std::max(length(to - from), 1e-4f);
-        float best = paths[0].pathLength;
-        for (int i = 1; i < np; ++i) best = std::min(best, paths[i].pathLength);
-        const float delta = std::max(best - directDist, 0.0f);
-        maekawa::gainBands(occ ? delta : -delta, outGain);
+        // 最小 δ から。**経路長から逆算してはいけない** ── aperture はクラスタの重心なので、
+        // 構成が変わると跳ぶ。δ は候補の min なので連続（min は連続性を保つ）。
+        // 探索を通すのが要点でもある ── minDetour を直接呼ぶと 2 次回折を通らないので、
+        // 2 段でしか届かない場所でゲインが 0 のままになる。
+        float best = paths[0].delta;
+        for (int i = 1; i < np; ++i) best = std::min(best, paths[i].delta);
+        maekawa::gainBands(best, outGain);
     }
 
     // 全候補稜線を回る迂回の余剰長 δ(m, 非負) の最小値。候補が無ければ false。
