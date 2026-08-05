@@ -176,6 +176,12 @@ namespace AcousticFlow
             IntPtr scene, AFVector3 center, AFVector3 halfExtents,
             AFVector3 right, AFVector3 up, int materialId);
 
+        // ソフト遮蔽。直接経路の透過(振幅・6帯域)と遮蔽割合(0..1)を別々に返す。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneComputeSoftOcclusion(
+            IntPtr scene, AFVector3 listener, AFVector3 source,
+            float[] outTrans, int count, out float outOccFrac);
+
         // 各方向から「どれだけ残響が返るか」を帯域別に得る。outEnergy は dirCount*6 要素。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneProbeDirectionalEnergy(

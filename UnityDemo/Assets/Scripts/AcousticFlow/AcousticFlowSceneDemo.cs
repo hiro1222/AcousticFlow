@@ -259,6 +259,8 @@ namespace AcousticFlow
         private float[] _directBands;
         // 回折タップ用のバッファ。回り込む総量を開口ごとの重みで割ったもの。
         private float[] _diffTapBands;
+        // ソフト遮蔽の透過（振幅）。直接タップはこれを使う（単一レイだと掠める位置で跳ぶ）。
+        private float[] _softTrans;
         // 副音源(1以降)の透過/回折を引くための一時バッファ（主音源は _bands/_diffBands を流用）。
         private float[] _srcTransmit, _srcDiffract;
 
@@ -1467,27 +1469,25 @@ namespace AcousticFlow
             // 回折の開口は直接タップの決定に要る（下記）ので先に取る。
             int df = _scene.GetDiffractionSources(idx, _tapDiffPos, _tapDiffGain);
 
-            // 直接タップ（基準 0ms）。
-            //   見通せている(lit)とき … 回折側が「直接音込みの総合値」を返す。開口が波長に対して
-            //     小さければ低域が落ちる（戸口のフレネル遮り）ので、その補正込みの値を採る。
-            //     透過は lit のとき必ず 1.0 なので、max を取ると補正が消えてしまう。
-            //   遮蔽されているとき … **透過だけ**を載せる。
-            //     回り込む成分は 'F' タップが開口の方向から鳴らすので、ここに混ぜてはいけない。
-            //     以前は max(透過, 回折) にしていたため、回り込みの一部が
-            //     「壁を突き抜ける方向」から鳴っていた（方向の矛盾＋二重計上）。
-            bool lit = true;
-            for (int b = 0; b < nb6; b++) if (tr[b] < 0.999f) { lit = false; break; }
-            bool diffHasSomewhereToGo = lit || df > 0;
-            for (int b = 0; b < nb6; b++)
+            // ★直接タップ（基準 0ms）＝ **ソフト遮蔽の透過**。分岐なし。
+            //
+            //   以前は「見通せているか(lit)」で意味を切り替えていた:
+            //     lit  → 回折ゲイン（境界で 0.56）
+            //     !lit → 透過（壁材なら 0.12）＋ F タップが開口に出現
+            //   境界を跨いだ瞬間に 13dB 落ち、同時に音が音源方向から開口方向へワープしていた。
+            //   これが「遮蔽ON/OFFの差が激しすぎる」の主因。
+            //
+            //   ソフト遮蔽は音源まわりの円盤をサンプルするので、掠める位置では
+            //   「一部だけ遮られる」状態がそのまま数値になる（見通し 1.0 → 境界 約0.5 → 影 材質の透過）。
+            //   連続なので分岐が要らない。
+            if (_softTrans == null) _softTrans = new float[nb6];
+            float occFrac;
+            if (!_scene.ComputeSoftOcclusion(lp, sp, _softTrans, out occFrac))
             {
-                if (lit) _directBands[b] = di[b];
-                else if (diffHasSomewhereToGo) _directBands[b] = tr[b];
-                // 遮蔽されているのに開口が 0 本＝回折の行き先が無い。捨てると直接音が
-                // 丸ごと欠落する（実測 -34dB）。エンジンの探索が2箇所で条件不一致な間の保険で、
-                // findDiffractionPaths への一本化（docs/DIFFRACTION_DESIGN.md §2）で不要になる。
-                else _directBands[b] = Mathf.Max(tr[b], di[b]);
+                for (int b = 0; b < nb6; b++) _softTrans[b] = tr[b];
+                occFrac = 0f;
             }
-            WriteTapBands(ts, n++, _directBands, 0, directDist, sp, 'D', 0f);
+            WriteTapBands(ts, n++, _softTrans, 0, directDist, sp, 'D', 0f);
 
             // 反射タップ（像源位置から経路長→遅延、6帯域ゲイン×空気吸収）。
             int er = _scene.GetEarlyReflections(idx, _tapErPos, _tapErGain);
@@ -1504,12 +1504,18 @@ namespace AcousticFlow
             //     遮蔽感の正体はこのハイ落ちなので、エンジンが計算した情報を捨てていたことになる。
             //   配分: エンジンの6帯域回折ゲイン(_diffBands = 回り込む総量) を、
             //     開口ごとの相対重み(_tapDiffGain, 合計1に正規化済み) で割り振る。
+            //   ★さらに**遮蔽割合(occFrac)で重み付け**する。
+            //     見通せているとき occFrac=0 なので回折タップは 0 になり、直接タップとの
+            //     二重計上が起きない。境界では 0.5 前後で滑らかに入れ替わる。
+            //     これで「見通せているか」の分岐なしに配分できる。
             for (int t = 0; t < df && n < SourceTaps.MaxTaps; t++)
             {
+                if (occFrac <= 1e-4f) break;                 // 見通せている＝回折の出番なし
                 float pl = Vector3.Distance(lp, _tapDiffPos[t]);
                 float rel = (pl - directDist) * toMs;
                 if (rel < 0f) rel = 0f;
-                for (int b = 0; b < nb6; b++) _diffTapBands[b] = di[b] * _tapDiffGain[t];
+                for (int b = 0; b < nb6; b++)
+                    _diffTapBands[b] = di[b] * _tapDiffGain[t] * occFrac;
                 WriteTapBands(ts, n++, _diffTapBands, 0, pl, _tapDiffPos[t], 'F', rel);
             }
             ts.Count = n;

@@ -80,6 +80,20 @@ int AF_SceneAddInstanceBox(AF_SceneHandle scene,
     return s->addInstance(makeObb(center, halfExtents, right, up), materialId);
 }
 
+int AF_SceneComputeSoftOcclusion(AF_SceneHandle scene,
+                                 AF_Vector3 listener, AF_Vector3 source,
+                                 float* outTrans, int count, float* outOccFrac) {
+    Scene* s = asScene(scene);
+    if (!s || !outTrans || count <= 0) return 0;
+    float t[kNumBands];
+    float frac = 0.0f;
+    s->computeSoftOcclusion(toVec3(listener), toVec3(source), t, frac);
+    const int n = std::min(count, kNumBands);
+    for (int b = 0; b < n; ++b) outTrans[b] = t[b];
+    if (outOccFrac) *outOccFrac = frac;
+    return n;
+}
+
 int AF_SceneComputeDiffractionKirchhoff(AF_SceneHandle scene,
                                         AF_Vector3 listener, AF_Vector3 source,
                                         float* outGains, int count,

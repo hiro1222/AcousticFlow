@@ -1101,6 +1101,45 @@ void testSecondOrderDiffraction() {
     AF_SceneDestroy(s);
 }
 
+// ================================================================ ソフト遮蔽
+// 壁の縁を横切るときに、透過と遮蔽割合が連続に動くか。
+//   単一レイの判定だと「当たる/当たらない」で 1.0 ⇄ 材質値 と一気に跳ぶ。
+//   これが「遮蔽ON/OFFの差が激しすぎる」の主因だった。
+void testSoftOcclusion() {
+    std::printf("\n[ソフト遮蔽] 壁の縁を横切るときの連続性\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    // z=0 に壁。x<=0 が壁、x>0 が開口。
+    AF_SceneAddInstanceBox(s, V(-5, 2, 0), V(5, 2, 0.15f), V(1, 0, 0), V(0, 1, 0), mat);
+
+    const AF_Vector3 src = V(-2, 1.6f, 2);
+    std::printf("      リスナー x   ソフト透過125Hz  遮蔽割合   単一レイ透過125Hz\n");
+
+    float prevSoft = -1.0f, maxSoftJump = 0.0f;
+    float prevHard = -1.0f, maxHardJump = 0.0f;
+    for (float x = 0.0f; x <= 4.01f; x += 0.25f) {
+        const AF_Vector3 L = V(x, 1.6f, -2);
+        float soft[kBands] = {}; float frac = 0.0f;
+        AF_SceneComputeSoftOcclusion(s, L, src, soft, kBands, &frac);
+        float hard[kBands] = {};
+        AF_SceneComputeTransmissionBands(s, L, src, hard, kBands);
+        std::printf("      %8.2f       %6.3f      %5.2f        %6.3f\n",
+                    x, soft[0], frac, hard[0]);
+        if (prevSoft >= 0.0f) {
+            maxSoftJump = std::max(maxSoftJump, std::fabs(soft[0] - prevSoft));
+            maxHardJump = std::max(maxHardJump, std::fabs(hard[0] - prevHard));
+        }
+        prevSoft = soft[0];
+        prevHard = hard[0];
+    }
+    char b[128];
+    std::snprintf(b, sizeof(b), "(ソフト %.3f / 単一レイ %.3f)", maxSoftJump, maxHardJump);
+    checkGreater("ソフト遮蔽の方が単一レイより滑らか", maxHardJump, maxSoftJump);
+    check("ソフト遮蔽の隣接差が小さい(<0.4)", maxSoftJump < 0.4f, b);
+
+    AF_SceneDestroy(s);
+}
+
 // ---------------------------------------------------------------- 頑健性
 // 不正入力で落ちない（移行中に呼び出し規約を変えるので、境界は明示的に守る）。
 void testRobustness() {
@@ -1142,6 +1181,7 @@ int main() {
     testMesh();
     testDirectionalProbe();
     testSecondOrderDiffraction();
+    testSoftOcclusion();
     testRobustness();
 
     std::printf("\n----\n");

@@ -223,6 +223,19 @@ ACOUSTIC_API void AF_SceneComputeEchogramBands(AF_SceneHandle scene,
                                                int numRays, int maxBounces,
                                                float distanceRef);
 
+/* 【ソフト遮蔽】直接経路の透過(振幅・6帯域)と「どれだけ遮られているか(0..1)」を別々に返す。
+ * outTrans(6要素以上) と outOccFrac(null可)。書き込んだ帯域数を返す。
+ *
+ * 音源まわりの円盤をサンプルするので、掠める位置では「一部だけ遮られる」状態がそのまま
+ * 数値になる。単一レイの透過判定と違い、透過も遮蔽割合も**連続に動く**。
+ * これを使うと「見通せているか」の二値分岐なしに直接音と回折を配分できる:
+ *     直接タップ = outTrans          （見通しで 1.0 / 境界で約 0.5 / 影で材質の透過）
+ *     回折タップ = 回折ゲイン × outOccFrac（見通しで 0 なので二重計上しない） */
+ACOUSTIC_API int AF_SceneComputeSoftOcclusion(AF_SceneHandle scene,
+                                              AF_Vector3 listener, AF_Vector3 source,
+                                              float* outTrans, int count,
+                                              float* outOccFrac);
+
 /* 【回折・キルヒホッフ版】開口の「大きさ」を実測してフレネル・キルヒホッフの解析解に渡す。
  * outGains(6要素以上) に帯域別ゲイン、outAperture に開口中心、outPathLength に実経路長。
  * 開口が見つかれば 1、面全体が塞がっていれば 0（呼び出し側で透過のみとする）。

@@ -839,11 +839,11 @@ public:
         const bool occ = isOccluded(listener, source);
         const float directDist = std::max(length(source - listener), 1e-4f);
 
-        // 候補の探索条件は遮蔽の有無にかかわらずここ 1 箇所で決める。
-        //   見通し時に margin>0 で近傍まで広げるのは、開口の縁がまだ効く領域
-        //   （フレネル遮り）を捉えるため。前川の式が効くのは δ < 0.1λ 程度なので、
-        //   最低域 125Hz(λ=2.7m) でも 0.3m 程度。4m あれば十分。
-        const float margin = occ ? 0.0f : 4.0f;
+        // ★候補の探索条件は遮蔽の有無で変えない。
+        //   以前は occ ? 0 : 4 と切り替えていたが、境界で候補集合が不連続に変わり、
+        //   最小 δ が飛ぶ原因になっていた。常に近傍まで広げておけば、影側では
+        //   余分な候補が増えるだけで min は変わらない（余分な候補ほど δ が大きいので）。
+        constexpr float margin = 4.0f;
 
         // 開口＝方向クラスタ。掠める点はクラスタ内の重み付き重心にして連続にスライドさせる
         // （手前稜線↔奥稜線の乗り換えで重心が滑らかに移る＝飛ばない）。
@@ -1191,6 +1191,63 @@ public:
             outGain[b] = clamp01(std::max(soft, dif[b]));
         }
         if (outDetourDelta) *outDetourDelta = detourDelta;
+    }
+
+    // 【ソフト遮蔽の素材】直接経路の透過(振幅)と「どれだけ遮られているか(0..1)」を別々に返す。
+    //
+    //   ★これがあると `occ` の二値分岐を全部消せる。
+    //     以前は「見通せているか」で直接タップの意味を切り替えていた:
+    //       lit  → 直接タップ = 回折ゲイン（境界で 0.56）
+    //       !lit → 直接タップ = 透過（壁材なら 0.12）＋ F タップが開口に出現
+    //     境界を跨いだ瞬間に 13dB 落ち、同時に音が音源方向から開口方向へワープしていた。
+    //
+    //   音源まわりの円盤をサンプルするので、掠める位置では「一部だけ遮られる」状態が
+    //   そのまま数値になる。透過も遮蔽割合も連続に動くので、分岐なしで書ける:
+    //       直接タップ = softTrans          （見通しで 1.0、境界で約 0.5、影で材質の透過）
+    //       F タップ   = 回折ゲイン × occFrac（見通しで 0 になるので二重計上しない）
+    //   sourceRadius が**遷移の幅**を決める。物理的には遷移幅はフレネルゾーン（低域ほど広い、
+    //   数メートル規模）だが、ここは帯域共通の1つの円盤で近似している。広げるほど滑らかに
+    //   なる代わりに影の縁がぼやけるので、耳で決めるチューニング値。
+    void computeSoftOcclusion(const Vec3& listener, const Vec3& source,
+                              float outTrans[kNumBands], float& outOccFrac,
+                              int numSamples = 32, float sourceRadius = 0.9f) const {
+        using namespace scene_detail;
+        Vec3 dir = source - listener;
+        const float dist = length(dir);
+        if (dist < 1e-4f) {
+            for (int b = 0; b < kNumBands; ++b) outTrans[b] = 1.0f;
+            outOccFrac = 0.0f;
+            return;
+        }
+        dir = dir * (1.0f / dist);
+        const Vec3 t = (std::fabs(dir.x) > 0.9f) ? Vec3(0, 1, 0) : Vec3(1, 0, 0);
+        const Vec3 u = normalized(cross(dir, t));
+        const Vec3 v = cross(dir, u);
+
+        const int N = numSamples < 1 ? 1 : numSamples;
+        float acc[kNumBands] = {0, 0, 0, 0, 0, 0};
+        float occWeighted = 0.0f;
+
+        // ★サンプル配置は**決定的**にする（フィボナッチ円盤）。
+        //   乱数で撒くと、リスナーが少し動くだけでパターンが変わり、遮蔽割合がガタつく
+        //   （実測で 0.511 → 0.371 → 0.794 と非単調になった）。
+        //   位置に依存しない固定配置なら、変化するのは幾何だけなので滑らかに動く。
+        constexpr float kGolden = 2.39996323f;
+        for (int i = 0; i < N; ++i) {
+            const float rr = sourceRadius * std::sqrt((i + 0.5f) / static_cast<float>(N));
+            const float aa = kGolden * static_cast<float>(i);
+            const Vec3 p = source + u * (rr * std::cos(aa)) + v * (rr * std::sin(aa));
+            float g[kNumBands];
+            computeTransmission(listener, p, g);      // エネルギー
+            for (int b = 0; b < kNumBands; ++b) acc[b] += g[b];
+            // 遮蔽割合も「何本当たったか」の二値カウントではなく、**低域の減衰量**で測る。
+            //   二値だと 1/N 刻みの階段になる。減衰量なら部分的な遮蔽が連続に出る。
+            occWeighted += 1.0f - std::sqrt(g[0]);
+        }
+        const float inv = 1.0f / static_cast<float>(N);
+        // エネルギーで平均してから振幅へ（material.h の単位規約）。
+        for (int b = 0; b < kNumBands; ++b) outTrans[b] = std::sqrt(acc[b] * inv);
+        outOccFrac = clamp01(occWeighted * inv);
     }
 
     // 【役割2(Phase 5)：反射込み遮蔽】リスナー起点で numRays 本のレイを撒き、壁で反射

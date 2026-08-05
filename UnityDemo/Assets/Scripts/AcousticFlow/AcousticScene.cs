@@ -42,6 +42,19 @@ namespace AcousticFlow
                 new AFVector3(right), new AFVector3(up), materialId);
         }
 
+        // ソフト遮蔽。直接経路の透過(振幅・6帯域)と遮蔽割合(0..1)を返す。
+        //   単一レイの透過判定と違い、掠める位置でも連続に動く。
+        //   これで「見通せているか」の二値分岐なしに直接音と回折を配分できる。
+        public bool ComputeSoftOcclusion(Vector3 listener, Vector3 source,
+                                         float[] outTrans, out float occFrac)
+        {
+            occFrac = 0f;
+            if (_handle == IntPtr.Zero || outTrans == null) return false;
+            return Native.AF_SceneComputeSoftOcclusion(
+                _handle, new AFVector3(listener), new AFVector3(source),
+                outTrans, outTrans.Length, out occFrac) > 0;
+        }
+
         // 各方向から「どれだけ残響が返るか」を帯域別に得る。
         //   outEnergy[i*6 + b] = 方向 dirs[i] の帯域 b。方向間の相対分布として使う。
         //   何にも当たらない方向は 0（開けている＝残響を返さない）。
