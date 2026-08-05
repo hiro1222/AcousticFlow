@@ -1181,7 +1181,10 @@ public:
         }
 
         for (int b = 0; b < kNumBands; ++b) {
-            const float soft = transAccum[b] * inv;   // 滑らかな直接透過（壁を抜けてくる分）
+            // 透過はエネルギー、回折(前川)は振幅。**そのまま比べてはいけない**ので
+            //   透過側を振幅へ揃える（material.h の単位規約）。
+            //   揃えないと壁越しの成分が二乗ぶん小さく評価され、実測で 9dB 過小だった。
+            const float soft = std::sqrt(transAccum[b] * inv);   // 滑らかな直接透過（振幅）
             // 壁を抜ける成分と回り込む成分の大きい方を採る。
             //   回折側は既に「照らされていれば直接音込み」の総合値なので、
             //   occFrac のような後付けのフェードは要らない。
@@ -1240,7 +1243,13 @@ public:
                 }
             }
             const float inv = 1.0f / static_cast<float>(numRays);
-            for (int b = 0; b < kNumBands; ++b) total[b] = clamp01(total[b] + reflected[b] * inv);
+            // total は振幅（computeDirectSoft の出力）、reflected はエネルギー。
+            //   直接と反射は無相関な別経路なので**エネルギーで足してから振幅へ戻す**。
+            //   単位を揃えずに足すと、反射ぶんが二乗の分だけ過大に効く。
+            for (int b = 0; b < kNumBands; ++b) {
+                const float e = total[b] * total[b] + reflected[b] * inv;
+                total[b] = clamp01(std::sqrt(e));
+            }
         }
 
         if (outBands6) for (int b = 0; b < kNumBands; ++b) outBands6[b] = total[b];
@@ -1347,10 +1356,14 @@ public:
                 }
             }
             const float inv = 1.0f / static_cast<float>(numRays);
+            // total は振幅、reflected はエネルギー。無相関な別経路なので
+            //   エネルギーで足してから振幅へ戻す（material.h の単位規約）。
             for (int j = 0; j < count; ++j)
-                for (int b = 0; b < kNumBands; ++b)
-                    total[j * kNumBands + b] =
-                        clamp01(total[j * kNumBands + b] + reflected[j * kNumBands + b] * inv);
+                for (int b = 0; b < kNumBands; ++b) {
+                    const float amp = total[j * kNumBands + b];
+                    const float e = amp * amp + reflected[j * kNumBands + b] * inv;
+                    total[j * kNumBands + b] = clamp01(std::sqrt(e));
+                }
         }
 
         // 出力。
@@ -1602,7 +1615,11 @@ public:
             if (dup) continue;
             pickedDir[n] = t.dir;
             outImagePos[n] = listener + t.dir * t.len;
-            for (int b = 0; b < kNumBands; ++b) outGain[n * kNumBands + b] = t.g[b];
+            // 内部はエネルギー（refl = 1-α-τ も透過も）、タップのゲインは振幅で返す
+            //   （material.h の単位規約）。ここを素通しにすると反射が二乗ぶん小さくなり、
+            //   高次ほど誤差が積み上がって尾が痩せる。
+            for (int b = 0; b < kNumBands; ++b)
+                outGain[n * kNumBands + b] = std::sqrt(t.g[b]);
             ++n;
         }
         return n;

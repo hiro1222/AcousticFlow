@@ -167,7 +167,8 @@ int AF_SceneComputeTransmissionBands(AF_SceneHandle scene,
     float gain[kNumBands];
     s->computeTransmission(toVec3(from), toVec3(to), gain);
     const int n = std::min(count, kNumBands);
-    for (int b = 0; b < n; ++b) outGains[b] = gain[b];
+    // 内部はエネルギー、ホストへ返すタップのゲインは振幅（material.h の規約）。
+    for (int b = 0; b < n; ++b) outGains[b] = std::sqrt(gain[b]);
     return n;
 }
 
