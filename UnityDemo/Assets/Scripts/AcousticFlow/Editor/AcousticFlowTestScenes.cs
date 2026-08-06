@@ -195,19 +195,25 @@ namespace AcousticFlow.EditorTools
             var scene = NewScene();
             var listener = MakeListener(new Vector3(0f, 1.6f, -5f));
 
-            // 床だけ置く（歩く基準が無いと位置が掴みにくいので）。壁は仕切りのみ。
-            MakeBox("Ground", new Vector3(0f, -0.5f, 0f), new Vector3(40f, 1f, 40f));
+            // ★完全に閉じた箱を作り、仕切りの開口だけを唯一の通り道にする。
+            //   床しか無いと壁の上も端も抜けてしまい、開口が複数できてテストが濁る。
+            const float hw = 10f, h = 5f, hd = 10f, t = 0.3f;
+            MakeBox("Floor",   new Vector3(0f, -t * 0.5f, 0f),      new Vector3(2 * hw, t, 2 * hd));
+            MakeBox("Ceiling", new Vector3(0f, h + t * 0.5f, 0f),   new Vector3(2 * hw, t, 2 * hd));
+            MakeBox("Wall_L",  new Vector3(-hw - t * 0.5f, h * 0.5f, 0f), new Vector3(t, h, 2 * hd));
+            MakeBox("Wall_R",  new Vector3(hw + t * 0.5f, h * 0.5f, 0f),  new Vector3(t, h, 2 * hd));
+            MakeBox("Wall_Back",  new Vector3(0f, h * 0.5f, -hd - t * 0.5f), new Vector3(2 * hw, h, t));
+            MakeBox("Wall_Front", new Vector3(0f, h * 0.5f, hd + t * 0.5f), new Vector3(2 * hw, h, t));
 
-            // Z=0 の仕切り壁。幅20m・高5m・厚0.3m、X=+2〜+4 に 2m の開口を1つだけ。
+            // Z=0 の仕切り。X=+2〜+4 に幅2mの開口を1つだけ（床から天井まで抜けた縦のスリット）。
             //   開口を中央から外してあるので、「音源の方向」と「開口の方向」が明確に別になる。
-            const float wallZ = 0f, thick = 0.3f, height = 5f, half = 10f;
             const float gapL = 2f, gapR = 4f;
-            float leftW = gapL - (-half);
-            MakeBox("Partition_L", new Vector3(-half + leftW * 0.5f, height * 0.5f, wallZ),
-                    new Vector3(leftW, height, thick));
-            float rightW = half - gapR;
-            MakeBox("Partition_R", new Vector3(gapR + rightW * 0.5f, height * 0.5f, wallZ),
-                    new Vector3(rightW, height, thick));
+            float leftW = gapL - (-hw);
+            MakeBox("Partition_L", new Vector3(-hw + leftW * 0.5f, h * 0.5f, 0f),
+                    new Vector3(leftW, h, t));
+            float rightW = hw - gapR;
+            MakeBox("Partition_R", new Vector3(gapR + rightW * 0.5f, h * 0.5f, 0f),
+                    new Vector3(rightW, h, t));
 
             // 音源は壁の奥・左寄り。開口(X=+3付近)とは反対側なので、
             // 直進では絶対に届かず、必ず開口を回り込むことになる。
@@ -228,8 +234,9 @@ namespace AcousticFlow.EditorTools
             }
 
             Save(scene, "Test_DiffractionOnly.unity",
-                "回折だけ: 壁は完全不透過、早期反射・残響なし。聞こえるのは開口(X=+2〜+4)を" +
-                "回り込んできた音だけ。音源は逆側(X=-4)の奥にあるので、直進では届かない。" +
+                "回折だけ: 閉じた箱を仕切りで2部屋に分け、通り道は X=+2〜+4 の開口ひとつだけ。" +
+                "壁は完全不透過、早期反射・残響もなし。聞こえるのは開口を回り込んできた音だけ。" +
+                "音源は逆側(X=-4)の奥にあるので直進では届かない。" +
                 "A/Dで左右に歩き、(1)音が開口の方向から来るか (2)歩いても方向が滑らかに動くか " +
                 "(3)開口から離れるほど自然に小さくなるか を確認する。");
         }
