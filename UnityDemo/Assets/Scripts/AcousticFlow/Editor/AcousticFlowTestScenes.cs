@@ -180,6 +180,60 @@ namespace AcousticFlow.EditorTools
                 "開閉の2状態ではなく、途中の角度すべてで連続に変わることを確認する。");
         }
 
+        // ── 回折だけを聴く：透過・反射・残響を全部落とす ──
+        // 壁を完全不透過にし、早期反射と後期残響も切る。
+        // **聞こえるのは「開口を回り込んできた音」だけ**になるので、
+        // 回折の定位と減衰を、他の要素に紛れずに判断できる。
+        //
+        // 確かめること:
+        //   ・音が開口の方向から聞こえるか（音源の方向ではなく）
+        //   ・左右に歩いたとき、その方向が滑らかに動くか
+        //   ・開口から遠ざかるほど自然に小さくなるか
+        [MenuItem("AcousticFlow/Test Scenes/Diffraction Only (回折だけ)")]
+        public static void DiffractionOnly()
+        {
+            var scene = NewScene();
+            var listener = MakeListener(new Vector3(0f, 1.6f, -5f));
+
+            // 床だけ置く（歩く基準が無いと位置が掴みにくいので）。壁は仕切りのみ。
+            MakeBox("Ground", new Vector3(0f, -0.5f, 0f), new Vector3(40f, 1f, 40f));
+
+            // Z=0 の仕切り壁。幅20m・高5m・厚0.3m、X=+2〜+4 に 2m の開口を1つだけ。
+            //   開口を中央から外してあるので、「音源の方向」と「開口の方向」が明確に別になる。
+            const float wallZ = 0f, thick = 0.3f, height = 5f, half = 10f;
+            const float gapL = 2f, gapR = 4f;
+            float leftW = gapL - (-half);
+            MakeBox("Partition_L", new Vector3(-half + leftW * 0.5f, height * 0.5f, wallZ),
+                    new Vector3(leftW, height, thick));
+            float rightW = half - gapR;
+            MakeBox("Partition_R", new Vector3(gapR + rightW * 0.5f, height * 0.5f, wallZ),
+                    new Vector3(rightW, height, thick));
+
+            // 音源は壁の奥・左寄り。開口(X=+3付近)とは反対側なので、
+            // 直進では絶対に届かず、必ず開口を回り込むことになる。
+            var srcPos = new Vector3(-4f, 1.6f, 5f);
+            AddDemo(listener, srcPos, AcousticMaterialPreset.Opaque);
+            var conv = AddConvolver(srcPos);
+
+            // 回折だけを残す。
+            conv.reflectionLevel = 1f;      // 'F'(回折)タップは直接音と同じ音量で鳴らす
+            conv.tailLevel = 0f;            // 後期残響なし
+            conv.enableReverbTail = false;
+            var demo = Object.FindObjectOfType<AcousticFlowSceneDemo>();
+            if (demo != null)
+            {
+                demo.enableEarlyReflections = false;   // 早期反射なし
+                demo.enableReverb = false;             // 残響なし
+                demo.useReflections = false;           // 反射込み遮蔽もなし
+            }
+
+            Save(scene, "Test_DiffractionOnly.unity",
+                "回折だけ: 壁は完全不透過、早期反射・残響なし。聞こえるのは開口(X=+2〜+4)を" +
+                "回り込んできた音だけ。音源は逆側(X=-4)の奥にあるので、直進では届かない。" +
+                "A/Dで左右に歩き、(1)音が開口の方向から来るか (2)歩いても方向が滑らかに動くか " +
+                "(3)開口から離れるほど自然に小さくなるか を確認する。");
+        }
+
         // ── メッシュ形状の検証：穴の空いた壁（箱では表せない形）──
         // 壁と戸口を「1枚のメッシュ」で作る。境界ボックスで判定していれば戸口も塞がるので、
         // 戸口の正面で音が通ることが、実形状を見ている証拠になる。

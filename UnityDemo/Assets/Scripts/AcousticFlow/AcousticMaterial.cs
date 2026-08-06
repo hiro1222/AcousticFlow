@@ -14,6 +14,7 @@ namespace AcousticFlow
         Default = 0,   // 一般的な内壁（石膏ボード相当）
         Concrete = 1,  // コンクリート（よく遮る）
         Glass = 2,     // ガラス（やや抜ける）
+        Opaque = 3,    // 完全不透過（検証用。回り込んだ音だけを残して回折を単体で聴く）
     }
 
     [Serializable]
@@ -55,12 +56,20 @@ namespace AcousticFlow
             new[] { 0.18f, 0.06f, 0.04f, 0.03f, 0.02f, 0.02f },
             new[] { 0.02f, 0.03f, 0.05f, 0.08f, 0.10f, 0.15f });
 
+        // 完全不透過（検証用）。透過を 0 にすると壁を抜けてくる成分が消え、
+        // 聞こえるのは回り込んだ音だけになる。現実の材質ではない。
+        public static AcousticMaterial Opaque() => new AcousticMaterial(
+            new[] { 0f, 0f, 0f, 0f, 0f, 0f },
+            new[] { 0.10f, 0.10f, 0.15f, 0.20f, 0.30f, 0.40f },
+            new[] { 0.10f, 0.15f, 0.20f, 0.30f, 0.40f, 0.50f });
+
         public static AcousticMaterial FromPreset(AcousticMaterialPreset preset)
         {
             switch (preset)
             {
                 case AcousticMaterialPreset.Concrete: return Concrete();
                 case AcousticMaterialPreset.Glass: return Glass();
+                case AcousticMaterialPreset.Opaque: return Opaque();
                 default: return DefaultWall();
             }
         }

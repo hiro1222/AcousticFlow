@@ -46,4 +46,15 @@ AcousticMaterial AcousticMaterial::glass() {
     };
 }
 
+AcousticMaterial AcousticMaterial::opaque() {
+    // 完全不透過（検証用）。壁を抜けてくる成分を消すと、聞こえるのは回り込んだ音だけになる。
+    //   吸収は中庸にして、反射・残響は普通に立つようにしてある
+    //   （回折だけを聴きたいときは、呼び出し側で反射/残響を切ること）。
+    return AcousticMaterial{
+        { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 0.10f, 0.10f, 0.15f, 0.20f, 0.30f, 0.40f },
+        { 0.10f, 0.15f, 0.20f, 0.30f, 0.40f, 0.50f },
+    };
+}
+
 }  // namespace acoustic
