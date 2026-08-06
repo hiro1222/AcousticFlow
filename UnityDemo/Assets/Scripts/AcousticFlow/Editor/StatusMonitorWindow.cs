@@ -92,6 +92,11 @@ namespace AcousticFlow.EditorTools
             int dCap = AcousticFlowSceneDemo.Status.DiffCap;
             bool dOn = AcousticFlowSceneDemo.Status.DiffSrcEnabled;
             DrawCountRow("回折二次音源 (V)", dOn, dAct, dCap);
+            EditorGUILayout.LabelField("  回折のゲイン",
+                AcousticFlowSceneDemo.Status.DiffDistanceOnly
+                    ? "距離減衰のみ（周波数依存なし。こもりは透過が担当）"
+                    : "前川の式による6帯域減衰",
+                EditorStyles.miniLabel);
 
             int eAct = AcousticFlowSceneDemo.Status.ErActive;
             int eCap = AcousticFlowSceneDemo.Status.ErCap;

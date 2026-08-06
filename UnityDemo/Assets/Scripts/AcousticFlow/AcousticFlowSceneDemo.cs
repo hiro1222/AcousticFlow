@@ -85,6 +85,17 @@ namespace AcousticFlow
         [Tooltip("残響の更新間隔（フレーム）。重いので数フレームに1回で十分（部屋は緩変）。")]
         public int reverbUpdateEveryFrames = 4;
 
+        [Header("回折の鳴らし方")]
+        [Tooltip("ON: 回折タップに周波数依存の減衰を掛けず、**開口までの総経路長による距離減衰だけ**にする。\n\n"
+                 + "回折が運ぶべき情報を『どこから抜けてくるか（定位）』に絞る立場。\n"
+                 + "こもり（LPF）は壁を抜けてくる透過音が担う ── 材質の6帯域透過が\n"
+                 + "そのまま低域寄りの性格を持つので、役割を分けられる。\n\n"
+                 + "根拠: 定位の手がかりは 700Hz 以下では ITD しか無い。回折成分を強く\n"
+                 + "ローパスすると『どこから来ているか』が分からなくなり、定位させたい成分の\n"
+                 + "高域を削るという自己矛盾になる。広帯域のまま鳴らすのが定位の条件。\n\n"
+                 + "OFF: 前川の式による6帯域減衰を掛ける（物理寄り）。A/B比較用。")]
+        public bool diffractionDistanceOnly = true;
+
         [Header("後期残響の方向づけ（方向プローブ）※既定オフ・下記参照")]
         [Tooltip("リスナー位置から全方向へレイを撒き、『どちらから残響が返るか』を測って"
                  + "尾の左右バランスに反映する。\n\n"
@@ -332,6 +343,7 @@ namespace AcousticFlow
             public static int ErActive, ErCap;      // 早期反射 鳴動/上限
             public static bool DiffSrcEnabled;
             public static int DiffActive, DiffCap;  // 回折二次音源 鳴動/上限
+            public static bool DiffDistanceOnly;    // 回折のゲインが距離減衰だけか（周波数依存なし）
             public static float[] BandsTransmit;    // 主音源 6帯域 透過
             public static float[] BandsDiffract;    // 主音源 6帯域 回折
             public static bool UseBandEq;           // 3バンドEQモードか
@@ -1287,6 +1299,7 @@ namespace AcousticFlow
             Status.ErActive = _erActiveTaps;
             Status.ErCap = (_sources != null) ? _sources.Length * _erTapCap : 0;
             Status.DiffSrcEnabled = enableDiffractionSources;
+            Status.DiffDistanceOnly = diffractionDistanceOnly;
             Status.DiffActive = _diffActive;
             Status.DiffCap = (_sources != null) ? _sources.Length * _diffCap : 0;
             Status.BandsTransmit = _bands;
@@ -1508,14 +1521,19 @@ namespace AcousticFlow
             //     見通せているとき occFrac=0 なので回折タップは 0 になり、直接タップとの
             //     二重計上が起きない。境界では 0.5 前後で滑らかに入れ替わる。
             //     これで「見通せているか」の分岐なしに配分できる。
+            //   ★diffractionDistanceOnly なら周波数依存の減衰を掛けない。
+            //     残るのは「開口の方向」「開口までの総経路長ぶんの遅延と距離減衰」だけ。
+            //     距離減衰と空気吸収は WriteTapBands が pl から掛けるので、ここでは
+            //     開口間の配分(_tapDiffGain)と、直接音との切り替え(occFrac)だけを渡す。
             for (int t = 0; t < df && n < SourceTaps.MaxTaps; t++)
             {
                 if (occFrac <= 1e-4f) break;                 // 見通せている＝回折の出番なし
                 float pl = Vector3.Distance(lp, _tapDiffPos[t]);
                 float rel = (pl - directDist) * toMs;
                 if (rel < 0f) rel = 0f;
+                float share = _tapDiffGain[t] * occFrac;
                 for (int b = 0; b < nb6; b++)
-                    _diffTapBands[b] = di[b] * _tapDiffGain[t] * occFrac;
+                    _diffTapBands[b] = diffractionDistanceOnly ? share : di[b] * share;
                 WriteTapBands(ts, n++, _diffTapBands, 0, pl, _tapDiffPos[t], 'F', rel);
             }
             ts.Count = n;
