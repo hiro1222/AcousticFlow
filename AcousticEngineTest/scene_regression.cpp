@@ -1140,6 +1140,80 @@ void testSoftOcclusion() {
     AF_SceneDestroy(s);
 }
 
+// ================================================================ 回折だけシーンの掃引
+// Unity の Test_DiffractionOnly と同じ幾何。閉じた箱を仕切りで2部屋に分け、
+// 通り道は X=+2〜+4 の開口ひとつだけ。壁は完全不透過。
+//   実機で「歩くと回折が消える位置がある（候補 1本 → 0本）」が観測されたので、
+//   それを数値で捕まえる。開口が唯一なのだから、部屋のどこにいても回折は 0 になってはいけない。
+void diagnoseDiffractionOnlySweep() {
+    std::printf("\n[診断] 回折だけシーン: リスナーを動かしたときの安定性\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    const float zero[6] = {0, 0, 0, 0, 0, 0};
+    const float absorb[6] = {0.10f, 0.10f, 0.15f, 0.20f, 0.30f, 0.40f};
+    const float scat[6] = {0.10f, 0.15f, 0.20f, 0.30f, 0.40f, 0.50f};
+    const int mat = AF_SceneAddMaterial(s, zero, absorb, scat, 6);   // 完全不透過
+
+    const float hw = 10, h = 5, hd = 10, t = 0.3f;
+    AF_SceneAddInstanceBox(s, V(0, -t * 0.5f, 0), V(hw, t * 0.5f, hd), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, h + t * 0.5f, 0), V(hw, t * 0.5f, hd), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(-hw - t * 0.5f, h * 0.5f, 0), V(t * 0.5f, h * 0.5f, hd), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(hw + t * 0.5f, h * 0.5f, 0), V(t * 0.5f, h * 0.5f, hd), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, h * 0.5f, -hd - t * 0.5f), V(hw, h * 0.5f, t * 0.5f), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, h * 0.5f, hd + t * 0.5f), V(hw, h * 0.5f, t * 0.5f), V(1,0,0), V(0,1,0), mat);
+    // 仕切り（開口 X=+2〜+4）
+    AF_SceneAddInstanceBox(s, V(-4, h * 0.5f, 0), V(6, h * 0.5f, t * 0.5f), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(7, h * 0.5f, 0), V(3, h * 0.5f, t * 0.5f), V(1,0,0), V(0,1,0), mat);
+
+    const AF_Vector3 S = V(-4, 1.6f, 5);
+    AF_SceneSetSource(s, 1, S);
+
+    std::printf("      リスナー x   125Hz   開口   到来方向(x,z)     経路長\n");
+    int zeroCount = 0;
+    float prevDx = 0, prevDz = 0, prevLen = 0; bool havePrev = false;
+    float maxDirJump = 0.0f, dirJumpAt = 0.0f;
+    float maxLenJump = 0.0f, lenJumpAt = 0.0f;
+
+    for (float x = -8.0f; x <= 8.01f; x += 1.0f) {
+        const AF_Vector3 L = V(x, 1.6f, -5);
+        AF_SceneSetListener(s, L);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+
+        float g[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+        AF_Vector3 pos[8]; float gain[8];
+        const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+
+        float dx = 0, dz = 0, plen = 0;
+        if (n > 0) {
+            const float vx = pos[0].x - L.x, vy = pos[0].y - L.y, vz = pos[0].z - L.z;
+            plen = std::sqrt(vx * vx + vy * vy + vz * vz);
+            if (plen > 1e-4f) { dx = vx / plen; dz = vz / plen; }
+        }
+        std::printf("      %8.1f   %6.3f   %d 本  (%5.2f,%5.2f)  %6.2f m%s\n",
+                    x, g[0], n, dx, dz, plen, (n == 0) ? "   ← 回折が消えた" : "");
+        if (n == 0 || g[0] <= 1e-4f) ++zeroCount;
+        if (havePrev && n > 0) {
+            const float d = std::sqrt((dx - prevDx) * (dx - prevDx) + (dz - prevDz) * (dz - prevDz));
+            if (d > maxDirJump) { maxDirJump = d; dirJumpAt = x; }
+            const float dl = std::fabs(plen - prevLen);
+            if (dl > maxLenJump) { maxLenJump = dl; lenJumpAt = x; }
+        }
+        if (n > 0) { prevDx = dx; prevDz = dz; prevLen = plen; havePrev = true; }
+    }
+
+    char b[128];
+    std::snprintf(b, sizeof(b), "(%d 箇所)", zeroCount);
+    check("開口が1つだけなので、どこにいても回折は消えない", zeroCount == 0, b);
+    std::snprintf(b, sizeof(b), "(最大 %.2f @ x=%.1f)", maxDirJump, dirJumpAt);
+    check("到来方向が滑らかに動く(隣接差<0.35)", maxDirJump < 0.35f, b);
+    // 経路長は遅延と距離減衰の両方を決める。距離減衰だけで鳴らす設定では、
+    // ここが飛ぶとそのまま音量の飛びになる。
+    std::snprintf(b, sizeof(b), "(最大 %.2fm @ x=%.1f)", maxLenJump, lenJumpAt);
+    check("経路長が滑らかに動く(隣接差<1.5m)", maxLenJump < 1.5f, b);
+
+    AF_SceneDestroy(s);
+}
+
 // ---------------------------------------------------------------- 頑健性
 // 不正入力で落ちない（移行中に呼び出し規約を変えるので、境界は明示的に守る）。
 void testRobustness() {
@@ -1182,6 +1256,7 @@ int main() {
     testDirectionalProbe();
     testSecondOrderDiffraction();
     testSoftOcclusion();
+    diagnoseDiffractionOnlySweep();
     testRobustness();
 
     std::printf("\n----\n");
