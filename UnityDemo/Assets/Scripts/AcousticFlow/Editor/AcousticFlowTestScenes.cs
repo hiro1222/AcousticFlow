@@ -427,23 +427,29 @@ namespace AcousticFlow.EditorTools
             MakeBox("Wall_Back",  new Vector3(0f, h * 0.5f, -hd - t * 0.5f), new Vector3(2 * hw, h, t));
             MakeBox("Wall_Front", new Vector3(0f, h * 0.5f, hd + t * 0.5f),  new Vector3(2 * hw, h, t));
 
+            // 戸口と扉は同じ寸法を共有する。別々に書くと扉が戸口を塞ぎきらず、
+            //   下に隙間が残ったり上へ突き抜けたりする（実際にそうなった）。
+            const float doorW = 1.2f, doorH = 2.4f;
+
             // 仕切り1（Z=0）＝**メッシュ**の戸口つき壁。箱では表せない形をメッシュで扱えることの実証。
             var wall = new GameObject("Partition1_Mesh");
             var mf = wall.AddComponent<MeshFilter>();
-            mf.sharedMesh = BuildDoorwayWall(2 * hw, h, t, 1.2f, 2.4f);
+            mf.sharedMesh = BuildDoorwayWall(2 * hw, h, t, doorW, doorH);
             wall.AddComponent<MeshRenderer>();
             wall.AddComponent<MeshCollider>().sharedMesh = mf.sharedMesh;
             Tint(wall.transform, new Color(0.72f, 0.74f, 0.8f));
 
             // その戸口に**スイングドア**（実行時の形状変化）。5/6 キーで開閉。
+            //   蝶番の Y は**扉の中心の高さ**（扉は蝶番を中心に上下へ伸びる）。
+            //   部屋の高さの半分を入れると扉が浮く。
             var hinge = new GameObject("Door_Hinge").transform;
-            hinge.position = new Vector3(-0.6f, h * 0.5f, 0f);
+            hinge.position = new Vector3(-doorW * 0.5f, doorH * 0.5f, 0f);
             var doorGo = GameObject.CreatePrimitive(PrimitiveType.Cube);
             doorGo.name = "Door";
             var door = doorGo.AddComponent<SwingDoor>();
             door.hinge = hinge;
-            door.width = 1.2f;
-            door.height = 2.4f;
+            door.width = doorW;
+            door.height = doorH;
             door.thickness = 0.06f;
             door.swingTowardPositiveZ = true;
             door.angleDeg = 35f;          // 半開きから始める（開き具合の変化を聴きやすい）

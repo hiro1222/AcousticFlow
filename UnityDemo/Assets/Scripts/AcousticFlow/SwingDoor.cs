@@ -20,10 +20,13 @@ namespace AcousticFlow
     public class SwingDoor : MonoBehaviour
     {
         [Header("蝶番")]
-        [Tooltip("回転軸の位置（ワールド）。扉の板の端に置く。")]
+        [Tooltip("回転軸の位置（ワールド）。扉の板の端に置く。\n"
+                 + "★Y は**扉の中心の高さ**にすること（扉は蝶番を中心に上下へ伸びる）。\n"
+                 + "  戸口が床から height まであるなら、蝶番の Y は height/2。\n"
+                 + "  部屋の高さの半分を入れると扉が浮き、下に隙間が残って音が漏れる。")]
         public Transform hinge;
 
-        [Tooltip("扉の幅(m)。蝶番から自由端まで。")]
+        [Tooltip("扉の幅(m)。蝶番から自由端まで。戸口の幅と一致させること。")]
         public float width = 1.0f;
 
         [Tooltip("扉の高さ(m)。戸口と同じにすること（低いと上に隙間が残る）。")]
