@@ -401,6 +401,77 @@ namespace AcousticFlow.EditorTools
                 "部屋のサイズは固定（廊下と接続しているため）。");
         }
 
+        // ── 完全対応：いま実装されている要素を全部載せる ──
+        // 個々の検証シーンは要素を切り分けるために何かを切っているが、これは逆に**全部入り**。
+        // 実際のゲームに近い条件で、要素どうしが噛み合っているかを聴くためのもの。
+        //
+        //   透過（材質・6帯域）／回折（1次・2次・メッシュ稜線）／早期反射／後期残響（実測IR）
+        //   ／HRTF（実測KEMAR）／メッシュ形状／実行時の形状変化（扉）／複数音源
+        //
+        // 構成: 大部屋 ─[メッシュの戸口＋スイングドア]─ 小部屋 ─[食い違いの2戸口]─ 奥の小部屋
+        //   ・大部屋にリスナー。小部屋と奥の部屋にそれぞれ音源
+        //   ・奥の音源へは戸口を2回抜ける必要がある＝2次回折
+        [MenuItem("AcousticFlow/Test Scenes/Full (全要素)")]
+        public static void FullScene()
+        {
+            var scene = NewScene();
+            var listener = MakeListener(new Vector3(0f, 1.6f, -8f));
+
+            const float t = 0.3f, h = 4f;
+            // 外周（閉じた箱）。X=[-10,10] / Z=[-14,14] / 高さ h。
+            const float hw = 10f, hd = 14f;
+            MakeBox("Floor",      new Vector3(0f, -t * 0.5f, 0f),    new Vector3(2 * hw, t, 2 * hd));
+            MakeBox("Ceiling",    new Vector3(0f, h + t * 0.5f, 0f), new Vector3(2 * hw, t, 2 * hd));
+            MakeBox("Wall_L",     new Vector3(-hw - t * 0.5f, h * 0.5f, 0f), new Vector3(t, h, 2 * hd));
+            MakeBox("Wall_R",     new Vector3(hw + t * 0.5f, h * 0.5f, 0f),  new Vector3(t, h, 2 * hd));
+            MakeBox("Wall_Back",  new Vector3(0f, h * 0.5f, -hd - t * 0.5f), new Vector3(2 * hw, h, t));
+            MakeBox("Wall_Front", new Vector3(0f, h * 0.5f, hd + t * 0.5f),  new Vector3(2 * hw, h, t));
+
+            // 仕切り1（Z=0）＝**メッシュ**の戸口つき壁。箱では表せない形をメッシュで扱えることの実証。
+            var wall = new GameObject("Partition1_Mesh");
+            var mf = wall.AddComponent<MeshFilter>();
+            mf.sharedMesh = BuildDoorwayWall(2 * hw, h, t, 1.2f, 2.4f);
+            wall.AddComponent<MeshRenderer>();
+            wall.AddComponent<MeshCollider>().sharedMesh = mf.sharedMesh;
+            Tint(wall.transform, new Color(0.72f, 0.74f, 0.8f));
+
+            // その戸口に**スイングドア**（実行時の形状変化）。5/6 キーで開閉。
+            var hinge = new GameObject("Door_Hinge").transform;
+            hinge.position = new Vector3(-0.6f, h * 0.5f, 0f);
+            var doorGo = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            doorGo.name = "Door";
+            var door = doorGo.AddComponent<SwingDoor>();
+            door.hinge = hinge;
+            door.width = 1.2f;
+            door.height = 2.4f;
+            door.thickness = 0.06f;
+            door.swingTowardPositiveZ = true;
+            door.angleDeg = 35f;          // 半開きから始める（開き具合の変化を聴きやすい）
+            door.Apply();
+            Tint(doorGo.transform, new Color(0.55f, 0.42f, 0.30f));
+
+            // 仕切り2（Z=+7）＝食い違いに置いた2戸口のうち奥側。1つ目とずらして 2次回折を作る。
+            //   Z=0 の戸口は X=[-0.6,0.6]、こちらは X=[4,5.5]。直線ではどちらも通らない。
+            MakeBox("Partition2_L", new Vector3(-3f, h * 0.5f, 7f), new Vector3(14f, h, t));
+            MakeBox("Partition2_R", new Vector3(7.75f, h * 0.5f, 7f), new Vector3(4.5f, h, t));
+
+            // 音源2つ。0=小部屋（戸口ごしに1次）／1=奥の部屋（2戸口ごしに2次）。
+            var srcNear = new Vector3(-2f, 1.6f, 3.5f);
+            var srcFar = new Vector3(4f, 1.6f, 11f);
+            var srcs = AddDemo(listener, srcNear, AcousticMaterialPreset.Default);
+            if (srcs.Length > 1) srcs[1].position = srcFar;
+            AddConvolver(srcNear, 0, name: "IrConvolver_Near");
+            AddConvolver(srcFar, 1, name: "IrConvolver_Far");
+
+            Save(scene, "Test_Full.unity",
+                "全要素: 透過/回折(1次・2次・メッシュ稜線)/早期反射/後期残響(実測IR)/HRTF(KEMAR)/" +
+                "メッシュ形状/実行時の形状変化/複数音源 を全部載せた総合シーン。" +
+                "大部屋 ─[メッシュの戸口＋スイングドア]─ 小部屋 ─[食い違いの戸口]─ 奥の部屋。" +
+                "音源0は戸口ごし(1次回折)、音源1は奥の部屋(2次回折)。" +
+                "5/6キーで扉を開閉すると、開き具合に応じて音源0の聞こえ方が連続的に変わる。" +
+                "W で戸口をくぐると部屋の響きが切り替わる。");
+        }
+
         // ── 共有ヘルパ ──
         private static UnityEngine.SceneManagement.Scene NewScene()
             => EditorSceneManager.NewScene(NewSceneSetup.DefaultGameObjects, NewSceneMode.Single);
@@ -469,10 +540,16 @@ namespace AcousticFlow.EditorTools
         }
 
         // IR畳み込みのテスト機。
-        //   音源は足音（過渡音）。持続音の楽曲より、早期反射のパターンや HRTF による
-        //   定位が聞き取りやすい（DEV_LOG E-3「テスト信号を目的で使い分ける」）。
-        //   楽曲で確かめたいとき（コムフィルタ・粒感）は TokyoGeto.wav に差し替える。
-        private const string kTestClipPath = "Assets/Audio/Footstep_Asphalt.mp3";
+        //   既定は楽曲（持続音）。こもり・コムフィルタ・粒感・残響の量が判断しやすい。
+        //   過渡音（足音）だと反射パターンや HRTF の定位は掴みやすいが、
+        //   音色の変化は分かりにくい（DEV_LOG E-3「テスト信号を目的で使い分ける」）。
+        //   定位や反射の粒を見たいときは Footstep_Asphalt.mp3 に差し替える。
+        //
+        //   ※この音源は市販楽曲。**ローカルでの検証用**であって、配布物には含められない。
+        //     ビルドを配る／リポジトリを公開する段になったら差し替えが要る。
+        private const string kTestClipPath =
+            "Assets/Audio/ロクデナシ「ブリザード」 Rokudenashi - Blizzard【Official Music Video】 - Rokudenashi (128k).wav";
+        private const string kTransientClipPath = "Assets/Audio/Footstep_Asphalt.mp3";
 
         // 音源 sourceIndex ぶんの畳み込み器。遅延も到来方向も遮蔽も音源ごとに違うので、
         // 鳴らしたい音源 1 つにつき 1 つ置く。clip を渡さなければ既定の足音を使う。
