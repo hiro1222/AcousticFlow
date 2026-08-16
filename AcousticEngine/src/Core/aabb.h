@@ -191,6 +191,37 @@ inline float segmentObbPenetration(const Vec3& p0, const Vec3& p1, const Obb& b)
     return (tmax - tmin) * length(p1 - p0);
 }
 
+// 線分が OBB の内部を通る「区間」を媒介変数 [outT0, outT1] (0..1) で返す。交差しなければ false。
+//   貫通長だけでは足りない場面がある。角を掠める正当な回折経路と、板を突き抜ける偽の経路は、
+//   貫通「量」が同じでも貫通「場所」が違う ── 前者は稜線のすぐ近く、後者は面の真ん中。
+//   区間の端が分かれば「稜線からどれだけ離れた所を貫いたか」で両者を分けられる。
+inline bool segmentObbPenetrationSpan(const Vec3& p0, const Vec3& p1, const Obb& b,
+                                      float& outT0, float& outT1) {
+    const Vec3 lp0 = obbToLocalPoint(p0, b), lp1 = obbToLocalPoint(p1, b);
+    const float dir[3] = { lp1.x - lp0.x, lp1.y - lp0.y, lp1.z - lp0.z };
+    const float org[3] = { lp0.x, lp0.y, lp0.z };
+    const float h[3] = { b.halfExtents.x, b.halfExtents.y, b.halfExtents.z };
+
+    float tmin = 0.0f, tmax = 1.0f;
+    const float kEps = 1e-8f;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (std::fabs(dir[axis]) < kEps) {
+            if (org[axis] < -h[axis] || org[axis] > h[axis]) return false;
+        } else {
+            const float ood = 1.0f / dir[axis];
+            float t1 = (-h[axis] - org[axis]) * ood;
+            float t2 = ( h[axis] - org[axis]) * ood;
+            if (t1 > t2) std::swap(t1, t2);
+            tmin = std::max(tmin, t1);
+            tmax = std::min(tmax, t2);
+            if (tmin > tmax) return false;
+        }
+    }
+    outT0 = tmin;
+    outT1 = tmax;
+    return tmax > tmin;
+}
+
 // レイと OBB の交差。ローカルでAABB判定し、出てきた法線を基底でワールドへ戻す。
 // dir は呼び出し側で正規化済みを前提（outT がそのまま距離になる）。
 inline bool rayIntersectsObb(const Vec3& origin, const Vec3& dir, const Obb& b,

@@ -313,6 +313,127 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneGetEchogramBands(IntPtr scene, [Out] float[] outBins, int numBins);
 
+        // ===== 音源レンダリング（段4: DSP の C++ 移行）=====
+        // これを使うと IR 畳み込み・HRTF・後期尾が全部エンジン側で回る。
+        // 既存の IrConvolver(C#) と並べて A/B できるよう、別系統として足してある。
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct AFVoiceConfig
+        {
+            public int sampleRate;
+            public int maxFrames;
+            public float tailSeconds;
+            public float tapCrossfadeMs;
+            public float hrtfCrossfadeMs;
+            public float hrtfCrossoverHz;
+            public int tailFirstBlock;
+            public int tailCapBlock;
+        }
+
+        // index 0 は必ず直接音にすること（HRTF はこれだけに掛かる）。
+        [StructLayout(LayoutKind.Sequential)]
+        public struct AFVoiceTap
+        {
+            public int delaySamples;
+            public float g0, g1, g2, g3, g4, g5;
+            public float panL, panR;
+            public float gSpec, gDiff;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct AFVoiceMetering
+        {
+            public float rmsDirect, rmsEarly, rmsScatter, rmsTail, rmsOut;
+        }
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern IntPtr AF_HrtfLoadFile(string path);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern IntPtr AF_HrtfCreateSynthetic(int sampleRate);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_HrtfDestroy(IntPtr hrtf);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_HrtfDirectionCount(IntPtr hrtf);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern IntPtr AF_VoiceCreate(ref AFVoiceConfig cfg);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceDestroy(IntPtr voice);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetTaps(IntPtr voice, [In] AFVoiceTap[] taps, int count);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceScatterSplit(float delayMs, float mixingTimeMs,
+            float scatterAmount, float timeGrowth, out float outSpec, out float outDiff);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetHrtf(IntPtr voice, IntPtr hrtf);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetHrtfEnabled(IntPtr voice, int enabled);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetDirection(IntPtr voice, AFVector3 dir, float headCm);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern float AF_VoiceRebuildTail(IntPtr voice,
+            [In] float[] echoBands, int binCount, float binMs, float startMs, float fadeMs,
+            float smoothMs, float smoothGrowth, float envAlpha,
+            float directGain, float targetRatio, [In] float[] earBandGain, int earBandGainLen);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetOutputGain(IntPtr voice, float gain);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetTailLevel(IntPtr voice, float level);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetScatterDiffusion(IntPtr voice, float g);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetTailEnvelope(IntPtr voice, float wet, float srcLevel);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_VoiceTailPartitions(IntPtr voice);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_VoiceTailLatency(IntPtr voice);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceRender(IntPtr voice, [In] float[] input, int frames,
+            [Out] float[] outL, [Out] float[] outR, ref AFVoiceMetering outMetering);
+
+        // 開口率（比較用。既定は samples=0 で無効）。扉は「ただの壁」として稜線探索に見せ、
+        // 開き具合は壁と扉の間にできる開口部の幾何がそのまま表す、というのが本筋。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetApertureOpen(
+            IntPtr scene, float refFrac, float power, float radius, int samples);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern float AF_SceneMeasureApertureOpenness(
+            IntPtr scene, AFVector3 listener, AFVector3 source);
+
+        // 開口率の**幅**を開く指数。形（1−cosθ のクレッシェンド）は物理から出ているが、
+        // 量が足りない（実測で扉の全掃引が 1.3dB）。形を保ったまま幅だけを開く演出用。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetApertureContrast(IntPtr scene, float p);
+
+        // 開口を通る成分を「透過の一部」として扱う。開口を素通りする音は
+        // 曲がりも壁抜けもしないので、前川の δ 減衰を払わせない。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetApertureIsTransmission(IntPtr scene, int on);
+
+        // インスタンスごとに材質を差し替える。壁はコンクリ、扉だけ木、のような使い方。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneSetInstanceMaterial(IntPtr scene, int instanceId,
+                                                             int materialId);
+
+        // ── ポータル（開口の矩形）──
+        // ホストは「ここが戸口」という矩形だけ置く。**開き具合は渡さない**。
+        // エンジンが毎フレーム実際の形状から測るので、扉が板で部分的に覆っていることも、
+        // 音源が戸口の正面にあるかどうかも、そのまま結果に出る。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneAddPortal(IntPtr scene, AFVector3 center,
+            AFVector3 axisU, AFVector3 axisV, float halfU, float halfV);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneUpdatePortal(IntPtr scene, int id, AFVector3 center,
+            AFVector3 axisU, AFVector3 axisV, float halfU, float halfV);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneMeasurePortal(IntPtr scene, int id,
+            AFVector3 listener, AFVector3 source, [Out] float[] outFrac6, out AFVector3 outPoint);
+
+        // 回折を BTM(有限楔の稜線積分)で出す。0=従来(前川＋開口積分) / 1=BTM。
+        // ※BTM はまだ検証途上（扉の掃引が反転する）。既定 OFF のまま使うこと。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetUseBtm(IntPtr scene, int on);
+
         // 反射経路トレース：origin→dir を鏡面反射で maxBounces 回追い、通過点を outPoints に書く。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneTraceReflectionPath(

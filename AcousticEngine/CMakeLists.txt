@@ -28,9 +28,11 @@ else()
 endif()
 
 # --- ソース構成 ---
+#   Dsp/     音の生成（FFT・畳み込み・HRTF・尾IR）。ヘッダオンリー
 set(ACOUSTIC_SOURCES
     src/Export/acoustic_api.cpp
     src/Export/scene_api.cpp
+    src/Export/voice_api.cpp
     src/Core/acoustic_world.cpp
     src/Core/material.cpp
     src/Core/source_directivity.cpp

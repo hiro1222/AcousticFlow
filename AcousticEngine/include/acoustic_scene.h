@@ -41,6 +41,23 @@ ACOUSTIC_API int AF_SceneAddMaterial(AF_SceneHandle scene,
                                      const float* scattering,
                                      int numBands);
 
+/* 既存の材質の中身を書き換える。成功で 1。引数の意味は AF_SceneAddMaterial と同じ。
+ * その材質を使っているインスタンスが**一斉に**変わる（「部屋をコンクリからガラスへ」）。
+ * 材質はクエリのたびにテーブルを引き直しているので、次のフレームから効く。
+ * BVH は形状だけなので再構築も起きない。 */
+ACOUSTIC_API int AF_SceneSetMaterial(AF_SceneHandle scene, int materialId,
+                                     const float* transmission,
+                                     const float* absorption,
+                                     const float* scattering,
+                                     int numBands);
+
+/* インスタンスの材質を付け替える。成功で 1。「この扉だけ木、この窓だけガラス」用。
+ * 材質を1つ共有していると、薄い扉と厚いコンクリ壁が同じ透過率になってしまう。 */
+ACOUSTIC_API int AF_SceneSetInstanceMaterial(AF_SceneHandle scene, int instanceId, int materialId);
+
+/* インスタンスの現在の materialId。範囲外は -1。 */
+ACOUSTIC_API int AF_SceneGetInstanceMaterial(AF_SceneHandle scene, int instanceId);
+
 /* ===== インスタンス（占有物） ===== */
 
 /* OBB インスタンスを追加し instanceId を返す。失敗時 -1。
@@ -223,6 +240,106 @@ ACOUSTIC_API void AF_SceneComputeEchogramBands(AF_SceneHandle scene,
                                                int numRays, int maxBounces,
                                                float distanceRef);
 
+/* 【開口の開き具合】回折の**音量**を決める。稜線探索は定位だけを担当する。
+ *
+ * 開口まわりに経路と垂直な円盤を張り、listener→点→source が通るサンプルの割合を数える。
+ * 閉まっていれば 0、開くにつれて連続に増える。扉が回っても戸口の枠は動かないので、
+ * 前川の式(δ)や「開口点まわりの差し渡し」では開き具合を捉えられなかった。
+ *
+ *   ref     : これだけ開いていれば素通しとみなす割合。既定 0.30。
+ *             円盤は戸口の周りの壁も含むので、全開の戸口でも 1 にはならない。
+ *   power   : カーブ。既定 1.0（割合に比例）。小さいほど開き始めで立ち上がる。
+ *   radius  : 断面を見る円盤の半径(m)。戸口を覆う大きさにする。既定 1.0。
+ *   samples : 円盤のサンプル数。既定 12。多いほど滑らかで重い。0 で無効化。 */
+ACOUSTIC_API void AF_SceneSetApertureOpen(AF_SceneHandle scene, float ref, float power,
+                                          float radius, int samples);
+ACOUSTIC_API void AF_SceneGetApertureOpen(AF_SceneHandle scene, float* outRef, float* outPower,
+                                          float* outRadius, int* outSamples);
+
+/* 【診断】フレネルゾーンのうちどれだけ開いているかを帯域別に返す（outFrac6 は6要素）。
+ * 戻り値 1 = 遮蔽物があって制限が掛かる / 0 = 遮るものが無く制限しない。 */
+ACOUSTIC_API int AF_SceneMeasureApertureFresnel(AF_SceneHandle scene, AF_Vector3 listener,
+                                                AF_Vector3 source, float* outFrac6);
+
+/* 【回折・帯域別】開口ごとに 6 帯域のゲインを返す（outBand6 は maxSrc*6 要素）。
+ * 隙間が狭いほど高域だけが通る＝**開くと音色が開く**。実測（現実の扉の開閉を収録）で
+ * 開−閉の差が 125Hz +2.6dB / 1kHz +10.3dB と、低域はほとんど変わらず中高域だけが
+ * 大きく増えることを確認した。低域は閉じていても壁を抜けるので増える余地が無く、
+ * 中高域は壁で止まっているぶん開いた分だけ丸ごと増える。 */
+ACOUSTIC_API int AF_SceneComputeDiffractionSourceBands(AF_SceneHandle scene,
+                                                       AF_Vector3 listener, AF_Vector3 source,
+                                                       AF_Vector3* outPos, float* outGain,
+                                                       float* outBand6, int maxSrc);
+
+/* 隙間のハイパスの傾き。1.0 = 6dB/oct。小さくすると音色の変化が穏やかになる。
+ * 実測に合わせる値ではなく、**聞かせたい音**に合わせて決めてよいチューニング値。 */
+/* ============================ ポータル（開口の矩形） ============================
+ * ホストが「ここが戸口」と矩形を置く。**開き具合は渡さない** ── エンジンが毎フレーム
+ * 実際の形状から測る。だから扉が板で部分的に覆っていることも、音源が戸口の正面に
+ * あるかどうかも、そのまま結果に出る（実測: 同じ扉角度で音源位置により 22.3dB と 2.9dB）。
+ *
+ * なぜ矩形を置くのか: 開口の測り方は「面のうちどこまで積分するか」に答えが無く、
+ * 4通り試して全部失敗した。ポータルはその答えそのもの（積分範囲＝この矩形）。
+ * エリアのトポロジはホスト、音響的な状態はエンジン、という役割分担。 */
+ACOUSTIC_API int AF_SceneAddPortal(AF_SceneHandle scene, AF_Vector3 center,
+                                   AF_Vector3 axisU, AF_Vector3 axisV,
+                                   float halfU, float halfV);
+ACOUSTIC_API void AF_SceneUpdatePortal(AF_SceneHandle scene, int id, AF_Vector3 center,
+                                       AF_Vector3 axisU, AF_Vector3 axisV,
+                                       float halfU, float halfV);
+
+/* ポータルがどれだけ開いているかを帯域別に測る。
+ *   outFrac6 : 帯域ごとに通る割合(0..1)。完全に塞がれれば 0、素通しなら 1。
+ *   outPoint : 開いている部分の重み付き重心（定位に使う）。
+ *              エネルギーと方向が同じ積分から出るので、両者がずれて飛ばない。 */
+ACOUSTIC_API int AF_SceneMeasurePortal(AF_SceneHandle scene, int id,
+                                       AF_Vector3 listener, AF_Vector3 source,
+                                       float* outFrac6, AF_Vector3* outPoint);
+
+/* 開口を「透過の一部」として扱う。0=従来（前川×開口率） / 1=合成透過率の f の項。既定 0。
+ * ON では開口タップが前川の δ 減衰を払わず f をそのまま持つ（δ の効果は f の重みに既に入って
+ * いるので、掛けると二重になる）。開口を通る成分は開口の方向から届くので、直接音ではなく
+ * 開口のタップへ入る＝定位は壊れない。 */
+ACOUSTIC_API void AF_SceneSetApertureIsTransmission(AF_SceneHandle scene, int on);
+
+/* ★試して却下した案の記録: 稜線探索で見つけた開口を「開口率最大のポータル」として
+ *   評価する（ゲイン = 開口の広さだけ。前川の δ も開口積分も掛けない）。
+ *   隣室へ歩く境界の段差は 5.6dB → 2.7dB と良くなったが、**衝立で破綻した** ──
+ *   幅の法則は「壁に空いた穴」の量で、有限の遮蔽物には定義されない。
+ *   実測で影の中の回折が全部 0.000 になり、回帰が 2/151 FAIL。
+ *   前川の δ は穴でも衝立でも定義されるので、そちらを土台に残すのが正しい。 */
+
+/* 開口率の**幅**を開く指数（コントラスト）。1.0=素通し（既定）。大きいほど開閉の差が開く。
+ * 開口率の形（1−cosθ のクレッシェンド、高域ほど大きく開く）は物理から出ているが、
+ * 量が足りない（実測で扉の全掃引が 1.3dB）。形を保ったまま幅だけを開くための演出用。
+ * 開口という一般の量への写像なので、扉を特別視しない。 */
+ACOUSTIC_API void AF_SceneSetApertureContrast(AF_SceneHandle scene, float p);
+
+/* BTM（有限楔の稜線積分）で回折の帯域ゲインを出す。0=従来（前川＋開口積分） / 1=BTM。既定 0。
+ * ON では前川の δ 減衰も開口率も使わない（まとめて置き換わる。両方掛けると二重になる）。 */
+ACOUSTIC_API void AF_SceneSetUseBtm(AF_SceneHandle scene, int on);
+
+/* 開口の積分で δ（遠回り）をどれだけ効かせるか。1=そのまま / 0=効かせない。既定 1。
+ * δ 減衰は前川の式として回折タップに既に掛かっているので、ここでも掛けると二重になる。
+ * 切り分けの実測用。 */
+ACOUSTIC_API void AF_SceneSetApertureDeltaWeight(AF_SceneHandle scene, float w);
+
+ACOUSTIC_API void AF_SceneSetSlitBandSlope(AF_SceneHandle scene, float slope);
+
+/* 【開口を面として鳴らす】開口を何点の二次音源に散らすか（1=点／2〜3=面）。既定 1。
+ * 点1つだと戸口がピンポイントに聞こえて「直線的」になる。開口の広がりに沿って散らすと、
+ * 点ごとに経路長と方向が違うので遅延とパンがばらけ、戸口サイズの面として聞こえる
+ * （ホイヘンスの原理）。定位は全点が同じ開口の上にあるので失われない。 */
+ACOUSTIC_API void AF_SceneSetApertureSpread(AF_SceneHandle scene, int points);
+ACOUSTIC_API int AF_SceneGetApertureSpread(AF_SceneHandle scene);
+
+/* 【診断】最有力の回折経路における実測の隙間幅(m)。回折の音量はこれで決まる。 */
+ACOUSTIC_API float AF_SceneMeasureSlitWidth(AF_SceneHandle scene, AF_Vector3 listener, AF_Vector3 source);
+
+/* 開口率(0..1)をそのまま測る（比較用。既定は無効）。 */
+ACOUSTIC_API float AF_SceneMeasureApertureOpenness(AF_SceneHandle scene, AF_Vector3 listener,
+                                                   AF_Vector3 source);
+
 /* 【ソフト遮蔽】直接経路の透過(振幅・6帯域)と「どれだけ遮られているか(0..1)」を別々に返す。
  * outTrans(6要素以上) と outOccFrac(null可)。書き込んだ帯域数を返す。
  *
@@ -235,6 +352,12 @@ ACOUSTIC_API int AF_SceneComputeSoftOcclusion(AF_SceneHandle scene,
                                               AF_Vector3 listener, AF_Vector3 source,
                                               float* outTrans, int count,
                                               float* outOccFrac);
+
+/* 【診断】どこから最も多く漏れているか（透過で重み付けた遮蔽面上の重心）。
+ * 壁より弱い扉があればそちらへ寄る。定位をここへ向けると「扉から漏れて聞こえる」になる。 */
+ACOUSTIC_API void AF_SceneMeasureLeakPoint(AF_SceneHandle scene,
+                                           AF_Vector3 listener, AF_Vector3 source,
+                                           AF_Vector3* outPoint);
 
 /* 【回折・キルヒホッフ版】開口の「大きさ」を実測してフレネル・キルヒホッフの解析解に渡す。
  * outGains(6要素以上) に帯域別ゲイン、outAperture に開口中心、outPathLength に実経路長。

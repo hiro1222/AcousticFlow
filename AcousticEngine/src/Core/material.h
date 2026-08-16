@@ -35,6 +35,7 @@ struct AcousticMaterial {
     static AcousticMaterial defaultWall();  // 一般的な内壁（石膏ボード相当）
     static AcousticMaterial concrete();     // コンクリート（よく遮る）
     static AcousticMaterial glass();        // ガラス（やや抜ける）
+    static AcousticMaterial woodDoor();     // 木の扉（壁より弱い＝部屋の弱点）
     // 完全不透過（検証用）。透過を 0 にすると「回り込んだ音だけ」が残るので、
     // 回折の定位と減衰を単体で確かめられる。現実の材質ではない。
     static AcousticMaterial opaque();

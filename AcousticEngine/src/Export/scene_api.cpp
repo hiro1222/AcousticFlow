@@ -72,12 +72,83 @@ int AF_SceneAddMaterial(AF_SceneHandle scene,
     return s->addMaterial(makeMaterial(transmission, absorption, scattering, numBands));
 }
 
+int AF_SceneSetMaterial(AF_SceneHandle scene, int materialId,
+                        const float* transmission, const float* absorption,
+                        const float* scattering, int numBands) {
+    Scene* s = asScene(scene);
+    if (!s) return 0;
+    return s->setMaterial(materialId,
+                          makeMaterial(transmission, absorption, scattering, numBands)) ? 1 : 0;
+}
+
+int AF_SceneSetInstanceMaterial(AF_SceneHandle scene, int instanceId, int materialId) {
+    Scene* s = asScene(scene);
+    if (!s) return 0;
+    return s->setInstanceMaterial(instanceId, materialId) ? 1 : 0;
+}
+
+int AF_SceneGetInstanceMaterial(AF_SceneHandle scene, int instanceId) {
+    Scene* s = asScene(scene);
+    return s ? s->instanceMaterial(instanceId) : -1;
+}
+
 int AF_SceneAddInstanceBox(AF_SceneHandle scene,
                            AF_Vector3 center, AF_Vector3 halfExtents,
                            AF_Vector3 right, AF_Vector3 up, int materialId) {
     Scene* s = asScene(scene);
     if (!s) return -1;
     return s->addInstance(makeObb(center, halfExtents, right, up), materialId);
+}
+
+void AF_SceneSetApertureOpen(AF_SceneHandle scene, float ref, float power,
+                             float radius, int samples) {
+    Scene* s = asScene(scene);
+    if (!s) return;
+    s->setApertureOpenRef(ref);
+    s->setApertureOpenPower(power);
+    s->setApertureOpenRadius(radius);
+    s->setApertureOpenSamples(samples);
+}
+
+void AF_SceneGetApertureOpen(AF_SceneHandle scene, float* outRef, float* outPower,
+                             float* outRadius, int* outSamples) {
+    Scene* s = asScene(scene);
+    if (outRef)     *outRef     = s ? s->apertureOpenRef() : 0.0f;
+    if (outPower)   *outPower   = s ? s->apertureOpenPower() : 0.0f;
+    if (outRadius)  *outRadius  = s ? s->apertureOpenRadius() : 0.0f;
+    if (outSamples) *outSamples = s ? s->apertureOpenSamples() : 0;
+}
+
+float AF_SceneMeasureSlitWidth(AF_SceneHandle scene, AF_Vector3 listener, AF_Vector3 source) {
+    Scene* s = asScene(scene);
+    if (!s) return 0.0f;
+    const Vec3 l = toVec3(listener), src = toVec3(source);
+    Scene::DiffractionPath paths[4];
+    const int np = s->findDiffractionPaths(l, src, paths, 4);
+    if (np <= 0) return 0.0f;
+    return paths[0].slitWidth;
+}
+
+float AF_SceneMeasureApertureOpenness(AF_SceneHandle scene, AF_Vector3 listener,
+                                      AF_Vector3 source) {
+    Scene* s = asScene(scene);
+    if (!s) return 0.0f;
+    // 最有力の開口での開口率を返す。開口点はホストからは取れない（二次音源が返すのは
+    // 定位用に投影し直した位置）ので、ここで探索してから測る。
+    const Vec3 l = toVec3(listener), src = toVec3(source);
+    Scene::DiffractionPath paths[4];
+    const int np = s->findDiffractionPaths(l, src, paths, 4);
+    if (np <= 0) return 0.0f;
+    return s->apertureOpenness(l, src, paths[0].aperture);
+}
+
+void AF_SceneMeasureLeakPoint(AF_SceneHandle scene, AF_Vector3 listener,
+                              AF_Vector3 source, AF_Vector3* outPoint) {
+    Scene* s = asScene(scene);
+    if (!s || !outPoint) return;
+    float t[kNumBands]; float frac = 0.0f; Vec3 p = toVec3(source);
+    s->computeSoftOcclusion(toVec3(listener), toVec3(source), t, frac, 32, 0.9f, &p);
+    *outPoint = fromVec3(p);
 }
 
 int AF_SceneComputeSoftOcclusion(AF_SceneHandle scene,
@@ -478,3 +549,90 @@ int AF_SceneGetEchogramBands(AF_SceneHandle scene, float* outBins, int numBins) 
 }
 
 }  // extern "C"
+
+void AF_SceneSetApertureSpread(AF_SceneHandle scene, int points) {
+    Scene* s = asScene(scene);
+    if (s) s->setApertureSpread(points);
+}
+
+int AF_SceneGetApertureSpread(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    return s ? s->apertureSpread() : 0;
+}
+
+int AF_SceneComputeDiffractionSourceBands(AF_SceneHandle scene,
+                                          AF_Vector3 listener, AF_Vector3 source,
+                                          AF_Vector3* outPos, float* outGain,
+                                          float* outBand6, int maxSrc) {
+    Scene* s = asScene(scene);
+    if (!s || !outPos || !outGain || maxSrc <= 0) return 0;
+    std::vector<Vec3> pos(static_cast<size_t>(maxSrc));
+    const int n = s->computeDiffractionSourceBands(toVec3(listener), toVec3(source),
+                                                   pos.data(), outGain, outBand6, maxSrc);
+    for (int i = 0; i < n; ++i) outPos[i] = fromVec3(pos[static_cast<size_t>(i)]);
+    return n;
+}
+
+int AF_SceneAddPortal(AF_SceneHandle scene, AF_Vector3 center,
+                      AF_Vector3 axisU, AF_Vector3 axisV, float halfU, float halfV) {
+    Scene* s = asScene(scene);
+    if (!s) return -1;
+    return s->addPortal(toVec3(center), toVec3(axisU), toVec3(axisV), halfU, halfV);
+}
+
+void AF_SceneUpdatePortal(AF_SceneHandle scene, int id, AF_Vector3 center,
+                          AF_Vector3 axisU, AF_Vector3 axisV, float halfU, float halfV) {
+    Scene* s = asScene(scene);
+    if (s) s->updatePortal(id, toVec3(center), toVec3(axisU), toVec3(axisV), halfU, halfV);
+}
+
+int AF_SceneMeasurePortal(AF_SceneHandle scene, int id,
+                          AF_Vector3 listener, AF_Vector3 source,
+                          float* outFrac6, AF_Vector3* outPoint) {
+    Scene* s = asScene(scene);
+    if (!s || !outFrac6 || id < 0 || id >= s->portalCount()) return 0;
+    Vec3 p(0, 0, 0);
+    const bool ok = s->portalOpenBands(s->portal(id), toVec3(listener), toVec3(source),
+                                       outFrac6, &p);
+    if (outPoint) *outPoint = fromVec3(p);
+    return ok ? 1 : 0;
+}
+
+void AF_SceneSetApertureIsTransmission(AF_SceneHandle scene, int on) {
+    Scene* s = asScene(scene);
+    if (s) s->setApertureIsTransmission(on);
+}
+
+void AF_SceneSetApertureContrast(AF_SceneHandle scene, float p) {
+    Scene* s = asScene(scene);
+    if (s) s->setApertureContrast(p);
+}
+
+void AF_SceneSetUseBtm(AF_SceneHandle scene, int on) {
+    Scene* s = asScene(scene);
+    if (s) s->setUseBtm(on);
+}
+
+void AF_SceneSetApertureDeltaWeight(AF_SceneHandle scene, float w) {
+    Scene* s = asScene(scene);
+    if (s) s->setApertureDeltaWeight(w);
+}
+
+void AF_SceneSetSlitBandSlope(AF_SceneHandle scene, float slope) {
+    Scene* s = asScene(scene);
+    if (s) s->setSlitBandSlope(slope);
+}
+
+int AF_SceneMeasureApertureFresnel(AF_SceneHandle scene, AF_Vector3 listener,
+                                   AF_Vector3 source, float* outFrac6) {
+    Scene* s = asScene(scene);
+    if (!s || !outFrac6) return 0;
+    const Vec3 L = toVec3(listener), S = toVec3(source);
+    float f[kNumBands];
+    // エンジン本体と同じ条件で測る（窓の中心＝直線と平面の交点）。
+    //   ここで開口点を渡す実験もしたが、開口点は跳ぶので窓ごと飛んで値が乱高下した。
+    //   窓は測定の基準ではなく積分の範囲、という設計に合わせて渡さない。
+    const bool ok = s->apertureFresnelBands(L, S, f);
+    for (int b = 0; b < kNumBands; ++b) outFrac6[b] = f[b];
+    return ok ? 1 : 0;
+}

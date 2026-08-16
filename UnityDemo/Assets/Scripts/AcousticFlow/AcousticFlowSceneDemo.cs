@@ -96,6 +96,75 @@ namespace AcousticFlow
                  + "OFF: 前川の式による6帯域減衰を掛ける（物理寄り）。A/B比較用。")]
         public bool diffractionDistanceOnly = true;
 
+        [Tooltip("回折タップだけの距離減衰の基準距離(m)。0 で『遮蔽チューニング → Distance Ref』と同じ。\n\n"
+                 + "diffractionDistanceOnly が ON のとき、回折が持つ情報は『開口の方向』と\n"
+                 + "『開口までの総経路長』だけになる。つまり**この距離減衰が回折の性格そのもの**。\n"
+                 + "直接音と別に調整できるようにしてある。\n\n"
+                 + "大きくすると近くで頭打ちになる区間が伸びる＝回り込みが近距離で大きく聞こえる。")]
+        [Range(0f, 12f)] public float diffractionDistanceRef = 0f;
+
+        [Tooltip("回折タップの距離減衰の急峻さ。1 = 物理どおりの 1/r。\n\n"
+                 + "  1 より小さい … 遠くでも落ちにくい（壁の向こうの気配を残したいとき）\n"
+                 + "  1 より大きい … 早く落ちる（回り込みを近距離だけの現象にしたいとき）\n"
+                 + "  0            … 距離で減衰しない\n\n"
+                 + "基準距離より近い側は 1 で頭打ちなので、ここを動かしても変わらない。\n"
+                 + "効くのは基準距離より遠い側だけ。")]
+        [Range(0f, 2.5f)] public float diffractionDistancePower = 1f;
+
+        [Header("タップの平滑化（歩いたときの段差を潰す）")]
+        [Tooltip("遮蔽割合と透過の帯域ゲインを、この時定数(秒)で追従させる。0 で無効。\n\n"
+                 + "幾何は連続でも、歩けば値は動く。実測で、戸口の影境界を跨ぐ 0.5m の間に\n"
+                 + "合計レベルが 5.9dB 動く（Unity の設定・物理の基準もほぼ同じ量なので\n"
+                 + "**幾何が悪いのではない**）。既存のゲーム音響が例外なく持っている平滑化を\n"
+                 + "ここでも掛けて、段差を段差として鳴らさないようにする。\n\n"
+                 + "対数（dB）で補間する。振幅で補間すると立ち上がりだけ速く聞こえるため。\n"
+                 + "大きくすると滑らかになるが、扉が開いた瞬間の反応が鈍る。")]
+        [Range(0f, 0.5f)] public float tapSmoothTime = 0.08f;
+
+        [Header("聞こえ方の調整（LPF は透過音が主役）")]
+        [Tooltip("壁を抜けてくる透過音の『こもり』の強さ。材質の6帯域カーブの**形はそのまま**に、\n"
+                 + "125Hz を基準にして傾きだけを強める／弱める。\n\n"
+                 + "  1   … 材質そのまま\n"
+                 + "  >1  … 高域がさらに落ちる（こもる）\n"
+                 + "  <1  … 平らに近づく（抜ける）\n\n"
+                 + "回折タップは平坦のままなので、こもりの担当はここに集まる。\n"
+                 + "『どこから聞こえるか』は回折、『壁の向こう感』は透過、と役割を分ける設計。")]
+        [Range(0.2f, 3f)] public float transmissionTilt = 1f;
+
+        [Tooltip("透過音のレベル(dB)。**『隣の部屋に移っただけで変わりすぎ』を下げる主役はここ。**\n\n"
+                 + "実測: 戸口を抜ける往復で合計レベルが 16.2dB 動く（物理の基準も約15dB なので\n"
+                 + "幾何は正しい）。平滑化は歩く速さの変化には効かない ── 0.5m 歩くのに 0.33秒\n"
+                 + "かかるので、0.08秒の時定数では追いついてしまうため。\n\n"
+                 + "ここを上げると壁の向こうの音が持ち上がり、部屋を移ったときの落差が縮む。\n"
+                 + "『壁の向こう感』は音量ではなく LPF（上の2つ）が担う、という役割分担にできる。\n"
+                 + "材質どうしの差（コンクリ vs 木の扉）は一律に上がるだけなので保たれる。")]
+        [Range(-24f, 24f)] public float transmissionGainDb = 0f;
+
+        [Tooltip("回折タップのレベル(dB)。**『隣の部屋に移っただけで変わりすぎ』に一番効くのはここ。**\n\n"
+                 + "遮蔽中に鳴っているのは透過音ではなく回折音の方（実測: 透過 -56dB に対し\n"
+                 + "回折 -22dB）。だから透過ゲインをいくら上げても合計はほとんど動かない\n"
+                 + "（+24dB で振れ幅 16.1→14.0dB だけ）。ここを上げると遮蔽側が持ち上がり、\n"
+                 + "戸口を跨ぐ落差がそのまま縮む。\n\n"
+                 + "回折タップは平坦なので、上げても『こもり』は増えない ── 音量差を詰めつつ\n"
+                 + "壁の向こう感は透過音の LPF が担う、という役割分担にできる。\n\n"
+                 + "実測（戸口を跨ぐ往復の振れ幅／最大隣接差）:\n"
+                 + "   +0dB  16.2dB / 5.8dB      +12dB   5.1dB / 4.9dB\n"
+                 + "   +6dB  10.2dB / 2.9dB ←既定 +18dB  10.1dB / 9.7dB\n"
+                 + "上げすぎると遮蔽側が見通し側より明るくなって逆に段差が増える。\n"
+                 + "0 にすれば従来どおり。")]
+        [Range(-24f, 24f)] public float diffractionGainDb = 6f;
+
+        [Tooltip("透過音に足すローパスの量(dB)。125Hz で 0dB、4kHz でこの値ぶん落とす\n"
+                 + "（間の帯域は対数周波数で線形に配分）。材質に依らず一律に効くので、\n"
+                 + "『材質はこのままで、もう少しこもらせたい』というときはこちら。")]
+        [Range(0f, 24f)] public float transmissionHighCutDb = 0f;
+
+        [Tooltip("回折タップに足すローパスの量(dB)。既定 0（＝平坦）。\n\n"
+                 + "diffractionDistanceOnly の方針では回折は平坦のままが筋（定位の手がかりを\n"
+                 + "削らないため）。それでも少し丸めたいときのための逃げ道として置いてある。\n"
+                 + "上げすぎると『どこから来ているか』が分からなくなる。")]
+        [Range(0f, 24f)] public float diffractionHighCutDb = 0f;
+
         [Header("後期残響の方向づけ（方向プローブ）※既定オフ・下記参照")]
         [Tooltip("リスナー位置から全方向へレイを撒き、『どちらから残響が返るか』を測って"
                  + "尾の左右バランスに反映する。\n\n"
@@ -168,6 +237,54 @@ namespace AcousticFlow
         [Tooltip("二次音源の位置(方向)の平滑時間(秒)。エッジ切替時の飛びを抑える。")]
         [Range(0.02f, 0.5f)] public float diffractionPosSmoothTime = 0.1f;
 
+        [Header("材質")]
+        [Tooltip("ON: シーン中の AcousticSurface が指す材質を毎フレーム送り直す。\n"
+                 + "Play 中に扉の材質を切り替えて聞き比べたいときに使う（毎フレーム材質表を\n"
+                 + "引き直すので少し重い。詰め終わったら OFF）。\n\n"
+                 + "材質の 125Hz/4kHz の遮音量:\n"
+                 + "  Concrete 26/54dB ・ Default 25/46 ・ Glass 20/35 ・ WoodDoor 15/27")]
+        public bool liveMaterialUpdate = false;
+
+        [Header("開口の扱い")]
+        [Tooltip("ON: 開口を通る成分を『透過の一部』として扱う（合成透過率 τ=τ壁(1−f)+f の f の項）。\n\n"
+                 + "開口をまっすぐ通る音は、曲がりもせず壁も抜けないので**何も払わない**。\n"
+                 + "これを回折の一部として前川の δ 減衰を払わせていたのが、扉の効きを潰していた本体。\n"
+                 + "実測: 音源が戸口に正対する配置で 開−閉 が 3.0dB → 22.3dB。\n"
+                 + "開口を通る成分は開口の方向から届くので、直接音ではなく開口のタップへ入る\n"
+                 + "＝定位は壊れない。")]
+        public bool apertureIsTransmission = true;
+
+        [Header("開口のコントラスト")]
+        [Tooltip("開口率の**幅**を開く指数。1.0=素通し（物理そのまま）。\n\n"
+                 + "開き具合の**形**は物理から出ている（隙間が 1−cosθ で増えるクレッシェンド、\n"
+                 + "高域ほど大きく開く）。ただし**量**が足りず、実測で扉の全掃引が 1.3dB しかない。\n"
+                 + "現実の合成透過率は同条件で 125Hz が 11dB、4kHz が 26dB 動く。\n\n"
+                 + "ここは形を保ったまま幅だけを開く演出用のつまみ。\n"
+                 + "『実測は参照であって目標ではない』の適用先。4 前後から試す。\n"
+                 + "開口という一般の量への写像なので、扉を特別視しない。")]
+        [Range(1f, 12f)] public float apertureContrast = 4f;
+
+        [Tooltip("回折を BTM（有限楔の稜線積分）で出す。\n\n"
+                 + "★検証途上。BTM 単体は性質チェック 7 件中 6 件を通っている\n"
+                 + "（相反性は誤差ゼロ、深い影で前川と 1.1倍一致、影境界で総和が連続）が、\n"
+                 + "シーンへ繋ぐと扉の掃引が反転する。渡している稜線集合の側の問題。\n"
+                 + "解決するまで OFF のまま。")]
+        public bool useBtmDiffraction = false;
+
+        [Header("DSP 経路 (段4)")]
+        [Tooltip("ON: 畳み込み・HRTF・後期尾を **C++ エンジン側**(VoiceConvolver)で回す。\n"
+                 + "OFF: **Unity C# 側**(IrConvolver)で回す。Y キー切替。\n\n"
+                 + "同じタップ束(SourceTaps.BandGain)を食わせているので、両者は同じ音が出るはず。\n"
+                 + "つまり聞こえ方の調整（透過/回折のゲインと LPF、平滑化）はどちらでも同じに効く。\n\n"
+                 + "★**既定は ON（C++ 経路）**。エンジンが本体で、C# 側は比較用という位置づけ。\n"
+                 + "  以前は『C++ 経路が耳で未検証』を理由に OFF を既定にしていたが、\n"
+                 + "  残響が減って聞こえる件（直接音の二重計上）を直して確認済みなので入れ替えた。\n"
+                 + "  比較したいときだけ Y で C# 側へ落とす。\n"
+                 + "  なお扉のタップ補間は C++ 側にしか無いので、\n"
+                 + "  『開けた瞬間ガタっと変わる』の確認は ON 側でしかできない。\n"
+                 + "  VoiceConvolver が載っていない古いシーンでは自動で C# 側に落ちて警告が出る。")]
+        public bool useCppDsp = true;
+
         [Header("可視化")]
         [Tooltip("ON: 反響経路（リスナーから撒いた反射レイの跳ね返り）を線で表示。R キー切替。" +
                  "※Game ビューでは上部の Gizmos ボタンを ON にすると見える。")]
@@ -229,6 +346,9 @@ namespace AcousticFlow
 
         private AcousticScene _scene;
         private int _materialId;
+        // プリセット→materialId。同じ材質の壁が何枚あってもテーブルは1つで済ませる。
+        private readonly System.Collections.Generic.Dictionary<int, int> _materialIdByPreset
+            = new System.Collections.Generic.Dictionary<int, int>();
         // occluder は箱かメッシュ。geomId < 0 が箱で、その場合 local* は使わない。
         //   メッシュはローカルAABBが単位箱になるよう正規化されて登録されるので、
         //   ホスト側は「そのローカルAABB＋Transform」から毎フレーム OBB を組み直す。
@@ -241,6 +361,9 @@ namespace AcousticFlow
             public Vector3 localHalf;     // メッシュのみ
         }
         private readonly List<Occluder> _occluders = new List<Occluder>();
+        private readonly List<AcousticPortal> _portals = new List<AcousticPortal>();
+        private SwingDoor[] _swingDoors;   // HUD に開き角を出すため（初回に一度だけ探す）
+        private readonly float[] _portalFrac = new float[AcousticEngine.NumBands];
         // 同じ Mesh アセットは 1 回だけアップロードする（形状は共有し、配置だけ増やす）。
         private readonly Dictionary<int, int> _meshGeomCache = new Dictionary<int, int>();
         private readonly Dictionary<int, Vector3> _meshLocalCenter = new Dictionary<int, Vector3>();
@@ -274,6 +397,13 @@ namespace AcousticFlow
         private float[] _softTrans;
         // 副音源(1以降)の透過/回折を引くための一時バッファ（主音源は _bands/_diffBands を流用）。
         private float[] _srcTransmit, _srcDiffract;
+        // タップ経路の平滑化。音源ごとに「遮蔽割合」と「透過の6帯域」を持ち越す。
+        //   既存の平滑化(_diffLevel など)は Wwise エミッタ経路のもので、
+        //   タップ(DSP)経路には掛かっていなかった。
+        private float[] _tapOccSm;          // 音源ごと
+        private float[] _tapTransSm;        // 音源ごと × 6帯域
+        private bool[]  _tapSmInit;         // 初回はスナップする（無音から立ち上げない）
+        private float   _diffGainLin = 1f;  // diffractionGainDb の線形値（毎フレーム更新）
 
         // ── 方向プローブ（後期残響の方向分布）──
         private Vector3[] _probeDirs;        // 球面上の等分布方向（ワールド固定）
@@ -316,6 +446,9 @@ namespace AcousticFlow
         public static float[] LatestEchogram { get; private set; }
         public static int EchogramBins { get; private set; }
         public static float EchogramBinMs { get; private set; }
+        /// エンジンの Scene。VoiceConvolver（C++ 側 DSP）がエコグラムを取りに来る。
+        /// 1シーンに1つの想定。破棄時に null へ戻す。
+        public static AcousticScene SharedScene { get; private set; }
         public static float[] LatestBandGains { get; private set; }  // 主音源の帯域別生存
         public static float[] OutHistoryL { get; private set; }
         public static float[] OutHistoryR { get; private set; }
@@ -461,6 +594,7 @@ namespace AcousticFlow
             if (listener == null && Camera.main != null) listener = Camera.main.transform;
 
             _scene = new AcousticScene();
+            SharedScene = _scene;   // VoiceConvolver がエコグラムを取りに来る
             if (!_scene.IsValid)
             {
                 _status = "Scene 生成失敗（DLL を確認）";
@@ -480,6 +614,7 @@ namespace AcousticFlow
             _materialId = _scene.AddMaterial(AcousticMaterial.FromPreset(occluderMaterial));
             CollectOccluders();
             RegisterInstances();
+            CollectPortals();
             SetupCamera();
             if (enableAudio) SetupAudio();
 
@@ -499,6 +634,9 @@ namespace AcousticFlow
 
             int n = Mathf.Max(1, _sources.Length);
             _srcPos = new Vector3[n];
+            _tapOccSm = new float[n];
+            _tapTransSm = new float[n * AcousticEngine.NumBands];
+            _tapSmInit = new bool[n];
             _occSmoothed = new float[n];
             _eqDbSmoothed = new float[n * 3];
             _srcSurvival = new float[n];
@@ -596,6 +734,37 @@ namespace AcousticFlow
             return c;
         }
 
+        // シーンに置かれた AcousticPortal を集めてエンジンへ登録する。
+        //   ホストが持つのは**トポロジだけ**（ここが開口である、という事実）。
+        //   開き具合は渡さない ── エンジンが毎フレーム実形状から測る。
+        private void CollectPortals()
+        {
+            _portals.Clear();
+            var found = FindObjectsByType<AcousticPortal>(
+                FindObjectsInactive.Include, FindObjectsSortMode.None);
+            foreach (var p in found)
+            {
+                if (p == null || !p.active) continue;
+                p.engineId = _scene.AddPortal(p.transform.position, p.AxisU, p.AxisV,
+                                              p.HalfU, p.HalfV);
+                if (p.engineId >= 0) _portals.Add(p);
+            }
+            if (_portals.Count > 0)
+                Debug.Log($"[AcousticFlowScene] ポータル {_portals.Count} 個を登録しました。");
+        }
+
+        // 扉ごと動く戸口もあるので、配置は毎フレーム送り直す（安い）。
+        private void UpdatePortals()
+        {
+            for (int i = 0; i < _portals.Count; i++)
+            {
+                var p = _portals[i];
+                if (p == null || p.engineId < 0) continue;
+                _scene.UpdatePortal(p.engineId, p.transform.position, p.AxisU, p.AxisV,
+                                    p.HalfU, p.HalfV);
+            }
+        }
+
         private void CollectOccluders()
         {
             _occluders.Clear();
@@ -638,11 +807,30 @@ namespace AcousticFlow
             return false;
         }
 
+        // このオクルーダーの材質 ID を解決する（段5: 材質の個別化）。
+        //   優先順位は AcousticSurface（明示）> グローバル既定。
+        //   材質は「見た目」からは決まらないので、必要な面にだけ AcousticSurface を付ける。
+        //   プリセットごとに1つだけ登録して使い回す（同じ材質の壁が何枚あってもテーブルは増えない）。
+        private int ResolveMaterialId(Occluder o)
+        {
+            if (o.col == null) return _materialId;
+            var surf = o.col.GetComponent<AcousticSurface>();
+            if (surf == null) surf = o.col.GetComponentInParent<AcousticSurface>();
+            if (surf == null) return _materialId;
+
+            int key = (int)surf.material;
+            if (_materialIdByPreset.TryGetValue(key, out int id)) return id;
+            id = _scene.AddMaterial(surf.Resolve());
+            _materialIdByPreset[key] = id;
+            return id;
+        }
+
         private void RegisterInstances()
         {
             _meshGeomCache.Clear();
             _meshLocalCenter.Clear();
             _meshLocalHalf.Clear();
+            _materialIdByPreset.Clear();
 
             for (int i = 0; i < _occluders.Count; i++)
             {
@@ -665,7 +853,7 @@ namespace AcousticFlow
                         o.localCenter = _meshLocalCenter[key];
                         o.localHalf = _meshLocalHalf[key];
                         GetObb(o, out Vector3 c, out Vector3 half, out Vector3 r, out Vector3 u);
-                        o.instanceId = _scene.AddInstanceMesh(geom, c, half, r, u, _materialId);
+                        o.instanceId = _scene.AddInstanceMesh(geom, c, half, r, u, ResolveMaterialId(o));
                         _occluders[i] = o;
                         continue;
                     }
@@ -673,7 +861,7 @@ namespace AcousticFlow
                 }
 
                 GetObb(o, out Vector3 bc, out Vector3 bhalf, out Vector3 br, out Vector3 bu);
-                o.instanceId = _scene.AddInstanceBox(bc, bhalf, br, bu, _materialId);
+                o.instanceId = _scene.AddInstanceBox(bc, bhalf, br, bu, ResolveMaterialId(o));
                 _occluders[i] = o;
             }
         }
@@ -830,6 +1018,7 @@ namespace AcousticFlow
             if (_audioReady && enableDiffractionSources) SetupDiffractionEmitters();
 
             ApplySpatializationState();  // HRTF/パンニングを反映
+            SetDspPath(useCppDsp);       // 片方の畳み込み器だけを有効にする
         }
 
         // 回折二次音源のエミッタを登録し、各音源と同じイベントを同フレームで再生（初期はミュート）。
@@ -952,6 +1141,38 @@ namespace AcousticFlow
             catch (System.EntryPointNotFoundException) { /* 古いDLLでは無視 */ }
         }
 
+        // ── DSP 経路の切替（C# の IrConvolver ⇔ C++ の VoiceConvolver）──
+        //   同じ GameObject に両方載せておき、**片方だけ enabled にする**。
+        //   Unity は無効な MonoBehaviour の OnAudioFilterRead を呼ばないので、
+        //   これだけで経路が入れ替わる（AudioSource は共有のまま＝再生位置がズレない）。
+        private void SetDspPath(bool cpp)
+        {
+            useCppDsp = cpp;
+            // ★FindObjectsInactive.Include が要る。切替の相手は**今まさに無効な方**なので、
+            //   既定（Exclude）だと有効な側しか拾えず、一度切ったら戻せなくなる。
+            var irs = FindObjectsByType<IrConvolver>(
+                FindObjectsInactive.Include, FindObjectsSortMode.None);
+            var voices = FindObjectsByType<VoiceConvolver>(
+                FindObjectsInactive.Include, FindObjectsSortMode.None);
+            int nIr = irs.Length, nVoice = voices.Length;
+            foreach (var c in irs) c.enabled = !cpp;
+            foreach (var c in voices) c.enabled = cpp;
+
+            if (cpp && nVoice == 0)
+            {
+                // シーンが古い（VoiceConvolver が載っていない）。黙って C# 経路のままにすると
+                // 「切り替えたのに音が変わらない」で悩むので、はっきり言う。
+                useCppDsp = false;
+                foreach (var c in irs) c.enabled = true;
+                Debug.LogWarning("[AcousticFlowScene] VoiceConvolver がシーンにありません。"
+                                 + "C# 経路(IrConvolver)のままです。メニュー "
+                                 + "AcousticFlow > テストシーン生成 でシーンを作り直してください。");
+                return;
+            }
+            Debug.Log($"[AcousticFlowScene] DSP 経路: {(useCppDsp ? "C++ (VoiceConvolver)" : "C# (IrConvolver)")}"
+                      + $"  IrConvolver {nIr} / VoiceConvolver {nVoice}");
+        }
+
         private void HandleMovement()
         {
             float dt = Time.deltaTime;
@@ -1033,6 +1254,11 @@ namespace AcousticFlow
                     else MuteAllDiffractionSources();
                 }
             }
+            // Y：DSP 経路の切替（C# の IrConvolver ⇔ C++ の VoiceConvolver）。
+            //   同じタップ束を食わせて鳴らし比べるためのもの。移行が正しければ同じ音が出る。
+            //   ★扉の開閉の連続性（タップのパラメータ補間）は C++ 側にしか入っていないので、
+            //     「開けた瞬間ガタっと変わる」を聞き分けるときは必ずこちらで確認すること。
+            if (Input.GetKeyDown(KeyCode.Y)) SetDspPath(!useCppDsp);
 
             _fps = Mathf.Lerp(_fps, 1f / Mathf.Max(1e-4f, Time.unscaledDeltaTime), 0.1f);
 
@@ -1065,6 +1291,18 @@ namespace AcousticFlow
             // 3) バッチ更新（ここから音響計算の時間計測）。
             _acStopwatch.Restart();
             _scene.SetUpdateConfig(BuildUpdateConfig());
+            // 開口の演出つまみ。Inspector で動かしたら次のフレームから効く。
+            UpdatePortals();          // 扉ごと動く戸口もあるので配置を送り直す
+            if (liveMaterialUpdate)   // Play 中に材質を切り替えて聞き比べたいとき
+                for (int i = 0; i < _occluders.Count; i++)
+                {
+                    var o = _occluders[i];
+                    if (o.instanceId >= 0)
+                        _scene.SetInstanceMaterial(o.instanceId, ResolveMaterialId(o));
+                }
+            _scene.SetApertureContrast(apertureContrast);
+            _scene.SetApertureIsTransmission(apertureIsTransmission);
+            _scene.SetUseBtm(useBtmDiffraction);
             _scene.Update(Time.deltaTime);
 
             // 3-b) 音源ごとの帯域別生存と到来方向を受け取る。
@@ -1460,6 +1698,8 @@ namespace AcousticFlow
 
             int n = 0;
             int nb6 = AcousticEngine.NumBands;
+            _diffGainLin = (Mathf.Abs(diffractionGainDb) > 0.01f)
+                         ? Mathf.Pow(10f, diffractionGainDb / 20f) : 1f;
             if (_directBands == null) _directBands = new float[nb6];
             if (_diffTapBands == null) _diffTapBands = new float[nb6];
             if (_srcTransmit == null) _srcTransmit = new float[nb6];
@@ -1500,6 +1740,43 @@ namespace AcousticFlow
                 for (int b = 0; b < nb6; b++) _softTrans[b] = tr[b];
                 occFrac = 0f;
             }
+
+            // ★聞こえ方の調整: 透過音のこもりはここで作る（LPF の主役）。
+            //   材質の6帯域カーブの**形**は残したまま、125Hz を基準に傾きだけ動かす。
+            //   形ごと差し替えないのは、材質の違い（コンクリ／木の扉）が消えてしまうため。
+            ApplyTilt(_softTrans, nb6, transmissionTilt, transmissionHighCutDb);
+            if (Mathf.Abs(transmissionGainDb) > 0.01f)
+            {
+                float tg = Mathf.Pow(10f, transmissionGainDb / 20f);
+                for (int b = 0; b < nb6; b++) _softTrans[b] = Mathf.Min(_softTrans[b] * tg, 1f);
+            }
+
+            // ★平滑化。幾何は連続でも歩けば値は動くので、時間方向で均す。
+            //   既存のゲーム音響が例外なく持っている処理で、ここには無かった。
+            //   dB（対数）で補間する ── 振幅で補間すると、大きい側へは速く小さい側へは
+            //   遅く動くので「立ち上がりだけ速い」不自然さが出る。
+            {
+                float dt = Time.deltaTime;
+                float a = (tapSmoothTime > 1e-4f && dt > 0f)
+                        ? 1f - Mathf.Exp(-dt / tapSmoothTime) : 1f;
+                int bo2 = si * nb6;
+                if (_tapSmInit != null && si < _tapSmInit.Length)
+                {
+                    if (!_tapSmInit[si])
+                    {
+                        _tapSmInit[si] = true; _tapOccSm[si] = occFrac;
+                        for (int b = 0; b < nb6; b++) _tapTransSm[bo2 + b] = _softTrans[b];
+                    }
+                    else
+                    {
+                        _tapOccSm[si] += (occFrac - _tapOccSm[si]) * a;
+                        for (int b = 0; b < nb6; b++)
+                            _tapTransSm[bo2 + b] = SmoothLog(_tapTransSm[bo2 + b], _softTrans[b], a);
+                    }
+                    occFrac = _tapOccSm[si];
+                    for (int b = 0; b < nb6; b++) _softTrans[b] = _tapTransSm[bo2 + b];
+                }
+            }
             WriteTapBands(ts, n++, _softTrans, 0, directDist, sp, 'D', 0f);
 
             // 反射タップ（像源位置から経路長→遅延、6帯域ゲイン×空気吸収）。
@@ -1531,9 +1808,13 @@ namespace AcousticFlow
                 float pl = Vector3.Distance(lp, _tapDiffPos[t]);
                 float rel = (pl - directDist) * toMs;
                 if (rel < 0f) rel = 0f;
-                float share = _tapDiffGain[t] * occFrac;
+                float share = _tapDiffGain[t] * occFrac * _diffGainLin;
                 for (int b = 0; b < nb6; b++)
                     _diffTapBands[b] = diffractionDistanceOnly ? share : di[b] * share;
+                // 既定 0 = 平坦のまま。回折は定位担当なので削らないのが筋だが、
+                //   少し丸めたいときのための逃げ道（上げすぎると定位が消える）。
+                if (diffractionHighCutDb > 0.01f)
+                    ApplyTilt(_diffTapBands, nb6, 1f, diffractionHighCutDb);
                 WriteTapBands(ts, n++, _diffTapBands, 0, pl, _tapDiffPos[t], 'F', rel);
             }
             ts.Count = n;
@@ -1580,11 +1861,50 @@ namespace AcousticFlow
         }
 
         // 6帯域(gOff..)×空気吸収(pathLen)×距離減衰 をタップnに書く＋到来方向のパン。
+        // 6帯域カーブの傾きを調整する。**形は残して傾きだけ**動かす。
+        //   tilt: 125Hz を基準にした指数。1=そのまま / >1=高域がさらに落ちる / <1=平ら寄り
+        //   cutDb: 一律に足すローパス量。125Hz で 0dB、最上帯域で cutDb ぶん落とす。
+        //   材質のカーブごと差し替えないのは、コンクリと木の扉の違いが消えてしまうため。
+        private static void ApplyTilt(float[] g, int nb, float tilt, float cutDb)
+        {
+            if (g == null || nb <= 1) return;
+            bool doTilt = Mathf.Abs(tilt - 1f) > 1e-3f;
+            bool doCut = cutDb > 1e-3f;
+            if (!doTilt && !doCut) return;
+            float lo = Mathf.Max(g[0], 1e-6f);
+            for (int b = 0; b < nb; b++)
+            {
+                float v = g[b];
+                if (doTilt)
+                {
+                    // 125Hz に対する比を累乗する。b=0 では比が 1 なので値が動かない。
+                    float rel = Mathf.Clamp(v / lo, 0f, 1f);
+                    v = lo * Mathf.Pow(rel, tilt);
+                }
+                if (doCut)
+                {
+                    float f = (nb > 1) ? (float)b / (nb - 1) : 0f;   // 帯域は1オクターブ刻み＝対数で等間隔
+                    v *= Mathf.Pow(10f, -(cutDb * f) / 20f);
+                }
+                g[b] = v;
+            }
+        }
+
+        // dB（対数）での一次追従。振幅で補間すると大きい側へだけ速く動いて不自然になる。
+        private static float SmoothLog(float cur, float target, float a)
+        {
+            const float floorAmp = 1e-5f;    // -100dB。無音を -inf にしないための床
+            float c = Mathf.Log(Mathf.Max(cur, floorAmp));
+            float t = Mathf.Log(Mathf.Max(target, floorAmp));
+            float v = Mathf.Exp(c + (t - c) * a);
+            return (v <= floorAmp * 1.01f && target <= 0f) ? 0f : v;
+        }
+
         private void WriteTapBands(SourceTaps ts, int n, float[] g, int gOff, float pathLen,
                                    Vector3 arrival, char type, float delayMs)
         {
             AirAbsorptionBands(pathLen, _airTmp);
-            float da = DistAtten(pathLen);   // ③ 絶対距離減衰（1/r）
+            float da = DistAtten(pathLen, type);   // ③ 絶対距離減衰（1/r）
             int nb = AcousticEngine.NumBands;
             int o = n * nb;
             float sum = 0f;
@@ -1601,10 +1921,24 @@ namespace AcousticFlow
 
 
         // ③ 絶対距離減衰（1/r・振幅）。distanceRef でゲイン1、以遠は refDist/pathLen。0で無効(=1)。
-        private float DistAtten(float pathLen)
+        //
+        //   回折タップ('F')だけは別の基準距離・別の急峻さを持てる。
+        //   diffractionDistanceOnly が ON のとき回折に残る情報は「開口の方向」と
+        //   「開口までの総経路長」だけなので、この減衰が回折の性格そのものになる。
+        //   直接音の距離感を保ったまま回り込みの遠達性だけ触れるようにしてある。
+        private float DistAtten(float pathLen, char type)
         {
-            if (distanceRef <= 0f) return 1f;
-            return distanceRef / Mathf.Max(pathLen, distanceRef);
+            float refDist = distanceRef;
+            float power = 1f;
+            if (type == 'F')
+            {
+                if (diffractionDistanceRef > 0f) refDist = diffractionDistanceRef;
+                power = diffractionDistancePower;
+            }
+            if (refDist <= 0f) return 1f;
+            float a = refDist / Mathf.Max(pathLen, refDist);
+            // Pow は毎タップ毎フレーム走るので、既定値のときは呼ばない。
+            return (power == 1f) ? a : Mathf.Pow(a, power);
         }
 
         // 到来点→リスナー左右軸への投影→等パワーパン（段3a：簡易ステレオ。前後・上下は中央＝HRTFは段3b）。
@@ -1890,7 +2224,7 @@ namespace AcousticFlow
                             $"空間化: {(useHrtf ? "HRTF" : "パン")} (H)    " +
                             $"方向ステア: {(useDirectionalSteering ? "ON" : "OFF")} (G)", style);
             if (enableMovement)
-                GUILayout.Label("操作: WASD / 右ドラッグ / QE / Shift / Space:重ね / H:HRTF / G:ステア / R:反響経路 / C:回折候補 / F:早期反射 / V:回折二次音源 / B:足音SE / Enter:足音ループ(音源0) / M:楽曲ミュート", style);
+                GUILayout.Label("操作: WASD / 右ドラッグ / QE / Shift / Space:重ね / H:HRTF / G:ステア / R:反響経路 / C:回折候補 / F:早期反射 / V:回折二次音源 / Y:DSP経路(C#/C++) / B:足音SE / Enter:足音ループ(音源0) / M:楽曲ミュート", style);
             GUILayout.Label($"音: {(_singleFootstep ? $"足音ループ・音源0のみ ({footstepEvent})" : (useFootstepSE ? $"足音SE・音源0のみ ({footstepEvent})" : "音楽ステム"))}  (B:足音切替 / Enter:足音ループ)", style);
             GUILayout.Label($"音源配置: {(_stacked ? "重ね(1点)" : "展開")}", style);
             if (enableReverb)
@@ -1922,6 +2256,37 @@ namespace AcousticFlow
             GUILayout.Label(enableDiffractionSources
                 ? $"回折二次音源(エッジ=音源): ON  鳴動 {_diffActive} 本/上限 {_sources?.Length * _diffCap} (V)"
                 : "回折二次音源(エッジ=音源): OFF (V)", style);
+            // 扉の開き角。音を判断する前提なので数字でも出す（見た目だけだと追えない）。
+            if (_swingDoors == null)
+                _swingDoors = FindObjectsByType<SwingDoor>(
+                    FindObjectsInactive.Include, FindObjectsSortMode.None);
+            for (int i = 0; i < _swingDoors.Length; i++)
+                if (_swingDoors[i] != null)
+                    GUILayout.Label($"扉 {_swingDoors[i].name}: {_swingDoors[i].angleDeg:F1}° (5/6キー)",
+                                    style);
+
+            // ポータルの開き具合。主音源に対して測って出す（見て分かるように）。
+            if (_portals.Count > 0 && _scene != null && _scene.IsValid)
+            {
+                var p0 = _portals[0];
+                if (p0 != null && p0.engineId >= 0
+                    && _scene.MeasurePortal(p0.engineId, listener.position, _srcPos[0],
+                                            _portalFrac, out Vector3 pc))
+                {
+                    GUILayout.Label(
+                        $"ポータル {_portals.Count}個  開口率 125Hz {_portalFrac[0]:F3} / "
+                        + $"1k {_portalFrac[3]:F3} / 4k {_portalFrac[5]:F3}", style);
+                    GUILayout.Label($"　開口の重心: ({pc.x:F2}, {pc.y:F2}, {pc.z:F2}) ＝ここへ定位する",
+                                    style);
+                }
+            }
+            GUILayout.Label(useBtmDiffraction
+                ? $"回折の出し方: BTM(検証途上)  開口コントラスト {apertureContrast:F1}"
+                : $"回折の出し方: 前川＋開口積分  開口コントラスト {apertureContrast:F1}", style);
+            // どちらの DSP で鳴っているか。扉の連続性は C++ 側にしか入っていないので必ず出す。
+            GUILayout.Label(useCppDsp
+                ? "DSP 経路: C++ (VoiceConvolver) ─ タップ補間あり (Y)"
+                : "DSP 経路: C# (IrConvolver) ─ タップ補間なし (Y)", style);
 
             if (_scene != null && _scene.IsValid)
             {

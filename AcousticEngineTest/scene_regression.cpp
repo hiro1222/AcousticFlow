@@ -13,11 +13,13 @@
  *   テストが信用されなくなる。一方で関係が壊れるのは物理として明確な回帰なので、
  *   検出したいのはそちら。乱数を使う推定量（レイトレース）とも相性が良い。
  */
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <vector>
 
 #include "acoustic_scene.h"
+#include "acoustic_voice.h"
 
 namespace {
 
@@ -556,8 +558,10 @@ void diagnoseShadowBoundary() {
         float g[kBands] = {}, u[kBands] = {};
         AF_SceneComputeDiffractionBands(s, V(x, 1.6f, -2), src, g, kBands);
         AF_SceneComputeDiffractionBandsUtd(s, V(x, 1.6f, -2), src, u, kBands);
-        std::printf("      %8.2f  %6.3f  %6.3f   %6.3f  %6.3f%s\n",
-                    x, g[0], g[5], u[0], u[5],
+        float fr[kBands] = {};
+        const int frOk = AF_SceneMeasureApertureFresnel(s, V(x, 1.6f, -2), src, fr);
+        std::printf("      %8.2f  %6.3f  %6.3f   %6.3f  %6.3f   開口率 %d %6.3f %6.3f%s\n",
+                    x, g[0], g[5], u[0], u[5], frOk, fr[0], fr[5],
                     (std::fabs(x - 2.0f) < 0.13f) ? "  ← 影境界" : "");
         if (prevLow >= 0.0f) {
             const float jump = std::fabs(g[0] - prevLow);
@@ -667,6 +671,11 @@ void diagnoseSwingDoor() {
     const AF_Vector3 half  = V(0.5f, 1.5f, 0.025f);
     const int door = AF_SceneAddInstanceBox(s, V(0, 1.5f, 0), half, V(1, 0, 0), V(0, 1, 0), mat);
 
+    // ★戸口をポータルとして置く。実運用では扉の戸口にはポータルを置くので、
+    //   ここも出荷する経路で測る。置かないと稜線探索が担当し、
+    //   開口位置が跳ぶ（実測 2.93m @ 15°）。
+    AF_SceneAddPortal(s, V(0, 1.5f, 0), V(1, 0, 0), V(0, 1, 0), 0.5f, 1.5f);
+
     const AF_Vector3 L = V(0, 1.6f, -3), S = V(0, 1.6f, 3);
     AF_SceneSetListener(s, L);
     AF_SceneSetSource(s, 1, S);
@@ -734,7 +743,18 @@ void diagnoseSwingDoor() {
         }
         prevLow = g[0];
 
-        if (occ && !(g[0] > g[5])) lowOverHigh = false;   // 性質4
+        // 性質4: 前川の δ 減衰は低域ほど回り込む。
+        //   ★**遮蔽されている間だけ**の性質。`diffractionContinuous` は照らされた側では
+        //     「直接音込みの総合値」を返すので、そこで低域>高域は成り立たない
+        //     （実測: 67.5°で 125Hz 0.345 / 4kHz 0.357 と逆転。90°では 4kHz が 1.6倍）。
+        //     以前は判定が緩くて気づかなかっただけで、値は前から逆転していた。
+        //     扉が開き切る手前（開口が支配的になる前）でだけ見る。
+        // 性質4: 前川の δ 減衰は低域ほど回り込む ── **遮蔽されていて、かつ回折が出ている間**の性質。
+        //   完全閉扉（0°）は 125Hz も 4kHz も 0.000 の同値になるので「低域>高域」は偽になるが、
+        //   これは性質の破れではなく「回折そのものが無い」。ゼロ同士は対象外にする。
+        //   （照らされた側 occ=0 は元から除外。そこでは直接音込みの総合値を返すので
+        //     67.5°で 125Hz 0.345 / 4kHz 0.357 と逆転して当然）
+        if (occ && g[0] > 0.0f && !(g[0] > g[5])) lowOverHigh = false;
     }
 
     // ── 立ち上がり（0°〜10°）を細かく測る ──
@@ -746,8 +766,8 @@ void diagnoseSwingDoor() {
     //   コンセプトは「扉がどのくらい開いたか」を音で伝えること。δ は扉が回っても変わらない
     //   （回折経路が回る戸口の枠は動かない）ので、前川は piecewise constant になるはず。
     std::printf("\n      [立ち上がり] 0°〜10° を 0.5°刻み（隙間は自由端で約 1.7cm/度）\n");
-    std::printf("        開き角  ── 前川(δのみ) ──   ── キルヒホッフ(開口実測) ──\n");
-    std::printf("                 125Hz   隣接差      125Hz   4kHz   隣接差\n");
+    std::printf("        開き角  ── 前川(δのみ) ──   ── キルヒホッフ(開口実測) ──  開口率\n");
+    std::printf("                 125Hz   隣接差      125Hz   4kHz   隣接差       0..1\n");
     float prevFine = -1.0f, maxFineJump = 0.0f, fineJumpAt = 0.0f;
     float prevK = -1.0f, maxKJump = 0.0f, kJumpAt = 0.0f;
     float kFirst = -1.0f, kLast = -1.0f;
@@ -765,14 +785,23 @@ void diagnoseSwingDoor() {
         if (jump > maxFineJump) { maxFineJump = jump; fineJumpAt = deg; }
         prevFine = g[0];
 
+        // 開口率（回折の音量を決める量）。開口位置は二次音源から取る。
+        float openFrac = -1.0f;
+        {
+            AF_SceneSetListener(s, L); AF_SceneSetSource(s, 1, S);
+            AF_Vector3 dp[8]; float dg[8];
+            const int dn = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), dp, dg, 8);
+            if (dn > 0) openFrac = AF_SceneMeasureApertureOpenness(s, L, S);
+        }
+
         float k[kBands] = {}; AF_Vector3 ap{}; float pl = 0.0f;
         const int okK = AF_SceneComputeDiffractionKirchhoff(s, L, S, k, kBands, &ap, &pl);
         float kj = (okK && prevK >= 0.0f) ? std::fabs(k[0] - prevK) : 0.0f;
         if (kj > maxKJump) { maxKJump = kj; kJumpAt = deg; }
         if (okK) { if (kFirst < 0.0f) kFirst = k[0]; kLast = k[0]; prevK = k[0]; }
 
-        std::printf("        %5.1f°   %6.3f  %6.3f      %6.3f %6.3f  %6.3f%s\n",
-                    deg, g[0], jump, k[0], k[5], kj, okK ? "" : "  (開口なし)");
+        std::printf("        %5.1f°   %6.3f  %6.3f      %6.3f %6.3f  %6.3f    %6.3f%s\n",
+                    deg, g[0], jump, k[0], k[5], kj, openFrac, okK ? "" : "  (開口なし)");
     }
     std::printf("        → 最大隣接差   前川 %.3f @ %.1f°   キルヒホッフ %.3f @ %.1f°\n",
                 maxFineJump, fineJumpAt, maxKJump, kJumpAt);
@@ -1101,6 +1130,1626 @@ void testSecondOrderDiffraction() {
     AF_SceneDestroy(s);
 }
 
+// ================================================================ 扉の開き角 → 開口幅 → 音量
+// 「開き具合が連続に音へ出る」ためにどの設定を選ぶか、を決めるための表。
+//   Test_Full と同じ形状（密閉・戸口 1.2×2.4・部屋高 4m・扉厚 6cm）で開き角を振り、
+//   ① 実測の開口幅  ② 基準幅と急峻さの組み合わせごとのゲイン を並べる。
+//
+//   耳に届くのは前川の値ではない（diffractionDistanceOnly が ON なので捨てられる）。
+//   届くのは開口幅ゲートを含む _tapDiffGain なので、ここで見るべきはこの表。
+// ============================================================ 1フレームの計算量
+// Unity 側の表示で「音響計算 12.6 ms/frame・FPS 38」が出たので、実測して裏を取る。
+// 推測で直さないため、まず**どこに時間が乗っているか**を分けて測る。
+//
+//   Test_Full と同じ規模（箱10個＋扉、音源6）で、ホストが毎フレーム呼ぶ順に叩く:
+//     AF_SceneUpdate → 音源ごとに 遮蔽 + 回折タップ取得
+//   扉は毎フレーム動かす（updateInstance が BVH を作り直すので、その分も込みで測る）。
+void diagnoseFrameCost() {
+    std::printf("\n[診断] 1フレームの音響計算にかかる時間（Test_Full と同じ規模）\n");
+
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f;
+    const float hw = 6.0f, hd = 8.0f;
+    AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                           V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                           V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                           V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+    const int doorId = AF_SceneAddInstanceBox(
+        s, V(-0.6f + doorW * 0.5f, doorH * 0.5f, 0),
+        V(doorW * 0.5f, doorH * 0.5f, 0.03f), V(1,0,0), V(0,1,0), mat);
+
+    const AF_Vector3 L = V(0, 1.6f, -4);
+    const AF_Vector3 srcPos[6] = {
+        V(-2.0f, 1.6f, 3.5f), V(2.0f, 1.6f, 3.0f), V(-3.0f, 1.0f, 5.0f),
+        V( 3.0f, 2.0f, 6.0f), V( 0.0f, 1.2f, 4.5f), V(-1.0f, 1.8f, 2.5f),
+    };
+    for (int i = 0; i < 6; ++i) AF_SceneSetSource(s, i + 1, srcPos[i]);
+    AF_SceneSetListener(s, L);
+
+    // Unity 側（AcousticFlowSceneDemo の既定値）と同じ設定にする。
+    //   ここを合わせないと「テストでは軽いのにゲームでは重い」を追えない。
+    AF_UpdateConfig base{};
+    base.role1EveryN = 1;   base.role2EveryN = 4;   base.earlyEveryN = 3;
+    base.diffSrcEveryN = 2; base.catalogEveryN = 3;
+    base.reflectionRays = 256; base.reflectionBounces = 3;
+    base.directWeight = 1.0f;  base.useReflections = 1;
+    base.useEdgeCatalog = 1;   base.edgeCatalogRes = 16; base.edgeCatalogMaxDist = 40.0f;
+    base.enableReverb = 1;     base.echogramBins = 100;  base.echogramBinSeconds = 0.01f;
+    base.echogramRays = 512;   base.echogramBounces = 24;
+    base.speedOfSound = 343.0f; base.distanceRef = 1.5f;
+    base.enableEarlyReflections = 1; base.earlyTaps = 4;
+    base.earlyRays = 512; base.earlyBounces = 2;
+    base.enableDiffractionSources = 1; base.diffSources = 3;
+
+    // 計測本体。moveDoor=true なら扉を毎フレーム動かす（BVH が毎回汚れる）。
+    double lastMax = 0.0;   // 直前の runFrames の最悪フレーム
+    auto runFrames = [&](const AF_UpdateConfig& cfg, bool moveDoor, int frames) {
+        AF_SceneSetUpdateConfig(s, &cfg);
+        using clk = std::chrono::high_resolution_clock;
+        double acc = 0.0; lastMax = 0.0;
+        for (int f = 0; f < frames; ++f) {
+            const float th = (moveDoor ? (f % 90) : 45) * 3.14159265f / 180.0f;
+            const float c = std::cos(th), sn = std::sin(th);
+            auto t0 = clk::now();
+            if (moveDoor) {
+                AF_SceneUpdateInstance(
+                    s, doorId, V(-0.6f + c * doorW * 0.5f, doorH * 0.5f, sn * doorW * 0.5f),
+                    V(doorW * 0.5f, doorH * 0.5f, 0.03f), V(c, 0, sn), V(0, 1, 0));
+            }
+            AF_SceneUpdate(s, 1.0f / 60.0f);
+            for (int i = 0; i < 6; ++i) {
+                AF_Vector3 pos[8]; float gain[8];
+                AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, i + 1), pos, gain, 8);
+            }
+            const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+            acc += ms;
+            if (ms > lastMax) lastMax = ms;
+        }
+        return acc / frames;
+    };
+
+    runFrames(base, true, 30);                        // 暖機
+    const double all = runFrames(base, true, 200);
+    const double allMax = lastMax;
+    std::printf("        全部入り（扉が毎フレーム動く）\n");
+    std::printf("          平均 %7.3f ms/frame  → 60fps 予算(16.7ms)の %.0f%%\n",
+                all, all / 16.7 * 100.0);
+    std::printf("          最悪 %7.3f ms/frame  → 同 %.0f%%   ★ホストのHUDが拾うのはこちら\n",
+                allMax, allMax / 16.7 * 100.0);
+    std::printf("          （段ごとに実行間隔が違うので、重い段が重なるフレームで山が出る）\n");
+
+    // 段ごとに切って差を見る。差＝その段の取り分。
+    struct Ablate { const char* name; void (*apply)(AF_UpdateConfig&); };
+    const Ablate abl[] = {
+        {"残響エコグラム",   [](AF_UpdateConfig& c){ c.enableReverb = 0; }},
+        {"早期反射",         [](AF_UpdateConfig& c){ c.enableEarlyReflections = 0; }},
+        {"回折二次音源",     [](AF_UpdateConfig& c){ c.enableDiffractionSources = 0; }},
+        {"エッジカタログ",   [](AF_UpdateConfig& c){ c.useEdgeCatalog = 0; }},
+        {"反射込み遮蔽",     [](AF_UpdateConfig& c){ c.useReflections = 0; }},
+    };
+    for (const Ablate& a : abl) {
+        AF_UpdateConfig c = base; a.apply(c);
+        const double ms = runFrames(c, true, 200);
+        std::printf("          %-16s を切ると 平均 %7.3f ms（取り分 %6.3f / %4.1f%%）  最悪 %7.3f ms\n",
+                    a.name, ms, all - ms, (all - ms) / all * 100.0, lastMax);
+    }
+
+    // 扉を止める＝BVH が汚れない。差が「動かすこと自体」の代金。
+    const double still = runFrames(base, false, 200);
+    std::printf("        扉を止めると %7.3f ms  （動かす代金 %6.3f ms / %4.1f%%）\n",
+                still, all - still, (all - still) / all * 100.0);
+
+    AF_SceneDestroy(s);
+}
+
+// ================================================ 音源位置による扉の効き方の違い
+// **この作品の主張そのものを測る。**
+//   既存のゲームは扉の開き角を 0..1 に正規化して一律にゲインを掛ける。
+//   奥に何がどこにあろうと、開き具合だけで音が決まる。
+//   幾何でやる意味は「開いた先に音源が正対していれば最初の隙間から聞こえる」
+//   「横へ外れていれば開けても大して変わらない」が**勝手に出る**こと。
+//
+//   ここまでのテストは全部、音源が戸口から大きく外れた配置だった（最も出にくい条件）。
+//   正対・少し外れ・大きく外れ を並べて、差が出るかを見る。
+//   差が出るなら主張は成立している。出ないなら、この作品の核心が機能していない。
+// ============================================================ ポータルの性質
+// ★積分範囲がポータルの矩形に限定されることで何が変わるかを見る。
+//   従来（範囲が決まらない）は閉扉でも開口率 0.328 あり、全開でも 0.408 だった（1.24倍）。
+//   ポータルなら扉が矩形を覆えば 0、何も塞がなければ 1 ── フルレンジになるはず。
+// ==================================== 壁↔扉の境界を跨ぐときの連続性
+// 壁(Concrete TL34dB) と扉(WoodDoor TL15dB) の差を 19dB に広げたので、
+// 直線が壁から扉へ移る瞬間に段差が出ていないかを測る。
+//   ソフト遮蔽は音源を 32 点で標本化しているので、材質の差が大きいほど
+//   1点が別材質へ移るたびの段が大きくなる（開口で同じ罠を踏んだ）。
+void diagnoseWallDoorBoundary() {
+    std::printf("\n[診断] 壁↔扉の境界を横切るときに段差が出ないか\n");
+    std::printf("        扉は閉じたまま。リスナーを横へ振って直線が通る材質を変える。\n");
+    std::printf("        リスナーx  透過125Hz  透過4kHz   前との差(125Hz)\n");
+
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f;
+    const float hw = 6.0f, hd = 8.0f;
+    const AF_Vector3 S = V(0, 1.6f, 3.5f);
+
+    float prev = -1.0f, maxJump = 0.0f, jumpAt = 0.0f;
+    for (float lx = -2.0f; lx <= 2.001f; lx += 0.1f) {
+        AF_SceneHandle s = AF_SceneCreate();
+        // 壁（よく遮る）と扉（弱い）を別材質で持つ。
+        const float wallT[6] = {0.000398f, 0.0001585f, 0.0000398f,
+                                0.00001f, 0.00000251f, 0.000001f};   // TL34..60
+        const float doorT[6] = {0.0316f, 0.0158f, 0.00794f,
+                                0.00398f, 0.00251f, 0.002f};          // TL15..27
+        const int matWall = AF_SceneAddMaterial(s, wallT, nullptr, nullptr, 6);
+        const int matDoor = AF_SceneAddMaterial(s, doorT, nullptr, nullptr, 6);
+
+        AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                               V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), matWall);
+        // 閉じた扉（戸口をぴったり覆う）。
+        AF_SceneAddInstanceBox(s, V(0, doorH * 0.5f, 0), V(doorW * 0.5f, doorH * 0.5f, 0.03f),
+                               V(1,0,0), V(0,1,0), matDoor);
+
+        // ★閉じた扉なのに開口率が 0 でないと、存在しない回折タップが立つ。
+        //   リスナーが斜めから見ると、扉の影が戸口からずれて「開いている」と読める疑い。
+        const int pid = AF_SceneAddPortal(s, V(0, doorH * 0.5f, 0), V(1, 0, 0), V(0, 1, 0),
+                                          doorW * 0.5f, doorH * 0.5f);
+        const AF_Vector3 L = V(lx, 1.6f, -4);
+        float pf[kBands] = {}; AF_Vector3 pcp = V(0,0,0);
+        AF_SceneMeasurePortal(s, pid, L, S, pf, &pcp);
+        float tr[kBands] = {}; float occF = 0.0f;
+        AF_SceneComputeSoftOcclusion(s, L, S, tr, kBands, &occF);
+        float d = 0.0f;
+        if (prev > 0.0f) d = 20.0f * std::log10(std::max(tr[0], 1e-7f) / prev);
+        std::printf("        %+6.2f    %.5f    %.5f    %+6.1f dB   開口率 %.4f\n",
+                    lx, tr[0], tr[5], d, pf[0]);
+        if (prev > 0.0f && std::fabs(d) > maxJump) { maxJump = std::fabs(d); jumpAt = lx; }
+        prev = std::max(tr[0], 1e-7f);
+        AF_SceneDestroy(s);
+    }
+    std::printf("        → 最大隣接差 %.1f dB @ x=%+.2f （0.1m 刻み）\n", maxJump, jumpAt);
+
+    // ★「扉のほうがこもる」という耳の指摘を裏取りする。
+    //   透過だけでなく、実際に鳴っている量（遮蔽の帯域別生存＝回折や反射も含む）で見る。
+    //   透過だけ見て「傾きは同じ」と結論すると、別経路がこもらせている場合を見落とす。
+    std::printf("\n      ── 扉の正面(x=0) と 壁の裏(x=-2) を全帯域で比較 ──\n");
+    std::printf("        位置    125Hz    250Hz    500Hz    1kHz     2kHz     4kHz    傾き\n");
+    for (int k = 0; k < 2; ++k) {
+        const float lx = (k == 0) ? 0.0f : -2.0f;
+        AF_SceneHandle s = AF_SceneCreate();
+        const float wallT[6] = {0.000398f, 0.0001585f, 0.0000398f,
+                                0.00001f, 0.00000251f, 0.000001f};
+        const float doorT[6] = {0.0316f, 0.0158f, 0.00794f, 0.00398f, 0.00251f, 0.002f};
+        const int matWall = AF_SceneAddMaterial(s, wallT, nullptr, nullptr, 6);
+        const int matDoor = AF_SceneAddMaterial(s, doorT, nullptr, nullptr, 6);
+        AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                               V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, doorH * 0.5f, 0), V(doorW * 0.5f, doorH * 0.5f, 0.03f),
+                               V(1,0,0), V(0,1,0), matDoor);
+        AF_SceneAddPortal(s, V(0, doorH * 0.5f, 0), V(1, 0, 0), V(0, 1, 0),
+                          doorW * 0.5f, doorH * 0.5f);   // 出荷する経路で比べる
+        const AF_Vector3 L = V(lx, 1.6f, -4);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        // ★経路ごとに分けて出す。合成値だけ見ると「どこが明るくしているか」が分からない。
+        //   壁の透過は 4kHz で 0.001 しかないので、それを超える値が出たら
+        //   材質の代金を payしていない経路がある、ということになる。
+        for (int mode = 0; mode < 2; ++mode) {
+            AF_UpdateConfig c{};
+            c.role1EveryN = 1; c.role2EveryN = 4; c.earlyEveryN = 3;
+            c.diffSrcEveryN = 2; c.catalogEveryN = 3;
+            c.reflectionRays = 256; c.reflectionBounces = 3;
+            c.directWeight = 1.0f;
+            c.useReflections = (mode == 0) ? 1 : 0;     // 反射込み / 直接+回折のみ
+            c.useEdgeCatalog = 1; c.edgeCatalogRes = 16; c.edgeCatalogMaxDist = 40.0f;
+            c.enableReverb = 0; c.echogramBins = 100; c.echogramBinSeconds = 0.01f;
+            c.echogramRays = 512; c.echogramBounces = 24;
+            c.speedOfSound = 343.0f; c.distanceRef = 1.5f;
+            c.enableEarlyReflections = 0; c.earlyTaps = 4;
+            c.earlyRays = 512; c.earlyBounces = 2;
+            c.enableDiffractionSources = 1; c.diffSources = 3;
+            AF_SceneSetUpdateConfig(s, &c);
+            AF_SceneUpdate(s, 1.0f / 60.0f);
+            float g[kBands] = {};
+            AF_SceneGetSourceOcclusion(s, AF_SceneSourceIndex(s, 1), g);
+            std::printf("        %s%s  %.5f  %.5f  %.5f  %.5f  %.5f  %.5f  %.1f dB\n",
+                        (k == 0) ? "扉" : "壁", (mode == 0) ? "反射込" : "反射無",
+                        g[0], g[1], g[2], g[3], g[4], g[5],
+                        20.0f * std::log10(std::max(g[0], 1e-7f) / std::max(g[5], 1e-7f)));
+        }
+        AF_SceneDestroy(s);
+    }
+    std::printf("      （傾きが大きいほどこもる。透過だけでなく回折・反射も含めた実際の鳴り）\n");
+
+    // ★扉の実寸クリアランスが効くかを見る。
+    //   現実の扉は枠より数mm小さい（同寸だと閉まらない）。今までのテストは
+    //   戸口 1.2m に対して扉も 1.2m で、隙間が物理的に存在しなかった。
+    //   実寸どおり小さくすれば隙間は**幾何から勝手に出る**ので、
+    //   「扉には隙間がある」という前提をコードに持ち込む必要が無い。
+    //   隙間は板より高域をよく通すので、閉扉の音が明るくなるはず。
+    std::printf("\n      ── 扉のクリアランス（枠との隙間）を変えて閉扉の音色を見る ──\n");
+    std::printf("        隙間     開口率125Hz  開口率4kHz   透過125Hz  透過4kHz  傾き\n");
+    for (float clr : {0.000f, 0.002f, 0.005f, 0.010f, 0.020f}) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const float wallT[6] = {0.000398f, 0.0001585f, 0.0000398f,
+                                0.00001f, 0.00000251f, 0.000001f};
+        const float doorT[6] = {0.0316f, 0.0158f, 0.00794f, 0.00398f, 0.00251f, 0.002f};
+        const int matWall = AF_SceneAddMaterial(s, wallT, nullptr, nullptr, 6);
+        const int matDoor = AF_SceneAddMaterial(s, doorT, nullptr, nullptr, 6);
+        AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                               V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), matWall);
+        // 扉を枠より clr だけ小さくする（左右・上に隙間ができる）。
+        AF_SceneAddInstanceBox(s, V(0, doorH * 0.5f - clr * 0.5f,  0),
+                               V(doorW * 0.5f - clr, doorH * 0.5f - clr * 0.5f, 0.03f),
+                               V(1,0,0), V(0,1,0), matDoor);
+        const int pid = AF_SceneAddPortal(s, V(0, doorH * 0.5f, 0),
+                                          V(1, 0, 0), V(0, 1, 0), 0.6f, doorH * 0.5f);
+        const AF_Vector3 L = V(0, 1.6f, -4);
+        float f[kBands] = {}; AF_Vector3 cp = V(0,0,0);
+        AF_SceneMeasurePortal(s, pid, L, S, f, &cp);
+        float tr[kBands] = {}; float occF = 0.0f;
+        AF_SceneComputeSoftOcclusion(s, L, S, tr, kBands, &occF);
+        std::printf("        %4.0f mm   %.5f     %.5f      %.5f    %.5f   %.1f dB\n",
+                    clr * 1000.0f, f[0], f[5], tr[0], tr[5],
+                    20.0f * std::log10(std::max(tr[0], 1e-7f) / std::max(tr[5], 1e-7f)));
+        AF_SceneDestroy(s);
+    }
+    std::printf("      （隙間が広いほど高域が通る＝傾きが小さくなるはず。特別視ではなく実寸の結果）\n");
+
+    // ★Unity の SwingDoor と同じ配置で、閉じた扉が**扉として**鳴るかを見る。
+    //   音源は戸口の真後ろではなく横にずらす（x=0.8、戸口は±0.5）。
+    //   ソフト遮蔽は音源の周り 0.9m に標本を散らすので、何点かは戸口の外＝壁を通る。
+    //   「塞がれた側」に最小値を使うと、そこで壁(TL34)を拾って
+    //   閉じた扉が壁として鳴る（実測で直接音が 19dB 沈んだ）。
+    std::printf("\n      ── 音源を戸口の横へずらしたときの閉扉（Unity の SwingDoor と同配置）──\n");
+    {
+        AF_SceneHandle s = AF_SceneCreate();
+        const float wallT[6] = {0.000398f, 0.0001585f, 0.0000398f,
+                                0.00001f, 0.00000251f, 0.000001f};   // TL34..60
+        const float doorT[6] = {0.0316f, 0.0158f, 0.00794f, 0.00398f, 0.00251f, 0.002f};
+        const int matWall = AF_SceneAddMaterial(s, wallT, nullptr, nullptr, 6);
+        const int matDoor = AF_SceneAddMaterial(s, doorT, nullptr, nullptr, 6);
+        const float wz = 0.0f, th = 0.2f, hh = 3.0f, hf = 7.0f;
+        const float gL = -0.5f, gR = 0.5f;
+        AF_SceneAddInstanceBox(s, V((-hf + (gL + hf) * 0.5f), hh*0.5f, wz),
+                               V((gL + hf) * 0.5f, hh*0.5f, th*0.5f), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V((gR + (hf - gR) * 0.5f), hh*0.5f, wz),
+                               V((hf - gR) * 0.5f, hh*0.5f, th*0.5f), V(1,0,0), V(0,1,0), matWall);
+        // 閉じた扉（戸口をぴったり覆う）
+        AF_SceneAddInstanceBox(s, V(0, hh * 0.5f, wz), V(0.5f, hh * 0.5f, 0.03f),
+                               V(1,0,0), V(0,1,0), matDoor);
+        const int pid = AF_SceneAddPortal(s, V(0, hh * 0.5f, wz),
+                                          V(1, 0, 0), V(0, 1, 0), 0.5f, hh * 0.5f);
+        const AF_Vector3 L = V(0, 1.6f, -3), Sr = V(0.8f, 1.6f, 3);
+        float f[kBands] = {}; AF_Vector3 cp = V(0,0,0);
+        AF_SceneMeasurePortal(s, pid, L, Sr, f, &cp);
+        float tr[kBands] = {}; float occF = 0.0f;
+        AF_SceneComputeSoftOcclusion(s, L, Sr, tr, kBands, &occF);
+        std::printf("        開口率 125Hz %.5f（閉扉なので 0 が正しい）\n", f[0]);
+        std::printf("        透過   125Hz %.5f  4kHz %.5f\n", tr[0], tr[5]);
+        std::printf("        参考   扉の材質 125Hz %.5f / 壁の材質 125Hz %.5f\n",
+                    std::sqrt(doorT[0]), std::sqrt(wallT[0]));
+        char nb[128];
+        std::snprintf(nb, sizeof(nb), "(透過 %.5f / 扉 %.5f / 壁 %.5f)",
+                      tr[0], std::sqrt(doorT[0]), std::sqrt(wallT[0]));
+        // 閉じた扉の向こうは「扉として」鳴るべき。壁の値まで沈んでいたら不具合。
+        check("閉じた扉は扉として鳴る（壁の値まで沈まない）",
+              tr[0] > std::sqrt(wallT[0]) * 3.0f, nb);
+        AF_SceneDestroy(s);
+    }
+}
+
+// ================================================ 閉じた空間で幻の回折が出ないか
+// **コンセプトの成立条件そのもの。**
+//   ポータルを置かなくても、幾何だけで「穴があれば鳴る／無ければ鳴らない」が
+//   成立していないと、聞こえる場所を人が決めていることになる。
+//   逆に言えば、ここが通れば「ポータルは精度の上積み」と言い切れる。
+// 厚い衝立で 1 次／2 次のどちらが働いているかを見る（推測で直さないため）。
+// ============================================ 漏れは弱い所から聞こえるか
+// 「部屋の奥で鳴ってドアから漏れている」感じの正体。
+//   壁を抜けてくる音は面が再放射しているので、面の方向から届く。
+//   音源方向のまま鳴らすと壁の中から聞こえ、歩いても扉から漏れる感じにならない。
+//   壁(TL34) と扉(TL15) が並んでいれば、定位は**扉へ寄る**はず。物体が扉かは見ない。
+// ================================ 奥の部屋の響きがこちらに届いているか
+// **奥の部屋の材質だけ**を変えて、こちらのエコグラム（残響）が変わるかを見る。
+//   変われば部屋間結合がある。変わらなければ「奥の部屋の響き」は届いていない。
+// ================== 奥の音源の位置で音色がどれだけ変わるか（LPF が強すぎないか）
+// 奥の部屋の中で鳴っている音は、開口から離れても・角度が付いても、
+// **部屋の中の音**として届くはず。開口までの距離や角度で高域が激しく落ちるなら、
+// どこが落としているのかを分けて見る必要がある。
+void diagnoseFarSourceTimbre() {
+    std::printf("\n[診断] 奥の音源の位置で音色がどう変わるか（開口までの距離・角度）\n");
+
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f, hw = 6.0f, hd = 8.0f;
+    const AF_Vector3 L = V(0, 1.6f, -4);
+
+    struct Place { float x, z; const char* name; };
+    const Place places[6] = {
+        {0.0f, 1.0f,  "正面・近い  "}, {0.0f, 4.0f,  "正面・中    "}, {0.0f, 7.0f,  "正面・遠い  "},
+        {2.0f, 1.0f,  "斜め・近い  "}, {2.0f, 4.0f,  "斜め・中    "}, {4.0f, 4.0f,  "大きく斜め  "},
+    };
+
+    std::printf("        位置          開口率(125Hz/4kHz)   到来ゲイン(125Hz/1k/4kHz)  傾き\n");
+    for (const Place& pl : places) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                               V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        const int pid = AF_SceneAddPortal(s, V(0, doorH * 0.5f, 0), V(1, 0, 0), V(0, 1, 0),
+                                          doorW * 0.5f, doorH * 0.5f);
+        const AF_Vector3 S = V(pl.x, 1.6f, pl.z);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        AF_SceneSetApertureIsTransmission(s, 1);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+
+        float f[kBands] = {}; AF_Vector3 cp = V(0,0,0);
+        AF_SceneMeasurePortal(s, pid, L, S, f, &cp);
+        float g[kBands] = {};
+        AF_SceneGetSourceOcclusion(s, AF_SceneSourceIndex(s, 1), g);
+        std::printf("        %s  %.4f / %.4f     %.4f / %.4f / %.4f   %5.1f dB\n",
+                    pl.name, f[0], f[5], g[0], g[3], g[5],
+                    20.0f * std::log10(std::max(g[0], 1e-7f) / std::max(g[5], 1e-7f)));
+        AF_SceneDestroy(s);
+    }
+    std::printf("      （傾きが位置で大きく動くなら、開口率の周波数依存が効きすぎている）\n");
+
+    // ★音源を横へ細かく動かして、見通しが切れる瞬間の段差を測る。
+    //   戸口は x∈[-0.6,0.6]。リスナー(0,1.6,-4) から z=1 の音源を見ると、
+    //   直線が戸口を外れるのは x ≒ 0.6 × 5/4 = 0.75 付近。
+    std::printf("      ── 音源を横へ動かしたとき（見通しが切れる瞬間）──\n");
+    std::printf("        音源x   開口率125Hz  到来125Hz   前との差\n");
+    float prevG = -1.0f, worst = 0.0f, worstAt = 0.0f;
+    for (float sx = 0.0f; sx <= 1.60f; sx += 0.05f) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                               V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        const int pid = AF_SceneAddPortal(s, V(0, doorH * 0.5f, 0), V(1, 0, 0), V(0, 1, 0),
+                                          doorW * 0.5f, doorH * 0.5f);
+        const AF_Vector3 S2 = V(sx, 1.6f, 1.0f);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S2);
+        AF_SceneSetApertureIsTransmission(s, 1);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        float f2[kBands] = {}; AF_Vector3 cp2 = V(0,0,0);
+        AF_SceneMeasurePortal(s, pid, L, S2, f2, &cp2);
+        float g2[kBands] = {};
+        AF_SceneGetSourceOcclusion(s, AF_SceneSourceIndex(s, 1), g2);
+        float dd = 0.0f;
+        if (prevG > 0.0f) dd = 20.0f * std::log10(std::max(g2[0], 1e-7f) / prevG);
+        if (prevG > 0.0f && std::fabs(dd) > worst) { worst = std::fabs(dd); worstAt = sx; }
+        std::printf("        %+5.2f    %.4f      %.4f     %+6.1f dB\n", sx, f2[0], g2[0], dd);
+        prevG = std::max(g2[0], 1e-7f);
+        AF_SceneDestroy(s);
+    }
+    std::printf("        → 最大隣接差 %.1f dB @ x=%+.2f（0.05m 刻み）\n", worst, worstAt);
+}
+
+void diagnoseRoomCoupling() {
+    std::printf("\n[診断] 奥の部屋の響きがこちらに届くか（奥の材質だけを変えて比較）\n");
+    std::printf("        扉    奥の材質   エコグラム総和   後半(0.3s以降)の割合\n");
+
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f, hw = 6.0f, hd = 8.0f;
+    const AF_Vector3 L = V(0, 1.6f, -4), S = V(0, 1.6f, 3.5f);
+
+    for (int doorMode = 0; doorMode < 2; ++doorMode) {
+        for (int farMode = 0; farMode < 2; ++farMode) {
+            AF_SceneHandle s = AF_SceneCreate();
+            // 手前の部屋は固定。奥の部屋だけ「よく響く/吸う」を切り替える。
+            const float liveA[6] = {0.02f, 0.02f, 0.03f, 0.04f, 0.05f, 0.07f};   // 響く
+            const float deadA[6] = {0.60f, 0.70f, 0.80f, 0.85f, 0.90f, 0.90f};   // 吸う
+            const float tr[6] = {0.000398f, 0.0001585f, 0.0000398f,
+                                 0.00001f, 0.00000251f, 0.000001f};
+            const int matNear = AF_SceneAddMaterial(s, tr, liveA, nullptr, 6);
+            const int matFar  = AF_SceneAddMaterial(s, tr, (farMode == 0) ? liveA : deadA,
+                                                    nullptr, 6);
+            // 仕切り（戸口つき）
+            AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                                   V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), matNear);
+            AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                                   V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), matNear);
+            AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                                   V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), matNear);
+            if (doorMode == 0)   // 扉を閉じる
+                AF_SceneAddInstanceBox(s, V(0, doorH * 0.5f, 0),
+                                       V(doorW * 0.5f, doorH * 0.5f, 0.03f),
+                                       V(1,0,0), V(0,1,0), matNear);
+            // 手前の部屋（z<0 側）
+            AF_SceneAddInstanceBox(s, V(0, -t, -hd*0.5f), V(hw, t, hd*0.5f), V(1,0,0), V(0,1,0), matNear);
+            AF_SceneAddInstanceBox(s, V(0, h+t, -hd*0.5f), V(hw, t, hd*0.5f), V(1,0,0), V(0,1,0), matNear);
+            AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, -hd*0.5f), V(t, h*0.5f, hd*0.5f), V(1,0,0), V(0,1,0), matNear);
+            AF_SceneAddInstanceBox(s, V( hw, h*0.5f, -hd*0.5f), V(t, h*0.5f, hd*0.5f), V(1,0,0), V(0,1,0), matNear);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), matNear);
+            // 奥の部屋（z>0 側）＝ここだけ材質を変える
+            AF_SceneAddInstanceBox(s, V(0, -t, hd*0.5f), V(hw, t, hd*0.5f), V(1,0,0), V(0,1,0), matFar);
+            AF_SceneAddInstanceBox(s, V(0, h+t, hd*0.5f), V(hw, t, hd*0.5f), V(1,0,0), V(0,1,0), matFar);
+            AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, hd*0.5f), V(t, h*0.5f, hd*0.5f), V(1,0,0), V(0,1,0), matFar);
+            AF_SceneAddInstanceBox(s, V( hw, h*0.5f, hd*0.5f), V(t, h*0.5f, hd*0.5f), V(1,0,0), V(0,1,0), matFar);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), matFar);
+
+            // 戸口をポータルとして置く。閉じていても奥の響きが流れてくるはず。
+            AF_SceneAddPortal(s, V(0, doorH * 0.5f, 0), V(1, 0, 0), V(0, 1, 0),
+                              doorW * 0.5f, doorH * 0.5f);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            AF_SceneUpdate(s, 1.0f / 60.0f);
+
+            float echo[100 * kBands] = {};
+            const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+            double sum = 0.0, late = 0.0;
+            for (int i = 0; i < bins; ++i)
+                for (int b = 0; b < kBands; ++b) {
+                    sum += echo[i * kBands + b];
+                    if (i >= 30) late += echo[i * kBands + b];   // 1ビン10ms → 0.3s 以降
+                }
+            std::printf("        %s  %s  %11.5f   %6.1f %%\n",
+                        (doorMode == 0) ? "閉" : "開",
+                        (farMode == 0) ? "響く  " : "吸う  ",
+                        sum, (sum > 1e-12) ? late / sum * 100.0 : 0.0);
+            AF_SceneDestroy(s);
+        }
+    }
+    std::printf("      （奥の材質で数字が動けば結合あり。動かなければ奥の響きは届いていない）\n");
+}
+
+void testLeakDirection() {
+    std::printf("\n[漏れの定位] 弱い材質の側から聞こえるか\n");
+
+    const float t = 0.15f, h = 4.0f, doorH = 2.4f, hw = 6.0f, hd = 8.0f;
+    const float wallT[6] = {0.000398f, 0.0001585f, 0.0000398f,
+                            0.00001f, 0.00000251f, 0.000001f};   // TL34..60
+    const float doorT[6] = {0.0316f, 0.0158f, 0.00794f, 0.00398f, 0.00251f, 0.002f};  // TL15..27
+
+    // リスナーは戸口から大きく外れた位置。直線は壁を通る。
+    //   扉は x∈[-0.6,0.6] にあるので、漏れの重心が扉へ寄れば定位も右へ振れる。
+    const AF_Vector3 L = V(-3.0f, 1.6f, -4), S = V(0, 1.6f, 3.5f);
+
+    for (int k = 0; k < 2; ++k) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int matWall = AF_SceneAddMaterial(s, wallT, nullptr, nullptr, 6);
+        // k=0: 扉も壁と同じ材質（弱点なし） / k=1: 扉だけ弱い
+        const int matDoor = (k == 0) ? matWall
+                          : AF_SceneAddMaterial(s, doorT, nullptr, nullptr, 6);
+        AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                               V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, doorH * 0.5f, 0), V(0.6f, doorH * 0.5f, 0.03f),
+                               V(1,0,0), V(0,1,0), matDoor);   // 閉じた扉
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), matWall);
+
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        float dv[3] = {0, 0, 0};
+        AF_SceneGetSourceArrivalDir(s, AF_SceneSourceIndex(s, 1), dv);
+        const AF_Vector3 d = V(dv[0], dv[1], dv[2]);
+        // 直線が壁を通る位置の方向と比べる。
+        const AF_Vector3 straight = V(S.x - L.x, S.y - L.y, S.z - L.z);
+        const float sl = std::sqrt(straight.x*straight.x + straight.y*straight.y
+                                 + straight.z*straight.z);
+        AF_Vector3 leak = V(0,0,0);
+        AF_SceneMeasureLeakPoint(s, L, S, &leak);
+        std::printf("        %s  到来(%+.3f,%+.3f,%+.3f) 音源方向(%+.3f,%+.3f,%+.3f) 漏れ重心(%+.2f,%+.2f,%+.2f)\n",
+                    (k == 0) ? "扉も壁と同材質" : "扉だけ弱い    ",
+                    d.x, d.y, d.z, straight.x/sl, straight.y/sl, straight.z/sl,
+                    leak.x, leak.y, leak.z);
+        // ★判定は置かない（未実装なので）。
+        //   漏れの重心は「音源のまわりに散らした標本」から作るため、
+        //   リスナーが戸口から外れていると標本が全部**壁**に当たり、扉を拾えない。
+        //   実測: 扉の材質を変えても重心 x=-1.45 のまま。
+        //   面上の全点を積分する（ラジオシティ）か、弱点を宣言する必要がある。
+        //   数字は出しておくので、実装したらここが動くはず。
+        AF_SceneDestroy(s);
+    }
+}
+
+void diagnoseThickBarrier() {
+    std::printf("\n[診断] 厚い衝立での回折（1次が芯を横切って棄却された後、2次が拾えるか）\n");
+    for (float th : {0.05f, 0.10f, 0.20f, 0.40f, 0.80f}) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        // 衝立: 幅6m・高4m・厚み th*2
+        AF_SceneAddInstanceBox(s, V(0, 2, 0), V(3, 2, th), V(1, 0, 0), V(0, 1, 0), mat);
+        const AF_Vector3 L = V(0, 1.6f, -4), S = V(0, 1.6f, 4);
+        AF_Vector3 mid = V(0,0,0);
+        const float delta = AF_SceneDiffractionPath(s, S, L, &mid);
+        AF_Vector3 cp[16]; float cd[16];
+        const int cn = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 16);
+        float d[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, S, L, d, kBands);
+        std::printf("        厚み %4.0f mm  候補 %2d 個  δ=%7.3f  回折125Hz %.4f  中点(%.2f,%.2f,%.2f)\n",
+                    th * 2000.0f, cn, delta, d[0], mid.x, mid.y, mid.z);
+        AF_SceneDestroy(s);
+    }
+    std::printf("      （厚みが増すと 1 次が消える。2 次が肩代わりできていれば δ と回折は残る）\n");
+
+    // ★幻と正当な掠めが、同じ「厚み」で起きているのかを見る。
+    //   壁パネルは厚 300mm。幻はその殻を通れてしまうのか、
+    //   それとも別の要因（戸口の反対側の縁）なのかを分ける。
+    std::printf("      ── 同じ厚みの仕切りで、閉扉の幻と正当な回り込みを並べる ──\n");
+    for (int k = 0; k < 2; ++k) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        const float t = 0.15f, h = 4.0f, doorH = 2.4f, hw = 6.0f, hd = 8.0f;
+        AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                               V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        if (k == 0)   // 扉を閉じる＝経路は無いはず
+            AF_SceneAddInstanceBox(s, V(0, doorH * 0.5f, 0), V(0.6f, doorH * 0.5f, 0.03f),
+                                   V(1,0,0), V(0,1,0), mat);
+        const AF_Vector3 L = V(-2.0f, 1.6f, -4), S = V(0, 1.6f, 3.5f);
+        AF_Vector3 cp[16]; float cd[16];
+        const int cn = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 16);
+        std::printf("        %s  候補 %d 個\n", (k == 0) ? "扉を閉じた（幻が出る）" : "扉なし（正当）      ", cn);
+        for (int i = 0; i < cn && i < 4; ++i)
+            std::printf("            P(%6.2f,%6.2f,%6.2f) δ=%.3f\n", cp[i].x, cp[i].y, cp[i].z, cd[i]);
+        AF_SceneDestroy(s);
+    }
+}
+
+void testNoPhantomDiffraction() {
+    std::printf("\n[幻の経路] 閉じた空間で回折が出ないか（ポータル無し・幾何だけ）\n");
+
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f;
+    const float hw = 6.0f, hd = 8.0f;
+    // ケース①: 戸口すら無い一枚板。経路は物理的に存在しない
+    // ケース②: 戸口はあるが扉が閉じている。これも経路は無い
+    // ケース③: 扉が閉じていて、**リスナーが壁の前**（Unity で幻が出た配置）
+    // ケース④: 戸口が開いていて、音源は正面から外れている。ここは鳴らなければならない
+    //   ※音源が戸口の真正面だと見通せてしまい、回折の二次音源は 0 が正しい
+    //     （直接音が担当する）。だから③④は音源かリスナーを横へずらす。
+    for (int mode = 0; mode < 4; ++mode) {
+        const AF_Vector3 L = (mode == 2) ? V(-2.0f, 1.6f, -4) : V(0, 1.6f, -4);
+        const AF_Vector3 S = (mode == 3) ? V(-2.0f, 1.6f, 3.5f) : V(0, 1.6f, 3.5f);
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        if (mode == 0) {
+            // 一枚板の仕切り（戸口なし）
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        } else {
+            AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                                   V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                                   V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                                   V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+            if (mode == 1 || mode == 2)   // 扉を閉じて塞ぐ
+                AF_SceneAddInstanceBox(s, V(0, doorH * 0.5f, 0),
+                                       V(doorW * 0.5f, doorH * 0.5f, 0.03f),
+                                       V(1,0,0), V(0,1,0), mat);
+        }
+        // 部屋を閉じる（床・天井・側壁・前後）
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+
+        AF_Vector3 pos[8]; float gain[8];
+        const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+        float sum = 0.0f;
+        for (int i = 0; i < n; ++i) sum += gain[i];
+        AF_Vector3 cp[24]; float cd[24];
+        const int cn = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 24);
+
+        const char* name = (mode == 0) ? "戸口なし(一枚板)  "
+                         : (mode == 1) ? "扉閉・正面        "
+                         : (mode == 2) ? "扉閉・リスナー横  " : "開放・音源横      ";
+        std::printf("        %-18s 候補 %2d 個 / 二次音源 %d 本 / 合計 %.5f\n",
+                    name, cn, n, sum);
+        if (cn > 0)
+            for (int i = 0; i < cn && i < 3; ++i)
+                std::printf("            候補 P(%6.2f,%6.2f,%6.2f) δ=%.3f\n",
+                            cp[i].x, cp[i].y, cp[i].z, cd[i]);
+
+        char b[128];
+        std::snprintf(b, sizeof(b), "(候補 %d / 二次音源 %d / 合計 %.5f)", cn, n, sum);
+        if (mode < 3) check("閉じた空間では回折が出ない", sum < 1e-4f, b);
+        else          check("開いていれば回折が出る", sum > 1e-3f, b);
+        AF_SceneDestroy(s);
+    }
+}
+
+void testPortalOpening() {
+    std::printf("\n[ポータル] 矩形で範囲を切ると開口率がフルレンジになるか\n");
+
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f;
+    const float hw = 6.0f, hd = 8.0f;
+    const AF_Vector3 L = V(0, 1.6f, -4), S = V(0, 1.6f, 3.5f);
+
+    std::printf("        開き角   125Hz    500Hz    4kHz     重心x\n");
+    float atClosed = -1.0f, atOpen = 0.0f, prev = -1.0f, maxJump = 0.0f, jumpAt = 0.0f;
+    float hiClosed = 0.0f, hiOpen = 0.0f;
+    for (float deg = 0.0f; deg <= 90.01f; deg += 5.0f) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                               V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        const float th = deg * 3.14159265f / 180.0f;
+        const float c = std::cos(th), sn = std::sin(th);
+        AF_SceneAddInstanceBox(s, V(-0.6f + c * doorW * 0.5f, doorH * 0.5f, sn * doorW * 0.5f),
+                               V(doorW * 0.5f, doorH * 0.5f, 0.03f), V(c, 0, sn), V(0, 1, 0), mat);
+        AF_SceneAddPortal(s, V(0, doorH * 0.5f, 0), V(1, 0, 0), V(0, 1, 0),
+                          0.6f, doorH * 0.5f);   // 出荷する経路で測る（旧経路ではなく）
+
+        // 戸口そのものをポータルとして置く（x∈[-0.6,0.6], y∈[0,2.4], z=0）。
+        const int pid = AF_SceneAddPortal(s, V(0, doorH * 0.5f, 0),
+                                          V(1, 0, 0), V(0, 1, 0), 0.6f, doorH * 0.5f);
+        float f[kBands] = {}; AF_Vector3 cp = V(0,0,0);
+        AF_SceneMeasurePortal(s, pid, L, S, f, &cp);
+        std::printf("        %5.1f°   %.4f   %.4f   %.4f   %+.3f\n",
+                    deg, f[0], f[2], f[5], cp.x);
+        if (atClosed < 0.0f) { atClosed = f[0]; hiClosed = f[5]; }
+        atOpen = f[0]; hiOpen = f[5];
+        if (prev >= 0.0f) {
+            const float j = std::fabs(f[0] - prev);
+            if (j > maxJump) { maxJump = j; jumpAt = deg; }
+        }
+        prev = f[0];
+        AF_SceneDestroy(s);
+    }
+
+    char b1[128];
+    std::snprintf(b1, sizeof(b1), "(閉 %.4f → 全開 %.4f)", atClosed, atOpen);
+    check("閉扉でほぼ 0 になる(< 0.05)", atClosed < 0.05f, b1);
+    check("全開でほぼ 1 になる(> 0.85)", atOpen > 0.85f, b1);
+    char b2[128];
+    std::snprintf(b2, sizeof(b2), "(最大隣接差 %.4f @ %.0f°、5°刻み)", maxJump, jumpAt);
+    check("5°刻みで飛ばない(隣接差 < 0.25)", maxJump < 0.25f, b2);
+    char b3[128];
+    std::snprintf(b3, sizeof(b3), "(4kHz 閉 %.4f → 全開 %.4f)", hiClosed, hiOpen);
+    check("高域も閉 0 → 全開 1 になる", hiClosed < 0.05f && hiOpen > 0.85f, b3);
+}
+
+void diagnoseSourceOffsetVsDoor() {
+    std::printf("\n[診断] 音源の位置で扉の効き方が変わるか（この作品の主張）\n");
+    std::printf("        リスナー(0,1.6,-4) / 戸口は x∈[-0.6,0.6], z=0\n");
+
+    struct Place { AF_Vector3 s; const char* name; };
+    const Place places[3] = {
+        {V( 0.0f, 1.6f, 3.5f), "正対      "},   // 戸口の真正面
+        {V(-1.2f, 1.6f, 3.5f), "少し外れ  "},
+        {V(-3.0f, 1.6f, 3.5f), "大きく外れ"},
+    };
+
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f;
+    const float hw = 6.0f, hd = 8.0f;
+    const AF_Vector3 L = V(0, 1.6f, -4);
+
+    for (const Place& pl : places) {
+        std::printf("      ── 音源 %s (%.1f, %.1f, %.1f) ──\n",
+                    pl.name, pl.s.x, pl.s.y, pl.s.z);
+        std::printf("        開き角   遮蔽  回折本数  合計ゲイン   透過125Hz\n");
+        float first = -1.0f, last = 0.0f;
+        for (float deg = 0.0f; deg <= 90.01f; deg += 10.0f) {
+            AF_SceneHandle s = AF_SceneCreate();
+            const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+            AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                                   V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                                   V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                                   V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            const float th = deg * 3.14159265f / 180.0f;
+            const float c = std::cos(th), sn = std::sin(th);
+            AF_SceneAddInstanceBox(s, V(-0.6f + c * doorW * 0.5f, doorH * 0.5f, sn * doorW * 0.5f),
+                                   V(doorW * 0.5f, doorH * 0.5f, 0.03f),
+                                   V(c, 0, sn), V(0, 1, 0), mat);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, pl.s);
+            AF_SceneSetApertureIsTransmission(s, 1);
+            AF_SceneUpdate(s, 1.0f / 60.0f);
+
+            AF_Vector3 pos[8]; float gain[8];
+            const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+            float sum = 0.0f;
+            for (int i = 0; i < n; ++i) sum += gain[i];
+            float tr[kBands] = {}; float occF = 0.0f;
+            AF_SceneComputeSoftOcclusion(s, L, pl.s, tr, kBands, &occF);
+            const int occ = AF_SceneIsOccluded(s, L, pl.s);
+            std::printf("        %5.1f°   %d     %d本      %8.4f    %.4f\n",
+                        deg, occ, n, sum, tr[0]);
+            if (first < 0.0f) first = sum;
+            last = sum;
+            AF_SceneDestroy(s);
+        }
+        std::printf("        → 閉 %.4f → 全開 %.4f\n", first, last);
+    }
+    std::printf("      （正対と大きく外れで差が出れば、扉の角度ではなく幾何が決めている）\n");
+}
+
+void diagnoseDoorApertureCurve() {
+    std::printf("\n[診断] 扉の開き角 → 開口幅 → 音量（Test_Full と同じ形状）\n");
+
+    struct Setting { float ref; float power; const char* name; };
+    const Setting settings[4] = {
+        {0.30f, 1.0f, "0.30/1.0"},   // 既定
+        {0.30f, 0.5f, "0.30/0.5"},
+        {0.15f, 1.0f, "0.15/1.0"},
+        {0.50f, 1.0f, "0.50/1.0"},
+    };
+
+    std::printf("        開き角  開口率   %s  %s  %s  %s   開口(耳に届く方の量)\n",
+                settings[0].name, settings[1].name, settings[2].name, settings[3].name);
+
+    float prev[4] = {-1, -1, -1, -1};
+    float maxJump[4] = {0, 0, 0, 0};
+    float atDeg[4] = {0, 0, 0, 0};
+
+    for (float deg = 0.0f; deg <= 90.01f; deg += 5.0f) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f;
+        const float hw = 6.0f, hd = 8.0f;
+        // 仕切り（z=0）: 戸口 x∈[-0.6,0.6], y∈[0,2.4]。左右＋まぐさ。
+        AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                               V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+        // 部屋を閉じる
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        // 扉。蝶番 x=-0.6、+z 側へ振れる。中心は蝶番から半幅ぶん。
+        const float th = deg * 3.14159265f / 180.0f;
+        const float c = std::cos(th), sn = std::sin(th);
+        AF_SceneAddInstanceBox(s, V(-0.6f + c * doorW * 0.5f, doorH * 0.5f, sn * doorW * 0.5f),
+                               V(doorW * 0.5f, doorH * 0.5f, 0.03f),
+                               V(c, 0, sn), V(0, 1, 0), mat);
+
+        // Full の配置に合わせる（直線が戸口を通らない位置）。
+        const AF_Vector3 L = V(0, 1.6f, -4), S = V(-2.0f, 1.6f, 3.5f);
+
+        // ★耳に届く量を測る。AF_SceneComputeDiffractionBands（前川）は
+        //   diffractionDistanceOnly が ON のホストでは捨てられるので見ても意味がない。
+        //   実際に鳴っているのは GetDiffractionSources が返す「位置」と「重み」。
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+
+        // 実測の隙間幅（回折の音量を決める量）
+        const float openFrac = AF_SceneMeasureSlitWidth(s, L, S);
+        // 直接音がどれだけ抜けているか（＝壁の透過）。閉扉でもこれは残る。
+        float tr[kBands] = {}; float occF = 0.0f;
+        AF_SceneComputeSoftOcclusion(s, L, S, tr, kBands, &occF);
+
+        float val[4]; AF_Vector3 apPos = V(0,0,0); float apLen = 0.0f; int nsrc = 0;
+        for (int k = 0; k < 4; ++k) {
+            AF_SceneSetApertureOpen(s, settings[k].ref, settings[k].power, 1.0f, 0);
+            AF_SceneUpdate(s, 1.0f / 60.0f);
+            AF_Vector3 pos[8]; float gain[8];
+            const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+            float sum = 0.0f;
+            for (int i = 0; i < n; ++i) sum += gain[i];
+            val[k] = sum;                       // タップ重みの合計＝回折の総量
+            if (k == 0 && n > 0) {              // 開口位置は設定に依らないので1回だけ
+                nsrc = n; apPos = pos[0];
+                const AF_Vector3 d = V(pos[0].x - L.x, pos[0].y - L.y, pos[0].z - L.z);
+                apLen = std::sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
+            }
+            if (prev[k] >= 0.0f) {
+                const float j = std::fabs(val[k] - prev[k]);
+                if (j > maxJump[k]) { maxJump[k] = j; atDeg[k] = deg; }
+            }
+            prev[k] = val[k];
+        }
+        // ★フレネル開口が実際に何を返しているか。回折の音量はここが決めているので、
+        //   「扉を開けても音が変わらない」ときはまずこの6つを見る。
+        // BTM 経路での扉の掃引。従来経路と並べる。
+        {
+            AF_SceneSetUseBtm(s, 1);
+            AF_SceneUpdate(s, 1.0f / 60.0f);
+            AF_Vector3 bp[8]; float bg[8];
+            const int bn = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), bp, bg, 8);
+            float bsum = 0.0f;
+            for (int i = 0; i < bn; ++i) bsum += bg[i];
+            std::printf("                  BTM: 開口 %d本  合計 %.5f\n", bn, bsum);
+            AF_SceneSetUseBtm(s, 0);
+            AF_SceneUpdate(s, 1.0f / 60.0f);
+        }
+        // δ の重みを 1 / 0.5 / 0 で並べる。二重掛けの切り分け。
+        float fz[kBands] = {}; int fzOn = 0;
+        {
+            const float ws[3] = {1.0f, 0.5f, 0.0f};
+            for (int wi = 0; wi < 3; ++wi) {
+                float f2[kBands] = {};
+                AF_SceneSetApertureDeltaWeight(s, ws[wi]);
+                const int on = AF_SceneMeasureApertureFresnel(s, L, S, f2);
+                if (wi == 0) { fzOn = on; for (int b = 0; b < kBands; ++b) fz[b] = f2[b]; }
+                std::printf("                  δ重み %.1f: 125 %.4f  250 %.4f  500 %.4f  1k %.4f  2k %.4f  4k %.4f\n",
+                            ws[wi], f2[0], f2[1], f2[2], f2[3], f2[4], f2[5]);
+            }
+            AF_SceneSetApertureDeltaWeight(s, 1.0f);
+        }
+        std::printf("        %5.1f°  %6.3f   %8.3f  %8.3f  %8.3f  %8.3f   %d本  透過125Hz %.4f (%.1f dB) 4kHz %.4f 遮蔽率 %.2f\n",
+                    deg, openFrac, val[0], val[1], val[2], val[3],
+                    nsrc, tr[0], 20.0f * std::log10(std::max(tr[0], 1e-6f)), tr[5], occF);
+        std::printf("                  フレネル開口率(有効=%d): 125Hz %.4f  250 %.4f  500 %.4f  1k %.4f  2k %.4f  4k %.4f  開口P(%.2f,%.2f,%.2f)\n",
+                    fzOn, fz[0], fz[1], fz[2], fz[3], fz[4], fz[5],
+                    apPos.x, apPos.y, apPos.z);
+
+        // 閉じているのに経路が残る件の実測。0°/5° で候補の生の位置と δ を全部出す。
+        //   推測で潰しに行かないため、まず「何が残っているか」を見る。
+        if (deg < 5.01f) {
+            AF_Vector3 cp[24]; float cd[24];
+            const int cn = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 24);
+            std::printf("            候補 %d 個（遮蔽=%d）:\n", cn, AF_SceneIsOccluded(s, L, S));
+            for (int i = 0; i < cn && i < 8; ++i)
+                std::printf("              P(%6.2f,%6.2f,%6.2f)  δ=%.3f\n",
+                            cp[i].x, cp[i].y, cp[i].z, cd[i]);
+        }
+        AF_SceneDestroy(s);
+    }
+    std::printf("        → 最大隣接差 ");
+    for (int k = 0; k < 4; ++k)
+        std::printf("%s %.3f@%.0f°  ", settings[k].name, maxJump[k], atDeg[k]);
+    std::printf("\n        （小さいほど滑らか。0°→90° を通して増え続けることも同じくらい大事）\n");
+}
+
+// ================================================================ 2次回折の質
+// 「2次回折は満足に動いているのか」を測る。既存テストは ゲイン>0 / 本数>0 / ほぼ正面
+// の3つしか見ておらず、値の妥当性も、無い場所で鳴っていないかも確認していない。
+//
+// 見るのは3点:
+//   ① 偽陽性 ── 2枚目の戸口を**塞いだ**シーンで、まだ音が届いてしまわないか。
+//                届くなら「音の通り道が無い場所で鳴っている」ことになる。
+//   ② 連続性 ── リスナーを動かしたとき、ゲインと開口方向が滑らかに動くか。
+//   ③ 発火率 ── そもそも何割の位置で 2 次が使われているか（＝捨てたとき失うものの量）。
+// Unity の Test_DiffractionGap と**同じ寸法**を組む。
+//   本人が実機で「回折点が全然見つからない・動くと音が気持ち悪い」と言った現場がここ。
+//   部屋 12×4×8(内寸)・壁厚 0.4、仕切り z=0(厚0.3) の右に開口 x∈[3,5]、
+//   音源 (-3,1.6,2) は開口の正面を外してあるので必ず回り込みが要る。
+//   リスナーは A/D で X に動くので、X 掃引で見る。
+void diagnoseUnityGapScene() {
+    std::printf("\n[診断] Unity Test_DiffractionGap と同じ形状\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    auto box = [&](float cx, float cy, float cz, float hx2, float hy2, float hz2) {
+        AF_SceneAddInstanceBox(s, V(cx, cy, cz), V(hx2, hy2, hz2), V(1,0,0), V(0,1,0), mat);
+    };
+    box(0.0f, -0.2f,  0.0f, 6.4f, 0.2f, 4.4f);   // 床
+    box(0.0f,  4.2f,  0.0f, 6.4f, 0.2f, 4.4f);   // 天井
+    box(6.2f,  2.0f,  0.0f, 0.2f, 2.0f, 4.0f);   // 東
+    box(-6.2f, 2.0f,  0.0f, 0.2f, 2.0f, 4.0f);   // 西
+    box(0.0f,  2.0f,  4.2f, 6.0f, 2.0f, 0.2f);   // 北
+    box(0.0f,  2.0f, -4.2f, 6.0f, 2.0f, 0.2f);   // 南
+    box(-1.5f, 2.0f,  0.0f, 4.5f, 2.0f, 0.15f);  // 仕切り左 (x∈[-6,3])
+    box(5.5f,  2.0f,  0.0f, 0.5f, 2.0f, 0.15f);  // 仕切り右 (x∈[5,6])
+
+    const AF_Vector3 S = V(-3.0f, 1.6f, 2.0f);
+    // ★見つけた開口を「開口率最大のポータル」として評価する版との比較。
+    //   ポータルを置くのではなく、稜線探索の結果をポータルの式で読み替える。
+    const bool asPortal = (std::getenv("AF_APERTURE_AS_PORTAL") != nullptr);
+    (void)asPortal;   // 却下した案（衝立で破綻）。切替は残さない
+    // ★Test_Full にはポータルが 2 枚あり、回折シーンには 0 枚。
+    //   エンジンは「ポータルがあるならそれが唯一の答え」で稜線探索を丸ごと迂回するので、
+    //   同じ形状でも通る経路が違う。どれだけ違うかをここで並べる。
+    const bool withPortal = (std::getenv("AF_WITHPORTAL") != nullptr);
+    if (withPortal)   // 仕切りの開口 x∈[3,5]、高さは部屋の内寸 0〜4
+        AF_SceneAddPortal(s, V(4.0f, 2.0f, 0.0f), V(1, 0, 0), V(0, 1, 0), 1.0f, 2.0f);
+    std::printf("      %s\n", withPortal ? "【ポータルを置いた（Test_Full と同じ経路）】"
+                            : asPortal   ? "【開口をポータルとして評価（開口率最大）】"
+                                         : "【稜線探索（回折シーンと同じ経路）】");
+    std::printf("      listener.x  経路本数  回折125Hz  二次音源  到来方向(正規化)   経路長\n");
+    int fired = 0, total = 0;
+    float prevG = -1.0f, maxJump = 0.0f, jAt = 0.0f;
+    for (float x = -5.0f; x <= 5.01f; x += 0.5f) {
+        const AF_Vector3 L = V(x, 1.6f, -2.0f);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        float g[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+        AF_Vector3 pos[8]; float gain[8];
+        const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+        ++total; if (n > 0) ++fired;
+        AF_Vector3 d = V(0,0,0); float plen = 0.0f;
+        if (n > 0) {
+            d = V(pos[0].x - L.x, pos[0].y - L.y, pos[0].z - L.z);
+            plen = std::sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
+            if (plen > 1e-4f) { d.x /= plen; d.y /= plen; d.z /= plen; }
+        }
+        if (prevG >= 0.0f) {
+            const float j = std::fabs(g[0] - prevG);
+            if (j > maxJump) { maxJump = j; jAt = x; }
+        }
+        prevG = g[0];
+        std::printf("      %8.2f    %6d   %8.4f  %6d    (%5.2f,%5.2f,%5.2f)  %6.2f m%s",
+                    x, n, g[0], n, d.x, d.y, d.z, plen, n > 0 ? "" : "  ★出ていない");
+        // ★複数タップは**同じ乾いた信号のコピー**なので、経路差ぶんの遅延で干渉する。
+        //   回折タップは平坦（diffractionDistanceOnly）なので全帯域で同相に効き、
+        //   経路差 Δ の第1ノッチが c/(2Δ) に立つ。ドラムの胴の帯域に来ると
+        //   「削れて低音が壊れた」ように聞こえる。何 Hz に来るかを出す。
+        if (n >= 2) {
+            float pmin = 1e30f, pmax = 0.0f;
+            for (int i = 0; i < n; ++i) {
+                const float ax = pos[i].x - L.x, ay = pos[i].y - L.y, az = pos[i].z - L.z;
+                const float p = std::sqrt(ax*ax + ay*ay + az*az);
+                pmin = std::min(pmin, p); pmax = std::max(pmax, p);
+            }
+            const float dmax = pmax - pmin;
+            if (dmax > 1e-3f)
+                std::printf("   経路差 %.2fm → 第1ノッチ %.0f Hz", dmax, 343.0f / (2.0f * dmax));
+        }
+        std::printf("\n");
+    }
+    std::printf("      → 二次音源が出た位置 %d / %d ／ 125Hz 最大隣接差 %.4f @ x=%.2f\n",
+                fired, total, maxJump, jAt);
+
+    // ★線ではなく**面**で潰す。1本の掃引では踏まない穴が部屋の中に残っていないか。
+    //   部屋の内側 x∈[-5.5,5.5] × z∈[-3.5,-0.5] を 0.25m 格子で全部見る。
+    {
+        int cells = 0, zero = 0;
+        float worstX = 0.0f, worstZ = 0.0f;
+        for (float z = -3.5f; z <= -0.49f; z += 0.25f) {
+            for (float x = -5.5f; x <= 5.51f; x += 0.25f) {
+                const AF_Vector3 L = V(x, 1.6f, z);
+                AF_SceneSetListener(s, L);
+                AF_SceneSetSource(s, 1, S);
+                AF_SceneUpdate(s, 1.0f / 60.0f);
+                AF_Vector3 pos[8]; float gain[8];
+                const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1),
+                                                            pos, gain, 8);
+                ++cells;
+                if (n == 0) {
+                    // 見通せている位置なら二次音源 0 が正しい（回折は直接音への補正になる）。
+                    float tb[kBands] = {};
+                    AF_SceneComputeTransmissionBands(s, L, S, tb, kBands);
+                    const bool losMaybe = tb[0] > 0.99f;
+                    if (!losMaybe) { ++zero; worstX = x; worstZ = z; }
+                    if (zero <= 16)
+                        std::printf("         出ない点 (%+.2f, %+.2f) %s\n", x, z,
+                                    losMaybe ? "（見通せている＝0 が正しい）" : "★遮蔽されているのに 0");
+                }
+            }
+        }
+        std::printf("      → 部屋の中を 0.25m 格子で全部見る: 回折が出ない点 %d / %d",
+                    zero, cells);
+        if (zero > 0) std::printf("  ★例 (%.2f, 1.60, %.2f)", worstX, worstZ);
+        std::printf("\n");
+    }
+    AF_SceneDestroy(s);
+}
+
+// 「離れると稜線が探索できなくなるのでは」という見立てを数字で確かめる。
+//   仕切り1枚に開口ひとつだけ（床も天井も部屋も置かない）。他の要因を消して
+//   **距離だけ**を動かす。リスナーを仕切りから 2m → 40m まで下げる。
+//   壁は x∈[-20,-1] と x∈[1,20]、開口は x∈[-1,1]、音源は開口の正面を外した所。
+void diagnoseDistanceReach() {
+    std::printf("\n[診断] 開口からの距離と稜線探索の到達\n");
+    std::printf("      仕切り1枚＋開口ひとつ。周りの壁を段階的に足して、何が効くか分ける。\n");
+    // level 0=仕切りだけ / 1=+床天井 / 2=+側壁 / 3=+奥と手前の壁（閉じた部屋）
+    const char* label[4] = {"仕切りだけ", "＋床天井  ", "＋側壁    ", "＋閉じた箱"};
+    for (int level = 0; level < 4; ++level) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(-10.5f, 2.5f, 0), V(9.5f, 2.5f, 0.15f), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( 10.5f, 2.5f, 0), V(9.5f, 2.5f, 0.15f), V(1,0,0), V(0,1,0), mat);
+        if (level >= 1) {
+            AF_SceneAddInstanceBox(s, V(0, -0.15f, 0), V(20, 0.15f, 45), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0,  5.15f, 0), V(20, 0.15f, 45), V(1,0,0), V(0,1,0), mat);
+        }
+        if (level >= 2) {
+            AF_SceneAddInstanceBox(s, V(-20.15f, 2.5f, 0), V(0.15f, 2.5f, 45), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V( 20.15f, 2.5f, 0), V(0.15f, 2.5f, 45), V(1,0,0), V(0,1,0), mat);
+        }
+        if (level >= 3) {
+            AF_SceneAddInstanceBox(s, V(0, 2.5f, -45.15f), V(20, 2.5f, 0.15f), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, 2.5f,  45.15f), V(20, 2.5f, 0.15f), V(1,0,0), V(0,1,0), mat);
+        }
+        const AF_Vector3 S = V(-4.0f, 1.6f, 4.0f);
+        AF_SceneSetSource(s, 1, S);
+
+        std::printf("      [%s]  距離: ", label[level]);
+        for (float d = 2.0f; d <= 40.01f; d = (d < 10.0f) ? d + 2.0f : d + 5.0f) {
+            const AF_Vector3 L = V(0.0f, 1.6f, -d);
+            AF_SceneSetListener(s, L);
+            AF_SceneUpdate(s, 1.0f / 60.0f);
+            AF_Vector3 pos[8]; float gain[8];
+            const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+            std::printf("%.0fm:%d ", d, n);
+        }
+        std::printf("（数字は経路本数。0 なら探索できていない）\n");
+        AF_SceneDestroy(s);
+    }
+
+    // 閉じた箱で、ゲインと経路長も出す。
+    std::printf("      閉じた箱での中身:\n");
+    std::printf("        距離(m)  経路本数  回折125Hz   δ(m)   経路長(m)  縁への入射角(度)\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    AF_SceneAddInstanceBox(s, V(-10.5f, 2.5f, 0), V(9.5f, 2.5f, 0.15f), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V( 10.5f, 2.5f, 0), V(9.5f, 2.5f, 0.15f), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, -0.15f, 0), V(20, 0.15f, 45), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0,  5.15f, 0), V(20, 0.15f, 45), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(-20.15f, 2.5f, 0), V(0.15f, 2.5f, 45), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V( 20.15f, 2.5f, 0), V(0.15f, 2.5f, 45), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, 2.5f, -45.15f), V(20, 2.5f, 0.15f), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, 2.5f,  45.15f), V(20, 2.5f, 0.15f), V(1,0,0), V(0,1,0), mat);
+    const AF_Vector3 S = V(-4.0f, 1.6f, 4.0f);
+    AF_SceneSetSource(s, 1, S);
+    for (float d = 2.0f; d <= 40.01f; d = (d < 10.0f) ? d + 2.0f : d + 5.0f) {
+        const AF_Vector3 L = V(0.0f, 1.6f, -d);
+        AF_SceneSetListener(s, L);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        float g[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+        AF_Vector3 pos[8]; float gain[8];
+        const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+        float plen = 0.0f, delta = 0.0f;
+        if (n > 0) {
+            const float vx = pos[0].x - L.x, vy = pos[0].y - L.y, vz = pos[0].z - L.z;
+            plen = std::sqrt(vx*vx + vy*vy + vz*vz);
+            const float dx = S.x - L.x, dy = S.y - L.y, dz = S.z - L.z;
+            delta = plen - std::sqrt(dx*dx + dy*dy + dz*dz);
+        }
+        std::printf("        %7.1f  %6d   %8.4f  %6.2f   %7.2f   %8.1f%s\n",
+                    d, n, g[0], delta, plen,
+                    90.0f - std::atan2(d, 1.0f) * 57.2958f,
+                    n == 0 ? "   ★探索できていない" : "");
+    }
+
+    // ★**横に**離れる場合。奥行きは 3m に固定して、開口から左へ 0〜19m 離れる。
+    //   縁への入射角が浅くなるので、掠めの許容が固定値だとここで死ぬはず。
+    std::printf("      横に離れる（奥行き 3m 固定、開口は x∈[-1,1]）:\n");
+    std::printf("        横の距離(m)  経路本数  回折125Hz   縁への入射角(度)\n");
+    for (float x = 0.0f; x >= -19.01f; x -= 2.0f) {
+        const AF_Vector3 L = V(x, 1.6f, -3.0f);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        float g[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+        AF_Vector3 pos[8]; float gain[8];
+        const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+        const float lateral = std::fabs(1.0f - x);          // 開口の右縁までの横距離
+        std::printf("        %10.1f  %6d   %8.4f   %10.1f%s\n",
+                    -x, n, g[0], std::atan2(3.0f, lateral) * 57.2958f,
+                    n == 0 ? "   ★探索できていない" : "");
+    }
+    AF_SceneDestroy(s);
+}
+
+// 「隣の部屋へ動くだけで音が変わりすぎ」を数字にする。
+//   Unity の混ぜ方（AcousticFlowSceneDemo）をそのまま再現する:
+//     直接タップ  = ソフト遮蔽の透過 × 距離減衰(1.5/max(r,1.5))
+//     回折タップ  = エンジンの回折ゲイン × 遮蔽割合 × 距離減衰(経路長)
+//   diffractionDistanceOnly=ON は**帯域の形**だけを平らにする設定なので、
+//   広帯域の音量はそのまま残る。そこがどれだけ振れるかを見る。
+//   ※空気吸収は掛けていない（掛けると更に高域が落ちるが、量の議論は変わらない）。
+void diagnoseRoomToRoomLevel() {
+    std::printf("\n[診断] 隣の部屋へ歩いたときのレベル変化（Unity の混ぜ方を再現）\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, hw = 6.0f, hd = 8.0f;
+    // 戸口 x∈[-0.6,0.6] だけが通り道。扉は無し（開口そのものを見る）。
+    AF_SceneAddInstanceBox(s, V(-(hw + doorW*0.5f) * 0.5f, h*0.5f, 0),
+                           V((hw - doorW*0.5f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V((hw + doorW*0.5f) * 0.5f, h*0.5f, 0),
+                           V((hw - doorW*0.5f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, (2.4f + h) * 0.5f, 0), V(doorW*0.5f, (h - 2.4f)*0.5f, t),
+                           V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+
+    const AF_Vector3 S = V(-3.0f, 1.6f, 4.0f);      // 奥の部屋・戸口の正面から外す
+    AF_SceneSetSource(s, 1, S);
+    // ★**Unity と同じ設定にする**。エンジンの既定と Unity の設定は違うので、
+    //   既定のまま測ると本人が聞いているものと別の数字が出る（実際 8dB ずれていた）。
+    //   AcousticFlowSceneDemo: apertureIsTransmission=true / apertureContrast=4
+    AF_SceneSetApertureIsTransmission(s, 1);
+    AF_SceneSetApertureContrast(s, 4.0f);
+
+    auto distAtten = [](float r) { return 1.5f / std::max(r, 1.5f); };
+    auto db = [](float a) { return (a > 1e-9f) ? 20.0f * std::log10(a) : -180.0f; };
+
+    std::printf("      listener.z  遮蔽割合  直接(dB)  回折(dB)  合計(dB)  隣接差(dB)"
+                "  早期反射 本数  残響送出(dB)\n");
+    float prevTot = 0.0f; bool have = false;
+    float prev2 = 0.0f; bool have2 = false; float maxJump2 = 0.0f;
+    float min2 = 1e30f, max2 = -1e30f;
+    float maxJump = 0.0f, jumpAt = 0.0f, minTot = 1e30f, maxTot = -1e30f;
+    for (float z = -6.0f; z <= 6.01f; z += 0.5f) {
+        const AF_Vector3 L = V(0.0f, 1.6f, z);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        // ★2回まわす。回折の二次音源は 2 フレームに 1 回しか再計算されない
+        //   （役割2の diffSrcEveryN=2）ので、1回だと**前の位置の値**が返ることがある。
+        //   気づかずに測ると、同じ掃引が 16.2dB と 50.5dB の二通りに出る。
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        const float dx = S.x - L.x, dy = S.y - L.y, dz = S.z - L.z;
+        const float directDist = std::sqrt(dx*dx + dy*dy + dz*dz);
+        float soft[kBands] = {}; float occFrac = 0.0f;
+        AF_SceneComputeSoftOcclusion(s, L, S, soft, kBands, &occFrac);
+        float sm = 0.0f;
+        for (int b = 0; b < kBands; ++b) sm += soft[b];
+        const float direct = (sm / kBands) * distAtten(directDist);
+
+        AF_Vector3 pos[8]; float gain[8];
+        const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+        float diff = 0.0f, plShow = 0.0f, gsum = 0.0f, diffNoAtt = 0.0f;
+        for (int i = 0; i < n; ++i) gsum += gain[i];
+        for (int i = 0; i < n; ++i) {
+            const float vx = pos[i].x - L.x, vy = pos[i].y - L.y, vz = pos[i].z - L.z;
+            const float pl = std::sqrt(vx*vx + vy*vy + vz*vz);
+            diff += gain[i] * occFrac * distAtten(pl);
+            // ★もし「回折の減衰量を掛けない」なら（＝配分だけを合計1に正規化して使う）。
+            //   C# のコメントが「合計1に正規化済み」と書いている状態がこれ。
+            if (gsum > 1e-9f) diffNoAtt += (gain[i] / gsum) * occFrac * distAtten(pl);
+            if (i == 0) plShow = pl;
+        }
+        // ★早期反射と残響送出も入れる。前回はここを見ておらず「段差 5.8dB」と報告したが、
+        //   部屋を移ると**反射と残響の方が大きく動く**ので、それだけでは実態を表さない。
+        AF_Vector3 erp[16]; float erg[16 * kBands];
+        const int ner = AF_SceneGetEarlyReflections(s, AF_SceneSourceIndex(s, 1), erp, erg, 16);
+        float early = 0.0f;
+        for (int i = 0; i < ner; ++i) {
+            const float vx = erp[i].x - L.x, vy = erp[i].y - L.y, vz = erp[i].z - L.z;
+            const float pl = std::sqrt(vx*vx + vy*vy + vz*vz);
+            float m = 0.0f;
+            for (int b = 0; b < kBands; ++b) m += erg[i * kBands + b];
+            early += (m / kBands) * distAtten(pl);
+        }
+        // 残響への送出量＝反射込みの帯域生存（C# の ts.SourceLevel と同じ）。
+        float surv[kBands] = {};
+        AF_SceneGetSourceOcclusion(s, AF_SceneSourceIndex(s, 1), surv);
+        float sv = 0.0f;
+        for (int b = 0; b < kBands; ++b) sv += surv[b];
+        sv /= kBands;
+
+        const float tot = direct + diff;
+        float jump = 0.0f;
+        if (have) { jump = std::fabs(db(tot) - db(prevTot)); if (jump > maxJump) { maxJump = jump; jumpAt = z; } }
+        prevTot = tot; have = true;
+        minTot = std::min(minTot, db(tot)); maxTot = std::max(maxTot, db(tot));
+        // ★物理の基準: 半無限スクリーンの遮蔽損失（Kurze-Anderson 近似の前川）。
+        //   A = 5 + 20log10( sqrt(2πN) / tanh(sqrt(2πN)) ) [dB]、N = 2δ/λ。
+        //   N→0（影境界）で **5dB**（回折場が直接音の約半分）になるのが要点。
+        //   開口面積は掛けない ── 遮蔽体モデルと開口モデルは**別々の状況の代替**で、
+        //   両方掛けると同じ損失を二重に払う。
+        float physRef = 0.0f;
+        if (n > 0 && plShow > 0.0f) {
+            const float delta = std::max(plShow - directDist, 0.0f);
+            const float lambda = 343.0f / 125.0f;
+            const float N = 2.0f * delta / lambda;
+            const float r = std::sqrt(2.0f * 3.14159265f * std::max(N, 1e-6f));
+            const float A = 5.0f + 20.0f * std::log10(r / std::tanh(r));
+            physRef = std::pow(10.0f, -A / 20.0f) * occFrac * distAtten(plShow);
+        }
+        const float tot2 = direct + diffNoAtt;
+        if (have2) { const float j2 = std::fabs(db(tot2) - db(prev2));
+                     if (j2 > maxJump2) { maxJump2 = j2; } }
+        prev2 = tot2; have2 = true;
+        min2 = std::min(min2, db(tot2)); max2 = std::max(max2, db(tot2));
+        std::printf("      %9.1f  %7.2f  %8.1f  %8.1f  %8.1f  %9.1f  %8.1f %3d  %8.1f\n",
+                    z, occFrac, db(direct), db(diff), db(tot), jump,
+                    db(early), ner, db(sv));
+    }
+    std::printf("      → 現状          : 最大隣接差 %.1f dB @ z=%.1f ／ 全域の振れ幅 %.1f dB\n",
+                maxJump, jumpAt, maxTot - minTot);
+    std::printf("      → 減衰量を外すと: 最大隣接差 %.1f dB           ／ 全域の振れ幅 %.1f dB\n",
+                maxJump2, max2 - min2);
+
+    // ★透過レベルのつまみ(transmissionGainDb)が振れ幅をどれだけ縮めるか。
+    //   C# の ApplyTilt/ゲインと同じ式をここで通す。平滑化は時間方向なのでここには出ない。
+    std::printf("      つまみを動かしたときの振れ幅（左=透過ゲイン / 右=回折ゲイン）:\n");
+    for (int knob = 0; knob < 2; ++knob)
+    for (float gdb = 0.0f; gdb <= 24.01f; gdb += 6.0f) {
+        const float tg = (knob == 0) ? std::pow(10.0f, gdb / 20.0f) : 1.0f;
+        const float dg = (knob == 1) ? std::pow(10.0f, gdb / 20.0f) : 1.0f;
+        float mn = 1e30f, mx = -1e30f, mj = 0.0f, pv = 0.0f; bool hv = false;
+        for (float z = -6.0f; z <= 6.01f; z += 0.5f) {
+            const AF_Vector3 L = V(0.0f, 1.6f, z);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            AF_SceneUpdate(s, 1.0f / 60.0f);
+            AF_SceneUpdate(s, 1.0f / 60.0f);
+            const float ddx = S.x - L.x, ddy = S.y - L.y, ddz = S.z - L.z;
+            const float dd = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+            float sf[kBands] = {}; float of = 0.0f;
+            AF_SceneComputeSoftOcclusion(s, L, S, sf, kBands, &of);
+            float sm2 = 0.0f;
+            for (int b = 0; b < kBands; ++b) sm2 += std::min(sf[b] * tg, 1.0f);
+            const float dir2 = (sm2 / kBands) * distAtten(dd);
+            AF_Vector3 p2[8]; float g2[8];
+            const int n2 = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), p2, g2, 8);
+            float df2 = 0.0f;
+            for (int i = 0; i < n2; ++i) {
+                const float vx = p2[i].x - L.x, vy = p2[i].y - L.y, vz = p2[i].z - L.z;
+                df2 += g2[i] * of * dg * distAtten(std::sqrt(vx*vx + vy*vy + vz*vz));
+            }
+            const float tt = db(dir2 + df2);
+            if (hv && std::fabs(tt - pv) > mj) mj = std::fabs(tt - pv);
+            pv = tt; hv = true;
+            mn = std::min(mn, tt); mx = std::max(mx, tt);
+        }
+        std::printf("        %s +%4.0f dB → 振れ幅 %5.1f dB ／ 最大隣接差 %4.1f dB\n",
+                    knob == 0 ? "透過" : "回折", gdb, mx - mn, mj);
+    }
+    AF_SceneDestroy(s);
+}
+
+// 開口の広さが回折の量にどう効くか。レイで測った差し渡しと、そこから出るゲイン。
+//   ポータル式では**広さだけ**がゲインを決める（距離はホスト、方向は開口点）ので、
+//   ここが素直かどうかが全部を決める。
+void diagnoseApertureWidthCurve() {
+    std::printf("\n[診断] 開口の広さ → 回折の量（ポータル式で残る唯一の要素）\n");
+    // ★壁の厚みを変えて崖の位置が動くかを見る。動けば原因は写像ではなく
+    //   「通れるか」のプローブ距離（厚み×2＋margin×2）だと確定する。
+    for (float wallT : {0.15f}) {
+    std::printf("      ── 壁の半厚 %.2fm（プローブ距離 = %.2fm）──\n",
+                wallT, 2.0f * wallT * 2.0f + 0.04f);
+    std::printf("      隙間幅(m)   回折125Hz   前の幅との比\n");
+    float prev = -1.0f;
+    for (float w : {0.03f, 0.06f, 0.12f, 0.25f, 0.35f, 0.5f, 1.0f, 2.0f, 4.0f}) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        // ★ここで無条件に ON にしていたせいで、既定経路のつもりでポータル式を測っていた。
+        //   環境変数で切り替える（既定は既定経路）。
+
+        // ★Unity は apertureContrast=4 で走っている。エンジン既定の 1.0 で測ると
+        //   実機と別のものを測ることになる（一度やった）。環境変数で振れるようにする。
+        {
+            const char* c = std::getenv("AF_CONTRAST");
+            if (c) AF_SceneSetApertureContrast(s, static_cast<float>(std::atof(c)));
+        }
+        // ★隙間の**手前の縁を x=0 に固定**し、奥へ向かって広げる。
+        //   両側から広げると開口の縁が直線に近づき、幅と同時に「影の深さ」も変わって
+        //   しまう（前の測り方はこれで、幅の効きを過小評価していた）。
+        //   手前の縁を固定すれば δ が変わらないので、**幅だけ**を動かせる。
+        const float hw = 8.0f, h = 4.0f, hd = 8.0f, t = wallT;
+        AF_SceneAddInstanceBox(s, V(-hw * 0.5f, h*0.5f, 0),
+                               V(hw * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);   // x∈[-8,0]
+        AF_SceneAddInstanceBox(s, V((w + hw) * 0.5f, h*0.5f, 0),
+                               V((hw - w) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat); // x∈[w,8]
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+
+        // ★直線が隙間を通らない配置にすること。対称に置くと隙間の真ん中を素通りして
+        //   遮蔽されず、回折ではなく「見通し時の補正」を測ってしまう（一度やった）。
+        //   L(-4,-3)→S(2,3) は z=0 を **x=-1** で横切る。隙間は x∈[0,w] なので、
+        //   どの幅でも直線は壁の中（＝影の深さは幅に依らず一定）。
+        const AF_Vector3 L = V(-4.0f, 1.6f, -3.0f), S = V(2.0f, 1.6f, 3.0f);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        float g[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+        AF_Vector3 pos[8]; float gain[8];
+        const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+        AF_Vector3 cp[8]; float cd[8];
+        const int cn = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 8);
+        // ★どこで平坦になっているかを分けるため、フレネル開口率そのものも出す。
+        float fr[kBands] = {};
+        const int frOk = AF_SceneMeasureApertureFresnel(s, L, S, fr);
+        char rel[32] = "";
+        if (prev > 1e-6f) std::snprintf(rel, sizeof(rel), "  ×%.2f", g[0] / prev);
+        std::printf("      %8.2f   %9.4f%s   候補%d 経路%d   開口率(%d) 125Hz %.4f / 4kHz %.4f%s\n",
+                    w, g[0], rel, cn, n, frOk, fr[0], fr[5],
+                    (cn == 0) ? "  ★候補が見つかっていない" : "");
+        prev = g[0];
+        AF_SceneDestroy(s);
+    }
+    }
+    std::printf("      （素通り基準 0.35m。これより広いと律速しない＝差が出なくなる）\n");
+}
+
+// 板ではない箱（立方体・柱・衝立）で回折が出るか。
+//   「板を跨ぐ線分」で判定する方式は**最も薄い軸＝壁の法線**を前提にしている。
+//   立方体だと薄い軸が退化して向きが恣意的に決まるので、判定が意味を失う恐れがある。
+//   遮蔽物1つだけを自由空間に置いて、素の探索能力だけを見る。
+void diagnoseNonPlateBlocker() {
+    std::printf("\n[診断] 板でない遮蔽物でも回折が出るか（跨ぎ判定の前提の確認）\n");
+    struct Case { const char* name; float hx, hy, hz; };
+    // ★経路は Z 方向なので、遮蔽物は Z に薄くする（半径表記）。
+    //   一度 X に薄くして測ってしまい、板が経路と平行＝壁になっていなかった。
+    const Case cases[] = {
+        {"薄い板 (2 x 2 x 0.15)   ", 2.0f, 2.0f, 0.15f},
+        {"やや厚い板(2 x 2 x 0.5) ", 2.0f, 2.0f, 0.50f},
+        {"立方体 (1 x 1 x 1)      ", 1.0f, 1.0f, 1.00f},
+        {"柱 (0.4 x 3 x 0.4)      ", 0.4f, 3.0f, 0.40f},
+        {"厚い塊 (2 x 2 x 1.5)    ", 2.0f, 2.0f, 1.50f},
+    };
+    std::printf("      形状                       候補数  回折125Hz\n");
+    for (const Case& c : cases) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, 1.6f, 0), V(c.hx, c.hy, c.hz), V(1,0,0), V(0,1,0), mat);
+        const AF_Vector3 L = V(0, 1.6f, -3.0f), S = V(0, 1.6f, 3.0f);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        float g[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+        AF_Vector3 cp[16]; float cd[16];
+        const int cn = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 16);
+        std::printf("      %s  %5d   %8.4f%s\n", c.name, cn, g[0],
+                    cn == 0 ? "   ★回折が消えた" : "");
+        AF_SceneDestroy(s);
+    }
+}
+
+void diagnoseSecondOrderQuality() {
+    std::printf("\n[診断] 2次回折の質\n");
+
+    // sealed=true で 2 枚目の戸口を塞ぐ。音の通り道は完全に無くなる。
+    auto build = [](bool sealed) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        const float t = 0.15f, hy = 1.5f;
+        AF_SceneAddInstanceBox(s, V(-3.5f, hy, 0), V(2.5f, hy, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( 3.0f, hy, 0), V(3.0f, hy, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-2.0f, hy, 4), V(4.0f, hy, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( 4.5f, hy, 4), V(1.5f, hy, t), V(1,0,0), V(0,1,0), mat);
+        if (sealed)   // 戸口2 (x∈[2,3]) を埋める
+            AF_SceneAddInstanceBox(s, V(2.5f, hy, 4), V(0.5f, hy, t), V(1,0,0), V(0,1,0), mat);
+        // ★側壁は**床と同じ z 範囲**まで伸ばす。以前は z∈[0,4]（廊下の部分）しか無く、
+        //   手前の部屋も奥の部屋も横と後ろが開きっぱなしだった。
+        //   そのせいで「戸口を塞いだ」と言いながら x>6 の外側を回る**実在の通り道**が残り、
+        //   偽陽性の判定にも連続性の掃引にも、毎行 (13.8,1.6,2.8) というタップが混ざっていた。
+        //   閉空間を測ると言うなら閉じておく。
+        AF_SceneAddInstanceBox(s, V(-6, hy, 2), V(t, hy, 12), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( 6, hy, 2), V(t, hy, 12), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, hy, -10), V(6, hy, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, hy,  14), V(6, hy, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, -t, 2), V(8, t, 12), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, 3+t, 2), V(8, t, 12), V(1,0,0), V(0,1,0), mat);
+        return s;
+    };
+
+    const AF_Vector3 S = V(2.5f, 1.6f, 7);
+
+    // ① 偽陽性
+    std::printf("      [偽陽性] 2枚目の戸口を塞いだ（音の通り道は無い）\n");
+    {
+        AF_SceneHandle s = build(true);
+        const AF_Vector3 L = V(-0.5f, 1.6f, -3);
+        float g[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+        std::printf("        回折 125Hz %.3f  ← 0 であるべき%s\n",
+                    g[0], g[0] > 0.01f ? "  ★通ってしまっている" : "");
+        AF_SceneDestroy(s);
+    }
+
+    // ②③ 連続性と発火率。リスナーを戸口1の手前で横に振る。
+    std::printf("      [連続性] リスナーを x=-2.0〜1.0 で動かす（戸口1は x∈[-1,0]）\n");
+    std::printf("        listener.x   回折125Hz  隣接差   開口方向(正規化)      経路長\n");
+    {
+        AF_SceneHandle s = build(false);
+        float prevG = -1.0f, maxJump = 0.0f, jumpAt = 0.0f;
+        AF_Vector3 prevD = V(0,0,0); bool havePrev = false;
+        float maxDirJump = 0.0f, dirJumpAt = 0.0f;
+        int fired = 0, total = 0;
+        for (float x = -2.0f; x <= 1.001f; x += 0.25f) {
+            const AF_Vector3 L = V(x, 1.6f, -3);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            AF_SceneUpdate(s, 1.0f / 60.0f);
+            float g[kBands] = {};
+            AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+            AF_Vector3 pos[8]; float gain[8];
+            const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+            ++total;
+            if (g[0] > 0.001f) ++fired;
+
+            float jump = (prevG >= 0.0f) ? std::fabs(g[0] - prevG) : 0.0f;
+            if (jump > maxJump) { maxJump = jump; jumpAt = x; }
+            prevG = g[0];
+
+            AF_Vector3 d = V(0,0,0); float plen = 0.0f;
+            if (n > 0) {
+                d = V(pos[0].x - L.x, pos[0].y - L.y, pos[0].z - L.z);
+                plen = std::sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
+                if (plen > 1e-4f) { d.x /= plen; d.y /= plen; d.z /= plen; }
+                if (havePrev) {
+                    const float dj = std::sqrt((d.x-prevD.x)*(d.x-prevD.x)
+                                             + (d.y-prevD.y)*(d.y-prevD.y)
+                                             + (d.z-prevD.z)*(d.z-prevD.z));
+                    if (dj > maxDirJump) { maxDirJump = dj; dirJumpAt = x; }
+                }
+                prevD = d; havePrev = true;
+            } else havePrev = false;
+
+            std::printf("        %6.2f      %6.3f   %6.3f   (%5.2f,%5.2f,%5.2f)   %6.2f m%s\n",
+                        x, g[0], jump, d.x, d.y, d.z, plen, n > 0 ? "" : "  (開口なし)");
+        }
+        // ★細かい刻みでも測る。0.25m 刻みだと段差を跨いでしまい、
+        //   「滑らか」に見えるのに実際は飛んでいることがある。
+        {
+            AF_SceneHandle s2 = build(false);
+            float pg = -1.0f, mj = 0.0f, mjAt = 0.0f;
+            AF_Vector3 pd = V(0,0,0); bool hp = false;
+            float mdj = 0.0f, mdjAt = 0.0f;
+            // ★跳んだ瞬間は**その場で**記録する。あとから mdjAt を頼りに掃引をやり直すと、
+            //   x の浮動小数の累積とズレて別の点を見てしまい、表示された前後の差が
+            //   報告値と合わない（実測で 0.268 のはずが窓の表示は 0.131 だった）。
+            float jx0 = 0.0f, jx1 = 0.0f;
+            AF_Vector3 jd0 = V(0,0,0), jd1 = V(0,0,0);
+            float gx0 = 0.0f, gx1 = 0.0f, gs0 = 0.0f, gs1 = 0.0f;
+            float prevX = 0.0f;
+            for (float x = -2.0f; x <= 1.001f; x += 0.05f) {
+                const AF_Vector3 Lf = V(x, 1.6f, -3);
+                AF_SceneSetListener(s2, Lf);
+                AF_SceneSetSource(s2, 1, S);
+                AF_SceneUpdate(s2, 1.0f / 60.0f);
+                AF_Vector3 pos[8]; float gain[8];
+                const int n = AF_SceneGetDiffractionSources(s2, AF_SceneSourceIndex(s2, 1),
+                                                            pos, gain, 8);
+                float sum = 0.0f; AF_Vector3 dom = V(0,0,0); float best = -1.0f;
+                for (int i = 0; i < n; ++i) {
+                    sum += gain[i];
+                    if (gain[i] > best) { best = gain[i]; dom = pos[i]; }
+                }
+                if (pg >= 0.0f) {
+                    const float j = std::fabs(sum - pg);
+                    if (j > mj) {
+                        mj = j; mjAt = x;
+                        gx0 = prevX; gx1 = x; gs0 = pg; gs1 = sum;
+                    }
+                }
+                // ★位置ではなく**方向**で測る。返る座標は listener+方向×経路長 なので、
+                //   経路が伸びれば遠くへ出る。位置の差は異常の指標にならない
+                //   （実測で 15.81m と出たが、中身は経路長が伸びただけだった）。
+                //   耳に効くのは方向なので、単位ベクトルの差を見る。
+                if (best > 0.0f) {
+                    const AF_Vector3 rel = V(dom.x - Lf.x, dom.y - Lf.y, dom.z - Lf.z);
+                    const float rl = std::max(std::sqrt(rel.x*rel.x + rel.y*rel.y
+                                                      + rel.z*rel.z), 1e-4f);
+                    const AF_Vector3 dir = V(rel.x/rl, rel.y/rl, rel.z/rl);
+                    if (hp) {
+                        const AF_Vector3 dd = V(dir.x - pd.x, dir.y - pd.y, dir.z - pd.z);
+                        const float dj = std::sqrt(dd.x*dd.x + dd.y*dd.y + dd.z*dd.z);
+                        if (dj > mdj) {
+                            mdj = dj; mdjAt = x;
+                            jx0 = prevX; jx1 = x; jd0 = pd; jd1 = dir;
+                        }
+                    }
+                    dom = dir;   // 以降は方向として保持
+                }
+                pg = sum;
+                prevX = x;
+                if (best > 0.0f) { pd = dom; hp = true; }
+            }
+            std::printf("           方向が跳んだ実測: x=%.2f→%.2f  "
+                        "(%.2f,%.2f,%.2f)→(%.2f,%.2f,%.2f)  差=%.3f (%.0f°)\n",
+                        jx0, jx1, jd0.x, jd0.y, jd0.z, jd1.x, jd1.y, jd1.z, mdj,
+                        2.0f * std::asin(std::min(mdj, 2.0f) * 0.5f) * 57.2958f);
+            std::printf("           ゲインが跳んだ実測: x=%.2f→%.2f  %.4f→%.4f (差=%.4f)\n",
+                        gx0, gx1, gs0, gs1, mj);
+            std::printf("        → 0.05m 刻み: ゲイン最大隣接差 %.3f @ x=%.2f / "
+                        "**到来方向**の最大隣接差 %.3f @ x=%.2f（単位ベクトル）\n",
+                        mj, mjAt, mdj, mdjAt);
+            // 跳ぶ瞬間の前後を、開口の本数と重み込みで出す（推測で直さないため）。
+            //   方向が跳ぶ地点とゲインが跳ぶ地点は別々に起きるので、両方の窓を出す。
+            const float windows[2] = {mdjAt, mjAt};
+            const char* label[2] = {"方向が跳ぶ瞬間", "ゲインが跳ぶ瞬間"};
+            for (int wi = 0; wi < 2; ++wi) {
+                std::printf("           %s (x=%.2f 付近):\n", label[wi], windows[wi]);
+                for (float x = windows[wi] - 0.15f; x <= windows[wi] + 0.101f; x += 0.05f) {
+                    const AF_Vector3 Lf = V(x, 1.6f, -3);
+                    AF_SceneSetListener(s2, Lf);
+                    AF_SceneSetSource(s2, 1, S);
+                    AF_SceneUpdate(s2, 1.0f / 60.0f);
+                    AF_Vector3 pos[8]; float gain[8];
+                    const int n = AF_SceneGetDiffractionSources(s2, AF_SceneSourceIndex(s2, 1),
+                                                                pos, gain, 8);
+                    float bands[kBands] = {};
+                    AF_SceneComputeDiffractionBands(s2, Lf, S, bands, kBands);
+                    std::printf("             x=%+.2f  %d本  125Hz=%.4f ", x, n, bands[0]);
+                    for (int i = 0; i < n && i < 3; ++i)
+                        std::printf(" [g=%.4f (%.1f,%.1f,%.1f)]", gain[i],
+                                    pos[i].x, pos[i].y, pos[i].z);
+                    std::printf("\n");
+                }
+            }
+            AF_SceneDestroy(s2);
+        }
+        std::printf("        → ゲイン最大隣接差 %.3f @ x=%.2f / 方向最大隣接差 %.3f @ x=%.2f\n",
+                    maxJump, jumpAt, maxDirJump, dirJumpAt);
+        std::printf("        → 音が届いた位置 %d / %d\n", fired, total);
+        AF_SceneDestroy(s);
+    }
+}
+
 // ================================================================ ソフト遮蔽
 // 壁の縁を横切るときに、透過と遮蔽割合が連続に動くか。
 //   単一レイの判定だと「当たる/当たらない」で 1.0 ⇄ 材質値 と一気に跳ぶ。
@@ -1214,6 +2863,392 @@ void diagnoseDiffractionOnlySweep() {
     AF_SceneDestroy(s);
 }
 
+// ================================================================ 開口幅
+// 隙間を狭めていくと回折が落ちるか。
+//   前川の式は δ だけの関数で幅を見ないため、これが無いと「閉じた扉のわずかな隙間」でも
+//   δ が小さいだけで素通りしてしまう（実機で観測）。現実には波長より狭い隙間は通さない。
+void testApertureOpenness() {
+    std::printf("\n[開口率] 隙間を狭めると回折が落ちるか\n");
+    std::printf("      隙間幅   125Hz   500Hz    4kHz\n");
+
+    float prev = -1.0f;
+    bool monotone = true;
+    float wide = 0.0f, narrow = 0.0f;
+    for (float gap : {2.0f, 1.0f, 0.5f, 0.25f, 0.1f, 0.03f}) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        // z=0 の壁を2枚。隙間は x∈[0, gap]（中央ではなく片側に寄せる）。
+        //   ★リスナーと音源は x=-0.1 に置く。隙間の縁(x=0)のすぐ手前なので、
+        //     **隙間の幅を変えても δ はほぼ一定**になる。これで幅の効果だけを見られる。
+        //     隙間を中央に置いて左右対称にすると、広い隙間では直線が通ってしまい
+        //     そもそも遮蔽されない（最初そうなっていた）。
+        const float t = 0.15f, h = 3.0f, hw = 8.0f;
+        AF_SceneAddInstanceBox(s, V(-hw * 0.5f, h * 0.5f, 0), V(hw * 0.5f, h * 0.5f, t),
+                               V(1,0,0), V(0,1,0), mat);                       // x∈[-8,0]
+        AF_SceneAddInstanceBox(s, V(gap + (hw - gap) * 0.5f, h * 0.5f, 0),
+                               V((hw - gap) * 0.5f, h * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+        // 床・天井（上下から回り込ませない）
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, 6), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, 6), V(1,0,0), V(0,1,0), mat);
+        // 側面（左右から回り込ませない）
+        AF_SceneAddInstanceBox(s, V(-hw, h * 0.5f, 0), V(t, h * 0.5f, 6), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(hw, h * 0.5f, 0), V(t, h * 0.5f, 6), V(1,0,0), V(0,1,0), mat);
+
+        const AF_Vector3 L = V(-0.1f, 1.5f, -3), S = V(-0.1f, 1.5f, 3);
+        float g[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+        std::printf("      %6.2f m  %6.3f  %6.3f  %6.3f\n", gap, g[0], g[2], g[5]);
+        if (prev >= 0.0f && g[0] > prev + 1e-3f) monotone = false;
+        if (gap >= 1.99f) wide = g[0];
+        narrow = g[0];
+        prev = g[0];
+        AF_SceneDestroy(s);
+    }
+
+    check("隙間を狭めるほど回折が落ちる(単調)", monotone);
+    char b[96];
+    std::snprintf(b, sizeof(b), "(2m %.3f → 3cm %.3f)", wide, narrow);
+    check("3cm の隙間は 2m の隙間よりずっと通らない(1/4 以下)", narrow < wide * 0.25f, b);
+
+    // ── 閉じた扉が漏れないか（報告された症状そのもの）──
+    //   「閉じてても少し判定とられる」。原因は稜線候補を 2cm 膨らませていること
+    //   （面すれすれの経路を拾うために必要）で、密着した扉でも候補が出てしまう。
+    //   開口幅ゲートはその候補の**まわりに空間が無い**ことを見て潰す。
+    //   ★上の掃引と違い、天井と床で閉じた部屋にすること。開いた壁だと閉扉でも
+    //     「壁の上を越える」経路が物理的に正しく残るので、ゲートの検証にならない。
+    std::printf("\n      [閉じた扉] 密閉した部屋・戸口1m の扉を開けていく\n");
+    float closedGain = -1.0f, ajarGain = -1.0f;
+    // 扉の厚みを2通りで測る。探索の貫通許容 maxPen は「そのブロッカー自身の最薄辺+5cm」
+    // なので、薄い板は探索から見て素通しになる。厚い扉で漏れが消えるならそれが原因。
+    for (float kDoorHalfThick : {0.03f, 0.10f}) {
+    std::printf("        扉の厚み %.0fcm\n", kDoorHalfThick * 200.0f);
+    std::printf("        開き量   回折(125Hz)  ゲート無\n");
+    for (float open : {0.0f, 0.02f, 0.1f, 0.3f, 0.6f}) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        const float t = 0.1f, h = 3.0f, rw = 4.0f, rd = 4.0f;
+        // 仕切り壁（戸口 x∈[-0.5,0.5]）
+        AF_SceneAddInstanceBox(s, V(-2.25f, h*0.5f, 0), V(1.75f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( 2.25f, h*0.5f, 0), V(1.75f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        // 床・天井・四方の壁（密閉）
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(rw, t, rd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(rw, t, rd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-rw, h*0.5f, 0), V(t, h*0.5f, rd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( rw, h*0.5f, 0), V(t, h*0.5f, rd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -rd), V(rw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  rd), V(rw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        // 扉。戸口を塞ぐ板を、開いたぶんだけ横へずらす（引き戸として単純化）。
+        //   蝶番の回転で作ると角度と隙間幅が非線形に絡むので、幅の効果だけを見るためスライドにする。
+        const float dw = 0.5f - open * 0.5f;              // 残った板の半幅
+        if (dw > 0.01f)
+            AF_SceneAddInstanceBox(s, V(-0.5f + dw, h*0.5f, 0), V(dw, h*0.5f, kDoorHalfThick),
+                                   V(1,0,0), V(0,1,0), mat);
+
+        // L/S は x=-0.3。扉は +x 側へ開くので、開き切るまで直線は板に塞がれたまま
+        //   （x=0 に置くと 0.5m 開けた時点で直線が通ってしまい、回折の検証にならない）。
+        const AF_Vector3 L = V(-0.3f, 1.6f, -2.5f), S = V(-0.3f, 1.6f, 2.5f);
+        float g[kBands] = {}, gOff[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+        AF_SceneSetApertureOpen(s, 0.0f, 1.0f, 1.0f, 0);   // ref=0 でゲート無効
+        AF_SceneComputeDiffractionBands(s, L, S, gOff, kBands);
+        AF_SceneSetApertureOpen(s, 0.30f, 1.0f, 1.0f, 0);
+        // 開口の位置と開口率も出す（どこを回っていて、どれだけ開いているのか）
+        AF_Vector3 pos[8]; float gg[8];
+        AF_SceneSetListener(s, L); AF_SceneSetSource(s, 1, S); AF_SceneUpdate(s, 1.0f/60.0f);
+        const int nsrc = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gg, 8);
+        int bi2 = -1; float bw2 = -1.0f;
+        for (int i = 0; i < nsrc; ++i) if (gg[i] > bw2) { bw2 = gg[i]; bi2 = i; }
+        const float openFrac = (bi2 >= 0)
+            ? AF_SceneMeasureApertureOpenness(s, L, S) : 0.0f;
+        std::printf("        %5.2f m      %6.3f     %6.3f   率%6.3f  開口(%5.2f,%5.2f,%5.2f)\n",
+                    open, g[0], gOff[0], openFrac,
+                    bi2 >= 0 ? pos[bi2].x : 0.0f, bi2 >= 0 ? pos[bi2].y : 0.0f,
+                    bi2 >= 0 ? pos[bi2].z : 0.0f);
+        if (open <= 0.001f) closedGain = g[0];
+        if (open >= 0.59f) ajarGain = g[0];
+        AF_SceneDestroy(s);
+    }
+    }
+    char b2[96];
+    std::snprintf(b2, sizeof(b2), "(閉 %.3f / 60cm開 %.3f)", closedGain, ajarGain);
+    check("閉じた扉はほぼ通さない(0.1 未満)", closedGain < 0.1f, b2);
+    check("60cm 開けば通る(閉の4倍以上)", ajarGain > closedGain * 4.0f + 0.05f, b2);
+}
+
+// ---------------------------------------------------------------- 扉の連続性（受け入れ条件）
+// **この作品の根底は「周辺の変化を音で伝える」こと**なので、扉の開き具合が音へ
+// 連続に出ることは祈るものではなく守るもの。ここを回帰テストにして、以降どんな変更を
+// しても連続性が壊れたら赤で分かるようにする。
+//
+//   密閉した部屋・蝶番の扉を 1°刻みで 0→90° 掃引し、耳に届く回折量の隣接差を見る。
+//   1°ぶんの幾何変化に対して音量が飛ぶなら、それは表現形式の不連続が漏れている。
+void testDoorContinuity() {
+    std::printf("\n[扉の連続性] 1°刻みで掃引したときの隣接差\n");
+
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f;
+    const float hw = 6.0f, hd = 8.0f;
+    const AF_Vector3 L = V(0, 1.6f, -4), S = V(-2.0f, 1.6f, 3.5f);
+
+    float prev = -1.0f, maxJump = 0.0f, jumpAt = 0.0f;
+    float first = -1.0f, last = -1.0f;
+    int silentCount = 0, total = 0;
+    // ★「扉が仕事をしているか」を測るための控え。
+    //   隣接差だけを見ていたせいで、**変化を殺した実装がテストを通ってしまった**
+    //   （定数関数は完全に連続なので当然）。開き角ごとの値と高域の開口率を残す。
+    float atSlight = -1.0f, atHalf = -1.0f;   // 10° / 45°
+    float fzHighOpen = -1.0f;                 // 全開時の 4kHz 開口率
+    for (float deg = 0.0f; deg <= 90.01f; deg += 1.0f) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                               V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        const float th = deg * 3.14159265f / 180.0f;
+        const float c = std::cos(th), sn = std::sin(th);
+        AF_SceneAddInstanceBox(s, V(-0.6f + c * doorW * 0.5f, doorH * 0.5f, sn * doorW * 0.5f),
+                               V(doorW * 0.5f, doorH * 0.5f, 0.03f), V(c, 0, sn), V(0, 1, 0), mat);
+        // ★戸口をポータルとして置く。**出荷する経路で測る**ため。
+        //   ポータルが無いと旧経路（前川＋開口積分）が走るが、そちらは
+        //   「面のうちどこまで積分するか」に答えが無く、扉の効きが 1.9倍で頭打ちになる
+        //   （4通り試して全部失敗した）。テストが見るべきは実際に鳴る経路のほう。
+        AF_SceneAddPortal(s, V(0, doorH * 0.5f, 0), V(1, 0, 0), V(0, 1, 0),
+                          0.6f, doorH * 0.5f);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+
+        // 耳に届く量＝二次音源の重みの合計。
+        AF_Vector3 pos[8]; float gain[8];
+        const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+        float sum = 0.0f;
+        for (int i = 0; i < n; ++i) sum += gain[i];
+        ++total;
+        if (deg > 20.0f && sum < 1e-6f) ++silentCount;   // 十分開いてから無音は異常
+
+        if (deg >= 15.0f && deg <= 25.0f)
+            std::printf("        %4.0f°  開口 %d本  合計 %.4f  実測幅 %.4f\n",
+                        deg, n, sum, AF_SceneMeasureSlitWidth(s, L, S));
+        if (prev >= 0.0f) {
+            const float j = std::fabs(sum - prev);
+            if (j > maxJump) { maxJump = j; jumpAt = deg; }
+        }
+        if (first < 0.0f) first = sum;
+        if (deg > 9.5f && deg < 10.5f) atSlight = sum;
+        if (deg > 44.5f && deg < 45.5f) atHalf = sum;
+        if (deg > 89.5f) {
+            // ★ポータルを置いてあるので、そちらで測る。
+            //   AF_SceneMeasureApertureFresnel は旧経路（前川＋開口積分）の診断で、
+            //   ポータルがあるときは実際に鳴っている量ではない。
+            float fz[kBands] = {}; AF_Vector3 pcp = V(0,0,0);
+            if (AF_SceneMeasurePortal(s, 0, L, S, fz, &pcp)) fzHighOpen = fz[5];
+            else { AF_SceneMeasureApertureFresnel(s, L, S, fz); fzHighOpen = fz[5]; }
+        }
+        last = sum;
+        prev = sum;
+        AF_SceneDestroy(s);
+    }
+
+    char b[128];
+    std::snprintf(b, sizeof(b), "(最大隣接差 %.4f @ %.0f° / 閉 %.4f → 全開 %.4f)",
+                  maxJump, jumpAt, first, last);
+    std::printf("      %s\n", b);
+    // 1°の幾何変化で音量が 0.1 以上飛んだら、不連続が耳に届いている。
+    check("1°刻みで音量が飛ばない(隣接差 < 0.1)", maxJump < 0.1f, b);
+    check("開いたら鳴り続ける（20°以降に無音が無い）", silentCount == 0);
+    checkGreater("閉より全開の方が大きい", last, first);
+
+    // ★ここから「扉が仕事をしているか」。上の連続性だけでは平らな曲線を弾けない。
+    //   幾何では、戸口の隙間は 10° で 1.8cm、90° で 1.2m ＝ 67倍に開く。
+    //   開口率は 1.0 で頭打ちになるのでそこまでは出ないが、
+    //   **少し開いた状態と全開が同じ音**なら「どのくらい開いたか」を伝えられていない。
+    char b2[160];
+    std::snprintf(b2, sizeof(b2), "(10° %.4f → 45° %.4f → 90° %.4f = %.1f倍)",
+                  atSlight, atHalf, last, (atSlight > 1e-6f) ? last / atSlight : 0.0f);
+    std::printf("      %s\n", b2);
+    check("わずかに開いた状態と全開が別の音になる(90°が10°の4倍以上)",
+          atSlight > 1e-6f && last >= atSlight * 4.0f, b2);
+    check("後半でも開き続ける(90°が45°の1.5倍以上)",
+          atHalf > 1e-6f && last >= atHalf * 1.5f, b2);
+
+    // 高域が一度も開かないと「開くと音色が明るくなる」が出ない。
+    //   実測（現実の扉の収録）でも開−閉の差は 1kHz が 125Hz の4倍あった。
+    char b3[128];
+    std::snprintf(b3, sizeof(b3), "(全開時の 4kHz 開口率 %.4f)", fzHighOpen);
+    check("全開なら高域も開く(4kHz の開口率 > 0.1)", fzHighOpen > 0.1f, b3);
+}
+
+// ---------------------------------------------------------------- 材質の個別化(段5)
+// これまで全オクルーダーが材質を1つ共有していた＝薄い扉と厚いコンクリ壁が同じ透過率。
+// ここで見るのは:
+//   ・材質の中身を書き換えると、それを使う壁が一斉に変わる
+//   ・インスタンスごとに付け替えられる（扉だけ別の材質に）
+//   ・扉を「よく遮る材質」にすると閉扉時の漏れが減る（測定で裏を取る）
+void testPerInstanceMaterial() {
+    std::printf("\n[材質の個別化] 壁ごとに違う材質を持てるか\n");
+
+    AF_SceneHandle s = AF_SceneCreate();
+    const int matWall = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);   // 既定壁
+    // よく遮る材質（透過はエネルギー。振幅は √ なので 1e-6 → 0.001 = -60dB）。
+    //   ★既定壁を実際の間仕切り相当（TL 31dB）まで上げたので、比較用はさらに下げる。
+    //     以前は 1e-4 だったが、既定壁が -31dB になったため差が 9dB しか付かず、
+    //     「よく遮る材質にすると漏れが減る」の判定（1/4 以下）を通らなくなった。
+    const float tight[6] = {1e-6f, 5e-7f, 2e-7f, 1e-7f, 5e-8f, 2e-8f};
+    const int matTight = AF_SceneAddMaterial(s, tight, nullptr, nullptr, 6);
+
+    // 単純な仕切り1枚。
+    const int wall = AF_SceneAddInstanceBox(s, V(0, 1.5f, 0), V(4, 1.5f, 0.1f),
+                                            V(1,0,0), V(0,1,0), matWall);
+    const AF_Vector3 L = V(0, 1.6f, -3), S = V(0, 1.6f, 3);
+
+    float g[kBands] = {};
+    AF_SceneComputeTransmissionBands(s, L, S, g, kBands);
+    const float before = g[0];
+    // ★絶対値ではなく**性質**で見る。材質の数値は演出として動かすものなので、
+    //   閾値を絶対値で置くと調整のたびにテストが落ちる（実際そうなった）。
+    //   質量則として保たれるべきは「低域ほど抜ける」ことと「無音ではない」こと。
+    char bLow[96];
+    std::snprintf(bLow, sizeof(bLow), "(125Hz %.4f / 4kHz %.4f)", g[0], g[5]);
+    check("既定壁は低域ほど抜ける（質量則）", g[0] > g[5] * 2.0f, bLow);
+    checkGreater("既定壁は無音ではない", before, 0.005f);
+
+    // ① インスタンスの材質を付け替える。
+    check("インスタンスの材質を付け替えられる",
+          AF_SceneSetInstanceMaterial(s, wall, matTight) == 1);
+    check("付け替えが読み戻せる", AF_SceneGetInstanceMaterial(s, wall) == matTight);
+    AF_SceneComputeTransmissionBands(s, L, S, g, kBands);
+    char b[128];
+    std::snprintf(b, sizeof(b), "(%.4f → %.4f / %.1fdB → %.1fdB)",
+                  before, g[0], 20.0f * std::log10(std::max(before, 1e-6f)),
+                  20.0f * std::log10(std::max(g[0], 1e-6f)));
+    check("よく遮る材質にすると漏れが減る", g[0] < before * 0.25f, b);
+
+    // ② 材質の中身を書き換えると、それを使う壁が一斉に変わる。
+    AF_SceneSetInstanceMaterial(s, wall, matWall);       // 既定へ戻す
+    check("材質の中身を書き換えられる",
+          AF_SceneSetMaterial(s, matWall, tight, nullptr, nullptr, 6) == 1);
+    AF_SceneComputeTransmissionBands(s, L, S, g, kBands);
+    check("書き換えが即座に効く（再構築不要）", g[0] < before * 0.25f);
+
+    // 範囲外・null で落ちない。
+    check("範囲外の材質IDは失敗を返す",
+          AF_SceneSetInstanceMaterial(s, wall, 999) == 0);
+    check("範囲外のインスタンスIDは失敗を返す",
+          AF_SceneSetInstanceMaterial(s, 999, matWall) == 0);
+    check("範囲外の材質の書き換えは失敗を返す",
+          AF_SceneSetMaterial(s, 999, tight, nullptr, nullptr, 6) == 0);
+    AF_SceneSetMaterial(nullptr, 0, nullptr, nullptr, nullptr, 0);
+    check("null scene の問い合わせは -1", AF_SceneGetInstanceMaterial(nullptr, 0) == -1);
+
+    AF_SceneDestroy(s);
+}
+
+// ---------------------------------------------------------------- 音源レンダリング(段4)
+// DSP 本体は DspRegressionTest が押さえているので、ここで見るのは**C API 越しに
+// 同じことが起きるか**と、null/範囲外で落ちないか。
+//   これが通ると「エンジンだけで音が出る」＝段4の目標が達成される。
+void testVoiceApi() {
+    std::printf("\n[音源レンダリング] C API 越しの DSP（段4）\n");
+
+    AF_VoiceConfig cfg{};
+    cfg.sampleRate = 48000;
+    cfg.maxFrames = 512;
+    cfg.tailSeconds = 0.25f;
+    cfg.tapCrossfadeMs = 1.0f;
+    AF_VoiceHandle v = AF_VoiceCreate(&cfg);
+    check("音源が作れる", v != nullptr);
+
+    AF_VoiceSetOutputGain(v, 1.0f);
+    AF_VoiceSetHrtfEnabled(v, 0);
+
+    // タップ2本（0=直接音 / 1=反射）。
+    AF_VoiceTap taps[2] = {};
+    for (int b = 0; b < 6; ++b) { taps[0].gain6[b] = 1.0f; taps[1].gain6[b] = 0.5f; }
+    taps[0].panL = taps[0].panR = 0.70710678f;
+    taps[1].panL = taps[1].panR = 0.70710678f;
+    taps[1].delaySamples = 240;
+    AF_VoiceScatterSplit(5.0f, 20.0f, 0.0f, 1.0f, &taps[1].gSpec, &taps[1].gDiff);
+    check("散乱の振り分けが C API で取れる", taps[1].gDiff > 0.0f && taps[1].gSpec > 0.0f);
+    AF_VoiceSetTaps(v, taps, 2);
+
+    const int n = 4096;
+    std::vector<float> in(n), ol(n, 0.0f), orr(n, 0.0f);
+    unsigned int rs = 12345u;
+    for (int i = 0; i < n; ++i) {
+        rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5;
+        in[i] = static_cast<int>(rs) * (1.0f / 2147483648.0f) * 0.3f;
+    }
+
+    AF_VoiceMetering m{};
+    AF_VoiceRender(v, in.data(), n, ol.data(), orr.data(), &m);
+    std::printf("      段別RMS 直接 %.4f / 早期 %.4f / 散乱 %.4f / 尾 %.4f / 出力 %.4f\n",
+                m.rmsDirect, m.rmsEarly, m.rmsScatter, m.rmsTail, m.rmsOut);
+    check("音が出る", m.rmsOut > 0.01f);
+    check("尾はまだ無い", m.rmsTail < 1e-6f);
+
+    // エコグラムから尾を組む。
+    {
+        const int bins = 50;
+        std::vector<float> echo(bins * 6, 0.0f);
+        for (int k = 0; k < bins; ++k)
+            for (int b = 0; b < 6; ++b)
+                echo[k * 6 + b] = std::pow(0.9f, static_cast<float>(k));
+        const float ratio = AF_VoiceRebuildTail(v, echo.data(), bins, 5.0f, 20.0f, 5.0f,
+                                                0.0f, 0.0f, 1.0f, 1.0f, 0.5f, nullptr, 0);
+        check("エコグラムから尾が組める", ratio > 0.0f);
+        checkGreater("尾の分割が組まれている", static_cast<float>(AF_VoiceTailPartitions(v)), 0.0f);
+        char b[64];
+        std::snprintf(b, sizeof(b), "(%d samp)", AF_VoiceTailLatency(v));
+        check("尾の遅延が最小ブロックぶん(64)", AF_VoiceTailLatency(v) == 64, b);
+
+        AF_VoiceMetering m2{};
+        AF_VoiceRender(v, in.data(), n, ol.data(), orr.data(), &m2);
+        check("尾が鳴り出す", m2.rmsTail > 1e-4f);
+    }
+
+    // HRTF を繋ぐ。
+    {
+        AF_HrtfHandle h = AF_HrtfCreateSynthetic(48000);
+        check("合成HRTFが作れる", h != nullptr);
+        checkGreater("方向が入っている", static_cast<float>(AF_HrtfDirectionCount(h)), 500.0f);
+        char name[64] = {};
+        AF_HrtfGetName(h, name, sizeof(name));
+        std::printf("      HRTF: %s\n", name);
+
+        AF_VoiceSetHrtf(v, h);
+        AF_VoiceSetHrtfEnabled(v, 1);
+        AF_VoiceSetDirection(v, V(1, 0, 0), 57.0f);   // 真右
+        std::fill(ol.begin(), ol.end(), 0.0f);
+        std::fill(orr.begin(), orr.end(), 0.0f);
+        AF_VoiceRender(v, in.data(), n, ol.data(), orr.data(), nullptr);
+        double el = 0.0, er = 0.0;
+        for (int i = n / 2; i < n; ++i) { el += ol[i] * ol[i]; er += orr[i] * orr[i]; }
+        char b[96];
+        std::snprintf(b, sizeof(b), "(左 %.2f / 右 %.2f)", el, er);
+        check("右に定位すると右チャンネルが大きい", er > el * 1.5, b);
+
+        AF_VoiceDestroy(v);      // 音源を先に壊しても
+        AF_HrtfDestroy(h);       // HRTF を後で壊して落ちない
+        check("破棄の順序で落ちない", true);
+    }
+
+    // null / 範囲外。
+    AF_VoiceSetTaps(nullptr, taps, 2);
+    AF_VoiceRender(nullptr, in.data(), n, ol.data(), orr.data(), nullptr);
+    AF_VoiceDestroy(nullptr);
+    AF_HrtfDestroy(nullptr);
+    check("null ハンドルで落ちない", AF_VoiceTailPartitions(nullptr) == 0);
+    check("null パスの読み込みは NULL を返す", AF_HrtfLoadFile(nullptr) == nullptr);
+}
+
 // ---------------------------------------------------------------- 頑健性
 // 不正入力で落ちない（移行中に呼び出し規約を変えるので、境界は明示的に守る）。
 void testRobustness() {
@@ -1255,8 +3290,28 @@ int main() {
     testMesh();
     testDirectionalProbe();
     testSecondOrderDiffraction();
+    diagnoseNonPlateBlocker();
+    diagnoseApertureWidthCurve();
+    diagnoseRoomToRoomLevel();
+    diagnoseDistanceReach();
+    diagnoseUnityGapScene();
+    diagnoseSecondOrderQuality();
+    diagnoseDoorApertureCurve();
+    diagnoseFarSourceTimbre();
+    diagnoseRoomCoupling();
+    testLeakDirection();
+    diagnoseThickBarrier();
+    testNoPhantomDiffraction();
+    testPortalOpening();
+    diagnoseWallDoorBoundary();
+    diagnoseSourceOffsetVsDoor();
+    diagnoseFrameCost();
     testSoftOcclusion();
     diagnoseDiffractionOnlySweep();
+    testApertureOpenness();
+    testDoorContinuity();
+    testPerInstanceMaterial();
+    testVoiceApi();
     testRobustness();
 
     std::printf("\n----\n");

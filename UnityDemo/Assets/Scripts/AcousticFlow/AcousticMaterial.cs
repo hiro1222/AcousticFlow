@@ -11,10 +11,11 @@ namespace AcousticFlow
     // プリセット選択肢（AcousticSurface / CollArea のインスペクタで使う）。
     public enum AcousticMaterialPreset
     {
-        Default = 0,   // 一般的な内壁（石膏ボード相当）
+        Default = 0,   // 部屋の境界としての内壁（両面張りの間仕切り）
         Concrete = 1,  // コンクリート（よく遮る）
         Glass = 2,     // ガラス（やや抜ける）
         Opaque = 3,    // 完全不透過（検証用。回り込んだ音だけを残して回折を単体で聴く）
+        WoodDoor = 4,  // 木の扉（壁より弱い＝部屋の弱点。閉めていても向こうが聞こえる）
     }
 
     [Serializable]
@@ -38,11 +39,23 @@ namespace AcousticFlow
         //   以前は同じ値を振幅として使っていたが、refl = 1-α-τ がエネルギーの式なので
         //   単位が壊れていた。エネルギー規約へ統一するにあたり旧値を二乗してある
         //   （0.12 → 0.0144 = TL 18.4dB）。聞こえ方は変わらず、意図した遮音量とも一致する。
+        // 既定は「部屋の境界としての内壁」＝両面張りの間仕切り。
+        //   以前は片面の石膏ボード1枚ぶん(TL 18.4dB@125Hz)で、部屋を仕切る壁としては
+        //   漏れすぎだった（密閉した部屋でも低域が素通りして聞こえた）。
         public static AcousticMaterial DefaultWall() => new AcousticMaterial(
-            // TL[dB]:      18.4     23.1     28.0     34.0      38.4        42.0
-            new[] { 0.0144f, 0.0049f, 0.0016f, 0.0004f, 0.000144f, 0.000064f },  // 石膏ボード相当
+            // TL[dB]:        25.0    30.0      36.0     40.0        44.0        46.0
+            new[] { 0.00316f, 0.001f, 0.000251f, 0.0001f, 0.0000398f, 0.0000251f },
             new[] { 0.10f, 0.10f, 0.15f, 0.20f, 0.30f, 0.40f },
             new[] { 0.10f, 0.15f, 0.20f, 0.30f, 0.40f, 0.50f });
+
+        // 木製の扉。**壁より明確に弱い**のが要点。
+        //   現実でも部屋の遮音を決めているのは壁ではなく扉と隙間。
+        //   壁 25dB / 扉 15dB という落差が「扉が閉まっている」体験を作る。
+        public static AcousticMaterial WoodDoor() => new AcousticMaterial(
+            // TL[dB]:      15.0     18.0      21.0      24.0      26.0     27.0
+            new[] { 0.0316f, 0.0158f, 0.00794f, 0.00398f, 0.00251f, 0.002f },
+            new[] { 0.10f, 0.08f, 0.08f, 0.08f, 0.09f, 0.10f },
+            new[] { 0.03f, 0.05f, 0.08f, 0.12f, 0.16f, 0.20f });
 
         public static AcousticMaterial Concrete() => new AcousticMaterial(
             // TL[dB]:      26.0     30.5      36.5       42.0       48.0        54.0
@@ -70,6 +83,7 @@ namespace AcousticFlow
                 case AcousticMaterialPreset.Concrete: return Concrete();
                 case AcousticMaterialPreset.Glass: return Glass();
                 case AcousticMaterialPreset.Opaque: return Opaque();
+                case AcousticMaterialPreset.WoodDoor: return WoodDoor();
                 default: return DefaultWall();
             }
         }

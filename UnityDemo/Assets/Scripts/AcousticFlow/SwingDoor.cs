@@ -95,24 +95,48 @@ namespace AcousticFlow
             transform.localScale = new Vector3(thickness, height, width);
         }
 
-        private void OnDrawGizmosSelected()
+        // ★選択していなくても出す。扉がどこにあって何度開いているかは、
+        //   音を判断するための前提情報なので、常に見えていないと確認にならない
+        //   （選択時だけだと、聞きながら角度を追えない）。
+        private void OnDrawGizmos() { DrawDoorGizmo(false); }
+        private void OnDrawGizmosSelected() { DrawDoorGizmo(true); }
+
+        private void DrawDoorGizmo(bool selected)
         {
             if (hinge == null) return;
-            Gizmos.color = Color.yellow;
+            const float a = 0.9f;
+            float s = swingTowardPositiveZ ? 1f : -1f;
+
+            // 蝶番の軸。ここを中心に回る。
+            Gizmos.color = new Color(1f, 0.85f, 0.2f, a);
             Gizmos.DrawLine(hinge.position + Vector3.down * height * 0.5f,
                             hinge.position + Vector3.up * height * 0.5f);
-            // 開き角の扇を描く（どちらへ振れるかが一目で分かるように）。
-            Gizmos.color = new Color(1f, 0.8f, 0.2f, 0.6f);
-            float s = swingTowardPositiveZ ? 1f : -1f;
+
+            // 閉じた位置（基準）を薄く。今どれだけ開いたかが比較で分かる。
+            Gizmos.color = new Color(1f, 1f, 1f, 0.25f);
+            Gizmos.DrawLine(hinge.position, hinge.position + new Vector3(width, 0f, 0f));
+
+            // 開き角の扇。今の角度まで塗る。
+            Gizmos.color = new Color(1f, 0.55f, 0.15f, selected ? 0.9f : 0.6f);
             Vector3 prev = hinge.position + new Vector3(width, 0f, 0f);
-            for (int i = 1; i <= 12; ++i)
+            for (int i = 1; i <= 16; ++i)
             {
-                float th = Mathf.Deg2Rad * (angleDeg * i / 12f);
+                float th = Mathf.Deg2Rad * (angleDeg * i / 16f);
                 Vector3 p = hinge.position + new Vector3(Mathf.Cos(th) * width, 0f,
                                                          s * Mathf.Sin(th) * width);
                 Gizmos.DrawLine(prev, p);
+                Gizmos.DrawLine(hinge.position, p);   // 扇を塗りつぶし気味に
                 prev = p;
             }
+
+            // 扉の**自由端**（隙間を作っている辺）を強調する。ここが開口を決める。
+            float t = Mathf.Deg2Rad * angleDeg;
+            Vector3 edge = hinge.position + new Vector3(Mathf.Cos(t) * width, 0f,
+                                                        s * Mathf.Sin(t) * width);
+            Gizmos.color = new Color(1f, 0.3f, 0.1f, 1f);
+            Gizmos.DrawLine(edge + Vector3.down * height * 0.5f,
+                            edge + Vector3.up * height * 0.5f);
+            Gizmos.DrawSphere(edge, 0.06f);
         }
     }
 }

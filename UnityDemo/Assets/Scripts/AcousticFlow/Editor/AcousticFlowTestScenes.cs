@@ -1,9 +1,17 @@
 // AcousticFlowTestScenes.cs (Editor 専用)
 // メニュー [AcousticFlow > Test Scenes > ...] で、現象ごとの検証用シーンを自動生成する。
-//   回折 / 透過 / 小部屋 / 広い部屋。各シーンに AcousticFlowSceneDemo（6音源・タップ算出）＋
-//   IrConvolver（クリックで反射パターンを聞く）を入れる。Play → M で楽曲ミュート →
-//   ヘッドホン＋Status Monitor（IRタップのプロット）で確認する。
-//   ※音源は本編と同じ6ステム。座標は全部同じ場所に重ねる（検証用なので分散不要）。
+//   回折 / 透過 / 小部屋 / 広い部屋。各シーンに AcousticFlowSceneDemo と畳み込み器を入れる。
+//   Play → M で楽曲ミュート → ヘッドホン＋Status Monitor（IRタップのプロット）で確認する。
+//
+//   ★音源オブジェクトと畳み込み器は**同じ GameObject**（IrConvolver_Right など）。
+//     以前は楽曲の6ステム（Source_Vocal 〜 Source_Other）を別に作っていたが、
+//     畳み込み器は1〜2個しか置かないので、残りは Wwise 無効ビルドでは鳴らないまま
+//     ヒエラルキーに並ぶだけだった。鳴る本数だけ作り、名前を役割に合わせてある。
+//
+//   畳み込み器は C# 経路(IrConvolver) と C++ 経路(VoiceConvolver) を**両方**載せ、
+//   AcousticFlowSceneDemo が片方だけ有効にする（実行中に Y キーで切替）。
+//   扉の開閉でタップが入れ替わるときの補間は C++ 側にしか無いので、
+//   「開けた瞬間ガタっと変わる」の確認は必ず C++ 経路で行うこと。
 using System.Collections.Generic;
 using System.IO;
 using UnityEditor;
@@ -24,10 +32,9 @@ namespace AcousticFlow.EditorTools
             var barrier = MakeBox("Barrier", new Vector3(0f, 2f, 0f), new Vector3(6f, 4f, 0.4f)); // 有限＝縁で回折
             Tint(barrier, new Color(0.85f, 0.55f, 0.35f));
             var srcPos = new Vector3(0f, 1.6f, 4f);   // 衝立の真裏
-            AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);   // 6音源を重ねる
-            AddConvolver(srcPos);
+            AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);
             Save(scene, "Test_Diffraction.unity",
-                "回折: 衝立の裏(+Z)に6音源。左右(A/D)に動くと縁を回り込む回折が変わる。Status Monitorで水色(回折)タップを確認。");
+                "回折: 衝立の裏(+Z)に音源。左右(A/D)に動くと縁を回り込む回折が変わる。Status Monitorで水色(回折)タップを確認。");
         }
 
         // ── 透過確認：密閉ボックスに音源→開口なし＝透過だけ（材質Defaultで漏れを聞く）──
@@ -45,10 +52,9 @@ namespace AcousticFlow.EditorTools
             MakeBox("Box_Top", new Vector3(0f, 4f, 4f), new Vector3(4f, 0.3f, 4f));
             MakeBox("Box_Bottom", new Vector3(0f, 0f, 4f), new Vector3(4f, 0.3f, 4f));
             var srcPos = new Vector3(0f, 2f, 4f);   // 密閉箱の中
-            AddDemo(listener, srcPos, AcousticMaterialPreset.Default);   // 6音源を重ねる（Default=石膏ボード相当）
-            AddConvolver(srcPos);
+            AddDemo(listener, srcPos, AcousticMaterialPreset.Default);   // Default=石膏ボード相当
             Save(scene, "Test_Transmission.unity",
-                "透過: 密閉ボックス内の6音源。開口が無いので透過だけ(低域寄りにこもる)。occluderMaterialをConcrete/Glassに変えて比較。");
+                "透過: 密閉ボックス内の音源。開口が無いので透過だけ(低域寄りにこもる)。occluderMaterialをConcrete/Glassに変えて比較。");
         }
 
         // ── 小部屋：ITDGが小さく反射が密集 ──
@@ -60,7 +66,6 @@ namespace AcousticFlow.EditorTools
             MakeRoom("Small", new Vector3(4f, 2.5f, 3f), 0.4f);            // 4×3m・高2.5m
             var srcPos = new Vector3(0f, 1.6f, 1f);   // 中心付近
             AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);  // 硬い壁＝反射多く残響が分かりやすい
-            AddConvolver(srcPos);
             Save(scene, "Test_SmallRoom.unity",
                 "小部屋: 反射がすぐ返る(ITDG小)。Status MonitorのIRプロットが左に密集。" +
                 "実行中に [ ] キーで部屋を拡縮できる（1/2/3=小/中/大プリセット）。");
@@ -75,7 +80,6 @@ namespace AcousticFlow.EditorTools
             MakeRoom("Large", new Vector3(30f, 12f, 24f), 0.6f);          // 30×24m・高12m
             var srcPos = new Vector3(0f, 1.6f, 1f);   // 中心付近
             AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);
-            AddConvolver(srcPos);
             Save(scene, "Test_LargeRoom.unity",
                 "広い部屋: 反射が遅れて返る(ITDG大)。IRプロットが右まで広がる。" +
                 "実行中に [ ] キーで部屋を拡縮できる（1/2/3=小/中/大プリセット）。");
@@ -110,7 +114,6 @@ namespace AcousticFlow.EditorTools
             // 音源は仕切りの奥・左寄り。開口の正面を外してあるので、必ず回折で回り込む必要がある。
             var srcPos = new Vector3(-3f, 1.6f, 2f);
             AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);
-            AddConvolver(srcPos);
             Save(scene, "Test_DiffractionGap.unity",
                 "回折(開口): 仕切りの右に2mの開口。音源は奥の左側なので直接は必ず遮蔽される。" +
                 "A/Dで左右に動くと開口の縁を回り込む回折が変化する。" +
@@ -146,6 +149,18 @@ namespace AcousticFlow.EditorTools
             MakeBox("Partition_R", new Vector3(gapR + rightW * 0.5f, height * 0.5f, wallZ),
                     new Vector3(rightW, height, thick));
 
+            // ★戸口そのものをポータルとして置く（扉ではなく**枠の内側**）。
+            //   開き具合は渡さない。エンジンが毎フレーム実形状から測るので、
+            //   扉が板でどれだけ覆っているかも、音源が戸口の正面にあるかも結果に出る。
+            {
+                var pgo = new GameObject("Portal_Doorway");
+                pgo.transform.position = new Vector3((gapL + gapR) * 0.5f, height * 0.5f, wallZ);
+                pgo.transform.rotation = Quaternion.identity;   // forward=+Z が開口の法線
+                var portal = pgo.AddComponent<AcousticPortal>();
+                portal.width = gapR - gapL;
+                portal.height = height;
+            }
+
             // 扉。左枠(X=-0.5)を蝶番にして +Z 側（音源のある奥）へ振れる。
             //   高さは戸口と同じにすること。低いと上に隙間が残り「扉を回り込む」検証にならない。
             var hinge = new GameObject("Door_Hinge").transform;
@@ -160,6 +175,17 @@ namespace AcousticFlow.EditorTools
             door.swingTowardPositiveZ = true;
             door.angleDeg = 0f;
             door.Apply();
+            // ★扉と仕切りの明度差をはっきり付ける。扉がどこにあって何度開いているかは
+            //   音を判断するための前提情報なので、見て分からないと確認にならない。
+            Tint(doorGo.transform, new Color(0.95f, 0.55f, 0.15f));   // 扉＝明るい橙
+            Tint(GameObject.Find("Partition_L").transform, new Color(0.30f, 0.33f, 0.40f));
+            Tint(GameObject.Find("Partition_R").transform, new Color(0.30f, 0.33f, 0.40f));
+            // ★扉だけ弱い材質にする。現実の部屋で音が漏れるのは壁ではなく扉。
+            //   壁(Concrete) 125Hz 26dB / 4kHz 54dB に対し、
+            //   木の扉は 15dB / 27dB。高域ほど差が大きい。
+            //   壁全体を弱くすると均一に漏れて**どこから聞こえるか分からなくなる**が、
+            //   扉だけ弱くすれば漏れてくる方向が扉になる ── 閉めていても気配が出る。
+            doorGo.AddComponent<AcousticSurface>().material = AcousticMaterialPreset.WoodDoor;
 
             // 音源2つ。扉が振れる向きに対して左右に置き、聞こえ始める順序の違いを出す。
             //   音源0（右・+X 側）… 隙間が開く方向。早い角度からダイレクトになる
@@ -168,11 +194,9 @@ namespace AcousticFlow.EditorTools
             //     それを超えると壁側で遮られるため、左右とも ±0.8m に置く。
             var srcRight = new Vector3(0.8f, 1.6f, 3f);
             var srcLeft = new Vector3(-0.8f, 1.6f, 3f);
-            var srcs = AddDemo(listener, srcRight, AcousticMaterialPreset.Concrete);
-            if (srcs.Length > 1) srcs[1].position = srcLeft;   // 音源1だけ左へ
-
-            AddConvolver(srcRight, 0, name: "IrConvolver_Right");
-            AddConvolver(srcLeft, 1, name: "IrConvolver_Left");
+            var srcs = AddDemo(listener, srcRight, AcousticMaterialPreset.Concrete,
+                               new[] { "Right", "Left" });
+            srcs[1].position = srcLeft;   // 音源1だけ左へ（畳み込み器ごと動く）
 
             Save(scene, "Test_SwingDoor.unity",
                 "扉の開き角: 5/6 キーで扉を開閉（Inspector の SwingDoor.angleDeg でも可）。" +
@@ -218,8 +242,8 @@ namespace AcousticFlow.EditorTools
             // 音源は壁の奥・左寄り。開口(X=+3付近)とは反対側なので、
             // 直進では絶対に届かず、必ず開口を回り込むことになる。
             var srcPos = new Vector3(-4f, 1.6f, 5f);
-            AddDemo(listener, srcPos, AcousticMaterialPreset.Opaque);
-            var conv = AddConvolver(srcPos);
+            var srcs0 = AddDemo(listener, srcPos, AcousticMaterialPreset.Opaque);
+            var conv = srcs0[0].GetComponent<IrConvolver>();
 
             // 回折だけを残す。
             conv.reflectionLevel = 1f;      // 'F'(回折)タップは直接音と同じ音量で鳴らす
@@ -269,7 +293,6 @@ namespace AcousticFlow.EditorTools
             // 音源は戸口の真正面・壁の向こう。
             var srcPos = new Vector3(0f, 1.6f, 4f);
             AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);
-            AddConvolver(srcPos);
 
             Save(scene, "Test_MeshWall.unity",
                 "メッシュ形状: 壁と戸口が1枚の MeshCollider。戸口の正面(X=0)では音が素通りし、" +
@@ -384,7 +407,6 @@ namespace AcousticFlow.EditorTools
                 f.target = listener;
                 f.offset = followOffset;
             }
-            AddConvolver(srcPos);
             // 畳み込み機も一緒に追従させる（音源と同じ位置に置く運用のため）。
             var convGo = GameObject.Find("IrConvolverTest");
             if (convGo != null)
@@ -454,7 +476,30 @@ namespace AcousticFlow.EditorTools
             door.swingTowardPositiveZ = true;
             door.angleDeg = 35f;          // 半開きから始める（開き具合の変化を聴きやすい）
             door.Apply();
-            Tint(doorGo.transform, new Color(0.55f, 0.42f, 0.30f));
+            // 扉は壁より弱い（段5: 材質の個別化）。壁 TL25dB / 扉 TL15dB の落差が
+            // 「閉めていても向こうが聞こえる」という現実の構図を作る。
+            doorGo.AddComponent<AcousticSurface>().material = AcousticMaterialPreset.WoodDoor;
+            // 扉は明るい橙。仕切り(灰青)との明度差で、開き具合が離れていても分かる。
+            Tint(doorGo.transform, new Color(0.95f, 0.55f, 0.15f));
+
+            // 戸口をポータルとして置く（扉ではなく枠の内側）。開き具合は渡さない。
+            {
+                var pgo = new GameObject("Portal_Doorway");
+                pgo.transform.position = new Vector3(0f, doorH * 0.5f, 0f);
+                pgo.transform.rotation = Quaternion.identity;
+                var portal = pgo.AddComponent<AcousticPortal>();
+                portal.width = doorW;
+                portal.height = doorH;
+            }
+            // 奥の戸口（X=[4,5.5]）にもポータル。ここを通ると 2 部屋ぶん先まで届く。
+            {
+                var pgo = new GameObject("Portal_Doorway_Far");
+                pgo.transform.position = new Vector3(4.75f, doorH * 0.5f, 7f);
+                pgo.transform.rotation = Quaternion.identity;
+                var portal = pgo.AddComponent<AcousticPortal>();
+                portal.width = 1.5f;
+                portal.height = doorH;
+            }
 
             // 仕切り2（Z=+7）＝食い違いに置いた2戸口のうち奥側。1つ目とずらして 2次回折を作る。
             //   Z=0 の戸口は X=[-0.6,0.6]、こちらは X=[4,5.5]。直線ではどちらも通らない。
@@ -464,10 +509,9 @@ namespace AcousticFlow.EditorTools
             // 音源2つ。0=小部屋（戸口ごしに1次）／1=奥の部屋（2戸口ごしに2次）。
             var srcNear = new Vector3(-2f, 1.6f, 3.5f);
             var srcFar = new Vector3(4f, 1.6f, 11f);
-            var srcs = AddDemo(listener, srcNear, AcousticMaterialPreset.Default);
-            if (srcs.Length > 1) srcs[1].position = srcFar;
-            AddConvolver(srcNear, 0, name: "IrConvolver_Near");
-            AddConvolver(srcFar, 1, name: "IrConvolver_Far");
+            var srcs = AddDemo(listener, srcNear, AcousticMaterialPreset.Default,
+                               new[] { "Near", "Far" });
+            srcs[1].position = srcFar;
 
             Save(scene, "Test_Full.unity",
                 "全要素: 透過/回折(1次・2次・メッシュ稜線)/早期反射/後期残響(実測IR)/HRTF(KEMAR)/" +
@@ -488,15 +532,6 @@ namespace AcousticFlow.EditorTools
             go.name = "Listener";
             go.transform.position = pos;
             go.transform.localScale = Vector3.one * 0.5f;
-            return go.transform;
-        }
-
-        private static Transform MakeSource(string name, Vector3 pos)
-        {
-            var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            go.name = name;
-            go.transform.position = pos;
-            go.transform.localScale = Vector3.one * 0.4f;
             return go.transform;
         }
 
@@ -523,12 +558,22 @@ namespace AcousticFlow.EditorTools
 
         // 本編と同じ6ステム音源を srcPos に全部重ねて配置し、デモ制御を付ける（座標かぶりOK）。
         // 戻り値は生成した音源の Transform 群（追従などを後付けするため）。
-        private static Transform[] AddDemo(Transform listener, Vector3 srcPos, AcousticMaterialPreset material)
+        // ★音源オブジェクトと畳み込み器を**1つの GameObject にまとめる**。
+        //   以前は Source_Vocal 〜 Source_Other の6個（楽曲のステム）を作り、
+        //   その横に IrConvolver_* を別に置いていた。ところが畳み込み器は 1〜2 個しか
+        //   置かないので、残りの音源は Wwise 無効ビルドでは**鳴らないまま並ぶだけ**だった。
+        //   ヒエラルキーが読めなくなるので、鳴る本数だけ作って名前を役割に合わせる。
+        //   音源の位置＝畳み込み器の位置になるので、ズレる余地も消える。
+        //
+        //   names に渡した数だけ音源を作る（例: {"Right","Left"} → IrConvolver_Right/Left）。
+        private static Transform[] AddDemo(Transform listener, Vector3 srcPos,
+                                           AcousticMaterialPreset material,
+                                           string[] names = null)
         {
-            string[] events = { "Vocal", "Guitar", "Piano", "Bass", "Drums", "Other" };
+            string[] events = names ?? new[] { "Main" };
             var srcs = new Transform[events.Length];
             for (int i = 0; i < events.Length; i++)
-                srcs[i] = MakeSource("Source_" + events[i], srcPos);
+                srcs[i] = AddConvolver(srcPos, i, name: "IrConvolver_" + events[i]).transform;
 
             var go = new GameObject("AcousticFlowSceneDemo");
             var demo = go.AddComponent<AcousticFlowSceneDemo>();
@@ -559,11 +604,20 @@ namespace AcousticFlow.EditorTools
 
         // 音源 sourceIndex ぶんの畳み込み器。遅延も到来方向も遮蔽も音源ごとに違うので、
         // 鳴らしたい音源 1 つにつき 1 つ置く。clip を渡さなければ既定の足音を使う。
+        //
+        // ★C# 経路(IrConvolver) と C++ 経路(VoiceConvolver) を**両方**載せる。
+        //   同じ AudioSource を共有し、AcousticFlowSceneDemo が片方だけ enabled にする
+        //   （Y キーで切替）。AudioSource を分けないのは、鳴らし比べのときに
+        //   再生位置がズレて「同じ瞬間の音」を比較できなくなるため。
         private static IrConvolver AddConvolver(Vector3 pos, int sourceIndex = 0,
                                                 string clipPath = null, string name = null)
         {
-            var go = new GameObject(name ?? ("IrConvolver_" + sourceIndex));
-            go.transform.position = pos;   // スピーカ(音源)と同じ位置に置く
+            // ★球にして**見える**ようにする。音源オブジェクトを兼ねているので、
+            //   どこで鳴っているかが目で分かることが要る（見えている物と音の一致が狙い）。
+            var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            go.name = name ?? ("IrConvolver_" + sourceIndex);
+            go.transform.position = pos;
+            go.transform.localScale = Vector3.one * 0.4f;
             var src = go.AddComponent<AudioSource>();
             var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(clipPath ?? kTestClipPath);
             if (clip == null) clip = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Audio/TokyoGeto.wav");
@@ -573,6 +627,11 @@ namespace AcousticFlow.EditorTools
             conv.sourceIndex = sourceIndex;
             conv.tailLevel = 0.3f;                       // 全シーン統一
             conv.generateTestSignal = (clip == null);    // clipがあれば実音源を畳み込み / 無ければテスト信号
+
+            var voice = go.AddComponent<VoiceConvolver>();
+            voice.sourceIndex = sourceIndex;
+            voice.tailLevel = 0.3f;                      // IrConvolver と揃える（A/B の条件を合わせる）
+            voice.enabled = false;                       // 既定は Demo 側の useCppDsp が決める
             return conv;
         }
 

@@ -39,6 +39,8 @@ public:
 
     bool empty() const { return tris_.empty(); }
     int triangleCount() const { return static_cast<int>(tris_.size()); }
+    // 三角形そのものを見たい用途（平面との断面を取るなど）。
+    const Triangle& triangle(int i) const { return tris_[static_cast<size_t>(i)]; }
 
     // 最近ヒット。ヒットしたら outT/outNormal を更新して true。
     // maxDist は探索上限（呼び出し側の現 best 距離）。

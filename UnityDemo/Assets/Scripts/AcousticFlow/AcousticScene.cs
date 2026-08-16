@@ -380,6 +380,107 @@ namespace AcousticFlow
             return n;
         }
 
+        /// <summary>
+        /// 開口率ゲートの設定（比較用。既定は samples=0 で無効）。
+        ///
+        /// 扉は「ただの壁」として稜線探索に見せ、開き具合は壁と扉の間にできる開口部の
+        /// 幾何がそのまま表す、というのが本筋。別指標として割合を持つと二重計上になる。
+        /// 開口断面へ点を撒いて「見える割合」を測る方式を比較用に残してある。
+        /// </summary>
+        public void SetApertureOpen(float refFrac, float power, float radius, int samples)
+        {
+            if (_handle != IntPtr.Zero)
+                Native.AF_SceneSetApertureOpen(_handle, refFrac, power, radius, samples);
+        }
+
+        /// <summary>
+        /// インスタンスごとに材質を差し替える。
+        /// 現実の部屋で音が漏れるのは壁ではなく**扉**なので、
+        /// 壁はコンクリ・扉は木、のように分けられることが要る。
+        /// </summary>
+        public bool SetInstanceMaterial(int instanceId, int materialId)
+        {
+            if (_handle == IntPtr.Zero) return false;
+            return Native.AF_SceneSetInstanceMaterial(_handle, instanceId, materialId) != 0;
+        }
+
+        /// <summary>
+        /// ポータル（開口の矩形）を登録して id を返す。
+        /// **開き具合は渡さない** ── エンジンが毎フレーム実形状から測る。
+        /// ホストは「ここが戸口」というトポロジだけ持つ、という役割分担。
+        /// </summary>
+        public int AddPortal(Vector3 center, Vector3 axisU, Vector3 axisV, float halfU, float halfV)
+        {
+            if (_handle == IntPtr.Zero) return -1;
+            return Native.AF_SceneAddPortal(_handle, new AFVector3(center),
+                new AFVector3(axisU), new AFVector3(axisV), halfU, halfV);
+        }
+
+        /// <summary>ポータルの配置を更新する（扉ごと動く戸口など）。</summary>
+        public void UpdatePortal(int id, Vector3 center, Vector3 axisU, Vector3 axisV,
+                                 float halfU, float halfV)
+        {
+            if (_handle != IntPtr.Zero)
+                Native.AF_SceneUpdatePortal(_handle, id, new AFVector3(center),
+                    new AFVector3(axisU), new AFVector3(axisV), halfU, halfV);
+        }
+
+        /// <summary>
+        /// ポータルがどれだけ開いているかを帯域別に測る（診断・可視化用）。
+        /// outPoint は開いている部分の重み付き重心＝定位に使う点。
+        /// </summary>
+        public bool MeasurePortal(int id, Vector3 listener, Vector3 source,
+                                  float[] outFrac6, out Vector3 outPoint)
+        {
+            outPoint = Vector3.zero;
+            if (_handle == IntPtr.Zero || outFrac6 == null) return false;
+            bool ok = Native.AF_SceneMeasurePortal(_handle, id, new AFVector3(listener),
+                new AFVector3(source), outFrac6, out AFVector3 p) != 0;
+            outPoint = p.ToVector3();
+            return ok;
+        }
+
+        /// <summary>
+        /// 開口を通る成分を「透過の一部」として扱う（合成透過率 τ=τ壁(1−f)+f の f の項）。
+        /// 開口をまっすぐ通る音は曲がりも壁抜けもしないので、前川の δ 減衰を払わせない。
+        /// 実測: 音源が戸口に正対する配置で 開−閉 が 3.0dB → 22.3dB。
+        /// </summary>
+        public void SetApertureIsTransmission(bool on)
+        {
+            if (_handle != IntPtr.Zero) Native.AF_SceneSetApertureIsTransmission(_handle, on ? 1 : 0);
+        }
+
+        /// <summary>
+        /// 開口率の**幅**を開く指数（コントラスト）。1.0=素通し。大きいほど開閉の差が開く。
+        ///
+        /// 開口率の形（1−cosθ のクレッシェンド、高域ほど大きく開く）は物理から出ているが、
+        /// 量が足りない（実測で扉の全掃引が 1.3dB。現実の合成透過率は 125Hz で 11dB）。
+        /// 形を保ったまま幅だけを開くための演出用。実測は参照であって目標ではない、の適用先。
+        /// 開口という一般の量への写像なので、扉を特別視しない。
+        /// </summary>
+        public void SetApertureContrast(float p)
+        {
+            if (_handle != IntPtr.Zero) Native.AF_SceneSetApertureContrast(_handle, p);
+        }
+
+        /// <summary>
+        /// 回折を BTM（有限楔の稜線積分）で出す。
+        /// ※検証途上。BTM 単体は 7 件中 6 件の性質チェックを通っているが、
+        ///   シーンへ繋ぐと扉の掃引が反転する（渡している稜線集合の問題）。既定 OFF。
+        /// </summary>
+        public void SetUseBtm(bool on)
+        {
+            if (_handle != IntPtr.Zero) Native.AF_SceneSetUseBtm(_handle, on ? 1 : 0);
+        }
+
+        /// <summary>開口率(0..1)をそのまま測る（診断用）。</summary>
+        public float MeasureApertureOpenness(Vector3 listener, Vector3 source)
+        {
+            if (_handle == IntPtr.Zero) return 0f;
+            return Native.AF_SceneMeasureApertureOpenness(
+                _handle, new AFVector3(listener), new AFVector3(source));
+        }
+
         // 帯域別エコグラム（outBins は numBins*6 要素）。書けたビン数を返す。
         public int GetEchogramBands(float[] outBins, int numBins)
         {
