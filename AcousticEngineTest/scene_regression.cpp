@@ -2809,6 +2809,141 @@ void diagnoseRoomDetection() {
 //   曲がり角・廊下・柱・食い違い壁 ── どれも「扉」ではないので、特別扱いを入れずに
 //   幾何だけで妥当な答えが出るかを見る。出るべきでない所に口が出たら偽の境界になり、
 //   出るべき所に出なければ結合の土台が無い。
+// 部屋を移る間、残響の送出がどう動くか。
+//   Unity 側は wet = (総和 - 直接ピーク) / 総和 で送出量を決めている。**比率**なので、
+//   直接音が壁で消えると分母が落ちて 1.0 に張り付く。これが「隣に移った瞬間 10dB 跳ねて
+//   上限に張り付く」の正体かを、リスナーを歩かせて数字で確かめる。
+void diagnoseReverbSendWalk() {
+    std::printf("\n[診断] 戸口をまたいで歩いたときの残響送出\n");
+    const float t = 0.15f, h = 4.0f, hw = 6.0f, hd = 8.0f, doorW = 0.9f;
+    AF_SceneHandle s = AF_SceneCreate();
+    const float liveA[6] = {0.02f, 0.02f, 0.03f, 0.04f, 0.05f, 0.07f};
+    const float tr[6] = {0.000398f, 0.0001585f, 0.0000398f,
+                         0.00001f, 0.00000251f, 0.000001f};
+    const int m = AF_SceneAddMaterial(s, tr, liveA, nullptr, 6);
+    // 仕切り z=0 に幅 0.9m の戸口（全高）
+    AF_SceneAddInstanceBox(s, V(-(hw + doorW*0.5f)*0.5f, h*0.5f, 0),
+                           V((hw - doorW*0.5f)*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V( (hw + doorW*0.5f)*0.5f, h*0.5f, 0),
+                           V((hw - doorW*0.5f)*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, -t, 0),    V(hw, t, hd), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+
+    // ★音源は戸口の正面から外す。真正面だと直接音が戸口を素通りして一度も遮られず、
+    //   「壁の向こうへ回り込む」場面にならない（この配置ミスを何度も踏んだ）。
+    const AF_Vector3 S = V(4.5f, 1.6f, 5.0f);
+    // Unity の UpdateReverbTargetRatio と同じ式を再現する。
+    //   V は occluder 全部の合成 AABB（＝レベル全体の外形箱。部屋を知らない）
+    const double vLevel = (2.0 * (hw + t)) * (h + 2.0 * t) * (2.0 * (hd + t));
+    const double binMs = 10.0;   // AF_UpdateConfig の既定
+    std::printf("      音源(4.5,1.6,5.0) 固定。リスナーを z=-6 → +4 へ（x=0、戸口を通る）\n");
+    std::printf("      Unity の送出式: RT60=エコグラムがピーク-60dB を超える最後のビン、\n"
+                "                      臨界距離 rc=0.057√(V/RT60)、目標比 t=(r/rc)²\n");
+    std::printf("      レベル全体の外形箱 V=%.0f m3（部屋ごとの体積は使っていない）\n", vLevel);
+    std::printf("        z     部屋 直接透過   wet   RT60(s)  部屋V  距離r   "
+                "目標比t   t(dB)  跳ね(dB)\n");
+    double prevT = -1.0, maxJump = 0.0; float jumpAt = 0.0f;
+    double prevWet = -1.0, maxWetJump = 0.0;
+    double prevRt = -1.0, maxRtJump = 0.0;
+    for (float z = -6.0f; z <= 4.01f; z += 0.5f) {
+        const AF_Vector3 L = V(0, 1.6f, z);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);   // 内部レートを流す
+        float echo[100 * kBands] = {};
+        const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+        std::vector<double> e(static_cast<std::size_t>(bins), 0.0);
+        double peak = 0.0, total = 0.0;
+        for (int i = 0; i < bins; ++i) {
+            double v = 0.0;
+            for (int b = 0; b < kBands; ++b) v += echo[i * kBands + b];
+            v /= kBands;
+            e[static_cast<std::size_t>(i)] = v;
+            if (v > peak) peak = v;
+            total += v;
+        }
+        const double tail = (total > peak) ? total - peak : 0.0;
+        const double wet = (total > 1e-12) ? tail / total : 0.0;
+        // RT60: ピークの -60dB を超える最後のビン（Unity と同じ）
+        const double floorE = peak * 0.001;
+        int tailBin = 0;
+        for (int i = 0; i < bins; ++i) if (e[static_cast<std::size_t>(i)] > floorE) tailBin = i;
+        const double rt60 = (tailBin + 1) * binMs * 0.001;
+
+        float g[kBands] = {};
+        AF_SceneComputeTransmissionBands(s, L, S, g, kBands);
+        double gm = 0.0; for (int b = 0; b < kBands; ++b) gm += g[b]; gm /= kBands;
+        const int room = AF_SceneRoomAt(s, L);
+        float vRoom = 0.0f;
+        if (room >= 0) AF_SceneRoomInfo(s, room, &vRoom, nullptr, nullptr, nullptr);
+
+        const double dx = S.x - L.x, dy = S.y - L.y, dz = S.z - L.z;
+        const double r = std::sqrt(dx*dx + dy*dy + dz*dz);
+        const double rc = 0.057 * std::sqrt(vLevel / std::max(rt60, 0.05));
+        const double tRatio = (r * r) / std::max(rc * rc, 1e-4);
+        const double tDb = 10.0 * std::log10(std::max(tRatio, 1e-12));
+        double jump = 0.0;
+        if (prevT >= 0.0) {
+            jump = std::fabs(tDb - 10.0 * std::log10(std::max(prevT, 1e-12)));
+            if (jump > maxJump) { maxJump = jump; jumpAt = z; }
+            maxWetJump = std::max(maxWetJump, std::fabs(wet - prevWet));
+            maxRtJump  = std::max(maxRtJump,  std::fabs(rt60 - prevRt));
+        }
+        prevT = tRatio; prevWet = wet; prevRt = rt60;
+        std::printf("        %5.1f  %2d  %8.5f %6.3f  %6.2f  %6.0f %6.2f  %8.2f %7.1f %8.1f\n",
+                    z, room, gm, wet, rt60, static_cast<double>(vRoom), r, tRatio, tDb, jump);
+    }
+    std::printf("      1 歩(0.5m)あたりの最大変化: 目標比 %.1f dB（z=%.1f 付近） / "
+                "wet %.3f / RT60 %.2f s\n", maxJump, jumpAt, maxWetJump, maxRtJump);
+
+    // ★部屋を音に使うための入口。部屋番号で切り替えると戸口のど真ん中に不連続が乗るので、
+    //   「まわりの何割がどの部屋か」という連続量にする。ここが跳ねないことが前提条件。
+    std::printf("      部屋の占め方（半径を振って。0.1m 刻みで戸口をまたぐ）\n");
+    std::printf("        z      部屋番号   ");
+    for (float rad : {0.5f, 1.0f, 2.0f}) std::printf("半径%.1fm:部屋0の割合  ", rad);
+    std::printf("\n");
+    double maxDw[3] = {0, 0, 0}, prevW[3] = {-1, -1, -1};
+    for (float z = -2.0f; z <= 2.001f; z += 0.1f) {
+        const AF_Vector3 L = V(0, 1.6f, z);
+        std::printf("        %5.2f     %2d      ", z, AF_SceneRoomAt(s, L));
+        int k = 0;
+        for (float rad : {0.5f, 1.0f, 2.0f}) {
+            int ids[8]; float w[8];
+            const int n = AF_SceneRoomWeights(s, L, rad, ids, w, 8);
+            float w0 = 0.0f;
+            for (int i = 0; i < n; ++i) if (ids[i] == 0) w0 = w[i];
+            if (prevW[k] >= 0.0) maxDw[k] = std::max(maxDw[k], std::fabs(w0 - prevW[k]));
+            prevW[k] = w0;
+            std::printf("       %6.3f        ", w0);
+            ++k;
+        }
+        std::printf("\n");
+    }
+    std::printf("      0.1m 進むごとの割合の最大変化: 半径0.5m %.3f / 1.0m %.3f / 2.0m %.3f"
+                "（部屋番号は 1 歩で 0→1 と跳ぶ）\n", maxDw[0], maxDw[1], maxDw[2]);
+
+    // 実効体積。レベル全体の外形箱と比べて、部屋ごとの値になっているか。
+    std::printf("      実効体積（半径1.0m）: ");
+    for (float z : {-6.0f, -1.0f, 0.0f, 1.0f, 4.0f})
+        std::printf("z=%.0f→%.0fm3  ", z, AF_SceneRoomVolumeAt(s, V(0, 1.6f, z), 1.0f));
+    std::printf("（外形箱だと全域 %.0fm3）\n", vLevel);
+    {   // 1 回引くのに掛かる時間（毎フレーム 2〜4 回引く想定）。
+        const int N = 2000;
+        int ids[8]; float w[8];
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < N; ++i)
+            AF_SceneRoomWeights(s, V(0, 1.6f, -1.0f + 0.001f * i), 1.0f, ids, w, 8);
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        std::printf("      占め方 1 回のコスト: %.1f us（13^3=2197 標本）\n",
+                    std::chrono::duration<double, std::micro>(t1 - t0).count() / N);
+    }
+    AF_SceneDestroy(s);
+}
+
 void diagnoseNonDoorShapes() {
     std::printf("\n[診断] 戸口ではない形（曲がり角・廊下・柱・食い違い壁）\n");
     const float h = 4.0f, t = 0.3f;
@@ -3822,6 +3957,54 @@ void testRoomSegmentation() {
         check("[開口] 壁だけなら口は出ない", AF_SceneApertureCount(s) == 0);
         AF_SceneDestroy(s);
     }
+    // ── 部屋の占め方（部屋を音に使うための唯一の入口）──
+    //   部屋番号そのもので残響を切り替えると、プレイヤーが必ず通る戸口のど真ん中に
+    //   不連続を置くことになる。割合が連続に変わることがこの層の存在理由なので、
+    //   「なめらかさ」を数値で縛る。
+    {
+        AF_SceneHandle s = build(0.9f);
+        int ids[8]; float w[8];
+        // 部屋の奥では 1 つの部屋で埋まる。
+        {
+            const int n = AF_SceneRoomWeights(s, V(0, 1.6f, -6.0f), 1.0f, ids, w, 8);
+            check("[占め方] 部屋の奥では 1 つの部屋が全部", n >= 1 && w[0] > 0.99f);
+        }
+        // 戸口の中では両側が混ざる（どちらにも寄り切らない）。
+        {
+            const int n = AF_SceneRoomWeights(s, V(0, 1.6f, 0.0f), 1.0f, ids, w, 8);
+            check("[占め方] 戸口では両側が混ざる",
+                  n >= 2 && w[0] < 0.8f && w[1] > 0.2f);
+            float sum = 0.0f; for (int i = 0; i < n; ++i) sum += w[i];
+            check("[占め方] 割合の合計が 1", std::fabs(sum - 1.0f) < 1e-3f);
+        }
+        // ★なめらかさ。0.1m ずつ歩いて、1 歩の変化が半径から決まる幾何的な限界の
+        //   2 倍以内に収まること（球が面を横切るときの最大傾きは 3/(4r)）。
+        for (float rad : {1.0f, 2.0f}) {
+            float prev = -1.0f, worst = 0.0f;
+            for (float z = -3.0f; z <= 3.001f; z += 0.1f) {
+                const int n = AF_SceneRoomWeights(s, V(0, 1.6f, z), rad, ids, w, 8);
+                float w0 = 0.0f;
+                for (int i = 0; i < n; ++i) if (ids[i] == 0) w0 = w[i];
+                if (prev >= 0.0f) worst = std::max(worst, std::fabs(w0 - prev));
+                prev = w0;
+            }
+            const float limit = 2.0f * (3.0f / (4.0f * rad)) * 0.1f;
+            char tag[80];
+            std::snprintf(tag, sizeof(tag),
+                          "[占め方] 半径%.0fm で 0.1m あたりの変化が %.3f 以内", rad, limit);
+            check(tag, worst <= limit);
+        }
+        // 実効体積が部屋の体積であること（レベル全体の外形箱ではない）。
+        {
+            float vr = 0.0f;
+            AF_SceneRoomInfo(s, AF_SceneRoomAt(s, V(0, 1.6f, -6.0f)), &vr,
+                             nullptr, nullptr, nullptr);
+            const float ve = AF_SceneRoomVolumeAt(s, V(0, 1.6f, -6.0f), 1.0f);
+            check("[占め方] 実効体積が部屋の体積", vr > 1.0f && std::fabs(ve - vr) < vr * 0.02f);
+        }
+        AF_SceneDestroy(s);
+    }
+
     // ── 戸口ではない形 ──
     //   曲がり角・柱・腰高の仕切りは「くびれ」ではないので割れてはいけない。
     //   割れると、そこに偽の境界ができて音が跳ねる。
@@ -3961,6 +4144,7 @@ int main() {
     testRoomIncremental();
     diagnoseRoomDetection();
     diagnoseNonDoorShapes();
+    diagnoseReverbSendWalk();
     diagnosePortalScope();
     diagnoseNonPlateBlocker();
     diagnoseApertureWidthCurve();

@@ -674,6 +674,18 @@ void AF_SceneSetRoomChamferFull(AF_SceneHandle scene, int full) {
     if (s) s->setRoomChamferFull(full != 0);
 }
 
+int AF_SceneRoomWeights(AF_SceneHandle scene, AF_Vector3 p, float radius,
+                        int* outRooms, float* outWeights, int maxOut) {
+    Scene* s = asScene(scene);
+    if (!s) return 0;
+    return s->roomWeights(toVec3(p), radius, outRooms, outWeights, maxOut);
+}
+
+float AF_SceneRoomVolumeAt(AF_SceneHandle scene, AF_Vector3 p, float radius) {
+    Scene* s = asScene(scene);
+    return s ? s->roomVolumeAt(toVec3(p), radius) : 0.0f;
+}
+
 int AF_SceneApertureCount(AF_SceneHandle scene) {
     Scene* s = asScene(scene);
     return s ? static_cast<int>(s->roomGraph().apertures.size()) : 0;

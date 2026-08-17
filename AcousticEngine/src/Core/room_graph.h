@@ -351,6 +351,82 @@ public:
         return room_[static_cast<std::size_t>(g.index(x, y, z))];
     }
 
+    // 【点のまわりの部屋の占め方】半径 radius の球の中で、各部屋が占める割合を返す。
+    //   書けた部屋数を返す（割合の大きい順、合計 1）。
+    //
+    // ★これが「部屋を音に使う」ための唯一の入口。部屋番号そのもので切り替えると、
+    //   プレイヤーが必ず通る戸口のど真ん中に不連続を置くことになる ── このエンジンで
+    //   潰してきた跳ねは全部「二値の判定が音に直結していた」ことが原因だった。
+    //   割合なら、部屋の真ん中では 100:0、戸口では 50:50 と連続に変わる。
+    //   残響の体積も減衰時間も、この割合で混ぜれば境界で跳ねない。
+    //   radius は戸口の幅の 1〜2 倍が目安（そのぶんの距離をかけて入れ替わる）。
+    int roomWeightsAt(const Vec3& p, float radius, int* outRooms, float* outWeights,
+                      int maxOut) const {
+        if (!outRooms || !outWeights || maxOut <= 0) return 0;
+        const Grid& g = res_.grid;
+        if (g.v.empty() || res_.rooms.empty()) return 0;
+        const float r = std::max(radius, g.cell);
+        // ★標本数と核の形は「連続かどうか」で決めた。
+        //   最初は半径あたり 3 点（7³）＋核 (1-d²)² にしたが、0.1m 動くごとに割合が
+        //   最大 0.364 も飛んだ。核が中心に尖りすぎていて実質 7 標本ぶんしか効いておらず、
+        //   量子化が 1/7 で出ていた。半径あたり 6 点（13³）＋核 (1-d²) に変えて、
+        //   球の中に約 900 標本が入るようにしてある。
+        const int half = 6;
+        const float step = r / static_cast<float>(half);
+        const float inv = 1.0f / (r * r);
+
+        // ★標本をずらす。等間隔のまま並べると、標本の間隔とボクセルの刻みが噛み合って
+        //   リスナーが動いたときに**一斉に**ボクセル境界を跨ぐ（実測: 0.1m 動くごとに
+        //   割合が 0.16 飛んだ）。位置をばらけさせると跨ぐ時刻がばらけて段が消える。
+        //   ずれは (i,j,k) から決まるので、同じ点を何度引いても同じ答えになる。
+        auto jitter = [](int a, int b, int c, int axis) -> float {
+            unsigned h = 2166136261u;
+            h = (h ^ static_cast<unsigned>(a * 73856093)) * 16777619u;
+            h = (h ^ static_cast<unsigned>(b * 19349663)) * 16777619u;
+            h = (h ^ static_cast<unsigned>(c * 83492791)) * 16777619u;
+            h = (h ^ static_cast<unsigned>(axis * 2971215073u)) * 16777619u;
+            return static_cast<float>((h >> 8) & 0xFFFF) / 65536.0f - 0.5f;
+        };
+
+        std::vector<float> acc(res_.rooms.size(), 0.0f);
+        float totalW = 0.0f;
+        for (int k = -half; k <= half; ++k)
+            for (int j = -half; j <= half; ++j)
+                for (int i = -half; i <= half; ++i) {
+                    const float dx = (i + jitter(i, j, k, 0)) * step;
+                    const float dy = (j + jitter(i, j, k, 1)) * step;
+                    const float dz = (k + jitter(i, j, k, 2)) * step;
+                    const float d2 = (dx*dx + dy*dy + dz*dz) * inv;
+                    if (d2 >= 1.0f) continue;                 // 球の外
+                    // 端で 0 になる重み。尖らせると中心の数標本で決まってしまう。
+                    const float wgt = 1.0f - d2;
+                    const int vx = static_cast<int>(std::floor((p.x + dx - g.origin.x) / g.cell));
+                    const int vy = static_cast<int>(std::floor((p.y + dy - g.origin.y) / g.cell));
+                    const int vz = static_cast<int>(std::floor((p.z + dz - g.origin.z) / g.cell));
+                    const int rm = roomAtVoxel(vx, vy, vz);
+                    if (rm < 0) continue;                     // 実体の中／部屋の外は数えない
+                    acc[static_cast<std::size_t>(rm)] += wgt;
+                    totalW += wgt;
+                }
+        if (totalW <= 0.0f) return 0;
+
+        // 大きい順に maxOut 個。
+        int n = 0;
+        std::vector<int> order(res_.rooms.size());
+        for (std::size_t i = 0; i < order.size(); ++i) order[i] = static_cast<int>(i);
+        std::sort(order.begin(), order.end(), [&](int a, int b) {
+            return acc[static_cast<std::size_t>(a)] > acc[static_cast<std::size_t>(b)];
+        });
+        for (int i = 0; i < static_cast<int>(order.size()) && n < maxOut; ++i) {
+            const float w = acc[static_cast<std::size_t>(order[i])];
+            if (w <= 0.0f) break;
+            outRooms[n] = order[i];
+            outWeights[n] = w / totalW;
+            ++n;
+        }
+        return n;
+    }
+
 private:
     // ── 設定 ──
     float cell_ = 0.25f;

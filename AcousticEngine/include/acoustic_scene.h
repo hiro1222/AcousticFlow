@@ -341,6 +341,20 @@ ACOUSTIC_API void AF_SceneSetRoomChamferFull(AF_SceneHandle scene, int full);
 
 /* 【開口】部屋どうしを繋ぐくびれ（戸口・窓・壊れた壁の穴）の数。面積の大きい順。
  * 壁で隔てられているだけの所には出ない（繋がっている所だけ）。 */
+/* 【点のまわりの部屋の占め方】半径 radius(m) の球の中で各部屋が占める割合を返す。
+ * outRooms/outWeights に大きい順に書き、書けた数を返す（割合の合計は 1）。
+ * ★部屋を音に使うときは必ずこれを通すこと。部屋番号そのもので切り替えると、
+ *   プレイヤーが必ず通る戸口のど真ん中に不連続を置くことになる。割合なら
+ *   部屋の真ん中で 100:0、戸口で 50:50 と連続に変わる。
+ *   radius は戸口の幅の 1〜2 倍が目安（そのぶんの距離をかけて入れ替わる）。 */
+ACOUSTIC_API int  AF_SceneRoomWeights(AF_SceneHandle scene, AF_Vector3 p, float radius,
+                                      int* outRooms, float* outWeights, int maxOut);
+
+/* 点における「実効的な部屋の体積」(m3)。上の割合で混ぜたもの。0 なら部屋の外。
+ * 残響量の土台（臨界距離 rc = 0.057√(V/RT60)）にそのまま入れられる。
+ * レベル全体の外形箱を V に使うと、狭い部屋でも広間でも同じ値になって残響量が合わない。 */
+ACOUSTIC_API float AF_SceneRoomVolumeAt(AF_SceneHandle scene, AF_Vector3 p, float radius);
+
 ACOUSTIC_API int  AF_SceneApertureCount(AF_SceneHandle scene);
 
 /* 開口 index の情報。各出力は null 可。成功で 1。

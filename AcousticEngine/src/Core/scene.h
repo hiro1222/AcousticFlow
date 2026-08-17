@@ -275,6 +275,29 @@ public:
     void setRoomBrick(int voxels) { roomBuilder_.setBrick(voxels); }
     void setRoomSeedRadius(float m) { roomBuilder_.setSeedRadius(m); }
     void setRoomChamferFull(bool on) { roomBuilder_.setChamferFull(on); }
+
+    // 点のまわりで各部屋が占める割合（合計 1、大きい順）。書けた数を返す。
+    // 部屋を音に使うときはこれを通すこと（部屋番号で切り替えると戸口で音が跳ねる）。
+    int roomWeights(const Vec3& p, float radius, int* rooms, float* weights, int maxOut) const {
+        roomGraph();   // 汚れていれば作り直す
+        return roomBuilder_.roomWeightsAt(p, radius, rooms, weights, maxOut);
+    }
+
+    // 点における「実効的な部屋の体積」(m3)。上の割合で混ぜたもの。
+    // 残響量の土台（臨界距離 rc = 0.057√(V/RT60)）にそのまま入れられる。
+    float roomVolumeAt(const Vec3& p, float radius) const {
+        int ids[8]; float w[8];
+        const int n = roomWeights(p, radius, ids, w, 8);
+        if (n <= 0) return 0.0f;
+        const rooms::Result& rr = roomBuilder_.result();
+        const float c = rr.grid.cell;
+        const float cellVol = c * c * c;
+        float v = 0.0f;
+        for (int i = 0; i < n; ++i)
+            v += w[i] * static_cast<float>(rr.rooms[static_cast<std::size_t>(ids[i])].voxels)
+                 * cellVol;
+        return v;
+    }
     // 点がどの部屋にいるか。-1 なら部屋の外／実体の中。
     int roomAt(const Vec3& p) const {
         const rooms::Grid& g = roomGraph().grid;
