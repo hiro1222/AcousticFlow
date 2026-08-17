@@ -674,6 +674,27 @@ void AF_SceneSetRoomChamferFull(AF_SceneHandle scene, int full) {
     if (s) s->setRoomChamferFull(full != 0);
 }
 
+int AF_SceneApertureCount(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    return s ? static_cast<int>(s->roomGraph().apertures.size()) : 0;
+}
+
+int AF_SceneApertureInfo(AF_SceneHandle scene, int index,
+                         float* outArea, AF_Vector3* outCenter, AF_Vector3* outNormal,
+                         int* outRoomA, int* outRoomB) {
+    Scene* s = asScene(scene);
+    if (!s) return 0;
+    const auto& aps = s->roomGraph().apertures;
+    if (index < 0 || index >= static_cast<int>(aps.size())) return 0;
+    const auto& a = aps[static_cast<std::size_t>(index)];
+    if (outArea)   *outArea   = a.area;
+    if (outCenter) *outCenter = fromVec3(a.center);
+    if (outNormal) *outNormal = fromVec3(a.normal);
+    if (outRoomA)  *outRoomA  = a.roomA;
+    if (outRoomB)  *outRoomB  = a.roomB;
+    return 1;
+}
+
 void AF_SceneSetApertureContrast(AF_SceneHandle scene, float p) {
     Scene* s = asScene(scene);
     if (s) s->setApertureContrast(p);

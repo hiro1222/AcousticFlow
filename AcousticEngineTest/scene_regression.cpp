@@ -2643,6 +2643,53 @@ void diagnoseRoomDetection() {
         }
         std::printf("\n");
     }
+    // ★開口の抽出。戸口の実寸（幅 × 高さ 4m）と突き合わせる。
+    //   ここで出るのは戸口＝開口の器であって、扉の開き具合ではない。
+    std::printf("      開口の抽出（戸口 幅 w × 高さ 4.0m、格子 0.10m）\n");
+    std::printf("        戸口     口数  面積(m2)  実寸   中心(x,y,z)          法線\n");
+    for (float gap : {0.0f, 0.6f, 0.9f, 1.2f, 2.0f}) {
+        AF_SceneHandle s = build(gap);
+        AF_SceneSetRoomCellSize(s, 0.1f);
+        const int na = AF_SceneApertureCount(s);
+        std::printf("        %4.1fm   %3d  ", gap, na);
+        if (na > 0) {
+            float area = 0.0f; AF_Vector3 c{}, n{}; int ra = 0, rb = 0;
+            AF_SceneApertureInfo(s, 0, &area, &c, &n, &ra, &rb);
+            std::printf("%7.2f  %5.2f  (%5.2f,%5.2f,%5.2f)  (%4.1f,%4.1f,%4.1f)  部屋 %d-%d",
+                        area, gap * 4.0f, c.x, c.y, c.z, n.x, n.y, n.z, ra, rb);
+        } else {
+            std::printf("      -      -");
+        }
+        std::printf("\n");
+        AF_SceneDestroy(s);
+    }
+    // 同じ 2 部屋を繋ぐ口が 2 つある形（仕切りに戸口を 2 箇所）。
+    {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        // 仕切り: 壁 x∈[-6,-3] / 戸口 0.9m / 壁 x∈[-2.1,2] / 戸口 0.6m / 壁 x∈[2.6,6]
+        AF_SceneAddInstanceBox(s, V(-4.5f,  h*0.5f, 0), V(1.5f,  h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-0.05f, h*0.5f, 0), V(2.05f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( 4.3f,  h*0.5f, 0), V(1.7f,  h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneSetRoomCellSize(s, 0.1f);
+        const int na = AF_SceneApertureCount(s);
+        std::printf("      仕切りに戸口 2 箇所（幅 0.9m と 0.6m）: 部屋 %d / 口 %d\n",
+                    AF_SceneRoomCount(s), na);
+        for (int i = 0; i < na && i < 4; ++i) {
+            float area = 0.0f; AF_Vector3 c{}, n{}; int ra = 0, rb = 0;
+            AF_SceneApertureInfo(s, i, &area, &c, &n, &ra, &rb);
+            std::printf("        口%d  面積 %6.2f m2  中心 (%5.2f,%5.2f,%5.2f)  部屋 %d-%d\n",
+                        i, area, c.x, c.y, c.z, ra, rb);
+        }
+        AF_SceneDestroy(s);
+    }
+
     // 塗り戻しが効いていること＝戸口のど真ん中に立っても必ずどちらかの部屋になる。
     {
         AF_SceneHandle s = build(0.9f);
@@ -3659,6 +3706,56 @@ void testRoomSegmentation() {
         check("[部屋] 戸口の両側が別の部屋", nearSide >= 0 && farSide >= 0 && nearSide != farSide);
         check("[部屋] 戸口の中にも部屋が付く", inDoor == nearSide || inDoor == farSide);
         check("[部屋] 壁際にも部屋が付く",     atWall == nearSide);
+        AF_SceneDestroy(s);
+    }
+
+    // ── 開口の抽出 ──
+    //   ★面積はボクセル 1 個ぶんの丸めが乗る（0.25m 格子なら幅が 0.25m 刻みに量子化）。
+    //     絶対値を当てにせず「実寸の 2 割以内」で縛る。
+    {
+        AF_SceneHandle s = build(0.9f);
+        AF_SceneSetRoomCellSize(s, 0.1f);
+        const int na = AF_SceneApertureCount(s);
+        float area = 0.0f; AF_Vector3 c{}, n{}; int ra = -1, rb = -1;
+        const int ok = (na > 0) ? AF_SceneApertureInfo(s, 0, &area, &c, &n, &ra, &rb) : 0;
+        check("[開口] 戸口 0.9m で口が 1 つ出る", na == 1);
+        check("[開口] 面積が実寸(3.6m2)の 2 割以内",
+              ok && std::fabs(area - 3.6f) <= 0.72f);
+        check("[開口] 中心が戸口の位置", ok && std::fabs(c.x) < 0.2f && std::fabs(c.z) < 0.2f);
+        check("[開口] 法線が仕切りに垂直", ok && std::fabs(n.z) > 0.9f);
+        check("[開口] 繋いでいる部屋が両側", ok && ra == 0 && rb == 1);
+        AF_SceneDestroy(s);
+    }
+    {
+        AF_SceneHandle s = build(0.0f);   // 完全に塞がっている
+        AF_SceneSetRoomCellSize(s, 0.1f);
+        check("[開口] 壁だけなら口は出ない", AF_SceneApertureCount(s) == 0);
+        AF_SceneDestroy(s);
+    }
+    // 同じ 2 部屋を繋ぐ口が 2 つあるとき、まとめずに分けること。
+    {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-4.5f,  h*0.5f, 0), V(1.5f,  h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-0.05f, h*0.5f, 0), V(2.05f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( 4.3f,  h*0.5f, 0), V(1.7f,  h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneSetRoomCellSize(s, 0.1f);
+        const int na = AF_SceneApertureCount(s);
+        float a0 = 0.0f, a1 = 0.0f; AF_Vector3 c0{}, c1{};
+        if (na >= 2) {
+            AF_SceneApertureInfo(s, 0, &a0, &c0, nullptr, nullptr, nullptr);
+            AF_SceneApertureInfo(s, 1, &a1, &c1, nullptr, nullptr, nullptr);
+        }
+        check("[開口] 戸口 2 箇所は 2 つの口に分かれる", na == 2);
+        check("[開口] 面積の大きい順に並ぶ", na == 2 && a0 >= a1);
+        check("[開口] それぞれの中心が各戸口の位置",
+              na == 2 && std::fabs(c0.x - (-2.55f)) < 0.3f && std::fabs(c1.x - 2.30f) < 0.3f);
         AF_SceneDestroy(s);
     }
 }

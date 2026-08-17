@@ -335,8 +335,27 @@ ACOUSTIC_API void AF_SceneRoomBuildTimes(AF_SceneHandle scene, float* alloc, flo
  * 0 で侵食なし＝素の連結成分。目安: 戸口の幅の半分 < 値 < 部屋の狭い所の半分。 */
 ACOUSTIC_API void AF_SceneSetRoomSeedRadius(AF_SceneHandle scene, float meters);
 
-/* 距離の近似（0=市街地距離の3近傍・既定 / 1=3-4-5 の13近傍）。品質とコストの比較用。 */
+/* 距離の近似（1=3-4-5 の13近傍・既定 / 0=市街地距離の3近傍）。
+ * 0 は 0.15m 以下の細かい格子でだけ使うこと（粗いと戸口の幅の差が丸まって消える）。 */
 ACOUSTIC_API void AF_SceneSetRoomChamferFull(AF_SceneHandle scene, int full);
+
+/* 【開口】部屋どうしを繋ぐくびれ（戸口・窓・壊れた壁の穴）の数。面積の大きい順。
+ * 壁で隔てられているだけの所には出ない（繋がっている所だけ）。 */
+ACOUSTIC_API int  AF_SceneApertureCount(AF_SceneHandle scene);
+
+/* 開口 index の情報。各出力は null 可。成功で 1。
+ *   outArea   : 断面積(m2)
+ *   outCenter : 断面の重心
+ *   outNormal : 面の向き（roomA → roomB が正）
+ *   outRoomA / outRoomB : 繋いでいる部屋番号（roomA < roomB）
+ * ★ここに出るのは**戸口**（開口の器）であって、扉の開き具合ではない。扉は動くものとして
+ *   静的な塗り分けから外してある。開き具合は回折・透過の経路が連続量で出しているので、
+ *   残響の結合ではそちらと組むこと（部屋番号で切り替えると境界で音が跳ねる）。 */
+ACOUSTIC_API int  AF_SceneApertureInfo(AF_SceneHandle scene, int index,
+                                       float* outArea,
+                                       AF_Vector3* outCenter,
+                                       AF_Vector3* outNormal,
+                                       int* outRoomA, int* outRoomB);
 
 /* 差分更新の粒度（ブロック一辺のボクセル数）。既定 16。変えると全再構築が走る。
  * 小さいほど更新は局所的になるが、走査線の区間が切り詰められて全再構築が遅くなる。 */

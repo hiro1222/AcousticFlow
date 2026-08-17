@@ -12,7 +12,8 @@
 //     2) 各ボクセルの「壁からの距離」を測る
 //     3) 距離が侵食半径以上のボクセル（＝種）の連結成分 ＝ 部屋
 //     4) 種でないボクセルを最寄りの部屋へ塗り戻す（戸口の中にも部屋が付く）
-//     5) 部屋どうしを繋ぐくびれ ＝ 開口（次の段階。ここではまだ作らない）
+//     5) 別の部屋どうしが接している面 ＝ 開口。壁で隔てられている所には出ない
+//        （実体が塗り戻しを遮るので、壁の両側は必ず片方が実体になる）
 //
 //   ★2〜3 の侵食が要る理由。素の連結成分だと、戸口で繋がった空間は全部ひとつの
 //     部屋になる（＝扉の向こうも同じ部屋）。それでは残響を切り替える土台にならない。
@@ -30,6 +31,19 @@
 //
 //     半径 0.6m を既定にしてある。人が通る戸口（〜1.2m）は分かれ、
 //     開けた口（2m〜）は分かれない。閾値は authoring ではなく幾何から決まる。
+//
+//   ★開口の実測（格子 0.10m、戸口は幅 w × 高さ 4.0m）
+//        戸口 0.6m → 口 1 個・面積 2.00 m2（実寸 2.40）
+//        戸口 0.9m → 口 1 個・面積 3.69 m2（実寸 3.60）  中心・法線とも実位置に一致
+//        戸口 1.2m 以上 → 部屋が分かれないので口も出ない（＝ひと続きの空間）
+//        仕切りに 0.9m と 0.6m の戸口 → 口 2 個（3.20 / 2.00 m2、中心も各戸口）
+//     面積にはボクセル 1 個ぶんの丸めが乗る（幅が格子の刻みに量子化される）。
+//     絶対値ではなく「実寸の 2 割以内」で扱うこと。
+//
+//   ★ここに出るのは**戸口**（開口の器）であって、扉の開き具合ではない。扉は動くものとして
+//     静的な塗り分けから外してある。残響の結合で部屋番号を使って切り替えると、
+//     プレイヤーが必ず通る戸口のど真ん中に不連続を置くことになる。開き具合は回折・透過の
+//     経路が連続量として出しているので、混合比はそちらから取ること。
 //
 //   リスナーに依存しないので、稜線探索から矩形を起こす案にあった
 //   「見えた稜線しか持っていないので開口の高さが分からない・リスナーが動くと変わる」
@@ -148,14 +162,28 @@ struct Room {
     Vec3  boundsMin{0, 0, 0}, boundsMax{0, 0, 0};
 };
 
+// 部屋どうしを繋ぐくびれ（戸口・窓・壊れた壁の穴）。
+//   塗り戻した後、別の部屋どうしが face で接している所がそのまま開口になる。
+//   壁で隔てられているだけの所には出ない（実体が伝播を遮るので接する face が無い）。
+//   ★扉そのものは入っていない。扉は「動くもの」として静的な塗り分けから外れているので、
+//     ここに出るのは**戸口**（開口の器）であって、その開き具合ではない。
+//     開き具合は既存の回折・透過の経路が連続量として出しているので、そちらと組む。
+struct Aperture {
+    int   roomA = -1, roomB = -1;   // 繋いでいる部屋（roomA < roomB）
+    float area = 0.0f;              // 断面積(m2)
+    Vec3  center{0, 0, 0};          // 断面の重心
+    Vec3  normal{0, 0, 0};          // 面の向き（A→B が正）。面積で重み付けした平均
+};
+
 struct Result {
     Grid grid;
     std::vector<Room> rooms;   // 添字がそのまま部屋番号
+    std::vector<Aperture> apertures;
     int  discarded = 0;        // 小さすぎて捨てた連結成分の数
     int  outsideVoxels = 0;    // 「外の世界」に落ちたボクセル数（格子の外周に届いた成分）
     // 段別の所要時間(ms)。どこを削るべきかを推測でなく数字で決めるため。
     double msAlloc = 0.0, msFill = 0.0, msDist = 0.0, msLabel = 0.0,
-           msMerge = 0.0, msGrow = 0.0;
+           msMerge = 0.0, msGrow = 0.0, msAperture = 0.0;
     int  dirtyBricks = 0;      // 直近の更新で塗り直したブロック数（0 なら全再構築）
     int  totalBricks = 0;
 };
@@ -574,6 +602,117 @@ private:
         }
     }
 
+    // ── 部屋どうしの境界 ＝ 開口 ──
+    //   塗り戻した後の部屋の場を見て、別の部屋が接している face を集める。
+    //   ★壁で隔てられている所には出ない。実体は塗り戻しを遮るので、壁の両側の face は
+    //     必ず片方が実体になり、この条件を満たさない。「繋がっている所」だけが残る。
+    //   ★同じ 2 部屋を繋ぐ口が複数あることは普通にある（大部屋の 2 つの入口など）。
+    //     部屋の組で 1 個にまとめず、face の繋がりで分ける。
+    void findApertures_() {
+        res_.apertures.clear();
+        const Grid& g = res_.grid;
+        const int nx = g.nx, ny = g.ny, nz = g.nz;
+        const int sy = nx, sz = nx * ny;
+        const std::int16_t* R = room_.data();
+        const std::uint8_t* V = g.v.data();
+
+        // 境界 face を集める。face は「手前側のボクセル + 軸」で表す。
+        faceIdx_.clear(); faceAxis_.clear();
+        const int step[3] = { 1, sy, sz };
+        for (int z = 0; z < nz; ++z)
+            for (int y = 0; y < ny; ++y) {
+                const int base = z * sz + y * sy;
+                for (int x = 0; x < nx; ++x) {
+                    const int i = base + x;
+                    if (V[i] == kSolid) continue;
+                    const int ra = R[i];
+                    if (ra < 0) continue;
+                    const int lim[3] = { nx - 1, ny - 1, nz - 1 };
+                    const int pos[3] = { x, y, z };
+                    for (int a = 0; a < 3; ++a) {
+                        if (pos[a] >= lim[a]) continue;
+                        const int j = i + step[a];
+                        if (V[j] == kSolid) continue;
+                        const int rb = R[j];
+                        if (rb < 0 || rb == ra) continue;
+                        faceIdx_.push_back(i);
+                        faceAxis_.push_back(static_cast<std::uint8_t>(a));
+                    }
+                }
+            }
+        if (faceIdx_.empty()) return;
+
+        // face を繋がりで分ける。手前側のボクセルが 6 近傍で繋がっていて、
+        // かつ繋いでいる部屋の組が同じなら同じ口。
+        const int nf = static_cast<int>(faceIdx_.size());
+        faceOf_.assign(static_cast<std::size_t>(nx) * ny * nz, -1);
+        for (int f = 0; f < nf; ++f) faceOf_[static_cast<std::size_t>(faceIdx_[f])] = f;
+
+        std::vector<std::uint8_t> seen(static_cast<std::size_t>(nf), 0);
+        std::vector<int> stack;
+        const float cellArea = g.cell * g.cell;
+        for (int f0 = 0; f0 < nf; ++f0) {
+            if (seen[static_cast<std::size_t>(f0)]) continue;
+            const int i0 = faceIdx_[f0];
+            const int a0 = faceAxis_[f0];
+            int pa = R[i0], pb = R[i0 + step[a0]];
+            if (pa > pb) std::swap(pa, pb);
+
+            stack.clear(); stack.push_back(f0);
+            seen[static_cast<std::size_t>(f0)] = 1;
+            double area = 0.0, cx = 0.0, cy = 0.0, cz = 0.0;
+            double nvx = 0.0, nvy = 0.0, nvz = 0.0;
+            while (!stack.empty()) {
+                const int f = stack.back(); stack.pop_back();
+                const int i = faceIdx_[f];
+                const int a = faceAxis_[f];
+                const int x = i % nx, y = (i / nx) % ny, z = i / sz;
+                area += cellArea;
+                // face の中心は 2 ボクセルの中点。
+                const float ax = (a == 0) ? 0.5f : 0.0f;
+                const float ay = (a == 1) ? 0.5f : 0.0f;
+                const float az = (a == 2) ? 0.5f : 0.0f;
+                cx += x + 0.5 + ax; cy += y + 0.5 + ay; cz += z + 0.5 + az;
+                // 法線は A→B 向き。手前が A ならその軸の正、逆なら負。
+                const float s = (R[i] == pa) ? 1.0f : -1.0f;
+                if (a == 0) nvx += s; else if (a == 1) nvy += s; else nvz += s;
+                // 隣の face を辿る（手前側ボクセルの 6 近傍）。
+                for (int d = 0; d < 6; ++d) {
+                    const int ax2 = x + ((d == 0) ? 1 : (d == 1) ? -1 : 0);
+                    const int ay2 = y + ((d == 2) ? 1 : (d == 3) ? -1 : 0);
+                    const int az2 = z + ((d == 4) ? 1 : (d == 5) ? -1 : 0);
+                    if (ax2 < 0 || ay2 < 0 || az2 < 0 || ax2 >= nx || ay2 >= ny || az2 >= nz)
+                        continue;
+                    const int ni = az2 * sz + ay2 * sy + ax2;
+                    const int nf2 = faceOf_[static_cast<std::size_t>(ni)];
+                    if (nf2 < 0 || seen[static_cast<std::size_t>(nf2)]) continue;
+                    int qa = R[faceIdx_[nf2]], qb = R[faceIdx_[nf2] + step[faceAxis_[nf2]]];
+                    if (qa > qb) std::swap(qa, qb);
+                    if (qa != pa || qb != pb) continue;
+                    seen[static_cast<std::size_t>(nf2)] = 1;
+                    stack.push_back(nf2);
+                }
+            }
+            const double cnt = area / cellArea;
+            Aperture ap;
+            ap.roomA = pa; ap.roomB = pb;
+            ap.area = static_cast<float>(area);
+            ap.center = Vec3(g.origin.x + static_cast<float>(cx / cnt) * g.cell,
+                             g.origin.y + static_cast<float>(cy / cnt) * g.cell,
+                             g.origin.z + static_cast<float>(cz / cnt) * g.cell);
+            const Vec3 nv(static_cast<float>(nvx), static_cast<float>(nvy),
+                          static_cast<float>(nvz));
+            const float nl = length(nv);
+            ap.normal = (nl > 1e-6f) ? nv * (1.0f / nl) : Vec3(0, 1, 0);
+            res_.apertures.push_back(ap);
+        }
+        // 大きい順。残響の結合では効く口から順に見たい。
+        std::sort(res_.apertures.begin(), res_.apertures.end(),
+                  [](const Aperture& a, const Aperture& b) { return a.area > b.area; });
+        // 次回のために掃除（格子ぶんの配列なので持ち越さない）。
+        for (int f = 0; f < nf; ++f) faceOf_[static_cast<std::size_t>(faceIdx_[f])] = -1;
+    }
+
     // ── ブロック 1 個をラベリングする ──
     //   ★走査線(scanline)で塗る。1 ボクセルずつ積む素直な塗りつぶしは、取り出すたびに
     //     近傍 6 個を**バラバラの番地**で読み、そのぶんスタックにも積む。1 個 14.8ns
@@ -840,6 +979,10 @@ private:
         growRooms_();
         const auto tG1 = std::chrono::high_resolution_clock::now();
 
+        findApertures_();
+        const auto tP1 = std::chrono::high_resolution_clock::now();
+        res_.msAperture = std::chrono::duration<double, std::milli>(tP1 - tG1).count();
+
         res_.msAlloc = std::chrono::duration<double, std::milli>(tA1 - tA0).count();
         res_.msFill  = std::chrono::duration<double, std::milli>(tF1 - tA1).count();
         res_.msDist  = std::chrono::duration<double, std::milli>(tD1 - tF1).count();
@@ -943,6 +1086,10 @@ private:
         growRooms_();
         const auto tG1 = std::chrono::high_resolution_clock::now();
 
+        findApertures_();
+        const auto tP1 = std::chrono::high_resolution_clock::now();
+        res_.msAperture = std::chrono::duration<double, std::milli>(tP1 - tG1).count();
+
         res_.msAlloc = 0.0;
         res_.msFill  = std::chrono::duration<double, std::milli>(tF1 - tF0).count();
         res_.msDist  = std::chrono::duration<double, std::milli>(tD1 - tF1).count();
@@ -955,6 +1102,9 @@ private:
 
     // 走査線の種（x,y,z を 3 本の配列で持つ。構造体より積み下ろしが軽い）。
     std::vector<int> seeds_, seedY_, seedZ_;
+    // 開口を拾うときの作業領域（毎回確保し直さない）。
+    std::vector<int> faceIdx_, faceOf_;
+    std::vector<std::uint8_t> faceAxis_;
 };
 
 }  // namespace rooms
