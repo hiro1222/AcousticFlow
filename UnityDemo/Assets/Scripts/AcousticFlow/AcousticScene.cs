@@ -488,6 +488,114 @@ namespace AcousticFlow
             return Native.AF_SceneGetEchogramBands(_handle, outBins, numBins);
         }
 
+        // ===== 部屋と開口（幾何から自動検出）=====
+        // 静的な形状をボクセル化して自由空間を塗り分け、狭いくびれ（戸口）で部屋を分ける。
+        // 手置きのボリュームは無く、壁を壊せば部屋の繋がりもその場で変わる。
+        //
+        // ★部屋を音に使うときは必ず RoomVolumeAt / Rt60At / RoomWeights を通すこと。
+        //   RoomAt（部屋番号）で残響を切り替えると、プレイヤーが必ず通る戸口のど真ん中に
+        //   不連続を置くことになる。このエンジンで潰してきた音の跳ねは、どれも
+        //   「二値の判定が音に直結していた」ことが原因だった。
+        //   割合なら部屋の真ん中で 100:0、戸口で 50:50 と連続に変わる。
+
+        public int RoomCount
+        {
+            get { return _handle == IntPtr.Zero ? 0 : Native.AF_SceneRoomCount(_handle); }
+        }
+
+        // 点がどの部屋か。-1 は部屋の外／実体の中。★表示・デバッグ用。音の切り替えには使わない。
+        public int RoomAt(Vector3 p)
+        {
+            if (_handle == IntPtr.Zero) return -1;
+            return Native.AF_SceneRoomAt(_handle, new AFVector3(p));
+        }
+
+        public bool GetRoomInfo(int room, out float volume, out Vector3 centroid,
+                                out Vector3 boundsMin, out Vector3 boundsMax)
+        {
+            volume = 0f; centroid = Vector3.zero; boundsMin = Vector3.zero; boundsMax = Vector3.zero;
+            if (_handle == IntPtr.Zero) return false;
+            AFVector3 c, lo, hi;
+            if (Native.AF_SceneRoomInfo(_handle, room, out volume, out c, out lo, out hi) == 0)
+                return false;
+            centroid = c.ToVector3(); boundsMin = lo.ToVector3(); boundsMax = hi.ToVector3();
+            return true;
+        }
+
+        // 半径 radius(m) の球の中で各部屋が占める割合（合計 1、大きい順）。書けた数を返す。
+        private int[] _roomIdBuf;
+        private float[] _roomWBuf;
+        public int GetRoomWeights(Vector3 p, float radius, int[] outRooms, float[] outWeights)
+        {
+            if (_handle == IntPtr.Zero || outRooms == null || outWeights == null) return 0;
+            int cap = Mathf.Min(outRooms.Length, outWeights.Length);
+            if (cap <= 0) return 0;
+            return Native.AF_SceneRoomWeights(_handle, new AFVector3(p), radius,
+                                              outRooms, outWeights, cap);
+        }
+
+        // 上の割合で混ぜた実効体積(m3)。0 なら部屋の外。
+        // 臨界距離 rc = 0.057√(V/RT60) にそのまま入れられる。
+        public float RoomVolumeAt(Vector3 p, float radius)
+        {
+            if (_handle == IntPtr.Zero) return 0f;
+            return Native.AF_SceneRoomVolumeAt(_handle, new AFVector3(p), radius);
+        }
+
+        // 帯域別の残響時間(s)。部屋ごとの Sabine 値を上の割合で混ぜたもの。
+        // outRt60 は 6 要素以上。書けた帯域数を返す。
+        public int GetRt60At(Vector3 p, float radius, float[] outRt60)
+        {
+            if (_handle == IntPtr.Zero || outRt60 == null) return 0;
+            return Native.AF_SceneRt60At(_handle, new AFVector3(p), radius,
+                                         outRt60, outRt60.Length);
+        }
+
+        // 部屋の音響量。境界面積・開口面積・帯域別の平均吸音率と残響時間。
+        public bool GetRoomAcoustics(int room, out float surface, out float openArea,
+                                     float[] absorb6, float[] rt60_6)
+        {
+            surface = 0f; openArea = 0f;
+            if (_handle == IntPtr.Zero) return false;
+            // C 側は 6 帯域ぶん書くので、短い配列を渡させない（渡されたら書かせない）。
+            if (absorb6 != null && absorb6.Length < 6) absorb6 = null;
+            if (rt60_6 != null && rt60_6.Length < 6) rt60_6 = null;
+            return Native.AF_SceneRoomAcoustics(_handle, room, out surface, out openArea,
+                                                absorb6, rt60_6) != 0;
+        }
+
+        public int ApertureCount
+        {
+            get { return _handle == IntPtr.Zero ? 0 : Native.AF_SceneApertureCount(_handle); }
+        }
+
+        // 開口 index の情報。★ここに出るのは戸口（開口の器）であって、扉の開き具合ではない。
+        //   扉は動くものとして静的な塗り分けから外してある。開き具合は回折・透過の経路が
+        //   連続量として出しているので、量を決めるときはそちらと組むこと。
+        public bool GetApertureInfo(int index, out float area, out Vector3 center,
+                                    out Vector3 normal, out int roomA, out int roomB)
+        {
+            area = 0f; center = Vector3.zero; normal = Vector3.zero; roomA = -1; roomB = -1;
+            if (_handle == IntPtr.Zero) return false;
+            AFVector3 c, n;
+            if (Native.AF_SceneApertureInfo(_handle, index, out area, out c, out n,
+                                            out roomA, out roomB) == 0) return false;
+            center = c.ToVector3(); normal = n.ToVector3();
+            return true;
+        }
+
+        // ボクセル一辺(m)。細かいほど狭い戸口を見分けられるがコストが増える。
+        public void SetRoomCellSize(float meters)
+        {
+            if (_handle != IntPtr.Zero) Native.AF_SceneSetRoomCellSize(_handle, meters);
+        }
+
+        // 部屋を戸口で割る半径(m)。幅がこの 2 倍に満たないくびれで部屋が分かれる。
+        public void SetRoomSeedRadius(float meters)
+        {
+            if (_handle != IntPtr.Zero) Native.AF_SceneSetRoomSeedRadius(_handle, meters);
+        }
+
         // 反射経路：origin→dir を鏡面反射で maxBounces 回追い、通過点を outPoints に書き点数を返す。
         // 内部バッファ(_pathBuf)を使い回して毎フレームの GC を避ける。
         private AFVector3[] _pathBuf;

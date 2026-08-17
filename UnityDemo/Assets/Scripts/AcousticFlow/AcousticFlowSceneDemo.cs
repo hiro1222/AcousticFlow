@@ -198,6 +198,27 @@ namespace AcousticFlow
                  + "人が感じる残響の多さはエネルギー比そのものではない（先行音効果で"
                  + "直接音が重く聞こえる）ため、物理値を知覚側へ寄せる補正。")]
         [Range(0f, 1f)] public float reverbRatioExponent = 0.5f;
+        [Tooltip("残響/直接比のやわらかい上限。50 までは素通しで、そこから上はこの値へ漸近する。\n"
+                 + "以前は 50 で硬くクランプしていたが、上限に達した瞬間から\n"
+                 + "どれだけ離れても値が動かなくなる（＝そこで反応が消える）。\n"
+                 + "50 以下にすると従来どおりの硬いクランプ。")]
+        [Range(50f, 400f)] public float reverbRatioCeiling = 150f;
+
+        [Header("部屋（幾何から自動検出）")]
+        [Tooltip("残響の体積と減衰時間を混ぜる半径(m)。\n"
+                 + "★部屋番号で切り替えず『まわりの何割がどの部屋か』で混ぜている。\n"
+                 + "  切り替えにすると、プレイヤーが必ず通る戸口のど真ん中に段差が乗る。\n"
+                 + "この半径が『何メートルかけて隣の部屋の響きへ入れ替わるか』そのもの。\n"
+                 + "実測の傾き（部屋をまたぐ 18dB の変化に対して、0.1m あたり）:\n"
+                 + "  0.5m→2.67dB / 1.0m→1.58dB / 2.0m→0.92dB / 3.0m→0.69dB")]
+        [Range(0.3f, 4f)] public float roomBlendRadius = 2.0f;
+        [Tooltip("部屋検出のボクセル一辺(m)。細かいほど狭い戸口を見分けられるがコストが増える。\n"
+                 + "0.25m だと幅 0.9m の戸口がぎりぎり（半ボクセルぶんの甘さがある）。")]
+        [Range(0.1f, 0.5f)] public float roomCellSize = 0.25f;
+        [Tooltip("部屋を戸口で割る半径(m)。幅がこの 2 倍に満たないくびれで部屋が分かれる。\n"
+                 + "0.6m なら人が通る戸口(〜1.2m)は分かれ、開けた口(2m〜)は分かれない。\n"
+                 + "曲がり角・柱・腰高の仕切りでは分かれない（くびれていないため）。")]
+        [Range(0f, 2f)] public float roomSeedRadius = 0.6f;
 
         [Header("早期反射 (A: 仮想エミッタ)")]
         [Tooltip("ON: 各音源の主要な初期反射を像源として抽出し、像源位置に『普通の3Dボイス』を立てて"
@@ -419,6 +440,8 @@ namespace AcousticFlow
         private float[] _echogram;      // 到達時間ビン（広帯域）
         private float[] _echogramBands; // 到達時間ビン×6帯域（実測された尾のIR用）
         private float _reverbWet, _reverbDecay;  // エコグラムから算出（RTPCへ）
+        private float[] _roomRt60;      // 部屋の帯域別 RT60（幾何と材質から。使い回し）
+        private int[] _roomIdsUi; private float[] _roomWUi;   // 画面表示用（使い回し）
         // ※ 各役割の更新レートはエンジンが持つ（段2）。ホストはカウンタを持たない。
 
         // 早期反射(A) 用バッファ。音源ごとに像源位置＋帯域ゲインを受け、仮想エミッタへ反映。
@@ -514,6 +537,11 @@ namespace AcousticFlow
             public static float MixingTimeMs;
             public static float RtSeconds;          // 残響RT60(秒)
             public static float Wet;                // 残響wet(0..1, tail/total)
+            // 部屋グラフから取った実効値（0 なら部屋が取れず外形箱にフォールバックした）。
+            //   RoomVolume: まわりの何割がどの部屋かで混ぜた体積(m3)
+            //   RoomRt60  : 部屋ごとの Sabine を同じ割合で混ぜた残響時間(s, 500Hz帯)
+            public static float RoomVolume;
+            public static float RoomRt60;
             public static float SourceLevel;        // 主音源の直線透過(遮蔽)レベル(0..1)。残響を遮蔽で絞る用
 
             // 後期残響の左右バランス（耳ごと×6帯域）。平均が 1 になるよう正規化してある
@@ -1303,6 +1331,9 @@ namespace AcousticFlow
             _scene.SetApertureContrast(apertureContrast);
             _scene.SetApertureIsTransmission(apertureIsTransmission);
             _scene.SetUseBtm(useBtmDiffraction);
+            // 部屋の検出設定。中で値の変化を見ているので、毎フレーム押しても作り直しは起きない。
+            _scene.SetRoomCellSize(roomCellSize);
+            _scene.SetRoomSeedRadius(roomSeedRadius);
             _scene.Update(Time.deltaTime);
 
             // 3-b) 音源ごとの帯域別生存と到来方向を受け取る。
@@ -1479,8 +1510,10 @@ namespace AcousticFlow
                     Status.DistanceRef = distanceRef;
                     Status.EchogramBinCount = _echogram.Length;
                     if (changed) Status.EchogramVersion++;
-                    UpdateReverbFromEchogram();
+                    // ★順番が逆になった。wet は残響/直接の物理比 t から出すようになったので、
+                    //   先に比を確定させる（旧: wet を出してから比を出していた）。
                     UpdateReverbTargetRatio();
+                    UpdateReverbFromEchogram();
                     // Reverb Monitor 窓へ。
                     LatestEchogram = _echogram;
                     EchogramBins = _echogram.Length;
@@ -1996,8 +2029,20 @@ namespace AcousticFlow
             }
         }
 
-        // エコグラムから wet量（反射割合）と RT60（尾の長さ）を算出し、Wwise 残響へ RTPC 送出。
+        // wet量（反射割合）と RT60（尾の長さ）を算出し、Wwise 残響へ RTPC 送出。
         //   ReverbWet   : 0..100（反射割合×100） / ReverbDecay : 秒（尾の長さ）
+        //
+        // ★wet の出し方を変えた。旧: (総和-ピーク)/総和。
+        //   これは比なので、ピーク（＝直接音）が壁で消えると分母だけが落ちて 1.0 へ寄る。
+        //   実測すると、直接音が遮蔽されていても(透過 0.0074)開けていても(1.0)
+        //   全区間 0.94〜0.96 に張り付いて、位置の情報を持っていなかった。
+        //   新: 残響/直接の物理比 t（部屋の体積と残響時間から出したもの）から
+        //   wet = t/(1+t) に変換する。t は 0〜∞ なので wet は 0〜1 に単調・連続で写り、
+        //   飽和しない（t=1 すなわち臨界距離でちょうど 0.5）。
+        //
+        // RT60 も部屋グラフ（Sabine）を優先する。エコグラム由来は窓が
+        // bins×binMs（既定 1 秒）しかなく、吸音率が 17.6 倍違う 2 部屋を
+        // 0.50s と 0.51s としか区別できていなかった（実測）。
         private void UpdateReverbFromEchogram()
         {
             int bins = _echogram.Length;
@@ -2005,15 +2050,30 @@ namespace AcousticFlow
             for (int k = 0; k < bins; k++) { float e = _echogram[k]; if (e > peak) peak = e; total += e; }
             if (peak <= 0f) return;
 
-            float tail = Mathf.Max(0f, total - peak);
-            float wet = Mathf.Clamp01(tail / Mathf.Max(total, 1e-6f));
             float floor = peak * 0.001f;   // -60dB
             int tailBin = 0;
             for (int k = 0; k < bins; k++) if (_echogram[k] > floor) tailBin = k;
             float rt60 = (tailBin + 1) * echogramBinMs * 0.001f;
+            // 部屋が取れているならそちらを使う（幾何と材質から。窓の長さに縛られない）。
+            if (Status.RoomRt60 > 0f) rt60 = Status.RoomRt60;
+
+            // 物理比 → wet。比が取れていないときだけ従来の割合に落とす。
+            float wet;
+            if (Status.ReverbTargetRatio > 0f)
+            {
+                float t = Status.ReverbTargetRatio;
+                wet = t / (1f + t);
+            }
+            else
+            {
+                float tailE = Mathf.Max(0f, total - peak);
+                wet = Mathf.Clamp01(tailE / Mathf.Max(total, 1e-6f));
+            }
 
             _reverbWet = Mathf.Lerp(_reverbWet, wet, 0.2f);
             _reverbDecay = Mathf.Lerp(_reverbDecay, rt60, 0.2f);
+            Status.Wet = _reverbWet;
+            Status.RtSeconds = _reverbDecay;
             // RTPC は Wwise が生きているときだけ。畳み込み経路は Status 経由で読む（Wwise非依存）。
             if (!_audioReady) return;
             AcousticEngine.SetRTPCValue("ReverbWet", _reverbWet * 100f * reverbWetScale);
@@ -2029,27 +2089,56 @@ namespace AcousticFlow
         //   部屋の広さ V と残響 RT60 だけで正しい比を与える。エコグラムは尾の“形”に専念させ、
         //   “量”はこの式で決める。→ tailLevel=1.0 が全部屋で物理どおりになり、部屋間で一貫する。
         //
-        // V は occluder(壁)の AABB から推定する。閉じた部屋なら外形箱＝ほぼ V。
-        //   ※ 開けた地面だけのシーンでは過大評価になるが、そこは RT60 が小さく残響自体が僅少。
+        // V と RT60 は **部屋グラフ**から取る（旧: occluder 全部の合成 AABB とエコグラム）。
+        //
+        // なぜ変えたか（実測、AcousticEngineTest の [診断] 戸口をまたいで歩いたときの残響送出）:
+        //   ・旧 V は occluder の合成 AABB ＝ レベル全体の外形箱で、部屋を一切見ていなかった。
+        //     2部屋(365/364m³)のシーンで全域 862m³。狭い部屋でも広間でも同じ値になる。
+        //   ・旧 RT60 はエコグラムが「ピーク-60dB を超える最後のビン」＝離散インデックス。
+        //     しかも窓が 100ビン×10ms=1秒しかないので、吸音率が 17.6 倍違う 2 部屋を
+        //     0.50s と 0.51s（＝1.0倍）としか区別できていなかった。部屋を測れていない。
+        //   ・新は部屋ごとの Sabine（RT60 = 0.161V/ΣSα）。同じ 2 部屋が 4.34s と 0.25s。
+        //     値は幾何で決まる定数なので、リスナーが動いても値そのものは動かない。
+        //
+        // ★不連続にしないための肝: 部屋番号で切り替えず、「まわりの何割がどの部屋か」で
+        //   混ぜる。切り替えにすると、プレイヤーが必ず通る戸口のど真ん中に段差が乗る。
+        //   混ぜる半径 = 何メートルかけて入れ替わるか。実測の傾き（部屋をまたぐ 18dB の
+        //   変化に対して）: 0.5m→2.67dB/0.1m / 1.0m→1.58 / 2.0m→0.92 / 3.0m→0.69。
         private void UpdateReverbTargetRatio()
         {
             if (_srcPos == null || _srcPos.Length == 0 || listener == null) return;
 
-            // 部屋の体積を occluder の合成 AABB から推定。
-            bool has = false;
-            Bounds b = default;
-            foreach (var o in _occluders)
+            float vol = _scene != null ? _scene.RoomVolumeAt(listener.position, roomBlendRadius) : 0f;
+            float rt;
+            if (vol > 1f)
             {
-                if (o.col == null) continue;
-                if (!has) { b = o.col.bounds; has = true; }
-                else b.Encapsulate(o.col.bounds);
+                // 部屋が見つかった。体積も残響時間も幾何と材質から。
+                if (_roomRt60 == null) _roomRt60 = new float[6];
+                _scene.GetRt60At(listener.position, roomBlendRadius, _roomRt60);
+                rt = Mathf.Max(0.05f, _roomRt60[2]);       // 500Hz 帯を代表に
+                Status.RoomVolume = vol;
+                Status.RoomRt60 = rt;
             }
-            if (!has) { Status.ReverbTargetRatio = 0f; return; }
-            Vector3 sz = b.size;
-            float vol = Mathf.Max(1f, sz.x * sz.y * sz.z);
+            else
+            {
+                // 部屋が取れない（屋外・囲われていない）。従来どおり外形箱で当てる。
+                bool has = false;
+                Bounds b = default;
+                foreach (var o in _occluders)
+                {
+                    if (o.col == null) continue;
+                    if (!has) { b = o.col.bounds; has = true; }
+                    else b.Encapsulate(o.col.bounds);
+                }
+                if (!has) { Status.ReverbTargetRatio = 0f; return; }
+                Vector3 sz = b.size;
+                vol = Mathf.Max(1f, sz.x * sz.y * sz.z);
+                rt = Mathf.Max(0.05f, _reverbDecay);
+                Status.RoomVolume = 0f;
+                Status.RoomRt60 = 0f;
+            }
 
             float r = Mathf.Max(0.1f, Vector3.Distance(listener.position, _srcPos[0]));
-            float rt = Mathf.Max(0.05f, _reverbDecay);
             // 臨界距離（メートル法, RT60[s], V[m³]）。
             float rc = 0.057f * Mathf.Sqrt(vol / rt);
             float t = (r * r) / Mathf.Max(rc * rc, 1e-4f);
@@ -2066,12 +2155,30 @@ namespace AcousticFlow
             Status.ReverbPhysicalRatio = t;                 // 圧縮前（診断用）
             t = Mathf.Pow(t, reverbRatioExponent);
 
-            // 暴走防止のクランプ（極端な V/RT60 推定の保険）。
-            Status.ReverbTargetRatio = Mathf.Clamp(t, 0f, 50f);
+            // ── 上限 ──
+            // ★以前は Clamp(t, 0, 50) だった。クランプは「上限に達した瞬間から、
+            //   どれだけ離れても値が動かなくなる」＝そこで導関数が 0 に落ちる不連続で、
+            //   遠くにいるあいだ張り付いたままになる。ソフトニー（比が上がるほど
+            //   効きを緩める）に置き換える。50 で 50 のまま、そこから上は圧縮されて
+            //   ceiling に漸近するので、どこまで離れても反応は残る。
+            Status.ReverbTargetRatio = SoftCeiling(t, 50f, reverbRatioCeiling);
 
             // mixing time ≈ √V(ms)（Polack の目安）。広い部屋ほど反射が拡散に溶けるのが遅い＝
             // 早期タップとして扱える時間が長い。特大部屋で遠壁の反射が早期窓から漏れるのを防ぐ。
             Status.MixingTimeMs = Mathf.Clamp(Mathf.Sqrt(vol), 5f, 500f);
+        }
+
+        // 上限のやわらかい当て方。knee までは素通し、そこから上は ceiling へ漸近する。
+        //   x <= knee            : x
+        //   x  > knee            : knee + (ceiling-knee) * (1 - exp(-(x-knee)/(ceiling-knee)))
+        // 導関数が knee で 1 から連続に落ちていくので、上限付近で「張り付いて動かない」
+        // 状態にならない。ceiling <= knee なら従来どおりの硬いクランプ。
+        private static float SoftCeiling(float x, float knee, float ceiling)
+        {
+            if (x <= knee) return x;
+            float span = ceiling - knee;
+            if (span <= 0f) return knee;
+            return knee + span * (1f - Mathf.Exp(-(x - knee) / span));
         }
 
         // 反響経路：リスナーから反射レイを撒き、跳ね返り経路をバッファに貯める（Gizmoが描く）。
@@ -2229,11 +2336,29 @@ namespace AcousticFlow
             GUILayout.Label($"音源配置: {(_stacked ? "重ね(1点)" : "展開")}", style);
             if (enableReverb)
             {
-                float wetP = _reverbWet * 100f;                 // 物理wet%（echogram: tail/total）
+                float wetP = _reverbWet * 100f;                 // 物理wet%（t/(1+t)）
                 float sendP = wetP * reverbWetScale;            // 送出 RTPC 値（0..100）
                 GUILayout.Label(
                     $"直接:反響(物理) = {100f - wetP:F0}:{wetP:F0}   " +
                     $"送出RTPC {sendP:F0}(×{reverbWetScale:F2})   RT {_reverbDecay:F2}s", style);
+                // 部屋（幾何から自動検出）。部屋番号は表示だけで、音は割合で混ぜている。
+                if (_scene != null)
+                {
+                    int nr = _scene.RoomCount;
+                    if (nr > 0)
+                    {
+                        if (_roomIdsUi == null) { _roomIdsUi = new int[4]; _roomWUi = new float[4]; }
+                        int n = _scene.GetRoomWeights(listener.position, roomBlendRadius,
+                                                      _roomIdsUi, _roomWUi);
+                        string mix = "";
+                        for (int i = 0; i < n && i < 3; i++)
+                            mix += $"{(i > 0 ? " + " : "")}部屋{_roomIdsUi[i]} {_roomWUi[i] * 100f:F0}%";
+                        if (n == 0) mix = "部屋の外";
+                        GUILayout.Label(
+                            $"部屋: {nr}個 / 開口 {_scene.ApertureCount}箇所   居場所 = {mix}   " +
+                            $"実効 V {Status.RoomVolume:F0}m3  RT60 {Status.RoomRt60:F2}s", style);
+                    }
+                }
             }
 
             if (_sources != null && _occSmoothed != null)

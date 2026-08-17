@@ -313,6 +313,65 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneGetEchogramBands(IntPtr scene, [Out] float[] outBins, int numBins);
 
+        // ===== 部屋と開口（幾何から自動検出）=====
+        // 静的な形状をボクセル化して自由空間を塗り分け、狭いくびれ（戸口）で部屋を分ける。
+        // 手置きのボリュームは無い。壁を壊せば部屋の繋がりもその場で変わる。
+        //
+        // ★部屋を音に使うときは必ず RoomWeights / RoomVolumeAt / Rt60At を通すこと。
+        //   部屋番号(RoomAt)で残響を切り替えると、プレイヤーが必ず通る戸口のど真ん中に
+        //   不連続を置くことになる。割合なら部屋の真ん中で 100:0、戸口で 50:50 と連続に変わる。
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneRoomCount(IntPtr scene);
+
+        // 点がどの部屋か。-1 は部屋の外／実体の中。★表示・デバッグ用。音の切り替えには使わない。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneRoomAt(IntPtr scene, AFVector3 p);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneRoomInfo(IntPtr scene, int room, out float outVolume,
+                                                  out AFVector3 outCentroid,
+                                                  out AFVector3 outMin, out AFVector3 outMax);
+
+        // 半径 radius(m) の球の中で各部屋が占める割合（合計 1、大きい順）。書けた数を返す。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneRoomWeights(IntPtr scene, AFVector3 p, float radius,
+                                                     [Out] int[] outRooms, [Out] float[] outWeights,
+                                                     int maxOut);
+
+        // 上の割合で混ぜた実効体積(m3)。0 なら部屋の外。臨界距離 rc=0.057√(V/RT60) に入れる。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern float AF_SceneRoomVolumeAt(IntPtr scene, AFVector3 p, float radius);
+
+        // 帯域別の残響時間(s)。部屋ごとの Sabine 値を上の割合で混ぜたもの。out は 6 要素以上。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneRt60At(IntPtr scene, AFVector3 p, float radius,
+                                                [Out] float[] outRt60, int count);
+
+        // 部屋の音響量。境界面積・開口面積・帯域別の平均吸音率と残響時間。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneRoomAcoustics(IntPtr scene, int room,
+                                                       out float outSurface, out float outOpenArea,
+                                                       [Out] float[] outAbsorb6,
+                                                       [Out] float[] outRt60_6);
+
+        // 部屋どうしを繋ぐ開口（戸口・窓・壊れた壁の穴）。面積の大きい順。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneApertureCount(IntPtr scene);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneApertureInfo(IntPtr scene, int index, out float outArea,
+                                                      out AFVector3 outCenter, out AFVector3 outNormal,
+                                                      out int outRoomA, out int outRoomB);
+
+        // ボクセル一辺(m)。既定 0.25。細かいほど狭い戸口を見分けられるがコストが増える。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetRoomCellSize(IntPtr scene, float meters);
+
+        // 部屋を戸口で割る半径(m)。既定 0.6。幅がこの 2 倍に満たないくびれで部屋が分かれる。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetRoomSeedRadius(IntPtr scene, float meters);
+
         // ===== 音源レンダリング（段4: DSP の C++ 移行）=====
         // これを使うと IR 畳み込み・HRTF・後期尾が全部エンジン側で回る。
         // 既存の IrConvolver(C#) と並べて A/B できるよう、別系統として足してある。
