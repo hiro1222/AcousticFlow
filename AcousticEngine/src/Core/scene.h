@@ -3453,6 +3453,34 @@ public:
         // エネルギーで平均してから振幅へ（material.h の単位規約）。
         for (int b = 0; b < kNumBands; ++b) outTrans[b] = std::sqrt(acc[b] * inv);
         outOccFrac = clamp01(occWeighted * inv);
+
+        // 【影の底を回折にする】
+        //   標本は「抜けたか塞がれたか」の二値なので、全部が塞がれた瞬間に残るのは
+        //   材質の透過だけになる。コンクリなら 1e-4 級まで一気に落ちる。
+        //   実測（0.6m 厚 2.4m 幅の柱、0.1m 刻みで陰へ歩く）:
+        //     遮蔽率 0.91 → 直接 0.250
+        //     遮蔽率 0.97 → 直接 0.0104   ＝ **1 歩で -27.6dB の崖**
+        //   32 標本のうち残り 2 点が隠れるだけでこれが起きる（1/N の粒度 × 316倍の
+        //   コントラスト）。同じ構造は下のポータル置き換えのコメントにも記録があるが、
+        //   そちらは**ポータルがある場合しか直っていなかった**。
+        //
+        //   物理的にも、コンクリの柱の陰へ届くのは透過ではなく**回り込み**。
+        //   回折は連続に動く（実測: 同じ 1 歩で 0.504 → 0.484）ので、これを下限にすれば
+        //   崖が消える。合成の作法は computeDirectSoft と同じ「大きい方を採る」。
+        //   ★ここを入れないと、HRTF が乗る＝定位を担う直接音タップだけが崖から落ち、
+        //     反射も尾も連続なのに「障害物が入った瞬間に音が別物になる」と聞こえる。
+        {
+            float dif[kNumBands];
+            diffractionContinuous(listener, source, isOccluded(listener, source), dif);
+            if (diffractionFlat_) {
+                float mean = 0.0f;
+                for (int b = 0; b < kNumBands; ++b) mean += dif[b];
+                mean /= static_cast<float>(kNumBands);
+                for (int b = 0; b < kNumBands; ++b) dif[b] = mean;
+            }
+            for (int b = 0; b < kNumBands; ++b)
+                outTrans[b] = clamp01(std::max(outTrans[b], dif[b]));
+        }
         if (outLeakPoint)
             *outLeakPoint = (leakW > 1e-9f) ? leakAcc * (1.0f / leakW) : source;
 

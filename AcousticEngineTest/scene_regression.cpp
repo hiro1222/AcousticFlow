@@ -3195,6 +3195,66 @@ void diagnosePillarTimbre() {
                 "壁の吸音が高域を食っているぶん＝物理的に正しい残り方）\n", hi2 - lo2);
 }
 
+// 柱の陰へ歩いて入るとき、直接音が「崖」で落ちていないか。
+//   ソフト遮蔽は「見通し 1.0 → 境界 約0.5 → 影 材質の透過」と連続に落ちる設計だが、
+//   影に入りきると材質の透過（コンクリで 1e-4 級）まで落ちる。つまり**影の中では
+//   直接音が事実上消える**。半分遮られただけで -43dB という実測があったので、
+//   遮蔽の進み方と直接音の落ち方を刻んで並べる。
+void diagnoseShadowCliff() {
+    std::printf("\n[診断] 柱の陰へ入るとき直接音はどう落ちるか\n");
+    const float h = 4.0f, t = 0.3f, hw = 6.0f, hd = 7.0f;
+    AF_SceneHandle s = AF_SceneCreate();
+    const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    AF_SceneAddInstanceBox(s, V(0, -t, 0),    V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, h+t, 0),   V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+    // ★柱を太くする。0.6m 角だと遮蔽率 0.85 までしか行かず「深い影」に入らない。
+    //   Unity の画面では柱が視界を大きく塞いでいたので、そこまで入れて測る。
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(1.2f, h*0.5f, 0.3f), V(1,0,0), V(0,1,0), m);
+
+    const AF_Vector3 S = V(0, 1.6f, 3.5f);
+    std::printf("      音源(0,1.6,3.5) 固定。リスナーを x=-2.0 → 0.0 へ（z=-3.5、柱は原点 2.4m幅）\n");
+    std::printf("        x      遮蔽率  直接音(ソフト遮蔽)     反射込み生存   回折二次音源  最終の目安\n");
+    std::printf("                       平均      dB(基準比)   平均      dB    本数 合計    dB\n");
+    double ref = 0.0;
+    double prevDb = 0.0, worst = 0.0; float worstAt = 0.0f; bool first = true;
+    for (float x = -2.0f; x <= 0.001f; x += 0.1f) {
+        const AF_Vector3 L = V(x, 1.6f, -3.5f);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+
+        float soft[kBands] = {}; float occFrac = 0.0f;
+        AF_SceneComputeSoftOcclusion(s, L, S, soft, kBands, &occFrac);
+        double sm = 0.0; for (int b = 0; b < kBands; ++b) sm += soft[b]; sm /= kBands;
+        if (first) ref = sm;
+        const double db = 20.0 * std::log10(std::max(sm, 1e-9) / std::max(ref, 1e-9));
+
+        float occ[kBands] = {};
+        const int idx = AF_SceneSourceIndex(s, 1);
+        if (idx >= 0) AF_SceneGetSourceOcclusion(s, idx, occ);
+        double om = 0.0; for (int b = 0; b < kBands; ++b) om += occ[b]; om /= kBands;
+
+        AF_Vector3 dpos[8]; float dg[8] = {};
+        const int nd = (idx >= 0) ? AF_SceneGetDiffractionSources(s, idx, dpos, dg, 8) : 0;
+        double dsum = 0.0; for (int i = 0; i < nd; ++i) dsum += dg[i];
+
+        if (!first) {
+            const double step = std::fabs(db - prevDb);
+            if (step > worst) { worst = step; worstAt = x; }
+        }
+        first = false; prevDb = db;
+        std::printf("        %5.2f   %5.2f   %7.5f  %8.1f    %6.3f %6.1f   %d  %6.4f  %6.1f\n",
+                    x, occFrac, sm, db, om, 20.0 * std::log10(std::max(om, 1e-9)),
+                    nd, dsum, 20.0 * std::log10(std::max(om, 1e-9)));
+    }
+    std::printf("      0.1m あたりの直接音の最大変化: %.1f dB（x=%.2f 付近）\n", worst, worstAt);
+    AF_SceneDestroy(s);
+}
+
 void diagnoseNonDoorShapes() {
     std::printf("\n[診断] 戸口ではない形（曲がり角・廊下・柱・食い違い壁）\n");
     const float h = 4.0f, t = 0.3f;
@@ -4560,6 +4620,7 @@ int main() {
     testRoomSegmentation();
     testRoomIncremental();
     diagnoseRoomDetection();
+    diagnoseShadowCliff();
     diagnoseNonDoorShapes();
     diagnosePillarTimbre();
     diagnoseReverbSendWalk();
