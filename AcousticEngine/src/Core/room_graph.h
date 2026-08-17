@@ -14,6 +14,18 @@
 //     4) 種でないボクセルを最寄りの部屋へ塗り戻す（戸口の中にも部屋が付く）
 //     5) 別の部屋どうしが接している面 ＝ 開口。壁で隔てられている所には出ない
 //        （実体が塗り戻しを遮るので、壁の両側は必ず片方が実体になる）
+//     6) 部屋ごとに境界面積と吸音率を集めて Sabine の RT60 を出す
+//
+// ■ なぜ残響時間を幾何から出すのか
+//   エコグラムから測ると、窓の長さ（既定 100ビン×10ms = 1秒）に縛られて部屋の違いが
+//   出ない。実測: 吸音率が 17.6 倍違う 2 部屋で、エコグラム由来の RT60 は 0.50 と 0.51 秒
+//   ＝**区別できていない**。Sabine（RT60 = 0.161 V / Σ Sα）なら形と材質だけで決まるので、
+//   同じ 2 部屋が 4.34 と 0.25 秒になる。しかも部屋ごとの定数なので、リスナーが動いても
+//   値そのものは動かない ── 動くのは「どの部屋をどれだけ占めているか」だけになり、
+//   そこが連続なら送出も連続になる。
+//   ★開口（別の部屋へ抜けている面）は吸音率 1 として数える。そこから出た音はこの部屋に
+//     戻らないので、音響的には穴＝完全吸音。部屋どうしの結合が「開口の面積」として
+//     自動的に効く（結合のために別の仕組みを足さなくてよい）。
 //
 //   ★2〜3 の侵食が要る理由。素の連結成分だと、戸口で繋がった空間は全部ひとつの
 //     部屋になる（＝扉の向こうも同じ部屋）。それでは残響を切り替える土台にならない。
@@ -136,10 +148,19 @@
 #include <vector>
 
 #include "Core/aabb.h"
+#include "Core/material.h"
 #include "Core/vec3.h"
 
 namespace acoustic {
 namespace rooms {
+
+// 塗り分けに渡す静的な形状。吸音率も一緒に持たせる。
+//   部屋の残響時間を**形と材質から**出すため（Sabine）。エコグラムから測ると
+//   レイのばらつきがそのまま乗るうえ、リスナー位置に依存して連続でなくなる。
+struct SolidBox {
+    Obb   obb;
+    float absorption[kNumBands] = {0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
+};
 
 // 格子の中身（実体か空きか）。部屋番号はここには入れない（ブロックごとの
 // ローカル番号 + union-find で引く。→ Builder::roomAtVoxel）。
@@ -176,6 +197,15 @@ struct Room {
     int   voxels = 0;          // 体積（ボクセル数）
     Vec3  centroid{0, 0, 0};
     Vec3  boundsMin{0, 0, 0}, boundsMax{0, 0, 0};
+    // ── 形と材質から出す残響（Sabine）──
+    //   RT60 = 0.161 V / A、A = Σ(面積 × 吸音率)。
+    //   ★開口（別の部屋へ抜けている面）は吸音率 1 として数える。そこから出た音は
+    //     この部屋には戻らないので、音響的には穴＝完全吸音で正しい。部屋どうしの
+    //     結合が「開口の面積」として自然に効く（結合のために別の仕組みを足さなくてよい）。
+    float surface = 0.0f;                 // 境界の面積(m2)。開口を含む
+    float openArea = 0.0f;                // そのうち開口ぶん(m2)
+    float absorb[kNumBands] = {};         // 平均吸音率（帯域別）
+    float rt60[kNumBands] = {};           // 残響時間(s)（帯域別）
 };
 
 // 部屋どうしを繋ぐくびれ（戸口・窓・壊れた壁の穴）。
@@ -331,7 +361,8 @@ public:
     bool dirty() const { return needFull_ || !dirtyRegions_.empty(); }
 
     // 最新の結果を返す。汚れていなければ何もしない。
-    const Result& build(const std::vector<Obb>& boxes) {
+    const Result& build(const std::vector<SolidBox>& boxes) {
+        boxes_ = boxes;
         if (!dirty()) return res_;
         // 格子の範囲から外れる変更が来ていたら全部作り直すしかない。
         if (!needFull_ && !regionsFitGrid_()) needFull_ = true;
@@ -447,6 +478,9 @@ private:
 
     // ── 状態 ──
     Result res_;
+    // ボクセルを塗った箱の番号（0xFFFF=なし）。境界面の吸音率を引くために持つ。
+    std::vector<std::uint16_t> boxOf_;
+    std::vector<SolidBox> boxes_;                     // 直近に受け取った形状（吸音率つき）
     std::vector<std::uint16_t> dist_;                 // 実体までのチャンファ距離（×3）
     std::vector<std::uint16_t> gdist_;                // 種までのチャンファ距離（塗り戻し用）
     std::vector<std::int16_t>  room_;                 // ボクセル → 部屋番号（-1 なし）
@@ -503,7 +537,7 @@ private:
     //     目安: cell は「いちばん薄い壁の厚み」と「いちばん狭い戸口の幅」の
     //     どちらよりも小さくすること。
     //   x/y/z の範囲を絞って塗る（clip が非 null ならそこと交差した範囲だけ）。
-    void rasterize_(const Obb& b, const int* clip) {
+    void rasterize_(const Obb& b, const int* clip, int boxIndex) {
         Grid& g = res_.grid;
         const float grow = g.cell * 0.25f;
         Obb fat = b;
@@ -522,11 +556,16 @@ private:
             y0 = std::max(y0, clip[2]); y1 = std::min(y1, clip[3]);
             z0 = std::max(z0, clip[4]); z1 = std::min(z1, clip[5]);
         }
+        const std::uint16_t bi = static_cast<std::uint16_t>(
+            (boxIndex >= 0 && boxIndex < 0xFFFF) ? boxIndex : 0xFFFF);
         for (int z = z0; z <= z1; ++z)
             for (int y = y0; y <= y1; ++y)
                 for (int x = x0; x <= x1; ++x)
-                    if (pointInObb(g.center(x, y, z), fat))
-                        g.v[static_cast<std::size_t>(g.index(x, y, z))] = kSolid;
+                    if (pointInObb(g.center(x, y, z), fat)) {
+                        const std::size_t i = static_cast<std::size_t>(g.index(x, y, z));
+                        g.v[i] = kSolid;
+                        boxOf_[i] = bi;
+                    }
     }
 
     // ── 実体までの距離を測る（3-4-5 チャンファ、前進＋後退の 2 走査）──
@@ -709,8 +748,16 @@ private:
         const std::uint8_t* V = g.v.data();
 
         // 境界 face を集める。face は「手前側のボクセル + 軸」で表す。
+        // 同じ走査で、部屋ごとの境界面積と吸音（Sabine の A）も貯める。
+        //   ★開口（別の部屋へ抜けている面）は吸音率 1 で数える。そこから出た音はこの部屋へ
+        //     戻らないので、音響的には穴＝完全吸音。これで部屋どうしの結合が「開口の面積」
+        //     として自動的に効く（結合のために別の仕組みを足さなくてよい）。
         faceIdx_.clear(); faceAxis_.clear();
         const int step[3] = { 1, sy, sz };
+        const float cellA = g.cell * g.cell;
+        const std::size_t nr = res_.rooms.size();
+        std::vector<double> area(nr, 0.0), openA(nr, 0.0);
+        std::vector<double> absA(nr * kNumBands, 0.0);
         for (int z = 0; z < nz; ++z)
             for (int y = 0; y < ny; ++y) {
                 const int base = z * sz + y * sy;
@@ -719,6 +766,29 @@ private:
                     if (V[i] == kSolid) continue;
                     const int ra = R[i];
                     if (ra < 0) continue;
+                    const std::size_t u = static_cast<std::size_t>(ra);
+                    // 6 近傍を見て境界面を数える（実体との境目＝壁、別部屋との境目＝開口）。
+                    const int nb6[6] = { i - 1, i + 1, i - sy, i + sy, i - sz, i + sz };
+                    const bool ok6[6] = { x > 0, x < nx - 1, y > 0, y < ny - 1, z > 0, z < nz - 1 };
+                    for (int d = 0; d < 6; ++d) {
+                        if (!ok6[d]) continue;
+                        const int j = nb6[d];
+                        if (V[j] == kSolid) {
+                            area[u] += cellA;
+                            const std::uint16_t bi = boxOf_[static_cast<std::size_t>(j)];
+                            const float* ab = (bi < boxes_.size())
+                                ? boxes_[bi].absorption : nullptr;
+                            for (int b = 0; b < kNumBands; ++b)
+                                absA[u * kNumBands + static_cast<std::size_t>(b)] +=
+                                    cellA * (ab ? ab[b] : 0.1f);
+                        } else if (R[j] >= 0 && R[j] != ra) {
+                            area[u] += cellA;
+                            openA[u] += cellA;
+                            for (int b = 0; b < kNumBands; ++b)
+                                absA[u * kNumBands + static_cast<std::size_t>(b)] += cellA;
+                        }
+                    }
+                    // 開口の抽出は +X/+Y/+Z だけ見れば重複しない。
                     const int lim[3] = { nx - 1, ny - 1, nz - 1 };
                     const int pos[3] = { x, y, z };
                     for (int a = 0; a < 3; ++a) {
@@ -732,6 +802,18 @@ private:
                     }
                 }
             }
+        // Sabine: RT60 = 0.161 V / A。A は吸音面積(m2 sabins)。
+        for (std::size_t u = 0; u < nr; ++u) {
+            Room& rm = res_.rooms[u];
+            rm.surface = static_cast<float>(area[u]);
+            rm.openArea = static_cast<float>(openA[u]);
+            const double vol = static_cast<double>(rm.voxels) * g.cell * g.cell * g.cell;
+            for (int b = 0; b < kNumBands; ++b) {
+                const double A = absA[u * kNumBands + static_cast<std::size_t>(b)];
+                rm.absorb[b] = (area[u] > 1e-9) ? static_cast<float>(A / area[u]) : 0.0f;
+                rm.rt60[b] = (A > 1e-9) ? static_cast<float>(0.161 * vol / A) : 0.0f;
+            }
+        }
         if (faceIdx_.empty()) return;
 
         // face を繋がりで分ける。手前側のボクセルが 6 近傍で繋がっていて、
@@ -1007,16 +1089,16 @@ private:
     }
 
     // ── 全再構築 ──
-    void rebuildAll_(const std::vector<Obb>& boxes) {
+    void rebuildAll_(const std::vector<SolidBox>& boxes) {
         res_ = Result();
-        loc_.clear(); brickStat_.clear(); facePairs_.clear();
+        loc_.clear(); brickStat_.clear(); facePairs_.clear(); boxOf_.clear();
         first_.clear(); parent_.clear(); rootSlot_.clear(); roomOfSlot_.clear();
         bx_ = by_ = bz_ = 0;
         if (boxes.empty() || cell_ <= 1e-3f) return;
 
         Vec3 lo(1e30f, 1e30f, 1e30f), hi(-1e30f, -1e30f, -1e30f);
-        for (const Obb& b : boxes) {
-            const Aabb bb = obbBounds(b);
+        for (const SolidBox& sb : boxes) {
+            const Aabb bb = obbBounds(sb.obb);
             lo = Vec3(std::min(lo.x, bb.min.x), std::min(lo.y, bb.min.y), std::min(lo.z, bb.min.z));
             hi = Vec3(std::max(hi.x, bb.max.x), std::max(hi.y, bb.max.y), std::max(hi.z, bb.max.z));
         }
@@ -1047,6 +1129,7 @@ private:
         g.v.assign(nv, kEmpty);
         loc_.assign(nv, kLocNone);
         dist_.assign(nv, kFar);
+        boxOf_.assign(nv, 0xFFFF);
         bx_ = (g.nx + brick_ - 1) / brick_;
         by_ = (g.ny + brick_ - 1) / brick_;
         bz_ = (g.nz + brick_ - 1) / brick_;
@@ -1055,7 +1138,8 @@ private:
         facePairs_.assign(static_cast<std::size_t>(nb) * 3, {});
         const auto tA1 = std::chrono::high_resolution_clock::now();
 
-        for (const Obb& b : boxes) rasterize_(b, nullptr);
+        for (std::size_t i = 0; i < boxes.size(); ++i)
+            rasterize_(boxes[i].obb, nullptr, static_cast<int>(i));
         const auto tF1 = std::chrono::high_resolution_clock::now();
 
         computeDistance_(nullptr);
@@ -1088,7 +1172,7 @@ private:
     // ── 差分更新 ──
     //   汚れた領域に触れるブロックだけ塗り直し、その面（自分の 3 面＋手前隣の 3 面）の
     //   対応表を作り直して、union-find を張り直す。
-    void rebuildDirty_(const std::vector<Obb>& boxes) {
+    void rebuildDirty_(const std::vector<SolidBox>& boxes) {
         Grid& g = res_.grid;
         const int nb = bx_ * by_ * bz_;
         std::vector<std::uint8_t> hot(static_cast<std::size_t>(nb), 0);
@@ -1134,8 +1218,12 @@ private:
             const int Z0 = bzi * brick_, Z1 = std::min(g.nz, Z0 + brick_) - 1;
             for (int z = Z0; z <= Z1; ++z)
                 for (int y = Y0; y <= Y1; ++y)
-                    std::memset(g.v.data() + (z * g.nx * g.ny + y * g.nx + X0), kEmpty,
-                                static_cast<std::size_t>(X1 - X0 + 1));
+                {
+                    const std::size_t o = static_cast<std::size_t>(z * g.nx * g.ny + y * g.nx + X0);
+                    const std::size_t n = static_cast<std::size_t>(X1 - X0 + 1);
+                    std::memset(g.v.data() + o, kEmpty, n);
+                    for (std::size_t k = 0; k < n; ++k) boxOf_[o + k] = 0xFFFF;
+                }
             const Vec3 wlo = Vec3(g.origin.x + X0 * g.cell,
                                   g.origin.y + Y0 * g.cell,
                                   g.origin.z + Z0 * g.cell);
@@ -1143,13 +1231,13 @@ private:
                                   g.origin.y + (Y1 + 1) * g.cell,
                                   g.origin.z + (Z1 + 1) * g.cell);
             const int clip[6] = { X0, X1, Y0, Y1, Z0, Z1 };
-            for (const Obb& box : boxes) {
-                const Aabb bb = obbBounds(box);
+            for (std::size_t bi = 0; bi < boxes.size(); ++bi) {
+                const Aabb bb = obbBounds(boxes[bi].obb);
                 const float grow = g.cell * 0.25f;
                 if (bb.max.x + grow < wlo.x || bb.min.x - grow > whi.x) continue;
                 if (bb.max.y + grow < wlo.y || bb.min.y - grow > whi.y) continue;
                 if (bb.max.z + grow < wlo.z || bb.min.z - grow > whi.z) continue;
-                rasterize_(box, clip);
+                rasterize_(boxes[bi].obb, clip, static_cast<int>(bi));
             }
         }
         const auto tF1 = std::chrono::high_resolution_clock::now();

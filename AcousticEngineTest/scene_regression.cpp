@@ -2817,21 +2817,29 @@ void diagnoseReverbSendWalk() {
     std::printf("\n[診断] 戸口をまたいで歩いたときの残響送出\n");
     const float t = 0.15f, h = 4.0f, hw = 6.0f, hd = 8.0f, doorW = 0.9f;
     AF_SceneHandle s = AF_SceneCreate();
-    const float liveA[6] = {0.02f, 0.02f, 0.03f, 0.04f, 0.05f, 0.07f};
+    // ★手前と奥で響きを変える。同じ材質だと部屋が変わっても送出が変わらず、
+    //   「連続かどうか」を試す場面にならない（変化しないものは必ず連続）。
+    const float liveA[6] = {0.02f, 0.02f, 0.03f, 0.04f, 0.05f, 0.07f};   // 響く
+    const float deadA[6] = {0.60f, 0.70f, 0.80f, 0.85f, 0.90f, 0.90f};   // 吸う
     const float tr[6] = {0.000398f, 0.0001585f, 0.0000398f,
                          0.00001f, 0.00000251f, 0.000001f};
-    const int m = AF_SceneAddMaterial(s, tr, liveA, nullptr, 6);
+    const int mNear = AF_SceneAddMaterial(s, tr, liveA, nullptr, 6);   // 手前(z<0)=響く
+    const int mFar  = AF_SceneAddMaterial(s, tr, deadA, nullptr, 6);   // 奥(z>0)=吸う
     // 仕切り z=0 に幅 0.9m の戸口（全高）
     AF_SceneAddInstanceBox(s, V(-(hw + doorW*0.5f)*0.5f, h*0.5f, 0),
-                           V((hw - doorW*0.5f)*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+                           V((hw - doorW*0.5f)*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mNear);
     AF_SceneAddInstanceBox(s, V( (hw + doorW*0.5f)*0.5f, h*0.5f, 0),
-                           V((hw - doorW*0.5f)*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), m);
-    AF_SceneAddInstanceBox(s, V(0, -t, 0),    V(hw, t, hd), V(1,0,0), V(0,1,0), m);
-    AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), m);
-    AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), m);
-    AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), m);
-    AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), m);
-    AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+                           V((hw - doorW*0.5f)*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mNear);
+    for (int side = 0; side < 2; ++side) {
+        const float zc = (side == 0) ? -hd * 0.5f : hd * 0.5f;
+        const int mm = (side == 0) ? mNear : mFar;
+        AF_SceneAddInstanceBox(s, V(0, -t, zc),    V(hw, t, hd*0.5f), V(1,0,0), V(0,1,0), mm);
+        AF_SceneAddInstanceBox(s, V(0, h + t, zc), V(hw, t, hd*0.5f), V(1,0,0), V(0,1,0), mm);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, zc), V(t, h*0.5f, hd*0.5f), V(1,0,0), V(0,1,0), mm);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, zc), V(t, h*0.5f, hd*0.5f), V(1,0,0), V(0,1,0), mm);
+    }
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mNear);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mFar);
 
     // ★音源は戸口の正面から外す。真正面だと直接音が戸口を素通りして一度も遮られず、
     //   「壁の向こうへ回り込む」場面にならない（この配置ミスを何度も踏んだ）。
@@ -2931,6 +2939,138 @@ void diagnoseReverbSendWalk() {
     for (float z : {-6.0f, -1.0f, 0.0f, 1.0f, 4.0f})
         std::printf("z=%.0f→%.0fm3  ", z, AF_SceneRoomVolumeAt(s, V(0, 1.6f, z), 1.0f));
     std::printf("（外形箱だと全域 %.0fm3）\n", vLevel);
+    // ★本題：送出が位置の連続関数になっているか。
+    //   旧: RT60 = エコグラムが「ピーク-60dB を超える最後のビン」（離散インデックス、
+    //       しかも床が直接音のピーク基準）、V = レベル全体の外形箱（部屋を見ていない）
+    //   新: RT60 = 部屋ごとの Sabine を占め方で混ぜた値、V = 実効体積
+    //   どちらも t=(r/rc)² に入れ、0.1m ごとの dB 変化を比べる。
+    std::printf("      部屋ごとの音響量（形と材質から）:\n");
+    for (int i = 0, n = AF_SceneRoomCount(s); i < n; ++i) {
+        float vol = 0.0f, surf = 0.0f, open = 0.0f, ab[6] = {}, rt[6] = {};
+        AF_SceneRoomInfo(s, i, &vol, nullptr, nullptr, nullptr);
+        AF_SceneRoomAcoustics(s, i, &surf, &open, ab, rt);
+        std::printf("        部屋%d  V=%.0fm3  境界=%.0fm2（うち開口 %.1fm2）"
+                    "  平均吸音率=%.3f  RT60=%.2fs\n", i, vol, surf, open, ab[2], rt[2]);
+    }
+    std::printf("      送出の連続性（0.1m 刻みで戸口をまたぐ。500Hz 帯）\n");
+    std::printf("        z      旧RT60  旧V   旧t(dB) 旧Δ  |  新RT60  新V   新t(dB) 新Δ\n");
+    double pOld = 0.0, pNew = 0.0, mOld = 0.0, mNew = 0.0;
+    float mOldAt = 0.0f, mNewAt = 0.0f;
+    bool first = true;
+    for (float z = -3.0f; z <= 3.001f; z += 0.1f) {
+        const AF_Vector3 L = V(0, 1.6f, z);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+        float echo[100 * kBands] = {};
+        const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+        double peak = 0.0;
+        std::vector<double> e(static_cast<std::size_t>(bins), 0.0);
+        for (int i = 0; i < bins; ++i) {
+            double v = 0.0;
+            for (int b = 0; b < kBands; ++b) v += echo[i * kBands + b];
+            e[static_cast<std::size_t>(i)] = v / kBands;
+            if (e[static_cast<std::size_t>(i)] > peak) peak = e[static_cast<std::size_t>(i)];
+        }
+        int tailBin = 0;
+        for (int i = 0; i < bins; ++i) if (e[static_cast<std::size_t>(i)] > peak * 0.001) tailBin = i;
+        const double rtOld = (tailBin + 1) * binMs * 0.001;
+
+        float rt6[6] = {};
+        AF_SceneRt60At(s, L, 1.0f, rt6, 6);
+        const double rtNew = std::max(static_cast<double>(rt6[2]), 0.05);
+        const double vNew = std::max(static_cast<double>(AF_SceneRoomVolumeAt(s, L, 1.0f)), 1.0);
+
+        const double dx = S.x - L.x, dy = S.y - L.y, dz = S.z - L.z;
+        const double r = std::sqrt(dx*dx + dy*dy + dz*dz);
+        auto ratioDb = [&](double vol, double rt) {
+            const double rc2 = 0.057 * 0.057 * vol / std::max(rt, 0.05);
+            return 10.0 * std::log10(std::max((r * r) / std::max(rc2, 1e-4), 1e-12));
+        };
+        const double dbOld = ratioDb(vLevel, rtOld);
+        const double dbNew = ratioDb(vNew, rtNew);
+        double dOld = 0.0, dNew = 0.0;
+        if (!first) {
+            dOld = std::fabs(dbOld - pOld); dNew = std::fabs(dbNew - pNew);
+            if (dOld > mOld) { mOld = dOld; mOldAt = z; }
+            if (dNew > mNew) { mNew = dNew; mNewAt = z; }
+        }
+        first = false; pOld = dbOld; pNew = dbNew;
+        std::printf("        %5.2f   %5.2f %6.0f %7.1f %5.2f  |  %5.2f %6.0f %7.1f %5.2f\n",
+                    z, rtOld, vLevel, dbOld, dOld, rtNew, vNew, dbNew, dNew);
+    }
+    std::printf("      0.1m あたりの最大変化: 旧 %.2f dB（z=%.1f）→ 新 %.2f dB（z=%.1f）\n",
+                mOld, mOldAt, mNew, mNewAt);
+
+    // ★上の比較は対等でない。旧式は RT60 が両部屋とも 0.48〜0.50s で、17 倍違う部屋を
+    //   区別できていない＝応答していないから変化が小さいだけ。動かない関数は必ず連続。
+    //   そこで「信号（部屋の違いにどれだけ応答するか）」と「雑音（同じ場所で何回引いても
+    //   同じ値か）」を分けて測る。
+    std::printf("      信号と雑音を分ける:\n");
+    {
+        auto measure = [&](float z, double& rtOld, double& rtNew) {
+            const AF_Vector3 L = V(0, 1.6f, z);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+            float echo[100 * kBands] = {};
+            const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+            double peak = 0.0;
+            std::vector<double> e(static_cast<std::size_t>(bins), 0.0);
+            for (int i = 0; i < bins; ++i) {
+                double v = 0.0;
+                for (int b = 0; b < kBands; ++b) v += echo[i * kBands + b];
+                e[static_cast<std::size_t>(i)] = v / kBands;
+                peak = std::max(peak, e[static_cast<std::size_t>(i)]);
+            }
+            int tb = 0;
+            for (int i = 0; i < bins; ++i)
+                if (e[static_cast<std::size_t>(i)] > peak * 0.001) tb = i;
+            rtOld = (tb + 1) * binMs * 0.001;
+            float rt6[6] = {};
+            AF_SceneRt60At(s, L, 1.0f, rt6, 6);
+            rtNew = rt6[2];
+        };
+        double aOld = 0, aNew = 0, bOld = 0, bNew = 0;
+        measure(-5.0f, aOld, aNew);   // 響く部屋の奥
+        measure( 5.0f, bOld, bNew);   // 吸う部屋の奥
+        std::printf("        信号: 響く部屋 → 吸う部屋 の RT60   旧 %.2f→%.2fs（%.1f 倍）"
+                    " / 新 %.2f→%.2fs（%.1f 倍）\n",
+                    aOld, bOld, aOld / std::max(bOld, 1e-3), aNew, bNew,
+                    aNew / std::max(bNew, 1e-3));
+        // 同じ場所で引き直したときのばらつき。
+        double loOld = 1e9, hiOld = -1e9, loNew = 1e9, hiNew = -1e9;
+        for (int k = 0; k < 12; ++k) {
+            double o = 0, n2 = 0;
+            measure(-5.0f, o, n2);
+            loOld = std::min(loOld, o); hiOld = std::max(hiOld, o);
+            loNew = std::min(loNew, n2); hiNew = std::max(hiNew, n2);
+        }
+        std::printf("        雑音: 同じ場所で 12 回引き直し           旧 %.2f〜%.2fs"
+                    "（幅 %.2f）  / 新 %.2f〜%.2fs（幅 %.2f）\n",
+                    loOld, hiOld, hiOld - loOld, loNew, hiNew, hiNew - loNew);
+    }
+    // 移り変わりの幅は占め方の半径で決まる。傾きは「総変化 ÷ 半径」なので、
+    // 半径を広げれば傾きは下がる（そのぶん遠くから変わり始める）。
+    std::printf("      占め方の半径 → 送出の傾き:\n");
+    for (float rad : {0.5f, 1.0f, 2.0f, 3.0f}) {
+        double prev = 0.0, worst = 0.0; bool f1 = true;
+        for (float z = -4.0f; z <= 4.001f; z += 0.1f) {
+            const AF_Vector3 L = V(0, 1.6f, z);
+            float rt6[6] = {};
+            AF_SceneRt60At(s, L, rad, rt6, 6);
+            const double vv = std::max(static_cast<double>(AF_SceneRoomVolumeAt(s, L, rad)), 1.0);
+            const double dx2 = S.x - L.x, dy2 = S.y - L.y, dz2 = S.z - L.z;
+            const double r2 = dx2*dx2 + dy2*dy2 + dz2*dz2;
+            const double rc2 = 0.057 * 0.057 * vv / std::max(static_cast<double>(rt6[2]), 0.05);
+            const double db = 10.0 * std::log10(std::max(r2 / std::max(rc2, 1e-4), 1e-12));
+            if (!f1) worst = std::max(worst, std::fabs(db - prev));
+            f1 = false; prev = db;
+        }
+        std::printf("        半径 %.1fm  →  0.1m あたり最大 %.2f dB"
+                    "（歩行 1.4m/s で %.0f dB/s）\n", rad, worst, worst * 14.0);
+    }
+
     {   // 1 回引くのに掛かる時間（毎フレーム 2〜4 回引く想定）。
         const int N = 2000;
         int ids[8]; float w[8];
@@ -4001,6 +4141,74 @@ void testRoomSegmentation() {
                              nullptr, nullptr, nullptr);
             const float ve = AF_SceneRoomVolumeAt(s, V(0, 1.6f, -6.0f), 1.0f);
             check("[占め方] 実効体積が部屋の体積", vr > 1.0f && std::fabs(ve - vr) < vr * 0.02f);
+        }
+        AF_SceneDestroy(s);
+    }
+
+    // ── 部屋の残響を形と材質から出す ──
+    //   エコグラムから測ると窓の長さに縛られて部屋の違いが出ない（実測: 材質が 17.6 倍
+    //   違う 2 部屋で RT60 が 0.50 と 0.51 秒＝区別できていない）。Sabine なら幾何で決まる。
+    {
+        const float hh = 4.0f, tt = 0.15f, hw2 = 6.0f, hd2 = 8.0f;
+        const float liveA[6] = {0.02f, 0.02f, 0.03f, 0.04f, 0.05f, 0.07f};
+        const float deadA[6] = {0.60f, 0.70f, 0.80f, 0.85f, 0.90f, 0.90f};
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mL = AF_SceneAddMaterial(s, nullptr, liveA, nullptr, 6);
+        const int mD = AF_SceneAddMaterial(s, nullptr, deadA, nullptr, 6);
+        AF_SceneAddInstanceBox(s, V(-(hw2+0.45f)*0.5f, hh*0.5f, 0),
+                               V((hw2-0.45f)*0.5f, hh*0.5f, tt), V(1,0,0), V(0,1,0), mL);
+        AF_SceneAddInstanceBox(s, V( (hw2+0.45f)*0.5f, hh*0.5f, 0),
+                               V((hw2-0.45f)*0.5f, hh*0.5f, tt), V(1,0,0), V(0,1,0), mL);
+        for (int side = 0; side < 2; ++side) {
+            const float zc = (side == 0) ? -hd2*0.5f : hd2*0.5f;
+            const int mm = (side == 0) ? mL : mD;
+            AF_SceneAddInstanceBox(s, V(0, -tt, zc),     V(hw2, tt, hd2*0.5f), V(1,0,0), V(0,1,0), mm);
+            AF_SceneAddInstanceBox(s, V(0, hh+tt, zc),   V(hw2, tt, hd2*0.5f), V(1,0,0), V(0,1,0), mm);
+            AF_SceneAddInstanceBox(s, V(-hw2, hh*0.5f, zc), V(tt, hh*0.5f, hd2*0.5f), V(1,0,0), V(0,1,0), mm);
+            AF_SceneAddInstanceBox(s, V( hw2, hh*0.5f, zc), V(tt, hh*0.5f, hd2*0.5f), V(1,0,0), V(0,1,0), mm);
+        }
+        AF_SceneAddInstanceBox(s, V(0, hh*0.5f, -hd2), V(hw2, hh*0.5f, tt), V(1,0,0), V(0,1,0), mL);
+        AF_SceneAddInstanceBox(s, V(0, hh*0.5f,  hd2), V(hw2, hh*0.5f, tt), V(1,0,0), V(0,1,0), mD);
+
+        const int rLive = AF_SceneRoomAt(s, V(0, 1.6f, -5.0f));
+        const int rDead = AF_SceneRoomAt(s, V(0, 1.6f,  5.0f));
+        float vL = 0, sL = 0, oL = 0, abL[6] = {}, rtL[6] = {};
+        float vD = 0, sD = 0, oD = 0, abD[6] = {}, rtD[6] = {};
+        const int okL = (rLive >= 0) && AF_SceneRoomAcoustics(s, rLive, &sL, &oL, abL, rtL);
+        const int okD = (rDead >= 0) && AF_SceneRoomAcoustics(s, rDead, &sD, &oD, abD, rtD);
+        AF_SceneRoomInfo(s, rLive, &vL, nullptr, nullptr, nullptr);
+        AF_SceneRoomInfo(s, rDead, &vD, nullptr, nullptr, nullptr);
+        check("[残響] 響く部屋と吸う部屋を別の部屋として見る", rLive >= 0 && rDead >= 0 && rLive != rDead);
+        check("[残響] 響く部屋の RT60 が吸う部屋の 5 倍以上",
+              okL && okD && rtL[2] > rtD[2] * 5.0f);
+        // Sabine の式どおりか（RT60 = 0.161 V / Σ Sα）を手計算と突き合わせる。
+        if (okL) {
+            const float A = sL * abL[2];
+            const float want = 0.161f * vL / std::max(A, 1e-6f);
+            check("[残響] Sabine の式に一致", std::fabs(rtL[2] - want) < want * 0.05f);
+        } else check("[残響] Sabine の式に一致", false);
+        // 吸音率が帯域で違うので RT60 も帯域で違うこと（低域ほど長い）。
+        check("[残響] 低域ほど残響が長い", okL && rtL[0] > rtL[5] * 1.5f);
+        // 開口は完全吸音として境界に入っていること（開口の面積と一致）。
+        {
+            float apA = 0.0f;
+            if (AF_SceneApertureCount(s) > 0)
+                AF_SceneApertureInfo(s, 0, &apA, nullptr, nullptr, nullptr, nullptr);
+            check("[残響] 開口が部屋の吸音面に入っている",
+                  okL && apA > 0.1f && std::fabs(oL - apA) < apA * 0.35f);
+        }
+        // 位置に対してなめらかであること（0.1m あたりの傾きが有界）。
+        {
+            float prev = -1.0f, worst = 0.0f;
+            for (float z = -4.0f; z <= 4.001f; z += 0.1f) {
+                float rt6[6] = {};
+                AF_SceneRt60At(s, V(0, 1.6f, z), 2.0f, rt6, 6);
+                if (prev >= 0.0f) worst = std::max(worst, std::fabs(rt6[2] - prev));
+                prev = rt6[2];
+            }
+            // 総変化 (rtL-rtD) を半径 2.0m ぶんで渡す＝理想は総変化/40 歩。3 倍まで許す。
+            const float ideal = (rtL[2] - rtD[2]) / 40.0f;
+            check("[残響] 位置に対する傾きが有界", worst < ideal * 3.0f);
         }
         AF_SceneDestroy(s);
     }

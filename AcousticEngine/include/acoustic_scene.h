@@ -355,6 +355,25 @@ ACOUSTIC_API int  AF_SceneRoomWeights(AF_SceneHandle scene, AF_Vector3 p, float 
  * レベル全体の外形箱を V に使うと、狭い部屋でも広間でも同じ値になって残響量が合わない。 */
 ACOUSTIC_API float AF_SceneRoomVolumeAt(AF_SceneHandle scene, AF_Vector3 p, float radius);
 
+/* 点における帯域別の残響時間(s)。out は 6 要素以上。書けた帯域数を返す。
+ * 部屋ごとの Sabine 値（RT60 = 0.161 V / A）を上の占め方で混ぜたもの。
+ * ★エコグラムから測ると (a) レイのばらつきが乗る (b)「-60dB を超える最後のビン」という
+ *   離散インデックスになる (c) その床が直接音のピーク基準なので遮蔽で床ごと動く ──
+ *   どれも位置に対して不連続。形と材質から出せば部屋ごとの定数になる。 */
+ACOUSTIC_API int AF_SceneRt60At(AF_SceneHandle scene, AF_Vector3 p, float radius,
+                                float* out, int count);
+
+/* 部屋 room の音響量。各出力は null 可。成功で 1。
+ *   outSurface : 境界の面積(m2)。開口を含む
+ *   outOpenArea: そのうち開口ぶん(m2)
+ *   outAbsorb6 : 平均吸音率（帯域別）
+ *   outRt60_6  : 残響時間(s)（帯域別）
+ * ★開口は吸音率 1 として数えている。そこから出た音はこの部屋に戻らないので、
+ *   音響的には穴＝完全吸音。部屋どうしの結合が開口の面積として自動的に効く。 */
+ACOUSTIC_API int AF_SceneRoomAcoustics(AF_SceneHandle scene, int room,
+                                       float* outSurface, float* outOpenArea,
+                                       float* outAbsorb6, float* outRt60_6);
+
 ACOUSTIC_API int  AF_SceneApertureCount(AF_SceneHandle scene);
 
 /* 開口 index の情報。各出力は null 可。成功で 1。

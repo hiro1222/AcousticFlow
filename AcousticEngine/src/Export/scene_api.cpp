@@ -686,6 +686,28 @@ float AF_SceneRoomVolumeAt(AF_SceneHandle scene, AF_Vector3 p, float radius) {
     return s ? s->roomVolumeAt(toVec3(p), radius) : 0.0f;
 }
 
+int AF_SceneRt60At(AF_SceneHandle scene, AF_Vector3 p, float radius, float* out, int count) {
+    Scene* s = asScene(scene);
+    if (!s) return 0;
+    return s->rt60At(toVec3(p), radius, out, count);
+}
+
+int AF_SceneRoomAcoustics(AF_SceneHandle scene, int room, float* outSurface,
+                          float* outOpenArea, float* outAbsorb6, float* outRt60_6) {
+    Scene* s = asScene(scene);
+    if (!s) return 0;
+    const auto& rr = s->roomGraph();
+    if (room < 0 || room >= static_cast<int>(rr.rooms.size())) return 0;
+    const auto& rm = rr.rooms[static_cast<std::size_t>(room)];
+    if (outSurface)  *outSurface  = rm.surface;
+    if (outOpenArea) *outOpenArea = rm.openArea;
+    for (int b = 0; b < kNumBands; ++b) {
+        if (outAbsorb6) outAbsorb6[b] = rm.absorb[b];
+        if (outRt60_6)  outRt60_6[b]  = rm.rt60[b];
+    }
+    return 1;
+}
+
 int AF_SceneApertureCount(AF_SceneHandle scene) {
     Scene* s = asScene(scene);
     return s ? static_cast<int>(s->roomGraph().apertures.size()) : 0;

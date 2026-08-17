@@ -260,14 +260,19 @@ public:
     //   変わった領域を rooms::Builder に伝えてあるので、触れたブロックだけ塗り直される。
     const rooms::Result& roomGraph() const {
         if (!roomBuilder_.dirty()) return roomBuilder_.result();
-        std::vector<Obb> statics;
+        std::vector<rooms::SolidBox> statics;
         statics.reserve(instances_.size());
         for (const Instance& in : instances_) {
             if (!in.active) continue;
             // ★動くもの（扉など）は入れない。入れると閉扉時に戸口が塞がって
             //   「そこに開口がある」という情報が幾何から消える。
             if (in.moved) continue;
-            statics.push_back(in.obb);
+            rooms::SolidBox sb;
+            sb.obb = in.obb;
+            // 吸音率も渡す。部屋の残響時間を形と材質から出す（Sabine）ため。
+            const AcousticMaterial& mat = materialOf(in.materialId);
+            for (int b = 0; b < kNumBands; ++b) sb.absorption[b] = mat.absorption[b];
+            statics.push_back(sb);
         }
         return roomBuilder_.build(statics);
     }
@@ -281,6 +286,27 @@ public:
     int roomWeights(const Vec3& p, float radius, int* rooms, float* weights, int maxOut) const {
         roomGraph();   // 汚れていれば作り直す
         return roomBuilder_.roomWeightsAt(p, radius, rooms, weights, maxOut);
+    }
+
+    // 点における帯域別の残響時間(s)。部屋ごとの Sabine 値を占め方で混ぜたもの。
+    //   ★エコグラムから測ると (a) レイのばらつきがそのまま乗る (b) 「-60dB を超える最後の
+    //     ビン」という離散インデックスになる (c) その床が直接音のピーク基準なので遮蔽で
+    //     床ごと動く ── どれも位置に対して不連続。形と材質から出せば部屋ごとの定数になり、
+    //     占め方で混ぜるぶんだけが連続に変わる。
+    //   戻り値は書けた帯域数。
+    int rt60At(const Vec3& p, float radius, float* out, int count) const {
+        if (!out || count <= 0) return 0;
+        const int nb = std::min(count, kNumBands);
+        for (int b = 0; b < nb; ++b) out[b] = 0.0f;
+        int ids[8]; float w[8];
+        const int n = roomWeights(p, radius, ids, w, 8);
+        if (n <= 0) return nb;
+        const rooms::Result& rr = roomBuilder_.result();
+        for (int i = 0; i < n; ++i) {
+            const rooms::Room& rm = rr.rooms[static_cast<std::size_t>(ids[i])];
+            for (int b = 0; b < nb; ++b) out[b] += w[i] * rm.rt60[b];
+        }
+        return nb;
     }
 
     // 点における「実効的な部屋の体積」(m3)。上の割合で混ぜたもの。
