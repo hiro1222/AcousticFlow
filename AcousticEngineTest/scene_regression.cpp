@@ -4244,6 +4244,55 @@ void testRoomSegmentation() {
             AF_SceneDestroy(s);
             return 20.0f * std::log10(std::max(hi, 1e-6f) / std::max(lo, 1e-6f));
         };
+        // ★★ ポータルの帯域依存は潰してはいけない ★★
+        //   ポータル経路の帯域差はフレネル半径 r1=√(λd1d2/(d1+d2)) が波長に依るぶんで、
+        //   「開口の広さ対波長」＝扉がどれだけ開いているかを音色で伝える当のもの。
+        //   前川（障害物のこもり）とは運んでいる情報が違う。一度これを一緒に均してしまった。
+        {
+            const float hh2 = 4.0f, tt2 = 0.15f, hw3 = 6.0f, hd3 = 8.0f, dw = 1.2f, dh = 2.4f;
+            auto buildPortal = [&](float openFrac) {
+                AF_SceneHandle s = AF_SceneCreate();
+                const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+                AF_SceneAddInstanceBox(s, V(-(hw3+dw*0.5f)*0.5f, hh2*0.5f, 0),
+                                       V((hw3-dw*0.5f)*0.5f, hh2*0.5f, tt2), V(1,0,0), V(0,1,0), m);
+                AF_SceneAddInstanceBox(s, V( (hw3+dw*0.5f)*0.5f, hh2*0.5f, 0),
+                                       V((hw3-dw*0.5f)*0.5f, hh2*0.5f, tt2), V(1,0,0), V(0,1,0), m);
+                AF_SceneAddInstanceBox(s, V(0, (dh+hh2)*0.5f, 0),
+                                       V(dw*0.5f, (hh2-dh)*0.5f, tt2), V(1,0,0), V(0,1,0), m);
+                AF_SceneAddInstanceBox(s, V(0, -tt2, 0),     V(hw3, tt2, hd3), V(1,0,0), V(0,1,0), m);
+                AF_SceneAddInstanceBox(s, V(0, hh2+tt2, 0),  V(hw3, tt2, hd3), V(1,0,0), V(0,1,0), m);
+                AF_SceneAddInstanceBox(s, V(-hw3, hh2*0.5f, 0), V(tt2, hh2*0.5f, hd3), V(1,0,0), V(0,1,0), m);
+                AF_SceneAddInstanceBox(s, V( hw3, hh2*0.5f, 0), V(tt2, hh2*0.5f, hd3), V(1,0,0), V(0,1,0), m);
+                AF_SceneAddInstanceBox(s, V(0, hh2*0.5f, -hd3), V(hw3, hh2*0.5f, tt2), V(1,0,0), V(0,1,0), m);
+                AF_SceneAddInstanceBox(s, V(0, hh2*0.5f,  hd3), V(hw3, hh2*0.5f, tt2), V(1,0,0), V(0,1,0), m);
+                // 戸口を openFrac だけ残して塞ぐ扉。
+                const float blocked = dw * (1.0f - openFrac);
+                if (blocked > 1e-3f)
+                    AF_SceneAddInstanceBox(s, V(-dw*0.5f + blocked*0.5f, dh*0.5f, 0),
+                                           V(blocked*0.5f, dh*0.5f, 0.03f), V(1,0,0), V(0,1,0), m);
+                AF_SceneAddPortal(s, V(0, dh*0.5f, 0), V(1,0,0), V(0,1,0), dw*0.5f, dh*0.5f);
+                return s;
+            };
+            auto portalTilt = [&](float openFrac) {
+                AF_SceneHandle s = buildPortal(openFrac);
+                AF_SceneSetListener(s, V(-2.0f, 1.6f, -4.0f));
+                AF_SceneSetSource(s, 1, V(2.0f, 1.6f, 4.0f));
+                for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+                float occ[kBands] = {};
+                const int idx = AF_SceneSourceIndex(s, 1);
+                if (idx >= 0) AF_SceneGetSourceOcclusion(s, idx, occ);
+                const float t = 20.0f * std::log10(std::max(occ[0], 1e-6f)
+                                                 / std::max(occ[kBands-1], 1e-6f));
+                AF_SceneDestroy(s);
+                return t;
+            };
+            // 隙間が狭いほど「低域だけ通る」＝低域と高域の差が開くこと。
+            const float narrow = portalTilt(0.08f);   // 1割弱だけ開いている
+            const float wide   = portalTilt(1.00f);   // 全開
+            check("[開口] 隙間が狭いほど低域が相対的に通る", narrow > wide + 1.0f);
+            check("[開口] 全開なら帯域差はほぼ無い", wide < 1.5f);
+        }
+
         check("[回折] 障害物なしなら生存ゲインは平坦", tiltDb(false, true, noAbsorb) < 0.2f);
         check("[回折] 柱を置いても生存ゲインは平坦（吸わない表面）",
               tiltDb(true, true, noAbsorb) < 0.2f);
