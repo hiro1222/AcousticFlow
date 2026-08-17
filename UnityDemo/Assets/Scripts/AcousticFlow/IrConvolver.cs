@@ -791,7 +791,12 @@ namespace AcousticFlow
             System.Array.Clear(_tailOut[1], 0, frames);
             if (tailMode == TailMode.Measured)
             {
-                float g = _tailGain * tailLevel;
+                // 尾の絶対レベル ＝ tailGain(= 自由音場の直接 × √target) × 好みの倍率
+                //                   × 部屋への注入量(srcLv)。
+                //   ★srcLv を掛けていなかったので、C++ 経路(VoiceConvolver)と比べて
+                //     遮蔽時に響きすぎていた。tailGain 側は遮蔽を割り戻してあるので、
+                //     ここで 1 回だけ掛けるのが正しい（wet は掛けない＝ target に含まれる）。
+                float g = _tailGain * tailLevel * srcLv;
                 if (_tailConvNU != null && _tailConvNU.HasIr)
                     _tailConvNU.ProcessAdd(_tailInMono, 0, frames, _tailOut, 0, g);
                 else if (_tailConv != null && _tailConv.HasIr)

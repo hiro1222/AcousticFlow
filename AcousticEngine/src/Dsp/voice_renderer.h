@@ -152,7 +152,12 @@ public:
     void setTailLevel(float g) { tailLevel_ = g; }        // 1.0 が物理どおり。好みの微調整
     void setScatterDiffusion(float g) { scatterDiffusion_ = g; }
 
-    /// 尾の絶対ゲインの掛かり方。wet は開けた場所ほど小さく、srcLevel は壁裏で小さくなる。
+    /// 尾の絶対ゲインの掛かり方。
+    ///   srcLevel : 音源がこの部屋にどれだけエネルギーを注げているか（反射込みの生存）。
+    ///   wet      : **尾のレベルには掛けない**。残響/直接比は rebuildTail に渡す target で
+    ///              既に決まっているので、ここで wet を掛けると二重計上になる
+    ///              （wet 自体が target から作られているため、なおさら）。
+    ///              引数は互換のために残してあるが、診断で覗く以外の用途は無い。
     void setTailEnvelope(float wet, float srcLevel) {
         tailWet_ = clamp01(wet);
         tailSrcLevel_ = (srcLevel > 0.0f) ? srcLevel : 1.0f;
@@ -192,7 +197,11 @@ private:
         std::fill(tailOutR_.begin(), tailOutR_.begin() + n, 0.0f);
         if (tailGain_ > 0.0f && tailConv_.hasIr()) {
             float* dst[2] = { tailOutL_.data(), tailOutR_.data() };
-            tailConv_.processAdd(input, 0, n, dst, 0, tailGain_ * tailLevel_ * tailWet_ * tailSrcLevel_);
+            // 尾の絶対レベル ＝ tailGain(= 自由音場の直接 × √target) × 好みの倍率 × 部屋への注入量。
+            //   ★以前はここに tailWet_ も掛けていたが、残響/直接比は tailGain の
+            //     √target で既に決まっており二重計上だった。C# 経路(IrConvolver)は
+            //     掛けていなかったので、同じシーンで C# の方が 3.9dB 響いていた。
+            tailConv_.processAdd(input, 0, n, dst, 0, tailGain_ * tailLevel_ * tailSrcLevel_);
         }
 
         // ② HRTF はブロック境界で HRIR を取り込む（方向変化のクロスフェード開始）。

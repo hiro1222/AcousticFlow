@@ -222,9 +222,13 @@ namespace AcousticFlow
                         //   ※ tailSrcLevel は反射込みの生存なので、同じ部屋の柱では大きく
                         //     下がらず、別の部屋なら下がる ── 「部屋にどれだけ注げているか」の
                         //     近似として機能する（将来は部屋グラフの開口面積で置き換えたい）。
+                        // ★帯域をまとめるのは二乗平均平方根(RMS)。target はエネルギー比なので、
+                        //   等価な広帯域「振幅」は各帯域のエネルギー平均の平方根になる。
+                        //   算術平均だと帯域が傾いているほど小さく出て、C# 経路(IrConvolver、
+                        //   こちらは RMS)と食い違う（壁越しの 0.05/0.03/0.02/0.01/0/0 で 2.6dB）。
                         float dg = 0f;
-                        for (int b = 0; b < nb; b++) dg += ts.BandGain[b];
-                        dg /= nb;
+                        for (int b = 0; b < nb; b++) dg += ts.BandGain[b] * ts.BandGain[b];
+                        dg = Mathf.Sqrt(dg / nb);
                         float occ = (ts.SourceLevel > 1e-3f) ? ts.SourceLevel : 1f;
                         dg /= occ;
                         Native.AF_VoiceRebuildTail(
