@@ -42,6 +42,11 @@ namespace AcousticFlow
         [Header("散乱・尾")]
         [Range(0f, 1f)] public float scatterAmount = 0.5f;
         [Range(0f, 0.8f)] public float scatterDiffusion = 0.62f;
+        [Tooltip("早期↔後期の境目の下限(ms)。境目は mixing time ≈ √V で決まるが、\n"
+                 + "畳み込みのブロック遅延を隠すために下限を掛ける。\n"
+                 + "※C# 経路(IrConvolver)の minSplitMs と同じ値にすること。片方だけ動かすと\n"
+                 + "  A/B したとき尾の始まりがずれて別の音に聞こえる。")]
+        [Range(1f, 60f)] public float minSplitMs = 3f;
         [Range(0.2f, 3f)] public float tailSeconds = 1.0f;
         [Tooltip("尾を組み直す間隔（フレーム）。重いので数フレームに1回で十分（部屋は緩変）。")]
         public int tailRebuildEveryFrames = 8;
@@ -65,6 +70,7 @@ namespace AcousticFlow
 
         // メインスレッドが書き、audio thread が読む（値のコピーだけなのでロックしない）。
         private volatile float _wet = 1f, _srcLevel = 1f;
+        private float _splitMs = 120f;   // 早期↔後期の境目。急に動かさない（下の解説）
 
         // ★C# 経路(IrConvolver)と同時に有効にしない。
         //   両方が OnAudioFilterRead を返すと、同じ音源が二重に鳴る（実際に踏んだ）。
@@ -231,11 +237,24 @@ namespace AcousticFlow
                         dg = Mathf.Sqrt(dg / nb);
                         float occ = (ts.SourceLevel > 1e-3f) ? ts.SourceLevel : 1f;
                         dg /= occ;
+                        // ★尾の開始は平滑して動かす。ここが動くと「早期タップの打ち切り」と
+                        //   「尾の開始」が同時にずれ、尾側はブロック境界でハードスワップなので
+                        //   段差として聞こえる。以前は max(10, mixingTime) を毎回そのまま
+                        //   渡していた（C# 経路は平滑していたので、そこも食い違っていた）。
+                        float mixT = AcousticFlowSceneDemo.Status.MixingTimeMs;
+                        if (mixT <= 0f) mixT = 120f;
+                        _splitMs = Mathf.Lerp(_splitMs, Mathf.Max(minSplitMs, mixT), 0.15f);
+
+                        // ★耳ごとの帯域ゲイン（後期残響の左右バランス）を渡す。
+                        //   これを null にしていたので C++ 経路の尾は**方向づけなしの均一**で、
+                        //   C# 経路（渡している）と比べて定位が弱く聞こえていた。
+                        var ear = AcousticFlowSceneDemo.Status.TailEarBandGain;
                         Native.AF_VoiceRebuildTail(
                             _voice, _echo, bins, AcousticFlowSceneDemo.Status.EchogramBinMs,
-                            Mathf.Max(10f, AcousticFlowSceneDemo.Status.MixingTimeMs), 8f,
+                            _splitMs, 20f,
                             30f, 0f, 0.6f, dg,
-                            AcousticFlowSceneDemo.Status.ReverbTargetRatio, null, 0);
+                            AcousticFlowSceneDemo.Status.ReverbTargetRatio,
+                            ear, ear != null ? ear.Length : 0);
                         tailPartitions = Native.AF_VoiceTailPartitions(_voice);
                         tailLatencySamples = Native.AF_VoiceTailLatency(_voice);
                     }
