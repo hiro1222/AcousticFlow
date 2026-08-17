@@ -3276,10 +3276,15 @@ void diagnoseShadowCliff() {
 
     const AF_Vector3 S = V(0, 1.6f, 3.5f);
     std::printf("      音源(0,1.6,3.5) 固定。リスナーを x=-2.0 → 0.0 へ（z=-3.5、柱は原点 2.4m幅）\n");
-    std::printf("        x      遮蔽率  直接音(ソフト遮蔽)     反射込み生存   回折二次音源  最終の目安\n");
-    std::printf("                       平均      dB(基準比)   平均      dB    本数 合計    dB\n");
+    // ★D タップ単体ではなく D⊕F の合計で見る。ホストは
+    //     D タップ = 透過（この関数の戻り）
+    //     F タップ = 回折 × 遮蔽割合
+    //   を別々に鳴らし、occFrac でクロスフェードする。D 単体は必ず崖になるが、
+    //   F が立ち上がるので合計は連続 ── そこを確かめるのがこの診断の目的。
+    std::printf("        x      遮蔽率   D(透過)   F(回折×遮蔽率)  D⊕F 合計    合計dB   反射込み生存\n");
     double ref = 0.0;
     double prevDb = 0.0, worst = 0.0; float worstAt = 0.0f; bool first = true;
+    double worstD = 0.0, prevD = 0.0;
     for (float x = -2.0f; x <= 0.001f; x += 0.1f) {
         const AF_Vector3 L = V(x, 1.6f, -3.5f);
         AF_SceneSetListener(s, L);
@@ -3289,8 +3294,6 @@ void diagnoseShadowCliff() {
         float soft[kBands] = {}; float occFrac = 0.0f;
         AF_SceneComputeSoftOcclusion(s, L, S, soft, kBands, &occFrac);
         double sm = 0.0; for (int b = 0; b < kBands; ++b) sm += soft[b]; sm /= kBands;
-        if (first) ref = sm;
-        const double db = 20.0 * std::log10(std::max(sm, 1e-9) / std::max(ref, 1e-9));
 
         float occ[kBands] = {};
         const int idx = AF_SceneSourceIndex(s, 1);
@@ -3300,17 +3303,27 @@ void diagnoseShadowCliff() {
         AF_Vector3 dpos[8]; float dg[8] = {};
         const int nd = (idx >= 0) ? AF_SceneGetDiffractionSources(s, idx, dpos, dg, 8) : 0;
         double dsum = 0.0; for (int i = 0; i < nd; ++i) dsum += dg[i];
+        // ホストと同じ配分: F タップは回折の総量 × 遮蔽割合。
+        const double fpart = dsum * occFrac;
+        // 別経路・別方向なのでエネルギーで足す。
+        const double total = std::sqrt(sm * sm + fpart * fpart);
+        if (first) ref = total;
+        const double db = 20.0 * std::log10(std::max(total, 1e-9) / std::max(ref, 1e-9));
 
         if (!first) {
             const double step = std::fabs(db - prevDb);
             if (step > worst) { worst = step; worstAt = x; }
+            worstD = std::max(worstD, std::fabs(20.0 * std::log10(std::max(sm, 1e-9))
+                                              - 20.0 * std::log10(std::max(prevD, 1e-9))));
         }
-        first = false; prevDb = db;
-        std::printf("        %5.2f   %5.2f   %7.5f  %8.1f    %6.3f %6.1f   %d  %6.4f  %6.1f\n",
-                    x, occFrac, sm, db, om, 20.0 * std::log10(std::max(om, 1e-9)),
-                    nd, dsum, 20.0 * std::log10(std::max(om, 1e-9)));
+        first = false; prevDb = db; prevD = sm;
+        std::printf("        %5.2f   %5.2f   %7.5f   %7.5f      %7.5f  %7.1f   %6.3f\n",
+                    x, occFrac, sm, fpart, total, db, om);
     }
-    std::printf("      0.1m あたりの直接音の最大変化: %.1f dB（x=%.2f 付近）\n", worst, worstAt);
+    std::printf("      0.1m あたりの最大変化: D⊕F の合計 %.1f dB / D タップ単体 %.1f dB"
+                "（x=%.2f 付近）\n", worst, worstD, worstAt);
+    std::printf("      → D 単体は必ず崖になる（標本が二値）。F が occFrac で立ち上がって"
+                "補うので、合計が連続なら設計どおり。\n");
     AF_SceneDestroy(s);
 }
 
