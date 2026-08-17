@@ -2541,6 +2541,7 @@ public:
         //   方向（開いている部分の重心）とエネルギー（開口率）が同じ積分から出るので、
         //   両者がずれて飛ぶこともない。ここが今日ずっと戦っていた問題の解。
         //   ポータルが1枚も反応しなければ、下の稜線探索へ落ちる（穴を空けない）。
+        int portalPaths = 0;          // ポータルが埋めた本数。稜線探索はこの続きから書く
         if (!portals_.empty()) {
             int np2 = 0;
             for (const Portal& pt : portals_) {
@@ -2570,21 +2571,62 @@ public:
                 }
                 ++np2;
             }
-            // ★ポータルがあるなら**それが唯一の答え**。0本でもここで返す。
-            //   以前は「0本なら旧経路（稜線探索）へ落ちる」としていたが、それだと
-            //   ポータルが閉じているとき＝回折が無いはずのときに旧経路が走り、
-            //   閉じた部屋の中で幻の経路を見つけて鳴らしていた
-            //   （実測: 閉扉で壁の前に立つと gain 0.32 の回折タップが立ち、
-            //     扉の前より大きく・平坦になっていた）。
-            //   ホストがポータルを置くのは「開口はここだけ」という宣言なので、
-            //   どれも開いていなければ開口経由の音は無い。
-            return np2;
+            portalPaths = np2;
         }
+
+        // ★ポータルは**自分が覆う開口だけ**を担当する。覆っていない開口は稜線探索が担当。
+        //
+        //   以前は「ポータルが 1 枚でもあれば稜線探索を丸ごと迂回」していた。
+        //   理由は「閉じたポータルのとき旧経路が走って幻を鳴らす」ことの回避だったが、
+        //   副作用が大きすぎた。実測（開口 2 つの仕切りで、片方にだけポータルを置く）:
+        //     ポータル無し          回折125Hz 0.3162
+        //     関係ない開口にポータル 回折125Hz 0.0021   ← **43dB 減**
+        //   リスナーの目の前にある開口が担当から外れ、遠いポータルだけが答えを出していた。
+        //   ホストがポータルを 1 枚置いた瞬間に他の開口が全部黙る、という挙動になる。
+        //
+        //   元の懸念（閉じたポータルの所で幻が出る）は、**覆っている開口のクラスタを
+        //   落とす**ことで保たれる ── 閉じた扉の戸口はポータルが覆っているので、
+        //   そこのクラスタは稜線探索側から除かれる。丸ごと迂回するより範囲が狭い。
+        //   さらに幻そのものは跨ぎ判定で消えているので、当時より条件も良い。
+        //   判定は「開口点が矩形の中にあるか」ではなく「**その経路がポータルを通るか**」。
+        //   点で見ると、扉が大きく開いたとき扉パネル自体の縁が矩形の外に出て
+        //   覆い判定を外れ、別タップが立つ（実測: 81°で合計が 0.386 → 0.619 に跳んだ。
+        //   ポータル開口率は 0.7235 → 0.7361 と滑らかなので、経路が増えたことが原因）。
+        //   経路で見れば「この音はその戸口を通ってくる」かどうかを直接問える。
+        auto segmentCrossesPortal = [&](const Vec3& a, const Vec3& b, const Portal& pt) {
+            const Vec3 n2 = normalized(cross(pt.axisU, pt.axisV));
+            const Vec3 d = b - a;
+            const float den = dot(n2, d);
+            if (std::fabs(den) < 1e-6f) return false;
+            const float t = dot(n2, pt.center - a) / den;
+            if (t < -0.05f || t > 1.05f) return false;
+            const Vec3 hit = a + d * t;
+            const Vec3 r = hit - pt.center;
+            return std::fabs(dot(r, pt.axisU)) <= pt.halfU + 0.25f
+                && std::fabs(dot(r, pt.axisV)) <= pt.halfV + 0.25f;
+        };
+        auto coveredByPortal = [&](const Vec3& p) {
+            for (const Portal& pt : portals_) {
+                if (!pt.active) continue;
+                // 開口点そのものが矩形の中／面の近くにある
+                const Vec3 n2 = normalized(cross(pt.axisU, pt.axisV));
+                const Vec3 d = p - pt.center;
+                if (std::fabs(dot(d, n2)) <= 0.5f
+                    && std::fabs(dot(d, pt.axisU)) <= pt.halfU + 0.25f
+                    && std::fabs(dot(d, pt.axisV)) <= pt.halfV + 0.25f) return true;
+                // または、その開口点を経由する経路がポータルを通る
+                if (segmentCrossesPortal(listener, p, pt)) return true;
+                if (segmentCrossesPortal(p, source, pt)) return true;
+            }
+            return false;
+        };
 
         // 遮蔽時は開口ごとに独立した経路。重み上位から maxPaths 本。
         bool used[kMaxCl] = {false};
-        int n = 0;
-        while (n < maxPaths && n < ncl) {
+        int n = portalPaths;
+        int taken = 0;
+        while (n < maxPaths && taken < ncl) {
+            ++taken;
             int bi = -1; float bw = -1.0f;
             for (int i = 0; i < ncl; ++i) if (!used[i] && cl[i].w > bw) { bw = cl[i].w; bi = i; }
             if (bi < 0) break;
@@ -2603,6 +2645,10 @@ public:
             const Vec3 geoCenter = (cl[bi].gw > 1e-6f)
                                  ? cl[bi].gAcc * (1.0f / cl[bi].gw) : wCentroid;
             const Vec3 centroid = (geoCenter + wCentroid) * 0.5f;
+            // ★この開口をポータルが覆っているなら、担当はポータル。稜線探索側は降りる。
+            //   両方が鳴らすと同じ開口が 2 タップになり、平坦なコピーが違う遅延で
+            //   足されて櫛形フィルタになる（クラスタ統合で潰したのと同じ現象）。
+            if (portalPaths > 0 && coveredByPortal(centroid)) continue;
             Vec3 Pc = centroid;
             Vec3 PcEdge(0, 1, 0);
             Vec3 PcRefT(1, 0, 0);   // 面の接線（⊥稜線・外向き）。2次の送り向きに使う

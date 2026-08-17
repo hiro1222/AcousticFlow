@@ -2573,6 +2573,55 @@ void diagnoseNonPlateBlocker() {
     }
 }
 
+// ポータルは「自分が覆う開口だけ」を担当すべき。
+//   現状は 1 枚でもポータルがあると稜線探索を丸ごと迂回するので、
+//   ポータルを置いていない開口が鳴らなくなる。それを直接測る。
+//   仕切りに開口を 2 つ（A: x∈[-4,-2] / B: x∈[2,4]）空け、A にだけポータルを置く。
+void diagnosePortalScope() {
+    std::printf("\n[診断] ポータルは自分が覆う開口だけを担当しているか\n");
+    auto build = [](bool withPortal) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        const float h = 4.0f, t = 0.15f, hw = 8.0f, hd = 8.0f;
+        // 仕切り z=0。開口 A: x∈[-4,-2]、開口 B: x∈[2,4]
+        AF_SceneAddInstanceBox(s, V(-6.0f, h*0.5f, 0), V(2.0f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( 0.0f, h*0.5f, 0), V(2.0f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( 6.0f, h*0.5f, 0), V(2.0f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        if (withPortal)   // 開口 A だけにポータル（中心 x=-3、幅 2m）
+            AF_SceneAddPortal(s, V(-3.0f, 2.0f, 0.0f), V(1,0,0), V(0,1,0), 1.0f, 2.0f);
+        return s;
+    };
+    // ★直線が開口を素通りしない配置にすること（一度やった）。
+    //   L(5,-3)→S(5,3) は z=0 を x=5 で横切る＝壁(x>4)。必ず遮蔽される。
+    //   最短の回り込みは開口B の縁(x=4)。開口A(x=-3)は遠い。
+    const AF_Vector3 L = V(5.0f, 1.6f, -3.0f), S = V(5.0f, 1.6f, 3.0f);
+    std::printf("      配置: リスナー(5,-3) 音源(5,3)。直線は z=0 を x=5 で横切る＝壁\n");
+    std::printf("             最短の回り込みは開口B(x∈[2,4])。ポータルは開口A(x∈[-4,-2])にだけ置く\n");
+    std::printf("      %-26s 経路本数  回折125Hz\n", "");
+    for (int k = 0; k < 2; ++k) {
+        AF_SceneHandle s = build(k == 1);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        float g[kBands] = {};
+        AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
+        AF_Vector3 pos[8]; float gain[8];
+        const int n = AF_SceneGetDiffractionSources(s, AF_SceneSourceIndex(s, 1), pos, gain, 8);
+        std::printf("      %-26s %6d   %8.4f%s\n",
+                    k == 0 ? "ポータル無し（基準）" : "開口Aにポータルを置く",
+                    n, g[0],
+                    (k == 1 && g[0] < 1e-4f) ? "  ★開口Bが鳴らなくなった" : "");
+        AF_SceneDestroy(s);
+    }
+}
+
 void diagnoseSecondOrderQuality() {
     std::printf("\n[診断] 2次回折の質\n");
 
@@ -3325,6 +3374,7 @@ int main() {
     testMesh();
     testDirectionalProbe();
     testSecondOrderDiffraction();
+    diagnosePortalScope();
     diagnoseNonPlateBlocker();
     diagnoseApertureWidthCurve();
     diagnoseRoomToRoomLevel();
