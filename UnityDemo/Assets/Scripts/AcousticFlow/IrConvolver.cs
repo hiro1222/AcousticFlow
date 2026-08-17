@@ -594,6 +594,12 @@ namespace AcousticFlow
                 for (int b = 0; b < kNumBands; b++) dg += bg[b] * bg[b];
                 dg = Mathf.Sqrt(dg / kNumBands);
             }
+            // ★遮蔽を割り戻して「遮られていなければどれだけ届くか」にする。
+            //   BandGain には生存(遮蔽)が入っているので、そのまま渡すと
+            //   尾 = (生存 × …) × √target × srcLv(= 生存) で**生存が 2 回**掛かり、
+            //   柱の陰に入っただけで残響ごと消える。遮蔽は srcLv の 1 箇所だけで掛ける。
+            //   （VoiceConvolver 側と同じ理由。詳細はそちらのコメント）
+            if (tsCal != null && tsCal.SourceLevel > 1e-3f) dg /= tsCal.SourceLevel;
             float target = AcousticFlowSceneDemo.Status.ReverbTargetRatio;
             _tailGain = ReverbTailIr.CalibrateGain(dg, target);
             Scope.TailToDirectRatio = target;   // スコープには使った目標比を出す

@@ -191,10 +191,26 @@ namespace AcousticFlow
                     int bins = scene.GetEchogramBands(_echo, _echo.Length / nb);
                     if (bins > 0)
                     {
-                        // 直接音の広帯域ゲイン＝絶対レベルの基準。
+                        // 尾の絶対レベルの基準になる直接音ゲイン。
+                        //
+                        // ★遮蔽を割り戻して「遮られていなければどれだけ届くか」にする。
+                        //   ts.BandGain = 生存(遮蔽) × 空気吸収 × 距離減衰 で、生存が入っている。
+                        //   これをそのまま渡すと
+                        //     尾 = (生存 × 空気 × 1/r) × √target × tailSrcLevel(= 生存)
+                        //   となって**生存が 2 回掛かる**。柱の陰に入っただけで尾が二乗ぶん
+                        //   落ちて、残響ごと消えてしまう（実測: 生存 0.775 で -4.4dB、
+                        //   隣の部屋なら -20dB 以上）。
+                        //   物理的には、部屋の残響音場は音源が部屋へ注いだパワーで決まるので、
+                        //   リスナーの見通しが柱で切れても残響は残る（むしろ相対的に増える）。
+                        //   遮蔽は tailSrcLevel の 1 箇所だけで掛ける。
+                        //   ※ tailSrcLevel は反射込みの生存なので、同じ部屋の柱では大きく
+                        //     下がらず、別の部屋なら下がる ── 「部屋にどれだけ注げているか」の
+                        //     近似として機能する（将来は部屋グラフの開口面積で置き換えたい）。
                         float dg = 0f;
                         for (int b = 0; b < nb; b++) dg += ts.BandGain[b];
                         dg /= nb;
+                        float occ = (ts.SourceLevel > 1e-3f) ? ts.SourceLevel : 1f;
+                        dg /= occ;
                         Native.AF_VoiceRebuildTail(
                             _voice, _echo, bins, AcousticFlowSceneDemo.Status.EchogramBinMs,
                             Mathf.Max(10f, AcousticFlowSceneDemo.Status.MixingTimeMs), 8f,
