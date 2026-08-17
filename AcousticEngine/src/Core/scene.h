@@ -273,6 +273,8 @@ public:
     }
     void setRoomCellSize(float m) { roomBuilder_.setCell(m); }
     void setRoomBrick(int voxels) { roomBuilder_.setBrick(voxels); }
+    void setRoomSeedRadius(float m) { roomBuilder_.setSeedRadius(m); }
+    void setRoomChamferFull(bool on) { roomBuilder_.setChamferFull(on); }
     // 点がどの部屋にいるか。-1 なら部屋の外／実体の中。
     int roomAt(const Vec3& p) const {
         const rooms::Grid& g = roomGraph().grid;

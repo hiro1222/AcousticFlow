@@ -644,15 +644,17 @@ void AF_SceneRoomGridDims(AF_SceneHandle scene, int* nx, int* ny, int* nz, float
 }
 
 void AF_SceneRoomBuildTimes(AF_SceneHandle scene, float* alloc, float* fill,
-                            float* label, float* merge,
+                            float* dist, float* label, float* merge, float* grow,
                             int* dirtyBricks, int* totalBricks) {
     Scene* s = asScene(scene);
     if (!s) return;
     const auto& rr = s->roomGraph();
     if (alloc)       *alloc       = static_cast<float>(rr.msAlloc);
     if (fill)        *fill        = static_cast<float>(rr.msFill);
+    if (dist)        *dist        = static_cast<float>(rr.msDist);
     if (label)       *label       = static_cast<float>(rr.msLabel);
     if (merge)       *merge       = static_cast<float>(rr.msMerge);
+    if (grow)        *grow        = static_cast<float>(rr.msGrow);
     if (dirtyBricks) *dirtyBricks = rr.dirtyBricks;
     if (totalBricks) *totalBricks = rr.totalBricks;
 }
@@ -660,6 +662,16 @@ void AF_SceneRoomBuildTimes(AF_SceneHandle scene, float* alloc, float* fill,
 void AF_SceneSetRoomBrick(AF_SceneHandle scene, int voxels) {
     Scene* s = asScene(scene);
     if (s) s->setRoomBrick(voxels);
+}
+
+void AF_SceneSetRoomSeedRadius(AF_SceneHandle scene, float meters) {
+    Scene* s = asScene(scene);
+    if (s) s->setRoomSeedRadius(meters);
+}
+
+void AF_SceneSetRoomChamferFull(AF_SceneHandle scene, int full) {
+    Scene* s = asScene(scene);
+    if (s) s->setRoomChamferFull(full != 0);
 }
 
 void AF_SceneSetApertureContrast(AF_SceneHandle scene, float p) {

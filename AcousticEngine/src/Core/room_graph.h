@@ -9,8 +9,27 @@
 // ■ 考え方
 //   自由空間を塗り分ける。
 //     1) 静的な形状をボクセル化して「詰まっている／空いている」に分ける
-//     2) 空きボクセルの連結成分 ＝ 部屋
-//     3) 部屋どうしを繋ぐくびれ ＝ 開口（次の段階。ここではまだ作らない）
+//     2) 各ボクセルの「壁からの距離」を測る
+//     3) 距離が侵食半径以上のボクセル（＝種）の連結成分 ＝ 部屋
+//     4) 種でないボクセルを最寄りの部屋へ塗り戻す（戸口の中にも部屋が付く）
+//     5) 部屋どうしを繋ぐくびれ ＝ 開口（次の段階。ここではまだ作らない）
+//
+//   ★2〜3 の侵食が要る理由。素の連結成分だと、戸口で繋がった空間は全部ひとつの
+//     部屋になる（＝扉の向こうも同じ部屋）。それでは残響を切り替える土台にならない。
+//     壁から半径ぶん内側だけを残してから繋がりを見ると、幅が半径の 2 倍に満たない
+//     **くびれ**が先に千切れるので、部屋が戸口で分かれる。
+//     実測でも切り替わりは「幅 = 半径 × 2」にぴたり乗る（下表）。
+//
+//        戸口\半径   0.00   0.30   0.45   0.60   0.75   1.00     ← 格子 0.10m
+//          0.0m        2      2      2      2      2      2
+//          0.3m        1      2      2      2      2      2
+//          0.6m        1      1      2      2      2      2
+//          0.9m        1      1      1      2      2      2
+//          1.2m        1      1      1      1      2      2
+//          2.0m        1      1      1      1      1      1
+//
+//     半径 0.6m を既定にしてある。人が通る戸口（〜1.2m）は分かれ、
+//     開けた口（2m〜）は分かれない。閾値は authoring ではなく幾何から決まる。
 //
 //   リスナーに依存しないので、稜線探索から矩形を起こす案にあった
 //   「見えた稜線しか持っていないので開口の高さが分からない・リスナーが動くと変わる」
@@ -41,12 +60,23 @@
 //   実行時に形状が変わる前提のエンジンなので、まず更新側を取った。
 //
 // ■ コスト（実測。12×4×16m の検証シーン。仕切りを 1 枚壊して 2 部屋 → 1 部屋）
-//                    全再構築        差分更新     塗り直したブロック
-//     0.25m 74,256    0.53 ms        0.107 ms      8 / 40
-//     0.10m 990,000   5.44 ms        0.479 ms     24 / 264
+//   既定（0.25m 格子・ブロック16・3-4-5・半径0.6m、74,256 ボクセル）:
+//     全再構築 3.19 ms（確保0.10 / 塗り0.11 / 距離1.61 / 連結0.19 / 併合0.00 / 塗戻1.18）
+//     差分更新 2.01 ms（         塗り0.05 / 距離0.78 / 連結0.10 / 併合0.00 / 塗戻1.09）
 //   差分更新の結果は全再構築と一致する（部屋数・体積とも）。
 //
-//   ブロック一辺の選び方（0.10m 格子で実測）:
+//   ★段によって差分更新の効き方が違う。
+//     塗り・連結・併合 … 触れたブロックだけ（16/40）。レベルの大きさに依存しない。
+//     距離           … 汚れた範囲＋侵食半径ぶんの箱だけ。同上。
+//     塗戻           … **全体**。戸口が開けば「どちらの部屋か」は遠くまで変わるし、
+//                      部屋の番号自体が振り直されるので局所では閉じない。
+//     結果として、差分更新のコストの半分以上が塗戻＝レベルの大きさに比例して残る。
+//     40×10×40m を 0.25m で切ると約 102 万ボクセルで、全再構築 約43ms・
+//     差分更新 約15ms の見込み。**まだ 1 フレームに収まらない。**
+//     空き空間を粗く持つ八分木にすれば、距離も塗戻も空きの大部分を 1 ノードで
+//     済ませられるのでここが縮む。未対応。
+//
+//   ブロック一辺の選び方（0.10m 格子・市街地距離で実測）:
 //        8 : 全再構築 9.41 ms / 更新 0.407 ms
 //       16 : 全再構築 5.44 ms / 更新 0.479 ms   ← 既定
 //       32 : 全再構築 4.50 ms / 更新 0.790 ms
@@ -59,11 +89,6 @@
 //     ブロック分割はそこから全再構築を 4.52→5.44ms に 2 割戻す代わりに、
 //     更新を 11 倍安くしている。全再構築はロード時に 1 回、更新は遊んでいる最中に何度も
 //     走るので、この交換は取る。
-//
-//   40×10×40m のレベルを 0.25m で切ると 160×40×160 = 約 102 万ボクセル。
-//   ロード時の全再構築が約 5ms、壁 1 枚の破壊が 0.1〜0.5ms。
-//   更新コストはレベルの大きさではなく**壊れた範囲**で決まる。
-//   （空き空間を粗く持つ八分木にすれば全再構築側がさらに縮む。未対応。）
 //
 // ■ LOD / ストリーミングとの関係（既知の限界）
 //   active=false のインスタンスは静的な塗り分けに入らない。つまり LOD で壁を降ろすと
@@ -129,10 +154,58 @@ struct Result {
     int  discarded = 0;        // 小さすぎて捨てた連結成分の数
     int  outsideVoxels = 0;    // 「外の世界」に落ちたボクセル数（格子の外周に届いた成分）
     // 段別の所要時間(ms)。どこを削るべきかを推測でなく数字で決めるため。
-    double msAlloc = 0.0, msFill = 0.0, msLabel = 0.0, msMerge = 0.0;
+    double msAlloc = 0.0, msFill = 0.0, msDist = 0.0, msLabel = 0.0,
+           msMerge = 0.0, msGrow = 0.0;
     int  dirtyBricks = 0;      // 直近の更新で塗り直したブロック数（0 なら全再構築）
     int  totalBricks = 0;
 };
+
+// チャンファ距離の近傍。前進走査は「ラスタ順で既に確定した側」の近傍だけを見る。
+//
+// ■ 2 種類ある理由（実測で選んだ。既定は 3-4-5）
+//   市街地距離（面だけ・3近傍・単位1）は 1 ボクセルあたり 6 回の参照で済んで速い。
+//   3-4-5（面3/辺4/角5・13近傍・単位3）は 26 回掛かる。
+//   最初は「戸口も壁も軸に並んだ板だから市街地で足りる」と踏んだが、実測すると
+//   0.25m 格子で幅 0.9m の戸口が割れなかった（市街地=1部屋 / 3-4-5=2部屋）。
+//   原因は斜め方向の精度ではなく**閾値の量子化**。市街地だと距離が整数ボクセルの
+//   倍数にしかならず、0.6m/0.25m = 2.4 が 2 に丸まる。3-4-5 は斜めの歩幅（4,5）が
+//   あるぶん 1/3 ボクセル刻みの値が出るので、2.33 ボクセルという閾値が表現できる。
+//   0.15m 以下に細かくすれば両者は一致するが、**同じ品質での総コストは 3-4-5 の
+//   粗い格子の方が安い**（実測: 3-4-5 @0.25m = 3.83ms/74k ボクセル、
+//   市街地 @0.15m = 6.33ms/308k ボクセル）。メモリも 1/4 で済む。
+struct ChamferNb { int dx, dy, dz, w; };
+
+// 市街地距離（3近傍・単位 1）。
+inline const ChamferNb* cityForward() {
+    static const ChamferNb t[3] = { {-1,0,0,1}, {0,-1,0,1}, {0,0,-1,1} };
+    return t;
+}
+inline const ChamferNb* cityBackward() {
+    static const ChamferNb t[3] = { {1,0,0,1}, {0,1,0,1}, {0,0,1,1} };
+    return t;
+}
+// 3-4-5（13近傍・単位 3）。比較用に残してある。
+inline const ChamferNb* chamferForward() {
+    static const ChamferNb t[13] = {
+        {-1,-1,-1,5}, { 0,-1,-1,4}, { 1,-1,-1,5},
+        {-1, 0,-1,4}, { 0, 0,-1,3}, { 1, 0,-1,4},
+        {-1, 1,-1,5}, { 0, 1,-1,4}, { 1, 1,-1,5},
+        {-1,-1, 0,4}, { 0,-1, 0,3}, { 1,-1, 0,4},
+        {-1, 0, 0,3},
+    };
+    return t;
+}
+inline const ChamferNb* chamferBackward() {
+    static const ChamferNb t[13] = {
+        { 1, 1, 1,5}, { 0, 1, 1,4}, {-1, 1, 1,5},
+        { 1, 0, 1,4}, { 0, 0, 1,3}, {-1, 0, 1,4},
+        { 1,-1, 1,5}, { 0,-1, 1,4}, {-1,-1, 1,5},
+        { 1, 1, 0,4}, { 0, 1, 0,3}, {-1, 1, 0,4},
+        { 1, 0, 0,3},
+    };
+    return t;
+}
+enum : std::uint16_t { kFar = 0xFFFF };
 
 // 点が OBB の中にあるか。
 inline bool pointInObb(const Vec3& p, const Obb& b) {
@@ -187,6 +260,25 @@ public:
         if (n >= 2 && n != brick_) { brick_ = n; needFull_ = true; }
     }
 
+    // 【部屋を戸口で割る半径(m)】自由空間をこの半径ぶん侵食してから連結成分を取る。
+    //   素の連結成分だと、戸口で繋がった空間は全部ひとつの部屋になってしまう
+    //   （＝扉の向こうも同じ部屋。残響を切り替える土台にならない）。
+    //   壁からこの距離より近い所を落としてから繋がりを見ると、幅がこの 2 倍に
+    //   満たない**くびれ**は先に千切れるので、部屋が戸口で分かれる。
+    //   落とした殻の部分は後で最寄りの部屋へ塗り戻すので、全ボクセルに部屋が付く。
+    //   0 にすると侵食なし＝素の連結成分（従来の挙動）。
+    //   目安: 戸口の幅の半分 < この値 < 部屋のいちばん狭い所の半分。
+    void setSeedRadius(float m) {
+        if (m >= 0.0f && m != seedRadius_) { seedRadius_ = m; needFull_ = true; }
+    }
+    float seedRadius() const { return seedRadius_; }
+
+    // 距離の近似（1=3-4-5 の13近傍・既定 / 0=市街地距離の3近傍）。
+    // 0 は 0.15m 以下の細かい格子でだけ使うこと（上の解説を参照）。
+    void setChamferFull(bool on) {
+        if (on != chamferFull_) { chamferFull_ = on; needFull_ = true; }
+    }
+
     // 幾何が変わった領域を伝える。**変更前と変更後の両方**の境界を渡すこと
     // （動いた壁は「元居た所」も塗り直さないと実体が残る）。
     void touch(const Aabb& region) { dirtyRegions_.push_back(region); }
@@ -212,11 +304,7 @@ public:
     int roomAtVoxel(int x, int y, int z) const {
         const Grid& g = res_.grid;
         if (!g.inside(x, y, z)) return -1;
-        const std::uint16_t l = loc_[static_cast<std::size_t>(g.index(x, y, z))];
-        if (l >= kLocNone) return -1;
-        const int b = brickOf_(x, y, z);
-        const int slot = rootSlot_[static_cast<std::size_t>(find_(first_[b] + l))];
-        return (slot >= 0) ? roomOfSlot_[static_cast<std::size_t>(slot)] : -1;
+        return room_[static_cast<std::size_t>(g.index(x, y, z))];
     }
 
 private:
@@ -224,7 +312,14 @@ private:
     float cell_ = 0.25f;
     int   minVoxels_ = 16;
     int   brick_ = 16;
+    float seedRadius_ = 0.6f;
+    bool  chamferFull_ = true;
     std::size_t maxVoxels_ = 4000000;
+
+    int chamferCount_() const { return chamferFull_ ? 13 : 3; }
+    int chamferUnit_()  const { return chamferFull_ ? 3 : 1; }
+    const ChamferNb* nbFwd_() const { return chamferFull_ ? chamferForward()  : cityForward();  }
+    const ChamferNb* nbBwd_() const { return chamferFull_ ? chamferBackward() : cityBackward(); }
 
     // ── 汚れ ──
     bool needFull_ = true;
@@ -232,6 +327,11 @@ private:
 
     // ── 状態 ──
     Result res_;
+    std::vector<std::uint16_t> dist_;                 // 実体までのチャンファ距離（×3）
+    std::vector<std::uint16_t> gdist_;                // 種までのチャンファ距離（塗り戻し用）
+    std::vector<std::int16_t>  room_;                 // ボクセル → 部屋番号（-1 なし）
+    std::vector<int> roomOfGid_;                      // 通し番号 → 部屋番号
+    int seedT_ = 1;                                   // 種の閾値（チャンファ単位）
     std::vector<std::uint16_t> loc_;                  // ボクセル → ブロック内ローカル番号
     int bx_ = 0, by_ = 0, bz_ = 0;                    // ブロック数
     std::vector<std::vector<LocalStat>> brickStat_;   // ブロック → ローカル空間の集計
@@ -309,6 +409,171 @@ private:
                         g.v[static_cast<std::size_t>(g.index(x, y, z))] = kSolid;
     }
 
+    // ── 実体までの距離を測る（3-4-5 チャンファ、前進＋後退の 2 走査）──
+    //   「戸口かどうか」は幅で決まるので、まず各ボクセルが壁からどれだけ離れているかが要る。
+    //   ★2 走査で済むのがこの方式の要点。侵食を 1 段ずつ繰り返すと半径ぶんの回数だけ
+    //     格子を舐めることになるが、チャンファなら半径によらず 2 回で確定する。
+    //   ★距離は整数（面3/辺4/角5）のまま持つ。3 で割ればボクセル単位。斜め方向の
+    //     誤差が 4/3 ≒ 1.33 でなく 5/(3√3) ≒ 0.96 に収まるので、部屋の角で
+    //     余計に千切れることがない。
+    //   clip が非 null ならその範囲だけ（差分更新用。距離は半径ぶんしか伝わらないので、
+    //   汚れた領域＋半径ぶんの余白を渡せば局所的に直せる）。
+    void computeDistance_(const int* clip) {
+        const Grid& g = res_.grid;
+        const int nx = g.nx, ny = g.ny, nz = g.nz;
+        const int sy = nx, sz = nx * ny;
+        const int X0 = clip ? clip[0] : 0, X1 = clip ? clip[1] : nx - 1;
+        const int Y0 = clip ? clip[2] : 0, Y1 = clip ? clip[3] : ny - 1;
+        const int Z0 = clip ? clip[4] : 0, Z1 = clip ? clip[5] : nz - 1;
+        std::uint16_t* D = dist_.data();
+        const std::uint8_t* V = g.v.data();
+
+        for (int z = Z0; z <= Z1; ++z)
+            for (int y = Y0; y <= Y1; ++y) {
+                const int base = z * sz + y * sy;
+                for (int x = X0; x <= X1; ++x)
+                    D[base + x] = (V[base + x] == kSolid) ? 0 : kFar;
+            }
+
+        const int kn = chamferCount_();
+        auto sweep = [&](const ChamferNb* nb, bool forward) {
+            for (int zi = Z0; zi <= Z1; ++zi) {
+                const int z = forward ? zi : (Z1 - (zi - Z0));
+                for (int yi = Y0; yi <= Y1; ++yi) {
+                    const int y = forward ? yi : (Y1 - (yi - Y0));
+                    const int base = z * sz + y * sy;
+                    for (int xi = X0; xi <= X1; ++xi) {
+                        const int x = forward ? xi : (X1 - (xi - X0));
+                        const int i = base + x;
+                        if (D[i] == 0) continue;
+                        int m = D[i];
+                        for (int k = 0; k < kn; ++k) {
+                            const int ax = x + nb[k].dx, ay = y + nb[k].dy, az = z + nb[k].dz;
+                            if (ax < 0 || ay < 0 || az < 0 || ax >= nx || ay >= ny || az >= nz)
+                                continue;
+                            const int c = static_cast<int>(D[az * sz + ay * sy + ax]) + nb[k].w;
+                            if (c < m) m = c;
+                        }
+                        D[i] = static_cast<std::uint16_t>(m);
+                    }
+                }
+            }
+        };
+        sweep(nbFwd_(), true);
+        sweep(nbBwd_(), false);
+    }
+
+    // ── 種から自由空間へ塗り戻す（同じく 2 走査）──
+    //   侵食で落とした殻（壁際と戸口）に、最寄りの部屋を配る。距離と部屋番号を
+    //   一緒に伝播させるチャンファ・ボロノイ。実体は伝播を遮るので、壁の向こうへは漏れない。
+    //   これで戸口に立っているリスナーにも必ずどちらかの部屋が付く。
+    void growRooms_() {
+        const Grid& g = res_.grid;
+        const int nx = g.nx, ny = g.ny, nz = g.nz;
+        const int sy = nx, sz = nx * ny;
+        const std::size_t n = static_cast<std::size_t>(nx) * ny * nz;
+        room_.assign(n, -1);
+        gdist_.assign(n, kFar);
+
+        // 通し番号 → 部屋番号の表を先に作る（ボクセルごとに union-find を引かない）。
+        const int nb = bx_ * by_ * bz_;
+        roomOfGid_.assign(static_cast<std::size_t>(first_[static_cast<std::size_t>(nb)]), -1);
+        for (int b = 0; b < nb; ++b)
+            for (int l = 0, k = static_cast<int>(brickStat_[static_cast<std::size_t>(b)].size());
+                 l < k; ++l) {
+                const int gid = first_[static_cast<std::size_t>(b)] + l;
+                const int slot = rootSlot_[static_cast<std::size_t>(find_(gid))];
+                roomOfGid_[static_cast<std::size_t>(gid)] =
+                    (slot >= 0) ? roomOfSlot_[static_cast<std::size_t>(slot)] : -1;
+            }
+
+        const std::uint16_t* L = loc_.data();
+        std::int16_t* R = room_.data();
+        std::uint16_t* GD = gdist_.data();
+        for (int b = 0; b < nb; ++b) {
+            const int bxi = b % bx_, byi = (b / bx_) % by_, bzi = b / (bx_ * by_);
+            const int X0 = bxi * brick_, X1 = std::min(nx, X0 + brick_) - 1;
+            const int Y0 = byi * brick_, Y1 = std::min(ny, Y0 + brick_) - 1;
+            const int Z0 = bzi * brick_, Z1 = std::min(nz, Z0 + brick_) - 1;
+            const int f0 = first_[static_cast<std::size_t>(b)];
+            for (int z = Z0; z <= Z1; ++z)
+                for (int y = Y0; y <= Y1; ++y) {
+                    const int base = z * sz + y * sy;
+                    for (int x = X0; x <= X1; ++x) {
+                        const std::uint16_t l = L[base + x];
+                        if (l >= kLocNone) continue;
+                        const int r = roomOfGid_[static_cast<std::size_t>(f0 + l)];
+                        if (r < 0) continue;                 // 外の世界／小さすぎて捨てた
+                        R[base + x] = static_cast<std::int16_t>(r);
+                        GD[base + x] = 0;
+                    }
+                }
+        }
+
+        const std::uint8_t* V = g.v.data();
+        const int kn = chamferCount_();
+        auto sweep = [&](const ChamferNb* nb2, bool forward) {
+            for (int zi = 0; zi < nz; ++zi) {
+                const int z = forward ? zi : (nz - 1 - zi);
+                for (int yi = 0; yi < ny; ++yi) {
+                    const int y = forward ? yi : (ny - 1 - yi);
+                    const int base = z * sz + y * sy;
+                    for (int xi = 0; xi < nx; ++xi) {
+                        const int x = forward ? xi : (nx - 1 - xi);
+                        const int i = base + x;
+                        if (V[i] == kSolid || GD[i] == 0) continue;   // 実体と種は動かさない
+                        int m = GD[i];
+                        int best = R[i];
+                        for (int k = 0; k < kn; ++k) {
+                            const int ax = x + nb2[k].dx, ay = y + nb2[k].dy, az = z + nb2[k].dz;
+                            if (ax < 0 || ay < 0 || az < 0 || ax >= nx || ay >= ny || az >= nz)
+                                continue;
+                            const int j = az * sz + ay * sy + ax;
+                            if (V[j] == kSolid) continue;             // 壁は伝播を遮る
+                            const int c = static_cast<int>(GD[j]) + nb2[k].w;
+                            if (c < m) { m = c; best = R[j]; }
+                        }
+                        GD[i] = static_cast<std::uint16_t>(m);
+                        R[i] = static_cast<std::int16_t>(best);
+                    }
+                }
+            }
+        };
+        sweep(nbFwd_(), true);
+        sweep(nbBwd_(), false);
+
+        // 体積・重心・境界は塗り戻した後の姿で取り直す（種だけの体積は実際より小さい）。
+        const std::size_t nr = res_.rooms.size();
+        if (nr == 0) return;
+        std::vector<long long> cnt(nr, 0), ax(nr, 0), ay(nr, 0), az(nr, 0);
+        std::vector<int> miX(nr, nx), miY(nr, ny), miZ(nr, nz),
+                         maX(nr, -1), maY(nr, -1), maZ(nr, -1);
+        for (int z = 0; z < nz; ++z)
+            for (int y = 0; y < ny; ++y) {
+                const int base = z * sz + y * sy;
+                for (int x = 0; x < nx; ++x) {
+                    const int r = R[base + x];
+                    if (r < 0) continue;
+                    const std::size_t u = static_cast<std::size_t>(r);
+                    ++cnt[u]; ax[u] += x; ay[u] += y; az[u] += z;
+                    if (x < miX[u]) miX[u] = x;  if (x > maX[u]) maX[u] = x;
+                    if (y < miY[u]) miY[u] = y;  if (y > maY[u]) maY[u] = y;
+                    if (z < miZ[u]) miZ[u] = z;  if (z > maZ[u]) maZ[u] = z;
+                }
+            }
+        for (std::size_t u = 0; u < nr; ++u) {
+            if (cnt[u] <= 0) continue;
+            const float inv = 1.0f / static_cast<float>(cnt[u]);
+            Room& rm = res_.rooms[u];
+            rm.voxels = static_cast<int>(cnt[u]);
+            rm.centroid = Vec3(g.origin.x + (static_cast<float>(ax[u]) * inv + 0.5f) * g.cell,
+                               g.origin.y + (static_cast<float>(ay[u]) * inv + 0.5f) * g.cell,
+                               g.origin.z + (static_cast<float>(az[u]) * inv + 0.5f) * g.cell);
+            rm.boundsMin = g.center(miX[u], miY[u], miZ[u]);
+            rm.boundsMax = g.center(maX[u], maY[u], maZ[u]);
+        }
+    }
+
     // ── ブロック 1 個をラベリングする ──
     //   ★走査線(scanline)で塗る。1 ボクセルずつ積む素直な塗りつぶしは、取り出すたびに
     //     近傍 6 個を**バラバラの番地**で読み、そのぶんスタックにも積む。1 個 14.8ns
@@ -329,13 +594,14 @@ private:
         const int Z0 = bzi * brick_, Z1 = std::min(g.nz, Z0 + brick_) - 1;
 
         std::uint16_t* L = loc_.data();
-        const std::uint8_t* V = g.v.data();
-        // 下地：実体は kLocSolid、空きは kLocNone。
+        const std::uint16_t* D = dist_.data();
+        // 下地：種（壁から seedRadius 以上離れた空き）だけを kLocNone にする。
+        //   実体の距離は 0 なので、この 1 つの判定で実体も落ちる。
         for (int z = Z0; z <= Z1; ++z)
             for (int y = Y0; y <= Y1; ++y) {
                 const int base = z * sz + y * sy;
                 for (int x = X0; x <= X1; ++x)
-                    L[base + x] = (V[base + x] == kSolid) ? kLocSolid : kLocNone;
+                    L[base + x] = (D[base + x] >= seedT_) ? kLocNone : kLocSolid;
             }
 
         std::vector<LocalStat>& st = brickStat_[static_cast<std::size_t>(b)];
@@ -542,10 +808,14 @@ private:
             g.nx = dim(lo.x, hi.x); g.ny = dim(lo.y, hi.y); g.nz = dim(lo.z, hi.z);
         }
 
+        // 種の閾値をチャンファ単位に落とす。0 なら侵食なし（素の連結成分）。
+        seedT_ = std::max(1, static_cast<int>(seedRadius_ / g.cell * chamferUnit_() + 0.5f));
+
         const auto tA0 = std::chrono::high_resolution_clock::now();
         const std::size_t nv = static_cast<std::size_t>(g.nx) * g.ny * g.nz;
         g.v.assign(nv, kEmpty);
         loc_.assign(nv, kLocNone);
+        dist_.assign(nv, kFar);
         bx_ = (g.nx + brick_ - 1) / brick_;
         by_ = (g.ny + brick_ - 1) / brick_;
         bz_ = (g.nz + brick_ - 1) / brick_;
@@ -557,6 +827,9 @@ private:
         for (const Obb& b : boxes) rasterize_(b, nullptr);
         const auto tF1 = std::chrono::high_resolution_clock::now();
 
+        computeDistance_(nullptr);
+        const auto tD1 = std::chrono::high_resolution_clock::now();
+
         for (int b = 0; b < nb; ++b) labelBrick_(b);
         for (int b = 0; b < nb; ++b) for (int f = 0; f < 3; ++f) buildFace_(b, f);
         const auto tL1 = std::chrono::high_resolution_clock::now();
@@ -564,10 +837,15 @@ private:
         merge_();
         const auto tM1 = std::chrono::high_resolution_clock::now();
 
+        growRooms_();
+        const auto tG1 = std::chrono::high_resolution_clock::now();
+
         res_.msAlloc = std::chrono::duration<double, std::milli>(tA1 - tA0).count();
         res_.msFill  = std::chrono::duration<double, std::milli>(tF1 - tA1).count();
-        res_.msLabel = std::chrono::duration<double, std::milli>(tL1 - tF1).count();
+        res_.msDist  = std::chrono::duration<double, std::milli>(tD1 - tF1).count();
+        res_.msLabel = std::chrono::duration<double, std::milli>(tL1 - tD1).count();
         res_.msMerge = std::chrono::duration<double, std::milli>(tM1 - tL1).count();
+        res_.msGrow  = std::chrono::duration<double, std::milli>(tG1 - tM1).count();
         res_.dirtyBricks = 0;
         res_.totalBricks = nb;
     }
@@ -580,14 +858,19 @@ private:
         const int nb = bx_ * by_ * bz_;
         std::vector<std::uint8_t> hot(static_cast<std::size_t>(nb), 0);
         int hotCount = 0;
+        // ★侵食の半径ぶん余分に広げる。距離は半径を超えて伝わらないので、
+        //   ここまで見れば「種かどうか」の判定は外側で変わらない。
+        //   （壁が消えると距離は増えるだけなので、既に種だったボクセルは種のまま。
+        //     壁が増えて距離が減るのは新しい壁から半径ぶんの範囲だけ。）
+        const int halo = (seedT_ + chamferUnit_() - 1) / chamferUnit_() + 1;
+        int cx0 = g.nx, cy0 = g.ny, cz0 = g.nz, cx1 = -1, cy1 = -1, cz1 = -1;
         for (const Aabb& a : dirtyRegions_) {
-            // 1 ボクセルぶん広げてから覆うブロックを拾う（膨張ぶんの取りこぼし防止）。
-            const int x0 = std::max(0, static_cast<int>(std::floor((a.min.x - g.origin.x) / g.cell)) - 1);
-            const int y0 = std::max(0, static_cast<int>(std::floor((a.min.y - g.origin.y) / g.cell)) - 1);
-            const int z0 = std::max(0, static_cast<int>(std::floor((a.min.z - g.origin.z) / g.cell)) - 1);
-            const int x1 = std::min(g.nx - 1, static_cast<int>(std::ceil((a.max.x - g.origin.x) / g.cell)) + 1);
-            const int y1 = std::min(g.ny - 1, static_cast<int>(std::ceil((a.max.y - g.origin.y) / g.cell)) + 1);
-            const int z1 = std::min(g.nz - 1, static_cast<int>(std::ceil((a.max.z - g.origin.z) / g.cell)) + 1);
+            const int x0 = std::max(0, static_cast<int>(std::floor((a.min.x - g.origin.x) / g.cell)) - halo);
+            const int y0 = std::max(0, static_cast<int>(std::floor((a.min.y - g.origin.y) / g.cell)) - halo);
+            const int z0 = std::max(0, static_cast<int>(std::floor((a.min.z - g.origin.z) / g.cell)) - halo);
+            const int x1 = std::min(g.nx - 1, static_cast<int>(std::ceil((a.max.x - g.origin.x) / g.cell)) + halo);
+            const int y1 = std::min(g.ny - 1, static_cast<int>(std::ceil((a.max.y - g.origin.y) / g.cell)) + halo);
+            const int z1 = std::min(g.nz - 1, static_cast<int>(std::ceil((a.max.z - g.origin.z) / g.cell)) + halo);
             if (x1 < x0 || y1 < y0 || z1 < z0) continue;
             for (int bz = z0 / brick_; bz <= z1 / brick_; ++bz)
             for (int by = y0 / brick_; by <= y1 / brick_; ++by)
@@ -596,6 +879,15 @@ private:
                 if (!hot[static_cast<std::size_t>(b)]) { hot[static_cast<std::size_t>(b)] = 1; ++hotCount; }
             }
         }
+        // 汚れたブロックをまとめて囲む範囲（距離の測り直しはこの箱の中だけでよい）。
+        for (int b = 0; b < nb; ++b) {
+            if (!hot[static_cast<std::size_t>(b)]) continue;
+            const int bxi = b % bx_, byi = (b / bx_) % by_, bzi = b / (bx_ * by_);
+            cx0 = std::min(cx0, bxi * brick_); cx1 = std::max(cx1, std::min(g.nx, (bxi + 1) * brick_) - 1);
+            cy0 = std::min(cy0, byi * brick_); cy1 = std::max(cy1, std::min(g.ny, (byi + 1) * brick_) - 1);
+            cz0 = std::min(cz0, bzi * brick_); cz1 = std::max(cz1, std::min(g.nz, (bzi + 1) * brick_) - 1);
+        }
+        if (cx1 < cx0) { res_.dirtyBricks = 0; res_.totalBricks = nb; return; }
 
         const auto tF0 = std::chrono::high_resolution_clock::now();
         // 汚れたブロックの中身を白紙に戻してから、そこに掛かる箱だけを塗り直す。
@@ -627,6 +919,10 @@ private:
         }
         const auto tF1 = std::chrono::high_resolution_clock::now();
 
+        const int clipAll[6] = { cx0, cx1, cy0, cy1, cz0, cz1 };
+        computeDistance_(clipAll);
+        const auto tD1 = std::chrono::high_resolution_clock::now();
+
         for (int b = 0; b < nb; ++b) if (hot[static_cast<std::size_t>(b)]) labelBrick_(b);
         // 面は「自分の +面」と「手前隣の +面」の両方が影響を受ける。
         for (int b = 0; b < nb; ++b) {
@@ -642,10 +938,17 @@ private:
         merge_();
         const auto tM1 = std::chrono::high_resolution_clock::now();
 
+        // ★塗り戻しだけは全体に及ぶ。戸口が開けば「どちらの部屋か」は遠くまで変わりうるし、
+        //   部屋の番号自体が振り直されるので、局所では閉じない。2 走査で済むので抱えている。
+        growRooms_();
+        const auto tG1 = std::chrono::high_resolution_clock::now();
+
         res_.msAlloc = 0.0;
         res_.msFill  = std::chrono::duration<double, std::milli>(tF1 - tF0).count();
-        res_.msLabel = std::chrono::duration<double, std::milli>(tL1 - tF1).count();
+        res_.msDist  = std::chrono::duration<double, std::milli>(tD1 - tF1).count();
+        res_.msLabel = std::chrono::duration<double, std::milli>(tL1 - tD1).count();
         res_.msMerge = std::chrono::duration<double, std::milli>(tM1 - tL1).count();
+        res_.msGrow  = std::chrono::duration<double, std::milli>(tG1 - tM1).count();
         res_.dirtyBricks = hotCount;
         res_.totalBricks = nb;
     }

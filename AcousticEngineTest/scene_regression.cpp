@@ -2607,36 +2607,81 @@ void diagnoseRoomDetection() {
         }
         return s;
     };
-    struct C { const char* name; float gap; int want; };
-    const C cases[] = {
-        {"仕切りで完全分断       ", 0.0f,  2},
-        {"戸口 1.2m でつながる   ", 1.2f,  1},
-        {"戸口 0.6m でつながる   ", 0.6f,  1},
-        {"戸口 0.3m でつながる   ", 0.3f,  1},
-    };
-    std::printf("      形状                     部屋数(期待)  格子      体積(m3)\n");
-    for (const C& c : cases) {
-        AF_SceneHandle s = build(c.gap);
+    // ★戸口の幅 × 侵食半径。素の連結成分（半径 0）だと戸口で繋がった空間は
+    //   全部ひとつの部屋になる。侵食を入れると、幅が半径の 2 倍に満たないくびれが
+    //   千切れて部屋が分かれる ── どの幅で切り替わるかを見る。
+    std::printf("      戸口の幅 × 侵食半径 → 部屋数（格子 0.10m）\n");
+    std::printf("        戸口\\半径   0.00   0.30   0.45   0.60   0.75   1.00\n");
+    for (float gap : {0.0f, 0.3f, 0.6f, 0.9f, 1.2f, 2.0f, 4.0f}) {
+        std::printf("        %5.1fm   ", gap);
+        for (float r : {0.0f, 0.3f, 0.45f, 0.6f, 0.75f, 1.0f}) {
+            AF_SceneHandle s = build(gap);
+            AF_SceneSetRoomCellSize(s, 0.1f);
+            AF_SceneSetRoomSeedRadius(s, r);
+            std::printf("%6d ", AF_SceneRoomCount(s));
+            AF_SceneDestroy(s);
+        }
+        std::printf("\n");
+    }
+    // ★格子が粗いと距離が整数に丸まって、戸口の幅の差が消える。既定半径での限界を見る。
+    //   距離の近似（市街地3近傍 / 3-4-5 の13近傍）でも並べる。判定が同じなら安い方でよい。
+    std::printf("      戸口の幅 × 格子の刻み → 部屋数（侵食半径 0.60m、括弧内は13近傍）\n");
+    std::printf("        戸口\\刻み    0.25m     0.15m     0.10m\n");
+    for (float gap : {0.0f, 0.6f, 0.9f, 1.2f, 2.0f}) {
+        std::printf("        %5.1fm   ", gap);
+        for (float cell : {0.25f, 0.15f, 0.1f}) {
+            int r[2] = {0, 0};
+            for (int full = 0; full < 2; ++full) {
+                AF_SceneHandle s = build(gap);
+                AF_SceneSetRoomCellSize(s, cell);
+                AF_SceneSetRoomChamferFull(s, full);
+                AF_SceneSetRoomSeedRadius(s, 0.6f);
+                r[full] = AF_SceneRoomCount(s);
+                AF_SceneDestroy(s);
+            }
+            std::printf("%6d(%d) ", r[0], r[1]);
+        }
+        std::printf("\n");
+    }
+    // 塗り戻しが効いていること＝戸口のど真ん中に立っても必ずどちらかの部屋になる。
+    {
+        AF_SceneHandle s = build(0.9f);
+        AF_SceneSetRoomCellSize(s, 0.1f);
+        const int n = AF_SceneRoomCount(s);
+        const int inDoor = AF_SceneRoomAt(s, V(0, 2.0f, 0));
+        const int nearSide = AF_SceneRoomAt(s, V(0, 2.0f, -4.0f));
+        const int farSide  = AF_SceneRoomAt(s, V(0, 2.0f,  4.0f));
+        std::printf("      戸口 0.9m: 部屋 %d / 手前 %d・戸口の中 %d・奥 %d%s\n",
+                    n, nearSide, inDoor, farSide,
+                    (inDoor >= 0 && nearSide >= 0 && farSide >= 0 && nearSide != farSide)
+                        ? "" : "  ★塗り戻しが効いていない");
+        AF_SceneDestroy(s);
+    }
+    std::printf("      体積(m3)  格子      形状\n");
+    for (float gap : {0.0f, 0.9f, 4.0f}) {
+        AF_SceneHandle s = build(gap);
         const int n = AF_SceneRoomCount(s);
         int nx = 0, ny = 0, nz = 0; float cell = 0.0f;
         AF_SceneRoomGridDims(s, &nx, &ny, &nz, &cell);
-        char vol[64] = "";
-        for (int i = 0; i < n && i < 3; ++i) {
+        char vol[96] = "";
+        for (int i = 0; i < n && i < 4; ++i) {
             float v = 0.0f;
             AF_SceneRoomInfo(s, i, &v, nullptr, nullptr, nullptr);
             char one[24]; std::snprintf(one, sizeof(one), "%.0f ", v);
             std::strncat(vol, one, sizeof(vol) - std::strlen(vol) - 1);
         }
-        std::printf("      %s %d(%d)%s  %3dx%3dx%3d @%.2fm  %s\n",
-                    c.name, n, c.want, (n == c.want) ? "  " : " ★", nx, ny, nz, cell, vol);
+        std::printf("      %-9s %3dx%3dx%3d @%.2fm  戸口 %.1fm（部屋 %d）\n",
+                    vol, nx, ny, nz, cell, gap, n);
         AF_SceneDestroy(s);
     }
     // ★作り直しのコスト。LOD/ストリーミング/破壊で形状が入れ替わるたびに走る。
-    std::printf("      全再構築のコスト（格子の刻み × ブロック一辺）:\n");
-    for (int brick : {8, 16, 32}) {
-        for (float cell : {0.25f, 0.1f}) {
+    std::printf("      全再構築のコスト（格子の刻み × 距離の近似。ブロックは16）:\n");
+    for (int full : {0, 1}) {
+        for (float cell : {0.25f, 0.15f, 0.1f}) {
+            const int brick = 16;
             AF_SceneHandle s = build(1.2f);
             AF_SceneSetRoomCellSize(s, cell);
+            AF_SceneSetRoomChamferFull(s, full);
             AF_SceneSetRoomBrick(s, brick);
             const auto t0 = std::chrono::high_resolution_clock::now();
             const int n = AF_SceneRoomCount(s);              // 初回はここで構築される
@@ -2644,11 +2689,13 @@ void diagnoseRoomDetection() {
             int nx = 0, ny = 0, nz = 0; float c2 = 0.0f;
             AF_SceneRoomGridDims(s, &nx, &ny, &nz, &c2);
             const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            float ma = 0, mf = 0, ml = 0, mm = 0; int hot = 0, nb = 0;
-            AF_SceneRoomBuildTimes(s, &ma, &mf, &ml, &mm, &hot, &nb);
-            std::printf("        %.2fm ブロック%2d  %7d ボクセル / %5d ブロック  %6.2f ms"
-                        "（確保 %.2f / 塗り %.2f / 連結 %.2f / 併合 %.2f）  部屋 %d\n",
-                        cell, brick, nx * ny * nz, nb, ms, ma, mf, ml, mm, n);
+            float ma = 0, mf = 0, md = 0, ml = 0, mm = 0, mg = 0; int hot = 0, nb = 0;
+            AF_SceneRoomBuildTimes(s, &ma, &mf, &md, &ml, &mm, &mg, &hot, &nb);
+            std::printf("        %.2fm %s  %7d ボクセル  %6.2f ms"
+                        "（確保 %.2f / 塗り %.2f / 距離 %.2f / 連結 %.2f / 併合 %.2f / 塗戻 %.2f）\n",
+                        cell, full ? "13近傍" : " 3近傍", nx * ny * nz, ms,
+                        ma, mf, md, ml, mm, mg);
+            (void)nb; (void)n;
             AF_SceneDestroy(s);
         }
     }
@@ -2675,8 +2722,8 @@ void diagnoseRoomDetection() {
             const int after = AF_SceneRoomCount(s);
             const auto t1 = std::chrono::high_resolution_clock::now();
             const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            float ma = 0, mf = 0, ml = 0, mm = 0; int hot = 0, nb = 0;
-            AF_SceneRoomBuildTimes(s, &ma, &mf, &ml, &mm, &hot, &nb);
+            float ma = 0, mf = 0, md = 0, ml = 0, mm = 0, mg = 0; int hot = 0, nb = 0;
+            AF_SceneRoomBuildTimes(s, &ma, &mf, &md, &ml, &mm, &mg, &hot, &nb);
             const double vInc = volumes(s);
             // 同じ形状を最初から作った場合（＝全再構築）と突き合わせる。
             AF_SceneHandle ref = build(0.0f);
@@ -2686,9 +2733,9 @@ void diagnoseRoomDetection() {
             const int refN = AF_SceneRoomCount(ref);
             const double vRef = volumes(ref);
             const bool same = (after == refN) && (std::fabs(vInc - vRef) < 0.5);
-            std::printf("        %.2fm ブロック%2d  %6.3f ms（塗り %.3f / 連結 %.3f / 併合 %.3f）"
+            std::printf("        %.2fm ブロック%2d  %6.3f ms（塗り %.3f / 距離 %.3f / 連結 %.3f / 併合 %.3f / 塗戻 %.3f）"
                         "  塗り直し %3d/%5d  部屋 %d→%d  体積 %.0f（全再構築 %.0f）%s\n",
-                        cell, brick, ms, mf, ml, mm, hot, nb, before, after, vInc, vRef,
+                        cell, brick, ms, mf, md, ml, mm, mg, hot, nb, before, after, vInc, vRef,
                         same ? "" : "  ★不一致");
             AF_SceneDestroy(ref);
             AF_SceneDestroy(s);
@@ -3560,6 +3607,62 @@ void testRoomIncremental() {
     }
 }
 
+// 部屋は「戸口で割れる」ことが要る。素の連結成分だと扉の向こうも同じ部屋になり、
+// 残響を切り替える土台にならない。侵食の半径で切り替わる位置を縛る。
+void testRoomSegmentation() {
+    std::printf("\n[部屋] 戸口で部屋が分かれるか\n");
+    const float h = 4.0f, t = 0.15f, hw = 6.0f, hd = 8.0f;
+    auto build = [&](float gap) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        const float half = gap * 0.5f;
+        if (gap <= 1e-3f) {
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        } else {
+            AF_SceneAddInstanceBox(s, V(-(hw + half) * 0.5f, h*0.5f, 0),
+                                   V((hw - half) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V( (hw + half) * 0.5f, h*0.5f, 0),
+                                   V((hw - half) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        }
+        return s;
+    };
+    auto rooms = [&](float gap, float radius) {
+        AF_SceneHandle s = build(gap);
+        AF_SceneSetRoomSeedRadius(s, radius);
+        const int n = AF_SceneRoomCount(s);
+        AF_SceneDestroy(s);
+        return n;
+    };
+    // 既定（半径 0.6m・格子 0.25m）で、人が通る幅の戸口が部屋を分けること。
+    check("[部屋] 閉じた仕切り → 2 部屋",        rooms(0.0f, 0.6f) == 2);
+    check("[部屋] 戸口 0.9m → 2 部屋（扉幅）",   rooms(0.9f, 0.6f) == 2);
+    check("[部屋] 戸口 2.0m → 1 部屋（開けた口）", rooms(2.0f, 0.6f) == 1);
+    // 半径 0 は侵食なし＝素の連結成分。戸口があれば必ず 1 部屋になる。
+    check("[部屋] 半径 0 なら戸口 0.3m でも 1 部屋", rooms(0.3f, 0.0f) == 1);
+    // 切り替わりの位置は「幅 = 半径 × 2」。半径を上げれば広い口も切れる。
+    check("[部屋] 半径 1.2m なら戸口 2.0m も 2 部屋", rooms(2.0f, 1.2f) == 2);
+
+    // 塗り戻し: 侵食で落とした殻にも部屋が付くこと。戸口のど真ん中に立っても
+    // どちらかの部屋になっていないと、そこでリスナーの部屋が消える。
+    {
+        AF_SceneHandle s = build(0.9f);
+        const int nearSide = AF_SceneRoomAt(s, V(0, 2.0f, -4.0f));
+        const int farSide  = AF_SceneRoomAt(s, V(0, 2.0f,  4.0f));
+        const int inDoor   = AF_SceneRoomAt(s, V(0, 2.0f,  0.0f));
+        const int atWall   = AF_SceneRoomAt(s, V(0, 2.0f, -7.8f));   // 壁から 0.05m
+        check("[部屋] 戸口の両側が別の部屋", nearSide >= 0 && farSide >= 0 && nearSide != farSide);
+        check("[部屋] 戸口の中にも部屋が付く", inDoor == nearSide || inDoor == farSide);
+        check("[部屋] 壁際にも部屋が付く",     atWall == nearSide);
+        AF_SceneDestroy(s);
+    }
+}
+
 void testRobustness() {
     std::printf("\n[頑健性] null / 不正引数\n");
     float g[kBands] = {};
@@ -3599,6 +3702,7 @@ int main() {
     testMesh();
     testDirectionalProbe();
     testSecondOrderDiffraction();
+    testRoomSegmentation();
     testRoomIncremental();
     diagnoseRoomDetection();
     diagnosePortalScope();

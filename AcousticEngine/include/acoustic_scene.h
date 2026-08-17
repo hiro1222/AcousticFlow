@@ -323,8 +323,20 @@ ACOUSTIC_API void AF_SceneRoomGridDims(AF_SceneHandle scene, int* nx, int* ny, i
  * どこを削るべきかを推測でなく数字で決めるため。null 可。
  * dirtyBricks が 0 なら全再構築、>0 なら差分更新。 */
 ACOUSTIC_API void AF_SceneRoomBuildTimes(AF_SceneHandle scene, float* alloc, float* fill,
-                                         float* label, float* merge,
+                                         float* dist, float* label, float* merge,
+                                         float* grow,
                                          int* dirtyBricks, int* totalBricks);
+
+/* 【部屋を戸口で割る半径(m)】既定 0.6。自由空間をこの半径ぶん侵食してから連結成分を取る。
+ * 素の連結成分だと戸口で繋がった空間が全部ひとつの部屋になり、扉の向こうも同じ部屋に
+ * なってしまう（残響を切り替える土台にならない）。幅がこの 2 倍に満たないくびれが
+ * 千切れるので、そこで部屋が分かれる。落とした殻は最寄りの部屋へ塗り戻すので、
+ * 全ボクセルに部屋が付く（戸口に立っていても必ずどちらかになる）。
+ * 0 で侵食なし＝素の連結成分。目安: 戸口の幅の半分 < 値 < 部屋の狭い所の半分。 */
+ACOUSTIC_API void AF_SceneSetRoomSeedRadius(AF_SceneHandle scene, float meters);
+
+/* 距離の近似（0=市街地距離の3近傍・既定 / 1=3-4-5 の13近傍）。品質とコストの比較用。 */
+ACOUSTIC_API void AF_SceneSetRoomChamferFull(AF_SceneHandle scene, int full);
 
 /* 差分更新の粒度（ブロック一辺のボクセル数）。既定 16。変えると全再構築が走る。
  * 小さいほど更新は局所的になるが、走査線の区間が切り詰められて全再構築が遅くなる。 */
