@@ -2805,6 +2805,96 @@ void diagnoseRoomDetection() {
     }
 }
 
+// 戸口ではない形で、部屋と開口がどう出るか。
+//   曲がり角・廊下・柱・食い違い壁 ── どれも「扉」ではないので、特別扱いを入れずに
+//   幾何だけで妥当な答えが出るかを見る。出るべきでない所に口が出たら偽の境界になり、
+//   出るべき所に出なければ結合の土台が無い。
+void diagnoseNonDoorShapes() {
+    std::printf("\n[診断] 戸口ではない形（曲がり角・廊下・柱・食い違い壁）\n");
+    const float h = 4.0f, t = 0.3f;
+    // 床天井壁で囲った中に置く塊。y を省くと全高。
+    struct Blk { float x0, x1, z0, z1; float y0 = 0.0f, y1 = -1.0f; };
+    // 内部 x∈[-X,X], z∈[-Z,Z], y∈[0,h] を壁で囲み、中に塊を置く。
+    auto world = [&](float X, float Z, const std::vector<Blk>& blocks) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),      V(X + t, t, Z + t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0),   V(X + t, t, Z + t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-X - t, h*0.5f, 0), V(t, h*0.5f, Z + t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( X + t, h*0.5f, 0), V(t, h*0.5f, Z + t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -Z - t), V(X + t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  Z + t), V(X + t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        for (const Blk& b : blocks) {
+            const float y0 = b.y0, y1 = (b.y1 < 0.0f) ? h : b.y1;
+            AF_SceneAddInstanceBox(s, V((b.x0 + b.x1) * 0.5f, (y0 + y1) * 0.5f, (b.z0 + b.z1) * 0.5f),
+                                   V((b.x1 - b.x0) * 0.5f, (y1 - y0) * 0.5f, (b.z1 - b.z0) * 0.5f),
+                                   V(1,0,0), V(0,1,0), m);
+        }
+        AF_SceneSetRoomCellSize(s, 0.1f);
+        return s;
+    };
+    auto report = [&](const char* name, AF_SceneHandle s) {
+        const int nr = AF_SceneRoomCount(s), na = AF_SceneApertureCount(s);
+        std::printf("      %-28s 部屋 %d / 口 %d", name, nr, na);
+        for (int i = 0; i < nr && i < 4; ++i) {
+            float v = 0.0f; AF_SceneRoomInfo(s, i, &v, nullptr, nullptr, nullptr);
+            std::printf("%s%.0fm3", (i == 0) ? "   体積 " : " ", v);
+        }
+        for (int i = 0; i < na && i < 3; ++i) {
+            float a = 0.0f; AF_Vector3 c{};
+            AF_SceneApertureInfo(s, i, &a, &c, nullptr, nullptr, nullptr);
+            std::printf("%s%.1fm2@(%.1f,%.1f)", (i == 0) ? "   口 " : " ", a, c.x, c.z);
+        }
+        std::printf("\n");
+        AF_SceneDestroy(s);
+    };
+
+    // ① L 字の曲がり角（幅 2.0m 一定）。曲がるだけで広さは変わらないので、
+    //    ここで部屋が割れたら偽の境界。
+    report("L字の曲がり角 幅2.0m", world(9.0f, 9.0f, {
+        {-9.0f, -1.0f,  1.0f,  9.0f}, { 1.0f,  9.0f,  1.0f,  9.0f},
+        { 1.0f,  9.0f, -1.0f,  1.0f}, {-9.0f,  9.0f, -9.0f, -1.0f},
+    }));
+    // ② 同じ L 字を幅 1.0m で。人が通る幅の廊下。
+    report("L字の曲がり角 幅1.0m", world(9.0f, 9.0f, {
+        {-9.0f, -0.5f,  0.5f,  9.0f}, { 0.5f,  9.0f,  0.5f,  9.0f},
+        { 0.5f,  9.0f, -0.5f,  0.5f}, {-9.0f,  9.0f, -9.0f, -0.5f},
+    }));
+
+    // ③ 廊下で繋がった 2 部屋。廊下の幅を振る。
+    for (float w : {0.9f, 1.2f, 2.0f, 3.0f}) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "廊下(長さ6m)で繋いだ2部屋 幅%.1fm", w);
+        report(name, world(10.0f, 5.0f, {
+            {-3.0f, 3.0f,  w * 0.5f,  5.0f}, {-3.0f, 3.0f, -5.0f, -w * 0.5f},
+        }));
+    }
+
+    // ④ 大部屋に柱。柱で部屋が割れたら偽の境界。
+    report("大部屋に柱 1.0m角", world(8.0f, 8.0f, {{-0.5f, 0.5f, -0.5f, 0.5f}}));
+    report("大部屋に柱 4本",     world(8.0f, 8.0f, {
+        {-4.5f, -3.5f, -4.5f, -3.5f}, { 3.5f, 4.5f, -4.5f, -3.5f},
+        {-4.5f, -3.5f,  3.5f,  4.5f}, { 3.5f, 4.5f,  3.5f,  4.5f},
+    }));
+
+    // ⑤ 食い違い壁（音を通しにくくするための Z 字。見通しは切れるが繋がっている）。
+    //    仕切り 2 枚を z=-0.5 と z=0.5 にずらして重ねる。
+    report("食い違い壁 隙間1.0m", world(6.0f, 6.0f, {
+        {-6.0f, 1.0f, -0.65f, -0.35f}, {-1.0f, 6.0f, 0.35f, 0.65f},
+    }));
+
+    // ⑥ 高さ方向の形。腰高の仕切りは上が全部開いているので割れないのが正しい。
+    //    壁に窓だけ開いている場合は割れて、口の面積が窓の実寸になるのが正しい。
+    report("腰高の仕切り(高さ1.2m)", world(6.0f, 6.0f, {
+        {-6.0f, 6.0f, -0.15f, 0.15f, 0.0f, 1.2f},
+    }));
+    report("窓だけの壁(1.0x1.0m)", world(6.0f, 6.0f, {
+        {-6.0f, -0.5f, -0.15f, 0.15f}, { 0.5f, 6.0f, -0.15f, 0.15f},
+        {-0.5f,  0.5f, -0.15f, 0.15f, 0.0f, 1.5f},
+        {-0.5f,  0.5f, -0.15f, 0.15f, 2.5f, 4.0f},
+    }));
+}
+
 void diagnosePortalScope() {
     std::printf("\n[診断] ポータルは自分が覆う開口だけを担当しているか\n");
     auto build = [](bool withPortal) {
@@ -3732,6 +3822,74 @@ void testRoomSegmentation() {
         check("[開口] 壁だけなら口は出ない", AF_SceneApertureCount(s) == 0);
         AF_SceneDestroy(s);
     }
+    // ── 戸口ではない形 ──
+    //   曲がり角・柱・腰高の仕切りは「くびれ」ではないので割れてはいけない。
+    //   割れると、そこに偽の境界ができて音が跳ねる。
+    {
+        const float hh = 4.0f, tt = 0.3f;
+        struct Blk { float x0, x1, z0, z1; float y0 = 0.0f, y1 = -1.0f; };
+        auto world = [&](float X, float Z, const std::vector<Blk>& blocks) {
+            AF_SceneHandle s = AF_SceneCreate();
+            const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+            AF_SceneAddInstanceBox(s, V(0, -tt, 0),     V(X+tt, tt, Z+tt), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, hh+tt, 0),   V(X+tt, tt, Z+tt), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(-X-tt, hh*0.5f, 0), V(tt, hh*0.5f, Z+tt), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V( X+tt, hh*0.5f, 0), V(tt, hh*0.5f, Z+tt), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, hh*0.5f, -Z-tt), V(X+tt, hh*0.5f, tt), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, hh*0.5f,  Z+tt), V(X+tt, hh*0.5f, tt), V(1,0,0), V(0,1,0), m);
+            for (const Blk& b : blocks) {
+                const float y0 = b.y0, y1 = (b.y1 < 0.0f) ? hh : b.y1;
+                AF_SceneAddInstanceBox(s, V((b.x0+b.x1)*0.5f, (y0+y1)*0.5f, (b.z0+b.z1)*0.5f),
+                                       V((b.x1-b.x0)*0.5f, (y1-y0)*0.5f, (b.z1-b.z0)*0.5f),
+                                       V(1,0,0), V(0,1,0), m);
+            }
+            AF_SceneSetRoomCellSize(s, 0.1f);
+            return s;
+        };
+        {   // L 字の曲がり角。曲がるだけで広さは変わらない＝境界ではない。
+            AF_SceneHandle s = world(9.0f, 9.0f, {
+                {-9.0f,-0.5f, 0.5f, 9.0f}, { 0.5f, 9.0f, 0.5f, 9.0f},
+                { 0.5f, 9.0f,-0.5f, 0.5f}, {-9.0f, 9.0f,-9.0f,-0.5f},
+            });
+            check("[開口] 曲がり角では割れない",
+                  AF_SceneRoomCount(s) == 1 && AF_SceneApertureCount(s) == 0);
+            AF_SceneDestroy(s);
+        }
+        {   // 大部屋の柱。周りを回れるので境界ではない。
+            AF_SceneHandle s = world(8.0f, 8.0f, {{-0.5f, 0.5f, -0.5f, 0.5f}});
+            check("[開口] 柱では割れない",
+                  AF_SceneRoomCount(s) == 1 && AF_SceneApertureCount(s) == 0);
+            AF_SceneDestroy(s);
+        }
+        {   // 腰高の仕切り。上が全部開いているので境界ではない。
+            AF_SceneHandle s = world(6.0f, 6.0f, {{-6.0f, 6.0f, -0.15f, 0.15f, 0.0f, 1.2f}});
+            check("[開口] 腰高の仕切りでは割れない",
+                  AF_SceneRoomCount(s) == 1 && AF_SceneApertureCount(s) == 0);
+            AF_SceneDestroy(s);
+        }
+        {   // 壁に 1.0 × 1.0m の窓だけ。割れて、口の面積が窓の実寸になること。
+            AF_SceneHandle s = world(6.0f, 6.0f, {
+                {-6.0f,-0.5f,-0.15f, 0.15f}, { 0.5f, 6.0f,-0.15f, 0.15f},
+                {-0.5f, 0.5f,-0.15f, 0.15f, 0.0f, 1.5f},
+                {-0.5f, 0.5f,-0.15f, 0.15f, 2.5f, 4.0f},
+            });
+            float a = 0.0f;
+            const int na = AF_SceneApertureCount(s);
+            if (na > 0) AF_SceneApertureInfo(s, 0, &a, nullptr, nullptr, nullptr, nullptr);
+            check("[開口] 窓だけの壁は割れる", AF_SceneRoomCount(s) == 2 && na == 1);
+            check("[開口] 窓の口の面積が実寸(1.0m2)", na == 1 && std::fabs(a - 1.0f) < 0.25f);
+            AF_SceneDestroy(s);
+        }
+        {   // 食い違い壁。見通しは切れるが繋がっている＝割れて口が出るのが正しい。
+            AF_SceneHandle s = world(6.0f, 6.0f, {
+                {-6.0f, 1.0f,-0.65f,-0.35f}, {-1.0f, 6.0f, 0.35f, 0.65f},
+            });
+            check("[開口] 食い違い壁は割れて口が出る",
+                  AF_SceneRoomCount(s) == 2 && AF_SceneApertureCount(s) == 1);
+            AF_SceneDestroy(s);
+        }
+    }
+
     // 同じ 2 部屋を繋ぐ口が 2 つあるとき、まとめずに分けること。
     {
         AF_SceneHandle s = AF_SceneCreate();
@@ -3802,6 +3960,7 @@ int main() {
     testRoomSegmentation();
     testRoomIncremental();
     diagnoseRoomDetection();
+    diagnoseNonDoorShapes();
     diagnosePortalScope();
     diagnoseNonPlateBlocker();
     diagnoseApertureWidthCurve();
