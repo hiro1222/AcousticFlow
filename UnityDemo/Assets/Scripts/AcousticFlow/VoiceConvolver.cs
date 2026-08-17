@@ -71,6 +71,29 @@ namespace AcousticFlow
         // メインスレッドが書き、audio thread が読む（値のコピーだけなのでロックしない）。
         private volatile float _wet = 1f, _srcLevel = 1f;
         private float _splitMs = 120f;   // 早期↔後期の境目。急に動かさない（下の解説）
+        private int _tailEchoVersion = -1;   // 最後に取り込んだエコグラムの版
+        private float[] _lastEarGain;        // 最後に焼き込んだ左右バランス
+
+        // 尾の左右バランスが意味のある量だけ変わったか。エコグラムより速く動くので、
+        // 版が同じでもこれが変われば作り直す必要がある。閾値未満は無視して差し替えを減らす。
+        private bool EarGainChanged(float[] ear)
+        {
+            if (ear == null) { bool had = _lastEarGain != null; _lastEarGain = null; return had; }
+            if (_lastEarGain == null || _lastEarGain.Length != ear.Length)
+            {
+                _lastEarGain = (float[])ear.Clone();
+                return true;
+            }
+            for (int i = 0; i < ear.Length; i++)
+            {
+                if (Mathf.Abs(ear[i] - _lastEarGain[i]) > 0.02f)
+                {
+                    System.Array.Copy(ear, _lastEarGain, ear.Length);
+                    return true;
+                }
+            }
+            return false;
+        }
 
         // ★C# 経路(IrConvolver)と同時に有効にしない。
         //   両方が OnAudioFilterRead を返すと、同じ音源が二重に鳴る（実際に踏んだ）。
@@ -204,12 +227,25 @@ namespace AcousticFlow
             tapCount = n;
 
             // ── 後期尾。重いので数フレームに1回 ──
+            //
+            // ★エコグラムの中身が変わったときだけ作り直す。
+            //   尾の IR はブロック境界で**ハードスワップ**される（クロスフェードしない）。
+            //   分割畳み込みは過去の入力ブロックを保持しているので、IR を差し替えると
+            //   「もう出ている尾」が別の IR で畳み直される。中身が同じでも毎回差し替えると
+            //   60fps で毎秒 7.5 回それが起き、移動中に尾が揺れて二重に聞こえる。
+            //   C# 経路(IrConvolver)には最初からこのガードがあったが、こちらには無かった。
+            //   エンジンはエコグラムを内部レートでしか作り直さないので、版が同じなら
+            //   差し替える理由が無い。
             if (++_frameCounter >= Mathf.Max(1, tailRebuildEveryFrames))
             {
                 _frameCounter = 0;
                 var scene = AcousticFlowSceneDemo.SharedScene;
-                if (scene != null && scene.IsValid)
+                int echoVer = AcousticFlowSceneDemo.Status.EchogramVersion;
+                var earNow = AcousticFlowSceneDemo.Status.TailEarBandGain;
+                bool earChanged = EarGainChanged(earNow);
+                if (scene != null && scene.IsValid && (echoVer != _tailEchoVersion || earChanged))
                 {
+                    _tailEchoVersion = echoVer;
                     int bins = scene.GetEchogramBands(_echo, _echo.Length / nb);
                     if (bins > 0)
                     {
