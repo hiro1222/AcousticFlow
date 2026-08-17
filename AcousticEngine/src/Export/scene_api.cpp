@@ -669,6 +669,11 @@ void AF_SceneSetRoomSeedRadius(AF_SceneHandle scene, float meters) {
     if (s) s->setRoomSeedRadius(meters);
 }
 
+void AF_SceneSetDiffractionFlat(AF_SceneHandle scene, int flat) {
+    Scene* s = asScene(scene);
+    if (s) s->setDiffractionFlat(flat != 0);
+}
+
 void AF_SceneSetRoomChamferFull(AF_SceneHandle scene, int full) {
     Scene* s = asScene(scene);
     if (s) s->setRoomChamferFull(full != 0);

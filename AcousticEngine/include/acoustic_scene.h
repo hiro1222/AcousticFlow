@@ -335,6 +335,13 @@ ACOUSTIC_API void AF_SceneRoomBuildTimes(AF_SceneHandle scene, float* alloc, flo
  * 0 で侵食なし＝素の連結成分。目安: 戸口の幅の半分 < 値 < 部屋の狭い所の半分。 */
 ACOUSTIC_API void AF_SceneSetRoomSeedRadius(AF_SceneHandle scene, float meters);
 
+/* 【回折を平坦にする】既定 ON(1)。回折が持つ情報を「開口の方向」と「回り込んだぶんの
+ * 距離減衰」に限り、周波数依存のこもりは**透過**だけに担当させる。
+ * OFF にすると前川の帯域依存が生存ゲインに乗る ── 直線上に 0.6m 角の柱を 1 本置くだけで
+ * 生存ゲインが 1.000 全帯域 → 0.895/0.883/0.834/0.774/0.679/0.584（傾き -3.7dB）になり、
+ * 障害物があるだけで音色が変わる。 */
+ACOUSTIC_API void AF_SceneSetDiffractionFlat(AF_SceneHandle scene, int flat);
+
 /* 距離の近似（1=3-4-5 の13近傍・既定 / 0=市街地距離の3近傍）。
  * 0 は 0.15m 以下の細かい格子でだけ使うこと（粗いと戸口の幅の差が丸まって消える）。 */
 ACOUSTIC_API void AF_SceneSetRoomChamferFull(AF_SceneHandle scene, int full);

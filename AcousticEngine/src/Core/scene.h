@@ -281,6 +281,12 @@ public:
     void setRoomSeedRadius(float m) { roomBuilder_.setSeedRadius(m); }
     void setRoomChamferFull(bool on) { roomBuilder_.setChamferFull(on); }
 
+    // 【回折を平坦にする】既定 ON。回折が持つ情報を「開口の方向」と「距離減衰」に限り、
+    //   周波数依存のこもりは透過だけに担当させる。OFF にすると前川の帯域依存が
+    //   生存ゲインに乗る（＝障害物を 1 つ置くだけで音色が傾く）。
+    void setDiffractionFlat(bool on) { diffractionFlat_ = on; }
+    bool diffractionFlat() const { return diffractionFlat_; }
+
     // 点のまわりで各部屋が占める割合（合計 1、大きい順）。書けた数を返す。
     // 部屋を音に使うときはこれを通すこと（部屋番号で切り替えると戸口で音が跳ねる）。
     int roomWeights(const Vec3& p, float radius, int* rooms, float* weights, int maxOut) const {
@@ -3306,6 +3312,22 @@ public:
             diffractionContinuous(listener, source, centerOcc, dif);
         }
 
+        // 【回折を平坦にする】回折が持つ情報は「開口の方向」と「回り込んだぶんの距離減衰」で、
+        //   周波数依存のこもりは**透過が担当**する ── という方針を前に決めてある。
+        //   ところがその切り替えはホスト側の二次音源タップにしか入っておらず、
+        //   ここ（メインのボイスに掛かる生存ゲイン）には前川の帯域依存がそのまま残っていた。
+        //   実測: 直線上に 0.6m 角の柱を 1 本置くだけで、生存ゲインが
+        //     柱なし 125..4k = 1.000 全帯域
+        //     柱あり 0.895 / 0.883 / 0.834 / 0.774 / 0.679 / 0.584（傾き -3.7dB）
+        //   になっていた。「回折で LPF は掛けない」と言いながら掛かっていた。
+        //   帯域平均に均して、量は保ったまま傾きだけを消す。
+        if (diffractionFlat_) {
+            float mean = 0.0f;
+            for (int b = 0; b < kNumBands; ++b) mean += dif[b];
+            mean /= static_cast<float>(kNumBands);
+            for (int b = 0; b < kNumBands; ++b) dif[b] = mean;
+        }
+
         // 迂回余剰長 δ（ステアの重み付けに使う）。非遮蔽=0 / 迂回路なし=大。
         float detourDelta = 0.0f;
         if (centerOcc) {
@@ -4629,6 +4651,8 @@ private:
     mutable bool bvhDirty_ = true;             // インスタンス変更で立つ再構築フラグ
     // 部屋・開口の検出。幾何が変わった領域だけ塗り直す（毎フレームではない）。
     mutable rooms::Builder roomBuilder_;
+    // 回折の帯域依存を捨てるか（既定 ON。こもりは透過が担当する方針）。
+    bool diffractionFlat_ = true;
     mutable std::vector<DiffEdge> edgeCatalog_;  // キューブマップ由来のシルエット稜線
 };
 

@@ -3084,6 +3084,117 @@ void diagnoseReverbSendWalk() {
     AF_SceneDestroy(s);
 }
 
+// 直線上に柱を 1 本置いただけで音色がどれだけ変わるか。
+//   回折の周波数依存は切ってあるので、帯域ごとのゲインは平坦なはず。それでも音色が
+//   変わるなら、原因はフィルタではなく「直接音と反射の力関係」と「反射どうしの櫛」。
+//   どちらがどれだけ効いているかを分けて出す。
+void diagnosePillarTimbre() {
+    std::printf("\n[診断] 直線上に柱があるだけで音色が変わる理由\n");
+    const float h = 4.0f, t = 0.3f, hw = 5.0f, hd = 6.0f;
+    auto build = [&](bool pillar, const float* absorb) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, absorb, nullptr, absorb ? 6 : 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),    V(hw + t, t, hd + t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw + t, t, hd + t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw - t, h*0.5f, 0), V(t, h*0.5f, hd + t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw + t, h*0.5f, 0), V(t, h*0.5f, hd + t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd - t), V(hw + t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd + t), V(hw + t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        if (pillar)   // 直線のど真ん中に 0.6m 角の柱
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(0.3f, h*0.5f, 0.3f), V(1,0,0), V(0,1,0), m);
+        return s;
+    };
+    const AF_Vector3 L = V(0, 1.6f, -3.5f), S = V(0, 1.6f, 3.5f);
+    const char* bandName[6] = {"125", "250", "500", " 1k", " 2k", " 4k"};
+
+    // 0: 柱なし / 1: 柱あり / 2: 柱あり＋表面が吸わない（残った傾きの出どころを切り分ける）
+    const float noAbsorb[6] = {0, 0, 0, 0, 0, 0};
+    const char* caseName[3] = {"柱なし:", "柱あり:", "柱あり・表面が吸わない:"};
+    double bandNo[6] = {}, bandYes[6] = {}, bandHard[6] = {};
+    for (int k = 0; k < 3; ++k) {
+        AF_SceneHandle s = build(k >= 1, (k == 2) ? noAbsorb : nullptr);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+
+        // 1) 適用される帯域ゲイン（＝フィルタとして掛かる量）
+        float occ[kBands] = {};
+        const int idx = AF_SceneSourceIndex(s, 1);
+        if (idx >= 0) AF_SceneGetSourceOcclusion(s, idx, occ);
+        std::printf("      %s\n", caseName[k]);
+        std::printf("        生存ゲイン(帯域) ");
+        for (int b = 0; b < kBands; ++b) std::printf(" %s=%.3f", bandName[b], occ[b]);
+        std::printf("\n");
+
+        // 2) 早期反射タップ（直接との力関係と、遅延の散らばり）
+        AF_Vector3 pos[16]; float g6[16 * kBands];
+        const int nt = (idx >= 0) ? AF_SceneGetEarlyReflections(s, idx, pos, g6, 16) : 0;
+        const double dx = S.x - L.x, dy = S.y - L.y, dz = S.z - L.z;
+        const double rDirect = std::sqrt(dx*dx + dy*dy + dz*dz);
+        double gDirect = 0.0;
+        for (int b = 0; b < kBands; ++b) gDirect += occ[b];
+        gDirect /= kBands;
+        std::printf("        直接: 距離 %.2fm  生存 %.3f\n", rDirect, gDirect);
+        std::printf("        反射 %d 本（遅延は直接との差）:\n", nt);
+        double sumRefl = 0.0, minDelay = 1e9, maxDelay = -1e9;
+        for (int i = 0; i < nt; ++i) {
+            const double ex = pos[i].x - L.x, ey = pos[i].y - L.y, ez = pos[i].z - L.z;
+            const double ri = std::sqrt(ex*ex + ey*ey + ez*ez);
+            const double delayMs = (ri - rDirect) / 343.0 * 1000.0;
+            double gm = 0.0;
+            for (int b = 0; b < kBands; ++b) gm += g6[i * kBands + b];
+            gm /= kBands;
+            sumRefl += gm;
+            if (gm > 0.01) { minDelay = std::min(minDelay, delayMs); maxDelay = std::max(maxDelay, delayMs); }
+            if (i < 6)
+                std::printf("          %2d  +%5.2f ms  ゲイン %.3f  （直接比 %+.1f dB）\n",
+                            i, delayMs, gm, 20.0 * std::log10(std::max(gm, 1e-6) / std::max(gDirect, 1e-6)));
+        }
+        if (nt > 0 && maxDelay > minDelay)
+            std::printf("        反射の合計 %.3f（直接の %.1f 倍 = %+.1f dB）  "
+                        "遅延の幅 %.2f〜%.2f ms → 櫛の最初の谷 %.0f Hz\n",
+                        sumRefl, sumRefl / std::max(gDirect, 1e-6),
+                        20.0 * std::log10(std::max(sumRefl, 1e-6) / std::max(gDirect, 1e-6)),
+                        minDelay, maxDelay, 1000.0 / (2.0 * std::max(minDelay, 0.01)));
+
+        // 3) 実際に耳へ届くスペクトル（エコグラムの帯域別総和）
+        float echo[100 * kBands] = {};
+        const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+        double* dst = (k == 0) ? bandNo : ((k == 1) ? bandYes : bandHard);
+        for (int b = 0; b < kBands; ++b) {
+            double sum = 0.0;
+            for (int i = 0; i < bins; ++i) sum += echo[i * kBands + b];
+            dst[b] = sum;
+        }
+        AF_SceneDestroy(s);
+    }
+
+    std::printf("      ── 音色の変化（柱あり ÷ 柱なし、帯域別の総エネルギー）──\n");
+    std::printf("        帯域    ");
+    for (int b = 0; b < kBands; ++b) std::printf("  %sHz ", bandName[b]);
+    std::printf("\n        変化(dB)");
+    double lo = 1e9, hi = -1e9;
+    for (int b = 0; b < kBands; ++b) {
+        const double d = 10.0 * std::log10(std::max(bandYes[b], 1e-12)
+                                         / std::max(bandNo[b], 1e-12));
+        lo = std::min(lo, d); hi = std::max(hi, d);
+        std::printf(" %+6.1f", d);
+    }
+    std::printf("\n        → 帯域間の傾き %.1f dB（0 なら音量だけ変わって音色は変わらない）\n",
+                hi - lo);
+    // 表面が吸わない場合と比べる。傾きが消えるなら、残りは回折ではなく吸音由来。
+    double lo2 = 1e9, hi2 = -1e9;
+    std::printf("        表面が吸わない場合 ");
+    for (int b = 0; b < kBands; ++b) {
+        const double d = 10.0 * std::log10(std::max(bandHard[b], 1e-12)
+                                         / std::max(bandNo[b], 1e-12));
+        lo2 = std::min(lo2, d); hi2 = std::max(hi2, d);
+        std::printf(" %+6.1f", d);
+    }
+    std::printf("\n        → 傾き %.1f dB（ここが 0 に近いなら、残りの傾きは回折ではなく"
+                "壁の吸音が高域を食っているぶん＝物理的に正しい残り方）\n", hi2 - lo2);
+}
+
 void diagnoseNonDoorShapes() {
     std::printf("\n[診断] 戸口ではない形（曲がり角・廊下・柱・食い違い壁）\n");
     const float h = 4.0f, t = 0.3f;
@@ -4097,6 +4208,55 @@ void testRoomSegmentation() {
         check("[開口] 壁だけなら口は出ない", AF_SceneApertureCount(s) == 0);
         AF_SceneDestroy(s);
     }
+    // ── 回折で音色を変えない ──
+    //   決めてある方針: 回折が持つ情報は「開口の方向」と「回り込んだぶんの距離減衰」で、
+    //   周波数依存のこもりは透過と吸音が担当する。ところがこの切り替えはホスト側の
+    //   二次音源タップにしか入っておらず、メインのボイスに掛かる生存ゲインには
+    //   前川の帯域依存が残っていた（実測: 柱 1 本で傾き -3.7dB）。
+    //   吸わない表面なら、障害物を置いても生存ゲインは平坦でなければならない。
+    {
+        const float hh = 4.0f, tt = 0.3f, hw2 = 5.0f, hd2 = 6.0f;
+        const float noAbsorb[6] = {0, 0, 0, 0, 0, 0};
+        auto build = [&](bool pillar, const float* absorb) {
+            AF_SceneHandle s = AF_SceneCreate();
+            const int m = AF_SceneAddMaterial(s, nullptr, absorb, nullptr, absorb ? 6 : 0);
+            AF_SceneAddInstanceBox(s, V(0, -tt, 0),    V(hw2+tt, tt, hd2+tt), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, hh+tt, 0),  V(hw2+tt, tt, hd2+tt), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(-hw2-tt, hh*0.5f, 0), V(tt, hh*0.5f, hd2+tt), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V( hw2+tt, hh*0.5f, 0), V(tt, hh*0.5f, hd2+tt), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, hh*0.5f, -hd2-tt), V(hw2+tt, hh*0.5f, tt), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, hh*0.5f,  hd2+tt), V(hw2+tt, hh*0.5f, tt), V(1,0,0), V(0,1,0), m);
+            if (pillar)
+                AF_SceneAddInstanceBox(s, V(0, hh*0.5f, 0), V(0.3f, hh*0.5f, 0.3f), V(1,0,0), V(0,1,0), m);
+            return s;
+        };
+        auto tiltDb = [&](bool pillar, bool flat, const float* absorb) {
+            AF_SceneHandle s = build(pillar, absorb);
+            AF_SceneSetDiffractionFlat(s, flat ? 1 : 0);
+            AF_SceneSetListener(s, V(0, 1.6f, -3.5f));
+            AF_SceneSetSource(s, 1, V(0, 1.6f, 3.5f));
+            for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+            float occ[kBands] = {};
+            const int idx = AF_SceneSourceIndex(s, 1);
+            if (idx >= 0) AF_SceneGetSourceOcclusion(s, idx, occ);
+            float lo = 1e9f, hi = -1e9f;
+            for (int b = 0; b < kBands; ++b) { lo = std::min(lo, occ[b]); hi = std::max(hi, occ[b]); }
+            AF_SceneDestroy(s);
+            return 20.0f * std::log10(std::max(hi, 1e-6f) / std::max(lo, 1e-6f));
+        };
+        check("[回折] 障害物なしなら生存ゲインは平坦", tiltDb(false, true, noAbsorb) < 0.2f);
+        check("[回折] 柱を置いても生存ゲインは平坦（吸わない表面）",
+              tiltDb(true, true, noAbsorb) < 0.2f);
+        // 切り替えが効いている証拠。★吸わない表面だと反射が強すぎて回折の傾きが薄まるので、
+        //   ここは既定壁（吸音あり）で比べる。既定壁では平坦化 ON でも吸音ぶんの傾きが残る
+        //   （物理的に正しい残り方）ので、絶対値ではなく ON/OFF の差で見る。
+        {
+            const float on = tiltDb(true, true, nullptr);
+            const float off = tiltDb(true, false, nullptr);
+            check("[回折] 平坦化を切ると傾きが増える", off > on + 1.0f);
+        }
+    }
+
     // ── 部屋の占め方（部屋を音に使うための唯一の入口）──
     //   部屋番号そのもので残響を切り替えると、プレイヤーが必ず通る戸口のど真ん中に
     //   不連続を置くことになる。割合が連続に変わることがこの層の存在理由なので、
@@ -4352,6 +4512,7 @@ int main() {
     testRoomIncremental();
     diagnoseRoomDetection();
     diagnoseNonDoorShapes();
+    diagnosePillarTimbre();
     diagnoseReverbSendWalk();
     diagnosePortalScope();
     diagnoseNonPlateBlocker();
