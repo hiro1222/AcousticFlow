@@ -3200,6 +3200,65 @@ void diagnosePillarTimbre() {
 //   影に入りきると材質の透過（コンクリで 1e-4 級）まで落ちる。つまり**影の中では
 //   直接音が事実上消える**。半分遮られただけで -43dB という実測があったので、
 //   遮蔽の進み方と直接音の落ち方を刻んで並べる。
+// 部屋の吸音率と「定位が立つか」の関係。
+//   残響が直接音を上回ると定位は失われる。境目は臨界距離 rc=0.057√(V/RT60) で、
+//   これより遠いと残響優位。裸のコンクリ箱だと rc が 0.5m を切り、部屋のどこにいても
+//   残響優位＝定位が立たない。素材をどこまで吸わせれば実用になるかを数字で出す。
+void diagnoseAbsorptionVsLocalization() {
+    std::printf("\n[診断] 部屋の吸音率と定位（臨界距離）\n");
+    const float h = 4.0f, t = 0.3f, hw = 6.0f, hd = 7.0f;
+    auto build = [&](const float* ab) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, ab, nullptr, 6);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),    V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0),   V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        return s;
+    };
+    struct C { const char* name; float a; };
+    const C cases[] = {
+        {"裸のコンクリ            ", 0.02f},
+        {"塗装コンクリ            ", 0.04f},
+        {"石膏ボード（既定壁）    ", 0.15f},
+        {"内装あり（家具・カーテン）", 0.25f},
+        {"よく吸う（布・吸音材）  ", 0.40f},
+    };
+    std::printf("      12x4x14m の部屋（V≒672m3）。r=5m の位置での残響/直接比。\n");
+    std::printf("        素材                        吸音率  RT60(s)  臨界距離  r=5m での比  wet\n");
+    for (const C& c : cases) {
+        const float ab[6] = {c.a, c.a, c.a, c.a, c.a, c.a};
+        AF_SceneHandle s = build(ab);
+        const int room = AF_SceneRoomAt(s, V(0, 1.6f, 0));
+        float vol = 0.0f, rt[6] = {};
+        if (room >= 0) {
+            AF_SceneRoomInfo(s, room, &vol, nullptr, nullptr, nullptr);
+            AF_SceneRoomAcoustics(s, room, nullptr, nullptr, nullptr, rt);
+        }
+        const double rc = 0.057 * std::sqrt(vol / std::max(static_cast<double>(rt[2]), 0.05));
+        const double tRaw = (5.0 * 5.0) / std::max(rc * rc, 1e-4);
+        const double tCmp = std::pow(tRaw, 0.5);          // 既定の知覚圧縮 exponent=0.5
+        const double wet = tCmp / (1.0 + tCmp);
+        std::printf("        %s  %.2f   %6.2f   %6.2f m   %7.1f→%5.1f  %.3f\n",
+                    c.name, c.a, rt[2], rc, tRaw, tCmp, wet);
+        AF_SceneDestroy(s);
+    }
+    std::printf("      ※臨界距離より遠いと残響優位＝定位が立たない。\n");
+    std::printf("        帯域別 RT60（内装ありの場合、空気吸収込み）: ");
+    {
+        const float ab[6] = {0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f};
+        AF_SceneHandle s = build(ab);
+        const int room = AF_SceneRoomAt(s, V(0, 1.6f, 0));
+        float rt[6] = {};
+        if (room >= 0) AF_SceneRoomAcoustics(s, room, nullptr, nullptr, nullptr, rt);
+        for (int b = 0; b < 6; ++b) std::printf("%.2f ", rt[b]);
+        std::printf("s\n");
+        AF_SceneDestroy(s);
+    }
+}
+
 void diagnoseShadowCliff() {
     std::printf("\n[診断] 柱の陰へ入るとき直接音はどう落ちるか\n");
     const float h = 4.0f, t = 0.3f, hw = 6.0f, hd = 7.0f;
@@ -4620,6 +4679,7 @@ int main() {
     testRoomSegmentation();
     testRoomIncremental();
     diagnoseRoomDetection();
+    diagnoseAbsorptionVsLocalization();
     diagnoseShadowCliff();
     diagnoseNonDoorShapes();
     diagnosePillarTimbre();

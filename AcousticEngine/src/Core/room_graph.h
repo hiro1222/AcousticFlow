@@ -802,7 +802,13 @@ private:
                     }
                 }
             }
-        // Sabine: RT60 = 0.161 V / A。A は吸音面積(m2 sabins)。
+        // Sabine（空気吸収込み）: RT60 = 0.161 V / (A + 4mV)。
+        //   A は境界の吸音面積(m2 sabins)、4mV は空気そのものが吸うぶん。
+        //   ★4mV を落としてはいけない。広い部屋・長い残響・高域ほど効き、実測では
+        //     4kHz で RT60 が半分近くになる。これが無いと高域だけ不自然に長く伸びる。
+        //     m の値はホスト側の空気吸収 dB/m と同じ表から換算（1 dB/m = 0.1151 Np/m）。
+        static const double kAirDbPerM[kNumBands] =
+            {0.0003, 0.0008, 0.0017, 0.003, 0.0085, 0.025};
         for (std::size_t u = 0; u < nr; ++u) {
             Room& rm = res_.rooms[u];
             rm.surface = static_cast<float>(area[u]);
@@ -810,8 +816,10 @@ private:
             const double vol = static_cast<double>(rm.voxels) * g.cell * g.cell * g.cell;
             for (int b = 0; b < kNumBands; ++b) {
                 const double A = absA[u * kNumBands + static_cast<std::size_t>(b)];
+                const double mAir = kAirDbPerM[b] * 0.1151;      // dB/m → ネーパ/m
+                const double denom = A + 4.0 * mAir * vol;
                 rm.absorb[b] = (area[u] > 1e-9) ? static_cast<float>(A / area[u]) : 0.0f;
-                rm.rt60[b] = (A > 1e-9) ? static_cast<float>(0.161 * vol / A) : 0.0f;
+                rm.rt60[b] = (denom > 1e-9) ? static_cast<float>(0.161 * vol / denom) : 0.0f;
             }
         }
         if (faceIdx_.empty()) return;
