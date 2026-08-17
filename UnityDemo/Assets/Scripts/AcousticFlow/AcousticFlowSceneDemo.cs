@@ -574,6 +574,14 @@ namespace AcousticFlow
             public int Count;
             public float ItdgMs;                    // 最初の反射までの相対遅延=ITDG
             public float SourceLevel;               // 反射込みの生存(0..1)。残響の送出量に使う
+            // 【自由音場の直接レベル】距離減衰と空気吸収だけ。遮蔽を**含まない**。
+            //   尾の絶対レベルの校正基準（tailGain = これ × √target）に使う。
+            //   ★BandGain[0..5]（直接音タップ）を使ってはいけない。あれは遮蔽込みなので、
+            //     柱の陰に入ると透過ぶんまで落ちる（実測 -31dB）。それを基準にすると
+            //     尾まで一緒に -31dB 落ちて、部屋の残響が消える。
+            //     部屋の残響音場は音源が部屋へ注いだパワーで決まり、リスナーの見通しが
+            //     柱で切れても消えない。遮蔽は SourceLevel の 1 箇所だけで効かせる。
+            public float FreeFieldDirect = 1f;
             public Vector3 DirectDirLocal = Vector3.forward;   // HRTF 用の到来方向
 
             public readonly float[] DelayMs = new float[MaxTaps];
@@ -1946,6 +1954,15 @@ namespace AcousticFlow
                 float v = g[gOff + b] * _airTmp[b] * da;
                 ts.BandGain[o + b] = v;
                 sum += v;
+            }
+            // 直接音タップのときだけ、遮蔽を含まない自由音場レベルを控えておく。
+            //   尾の絶対レベルはこれを基準にする（BandGain だと遮蔽込みで、柱の陰で
+            //   残響まで消えてしまう）。target がエネルギー比なので二乗平均平方根で束ねる。
+            if (type == 'D')
+            {
+                float e = 0f;
+                for (int b = 0; b < nb; b++) e += (_airTmp[b] * da) * (_airTmp[b] * da);
+                ts.FreeFieldDirect = Mathf.Sqrt(e / nb);
             }
             ts.Gain[n] = sum / nb;                  // 広帯域（プロット/表示用）
             ComputePan(arrival, out ts.PanL[n], out ts.PanR[n]);

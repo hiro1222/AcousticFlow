@@ -602,20 +602,13 @@ namespace AcousticFlow
             //   ・直接音タップの広帯域ゲイン dg = 距離減衰・透過を含む絶対レベルの基準。
             //   尾IRはエネルギー1に正規化済みなので、tailGain = dg × √target で
             //   出力の 尾/直接 パワー比がちょうど target になる。
-            var tsCal = MyTaps();
-            var bg = tsCal != null ? tsCal.BandGain : AcousticFlowSceneDemo.Status.TapBandGain;
-            float dg = 0f;
-            if (bg != null && bg.Length >= kNumBands)
-            {
-                for (int b = 0; b < kNumBands; b++) dg += bg[b] * bg[b];
-                dg = Mathf.Sqrt(dg / kNumBands);
-            }
-            // ★遮蔽を割り戻して「遮られていなければどれだけ届くか」にする。
-            //   BandGain には生存(遮蔽)が入っているので、そのまま渡すと
-            //   尾 = (生存 × …) × √target × srcLv(= 生存) で**生存が 2 回**掛かり、
-            //   柱の陰に入っただけで残響ごと消える。遮蔽は srcLv の 1 箇所だけで掛ける。
+            // ★遮蔽を含まない自由音場の直接レベル（距離減衰＋空気吸収だけ）を基準にする。
+            //   直接音タップの BandGain を使うと、柱の陰では透過ぶんまで落ちて -31dB になり
+            //   （実測）、尾まで一緒に消える。SourceLevel で割り戻すだけでは戻らない。
+            //   遮蔽は下の srcLv の 1 箇所だけで効かせる。
             //   （VoiceConvolver 側と同じ理由。詳細はそちらのコメント）
-            if (tsCal != null && tsCal.SourceLevel > 1e-3f) dg /= tsCal.SourceLevel;
+            var tsCal = MyTaps();
+            float dg = (tsCal != null) ? tsCal.FreeFieldDirect : 1f;
             float target = AcousticFlowSceneDemo.Status.ReverbTargetRatio;
             _tailGain = ReverbTailIr.CalibrateGain(dg, target);
             Scope.TailToDirectRatio = target;   // スコープには使った目標比を出す
