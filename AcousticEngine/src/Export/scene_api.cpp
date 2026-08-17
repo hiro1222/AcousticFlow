@@ -603,6 +603,55 @@ void AF_SceneSetApertureIsTransmission(AF_SceneHandle scene, int on) {
     if (s) s->setApertureIsTransmission(on);
 }
 
+int AF_SceneRoomCount(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    return s ? static_cast<int>(s->roomGraph().rooms.size()) : 0;
+}
+
+int AF_SceneRoomAt(AF_SceneHandle scene, AF_Vector3 p) {
+    Scene* s = asScene(scene);
+    return s ? s->roomAt(toVec3(p)) : -1;
+}
+
+int AF_SceneRoomInfo(AF_SceneHandle scene, int room, float* outVolume,
+                     AF_Vector3* outCentroid, AF_Vector3* outMin, AF_Vector3* outMax) {
+    Scene* s = asScene(scene);
+    if (!s) return 0;
+    const auto& rr = s->roomGraph();
+    if (room < 0 || room >= static_cast<int>(rr.rooms.size())) return 0;
+    const auto& rm = rr.rooms[static_cast<std::size_t>(room)];
+    const float c = rr.grid.cell;
+    if (outVolume) *outVolume = static_cast<float>(rm.voxels) * c * c * c;
+    if (outCentroid) *outCentroid = fromVec3(rm.centroid);
+    if (outMin) *outMin = fromVec3(rm.boundsMin);
+    if (outMax) *outMax = fromVec3(rm.boundsMax);
+    return 1;
+}
+
+void AF_SceneSetRoomCellSize(AF_SceneHandle scene, float meters) {
+    Scene* s = asScene(scene);
+    if (s) s->setRoomCellSize(meters);
+}
+
+void AF_SceneRoomGridDims(AF_SceneHandle scene, int* nx, int* ny, int* nz, float* cell) {
+    Scene* s = asScene(scene);
+    if (!s) return;
+    const auto& g = s->roomGraph().grid;
+    if (nx) *nx = g.nx;
+    if (ny) *ny = g.ny;
+    if (nz) *nz = g.nz;
+    if (cell) *cell = g.cell;
+}
+
+void AF_SceneRoomBuildTimes(AF_SceneHandle scene, float* alloc, float* fill, float* label) {
+    Scene* s = asScene(scene);
+    if (!s) return;
+    const auto& rr = s->roomGraph();
+    if (alloc) *alloc = static_cast<float>(rr.msAlloc);
+    if (fill)  *fill  = static_cast<float>(rr.msFill);
+    if (label) *label = static_cast<float>(rr.msLabel);
+}
+
 void AF_SceneSetApertureContrast(AF_SceneHandle scene, float p) {
     Scene* s = asScene(scene);
     if (s) s->setApertureContrast(p);

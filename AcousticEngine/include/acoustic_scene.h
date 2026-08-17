@@ -302,6 +302,27 @@ ACOUSTIC_API int AF_SceneMeasurePortal(AF_SceneHandle scene, int id,
  * 開口のタップへ入る＝定位は壊れない。 */
 ACOUSTIC_API void AF_SceneSetApertureIsTransmission(AF_SceneHandle scene, int on);
 
+/* ── 部屋の検出（Rooms & Portals の土台）───────────────────────────
+ * 静的な形状だけをボクセル化し、空きの連結成分を「部屋」とする。
+ * 一度でも変換が更新されたインスタンス（＝扉のように動くもの）は静的に含めない。
+ * 含めると閉扉時に戸口が塞がって「そこに開口がある」という情報が幾何から消えるため。
+ * 幾何が変わったときだけ再計算される（毎フレーム呼んでも中で弾かれる）。 */
+ACOUSTIC_API int  AF_SceneRoomCount(AF_SceneHandle scene);
+/* 点がどの部屋にいるか。-1 は部屋の外／実体の中。 */
+ACOUSTIC_API int  AF_SceneRoomAt(AF_SceneHandle scene, AF_Vector3 p);
+/* 部屋の体積(m3 相当)・重心・境界。out は null 可。 */
+ACOUSTIC_API int  AF_SceneRoomInfo(AF_SceneHandle scene, int room, float* outVolume,
+                                   AF_Vector3* outCentroid,
+                                   AF_Vector3* outMin, AF_Vector3* outMax);
+/* ボクセル一辺(m)。戸口の幅を数ボクセルで割れる大きさにすること（既定 0.25）。 */
+ACOUSTIC_API void AF_SceneSetRoomCellSize(AF_SceneHandle scene, float meters);
+/* 検出に使った格子の寸法（診断用）。 */
+ACOUSTIC_API void AF_SceneRoomGridDims(AF_SceneHandle scene, int* nx, int* ny, int* nz,
+                                       float* cell);
+/* 構築の段別所要時間(ms)。どこを削るべきかを数字で決めるため。 */
+ACOUSTIC_API void AF_SceneRoomBuildTimes(AF_SceneHandle scene, float* alloc,
+                                         float* fill, float* label);
+
 /* ★試して却下した案の記録: 稜線探索で見つけた開口を「開口率最大のポータル」として
  *   評価する（ゲイン = 開口の広さだけ。前川の δ も開口積分も掛けない）。
  *   隣室へ歩く境界の段差は 5.6dB → 2.7dB と良くなったが、**衝立で破綻した** ──

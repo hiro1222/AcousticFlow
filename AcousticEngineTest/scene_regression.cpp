@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include "acoustic_scene.h"
@@ -2577,6 +2578,94 @@ void diagnoseNonPlateBlocker() {
 //   現状は 1 枚でもポータルがあると稜線探索を丸ごと迂回するので、
 //   ポータルを置いていない開口が鳴らなくなる。それを直接測る。
 //   仕切りに開口を 2 つ（A: x∈[-4,-2] / B: x∈[2,4]）空け、A にだけポータルを置く。
+// 幾何から「部屋」が正しく出るか。Rooms & Portals の土台の最初の検証。
+//   期待: 仕切りで2つに割った箱 → 部屋 2 つ。開口があっても**繋がっていれば 1 つ**。
+//   扉は動くものなので静的な塗り分けに入らず、閉扉でも部屋は分かれないのが正しい
+//   （「そこに開口がある」という情報を残すため）。
+void diagnoseRoomDetection() {
+    std::printf("\n[診断] 幾何から部屋を検出する\n");
+    const float h = 4.0f, t = 0.15f, hw = 6.0f, hd = 8.0f;
+    // gap: 仕切りの開口幅（0 なら完全に塞ぐ）
+    auto build = [&](float gap) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        if (gap <= 1e-3f) {   // 仕切り 1 枚で完全に分断
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        } else {              // 中央に幅 gap の戸口
+            const float half = gap * 0.5f;
+            AF_SceneAddInstanceBox(s, V(-(hw + half) * 0.5f, h*0.5f, 0),
+                                   V((hw - half) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V( (hw + half) * 0.5f, h*0.5f, 0),
+                                   V((hw - half) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        }
+        return s;
+    };
+    struct C { const char* name; float gap; int want; };
+    const C cases[] = {
+        {"仕切りで完全分断       ", 0.0f,  2},
+        {"戸口 1.2m でつながる   ", 1.2f,  1},
+        {"戸口 0.6m でつながる   ", 0.6f,  1},
+        {"戸口 0.3m でつながる   ", 0.3f,  1},
+    };
+    std::printf("      形状                     部屋数(期待)  格子      体積(m3)\n");
+    for (const C& c : cases) {
+        AF_SceneHandle s = build(c.gap);
+        const int n = AF_SceneRoomCount(s);
+        int nx = 0, ny = 0, nz = 0; float cell = 0.0f;
+        AF_SceneRoomGridDims(s, &nx, &ny, &nz, &cell);
+        char vol[64] = "";
+        for (int i = 0; i < n && i < 3; ++i) {
+            float v = 0.0f;
+            AF_SceneRoomInfo(s, i, &v, nullptr, nullptr, nullptr);
+            char one[24]; std::snprintf(one, sizeof(one), "%.0f ", v);
+            std::strncat(vol, one, sizeof(vol) - std::strlen(vol) - 1);
+        }
+        std::printf("      %s %d(%d)%s  %3dx%3dx%3d @%.2fm  %s\n",
+                    c.name, n, c.want, (n == c.want) ? "  " : " ★", nx, ny, nz, cell, vol);
+        AF_SceneDestroy(s);
+    }
+    // ★作り直しのコスト。LOD/ストリーミングで形状が入れ替わるたびに走るので、
+    //   ここが許容できないなら八分木＋差分更新が要る。
+    std::printf("      作り直しのコスト（格子の刻みを変えて）:\n");
+    for (float cell : {0.5f, 0.25f, 0.15f, 0.1f}) {
+        AF_SceneHandle s = build(1.2f);
+        AF_SceneSetRoomCellSize(s, cell);
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        const int n = AF_SceneRoomCount(s);              // 初回はここで構築される
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        int nx = 0, ny = 0, nz = 0; float c2 = 0.0f;
+        AF_SceneRoomGridDims(s, &nx, &ny, &nz, &c2);
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        float ma = 0.0f, mf = 0.0f, ml = 0.0f;
+        AF_SceneRoomBuildTimes(s, &ma, &mf, &ml);
+        std::printf("        %.2fm  %3dx%3dx%3d = %7d ボクセル  %6.2f ms"
+                    "（確保 %.2f / 塗り %.2f / 連結 %.2f）  部屋 %d\n",
+                    cell, nx, ny, nz, nx * ny * nz, ms, ma, mf, ml, n);
+        AF_SceneDestroy(s);
+    }
+
+    // 扉が閉まっても部屋は分かれないこと（扉は動くものなので静的に含めない）。
+    {
+        AF_SceneHandle s = build(1.2f);
+        const int before = AF_SceneRoomCount(s);
+        // 戸口をぴったり塞ぐ扉を置き、**動かして**「動くもの」と認識させる。
+        const int door = AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(0.6f, h*0.5f, 0.03f),
+                                                V(1,0,0), V(0,1,0), 0);
+        AF_SceneUpdateInstance(s, door, V(0, h*0.5f, 0.001f), V(0.6f, h*0.5f, 0.03f),
+                               V(1,0,0), V(0,1,0));
+        const int after = AF_SceneRoomCount(s);
+        std::printf("      扉を閉めて動かす         %d → %d（1 のままが正しい）%s\n",
+                    before, after, (after == 1) ? "" : "  ★分かれてしまった");
+        AF_SceneDestroy(s);
+    }
+}
+
 void diagnosePortalScope() {
     std::printf("\n[診断] ポータルは自分が覆う開口だけを担当しているか\n");
     auto build = [](bool withPortal) {
@@ -3374,6 +3463,7 @@ int main() {
     testMesh();
     testDirectionalProbe();
     testSecondOrderDiffraction();
+    diagnoseRoomDetection();
     diagnosePortalScope();
     diagnoseNonPlateBlocker();
     diagnoseApertureWidthCurve();
