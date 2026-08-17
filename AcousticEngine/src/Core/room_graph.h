@@ -22,24 +22,48 @@
 //   閉扉時に戸口が消えてしまう（＝「そこに開口がある」という情報が幾何から失われる）。
 //   これは authoring ではなく観測で決まるので、手続き生成でも自動で効く。
 //
-// ■ 実装の段階
-//   まずは密なグリッドで作る。八分木は同じアルゴリズムの省メモリ版なので、
-//   「部屋が正しく出るか」を確かめてから移す。
+// ■ ブロック分割（差分更新の土台）
+//   連結成分は本来「全体」の性質なので、素直に作ると壁が 1 枚壊れただけで
+//   レベル全体を塗り直すことになる。そこで格子をブロック（既定 8³ ボクセル）に切り、
+//     ・ブロックの中だけでラベリングする（ローカル番号 0,1,2…）
+//     ・ブロック境界で「こちらの 2 番とあちらの 0 番は同じ空間」という対応表を作る
+//     ・対応表を union-find で束ねたものが部屋
+//   という形にした。壁が壊れたら、
+//     ・触れたブロックだけ塗り直してローカル番号を振り直す
+//     ・そのブロックの面の対応表だけ作り直す
+//     ・union-find を張り直す（対応表の総数ぶんなので数千回＝誤差）
+//   で済む。**他のブロックのローカル番号は一切変わらない**のがこの形の要点で、
+//   更新コストがレベルの大きさに依存しなくなる。
 //
-// ■ コスト（実測。12×4×16m の検証シーン）
-//                            全再構築    内訳（確保 / 塗り / 連結）
-//     0.50m   11,340 ボクセル   0.09 ms   0.00 / 0.03 / 0.05
-//     0.25m   74,256 ボクセル   0.42 ms   0.02 / 0.12 / 0.28   ← 既定
-//     0.15m  307,692 ボクセル   1.58 ms   0.04 / 0.35 / 1.17
-//     0.10m  990,000 ボクセル   4.52 ms   0.21 / 1.35 / 2.94
-//   ボクセル数にほぼ比例（約 4.0ns/個）。
+//   「壊れた壁の向こうと繋がった」のような**全体の連結が変わる**変化でも、
+//   変わるのは対応表だけなので同じコストで通る。八分木は空き空間を粗く持つので
+//   初回構築は速くなるが、この性質は得られない（連結が変われば結局全部塗り直す）。
+//   実行時に形状が変わる前提のエンジンなので、まず更新側を取った。
 //
-//   ※ 経緯：最初は 14ns/個で、その 92% が連結成分だった。整数除算を消して 11.4ns、
-//     走査線方式にして 4.0ns。「連結が重い」を測ってから手を打った結果で、
+// ■ コスト（実測。12×4×16m の検証シーン。仕切りを 1 枚壊して 2 部屋 → 1 部屋）
+//                    全再構築        差分更新     塗り直したブロック
+//     0.25m 74,256    0.53 ms        0.107 ms      8 / 40
+//     0.10m 990,000   5.44 ms        0.479 ms     24 / 264
+//   差分更新の結果は全再構築と一致する（部屋数・体積とも）。
+//
+//   ブロック一辺の選び方（0.10m 格子で実測）:
+//        8 : 全再構築 9.41 ms / 更新 0.407 ms
+//       16 : 全再構築 5.44 ms / 更新 0.479 ms   ← 既定
+//       32 : 全再構築 4.50 ms / 更新 0.790 ms
+//     小さいほど更新は局所的になるが、走査線の区間がブロック幅で切り詰められて
+//     全再構築が重くなる。8 は更新が 15% 速いだけで全再構築が 73% 遅い＝割に合わない。
+//
+//   ※ 連結成分の経緯：最初は 14ns/個で、その 92% が連結成分だった。整数除算を消して
+//     11.4ns、走査線方式にして 4.0ns。「連結が重い」を測ってから手を打った結果で、
 //     推測で塗りを速くしていたら 1 割も縮まなかった。
+//     ブロック分割はそこから全再構築を 4.52→5.44ms に 2 割戻す代わりに、
+//     更新を 11 倍安くしている。全再構築はロード時に 1 回、更新は遊んでいる最中に何度も
+//     走るので、この交換は取る。
 //
-//   それでも 40×10×40m を 0.25m で切ると約 400 万個 = **約 16ms** で、
-//   全再構築は 1 フレームに収まらない。変わった領域だけ塗り直す差分更新が要る。未対応。
+//   40×10×40m のレベルを 0.25m で切ると 160×40×160 = 約 102 万ボクセル。
+//   ロード時の全再構築が約 5ms、壁 1 枚の破壊が 0.1〜0.5ms。
+//   更新コストはレベルの大きさではなく**壊れた範囲**で決まる。
+//   （空き空間を粗く持つ八分木にすれば全再構築側がさらに縮む。未対応。）
 //
 // ■ LOD / ストリーミングとの関係（既知の限界）
 //   active=false のインスタンスは静的な塗り分けに入らない。つまり LOD で壁を降ろすと
@@ -48,12 +72,12 @@
 //   エンジンからは「LOD で降ろされた」のか「壊されて無くなった」のか区別できない。
 //   音響的には後者の解釈が一貫している（無い壁は音を止めない）が、
 //   運用としては「部屋を囲う壁は LOD で落とさない」という制約が要る。
-//   ※ setInstanceActive では再構築フラグを立ててあるので、結果が古くなることはない。
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include "Core/aabb.h"
@@ -62,20 +86,25 @@
 namespace acoustic {
 namespace rooms {
 
-// ボクセルの状態。
+// 格子の中身（実体か空きか）。部屋番号はここには入れない（ブロックごとの
+// ローカル番号 + union-find で引く。→ Builder::roomAtVoxel）。
 enum : std::uint8_t {
-    kSolid     = 0xFF, // 実体が入っている
-    kUnlabeled = 0xFE, // 空いているがまだ部屋番号が付いていない
-    kOutside   = 0xFD, // 空いているが部屋ではない（外の世界／小さすぎる隙間）
-    // 0x00..0xFC は部屋番号
-    kMaxRooms  = 0xFD,
+    kEmpty = 0x00,
+    kSolid = 0xFF,
+};
+
+// ブロック内のローカル番号。1 ブロックは既定 8³=512 ボクセルなので、
+// 最悪（市松模様）でも 256 個までしか出ない。16bit で足りる。
+enum : std::uint16_t {
+    kLocNone  = 0xFFFE,   // 空きだがまだ番号なし
+    kLocSolid = 0xFFFF,   // 実体
 };
 
 struct Grid {
     Vec3 origin{0, 0, 0};      // 格子の原点（最小コーナー）
     float cell = 0.25f;        // 一辺(m)
     int nx = 0, ny = 0, nz = 0;
-    std::vector<std::uint8_t> v;   // nx*ny*nz
+    std::vector<std::uint8_t> v;   // nx*ny*nz。kEmpty / kSolid
 
     int index(int x, int y, int z) const { return (z * ny + y) * nx + x; }
     bool inside(int x, int y, int z) const {
@@ -100,7 +129,9 @@ struct Result {
     int  discarded = 0;        // 小さすぎて捨てた連結成分の数
     int  outsideVoxels = 0;    // 「外の世界」に落ちたボクセル数（格子の外周に届いた成分）
     // 段別の所要時間(ms)。どこを削るべきかを推測でなく数字で決めるため。
-    double msAlloc = 0.0, msFill = 0.0, msLabel = 0.0;
+    double msAlloc = 0.0, msFill = 0.0, msLabel = 0.0, msMerge = 0.0;
+    int  dirtyBricks = 0;      // 直近の更新で塗り直したブロック数（0 なら全再構築）
+    int  totalBricks = 0;
 };
 
 // 点が OBB の中にあるか。
@@ -111,56 +142,136 @@ inline bool pointInObb(const Vec3& p, const Obb& b) {
         && std::fabs(dot(d, b.axisZ)) <= b.halfExtents.z;
 }
 
-// ボクセル化 ＋ 連結成分（部屋）。
-//   boxes      : 静的な形状（呼び出し側で「動くもの」を除いてから渡す）
-//   cell       : ボクセル一辺(m)。戸口の幅を数ボクセルで割れる大きさにすること
-//   minVoxels  : これ未満の連結成分は部屋として扱わない（隙間のノイズを捨てる）
-//   maxVoxels  : 格子の総数の上限。超えるなら cell を粗くして収める
-//
-// ★格子は形状の境界そのものではなく **1 ボクセルぶん外側**まで取る。
-//   部屋の外側に空きの層があると「外の世界」がひとつの連結成分になり、
-//   閉じた部屋と区別できる（外に繋がっている＝部屋ではない、と判定できる）。
-inline Result buildRooms(const std::vector<Obb>& boxes, float cell,
-                         int minVoxels = 16, std::size_t maxVoxels = 4000000) {
-    Result r;
-    if (boxes.empty() || cell <= 1e-3f) return r;
+// OBB を囲む軸並行境界（8 頂点から取るので回転していても正しい）。
+inline Aabb obbBounds(const Obb& b) {
+    Aabb r;
+    r.min = Vec3( 1e30f,  1e30f,  1e30f);
+    r.max = Vec3(-1e30f, -1e30f, -1e30f);
+    for (int i = 0; i < 8; ++i) {
+        const float sx = (i & 1) ? 1.0f : -1.0f;
+        const float sy = (i & 2) ? 1.0f : -1.0f;
+        const float sz = (i & 4) ? 1.0f : -1.0f;
+        const Vec3 p = b.center + b.axisX * (b.halfExtents.x * sx)
+                                + b.axisY * (b.halfExtents.y * sy)
+                                + b.axisZ * (b.halfExtents.z * sz);
+        r.min = Vec3(std::min(r.min.x, p.x), std::min(r.min.y, p.y), std::min(r.min.z, p.z));
+        r.max = Vec3(std::max(r.max.x, p.x), std::max(r.max.y, p.y), std::max(r.max.z, p.z));
+    }
+    return r;
+}
 
-    Vec3 lo(1e30f, 1e30f, 1e30f), hi(-1e30f, -1e30f, -1e30f);
-    for (const Obb& b : boxes) {
-        // OBB の 8 頂点で境界を取る（回転していても正しく囲む）。
-        for (int i = 0; i < 8; ++i) {
-            const float sx = (i & 1) ? 1.0f : -1.0f;
-            const float sy = (i & 2) ? 1.0f : -1.0f;
-            const float sz = (i & 4) ? 1.0f : -1.0f;
-            const Vec3 p = b.center + b.axisX * (b.halfExtents.x * sx)
-                                    + b.axisY * (b.halfExtents.y * sy)
-                                    + b.axisZ * (b.halfExtents.z * sz);
-            lo = Vec3(std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z));
-            hi = Vec3(std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z));
+// ブロック内のローカル空間ひとつぶんの集計。ブロックを塗り直すまで作り直さない。
+struct LocalStat {
+    int count = 0;
+    long long sx = 0, sy = 0, sz = 0;               // 格子座標の総和（重心用）
+    int miX = 0, miY = 0, miZ = 0;
+    int maX = 0, maY = 0, maZ = 0;
+    bool touchesBoundary = false;                   // 格子の外周に接している
+};
+
+class Builder {
+public:
+    // ボクセル一辺(m)。戸口の幅を数ボクセルで割れる大きさにすること。
+    void setCell(float m) {
+        if (m > 1e-3f && m != cell_) { cell_ = m; needFull_ = true; }
+    }
+    float cell() const { return cell_; }
+
+    // これ未満の連結成分は部屋として扱わない（隙間のノイズを捨てる）。
+    void setMinVoxels(int n) {
+        if (n != minVoxels_ && n > 0) { minVoxels_ = n; needFull_ = true; }
+    }
+
+    // ブロック一辺（ボクセル数）。差分更新の粒度。
+    void setBrick(int n) {
+        if (n >= 2 && n != brick_) { brick_ = n; needFull_ = true; }
+    }
+
+    // 幾何が変わった領域を伝える。**変更前と変更後の両方**の境界を渡すこと
+    // （動いた壁は「元居た所」も塗り直さないと実体が残る）。
+    void touch(const Aabb& region) { dirtyRegions_.push_back(region); }
+    // 全部作り直す（格子の刻みが変わった／形状が総入れ替えになった等）。
+    void invalidateAll() { needFull_ = true; }
+    bool dirty() const { return needFull_ || !dirtyRegions_.empty(); }
+
+    // 最新の結果を返す。汚れていなければ何もしない。
+    const Result& build(const std::vector<Obb>& boxes) {
+        if (!dirty()) return res_;
+        // 格子の範囲から外れる変更が来ていたら全部作り直すしかない。
+        if (!needFull_ && !regionsFitGrid_()) needFull_ = true;
+        if (needFull_) rebuildAll_(boxes);
+        else           rebuildDirty_(boxes);
+        dirtyRegions_.clear();
+        needFull_ = false;
+        return res_;
+    }
+
+    const Result& result() const { return res_; }
+
+    // 格子座標がどの部屋か。-1 なら部屋の外／実体の中。
+    int roomAtVoxel(int x, int y, int z) const {
+        const Grid& g = res_.grid;
+        if (!g.inside(x, y, z)) return -1;
+        const std::uint16_t l = loc_[static_cast<std::size_t>(g.index(x, y, z))];
+        if (l >= kLocNone) return -1;
+        const int b = brickOf_(x, y, z);
+        const int slot = rootSlot_[static_cast<std::size_t>(find_(first_[b] + l))];
+        return (slot >= 0) ? roomOfSlot_[static_cast<std::size_t>(slot)] : -1;
+    }
+
+private:
+    // ── 設定 ──
+    float cell_ = 0.25f;
+    int   minVoxels_ = 16;
+    int   brick_ = 16;
+    std::size_t maxVoxels_ = 4000000;
+
+    // ── 汚れ ──
+    bool needFull_ = true;
+    std::vector<Aabb> dirtyRegions_;
+
+    // ── 状態 ──
+    Result res_;
+    std::vector<std::uint16_t> loc_;                  // ボクセル → ブロック内ローカル番号
+    int bx_ = 0, by_ = 0, bz_ = 0;                    // ブロック数
+    std::vector<std::vector<LocalStat>> brickStat_;   // ブロック → ローカル空間の集計
+    std::vector<std::vector<std::uint32_t>> facePairs_;  // (ブロック*3 + 面) → (la<<16|lb)
+    std::vector<int> first_;                          // ブロック → 通し番号の先頭（累積）
+    mutable std::vector<int> parent_;                 // union-find
+    std::vector<int> rootSlot_;                       // 通し番号 → 集計スロット (-1)
+    std::vector<int> roomOfSlot_;                     // 集計スロット → 部屋番号 (-1)
+
+    // ── union-find（経路半減）──
+    int find_(int i) const {
+        while (parent_[static_cast<std::size_t>(i)] != i) {
+            const int p = parent_[static_cast<std::size_t>(i)];
+            parent_[static_cast<std::size_t>(i)] = parent_[static_cast<std::size_t>(p)];
+            i = parent_[static_cast<std::size_t>(i)];
         }
+        return i;
     }
-    // 外側に 1 ボクセルの余白。
-    lo = Vec3(lo.x - cell, lo.y - cell, lo.z - cell);
-    hi = Vec3(hi.x + cell, hi.y + cell, hi.z + cell);
-
-    Grid& g = r.grid;
-    g.cell = cell;
-    g.origin = lo;
-    auto dim = [&](float a, float b) {
-        return std::max(1, static_cast<int>(std::ceil((b - a) / cell)));
-    };
-    g.nx = dim(lo.x, hi.x); g.ny = dim(lo.y, hi.y); g.nz = dim(lo.z, hi.z);
-
-    // 総数が上限を超えるなら、収まるまで粗くする。
-    while (static_cast<std::size_t>(g.nx) * g.ny * g.nz > maxVoxels) {
-        g.cell *= 1.5f;
-        g.nx = dim(lo.x, hi.x); g.ny = dim(lo.y, hi.y); g.nz = dim(lo.z, hi.z);
+    void unite_(int a, int b) {
+        a = find_(a); b = find_(b);
+        if (a != b) parent_[static_cast<std::size_t>(a > b ? a : b)] = (a < b ? a : b);
     }
-    cell = g.cell;
 
-    const auto tA0 = std::chrono::high_resolution_clock::now();
-    g.v.assign(static_cast<std::size_t>(g.nx) * g.ny * g.nz, kUnlabeled);
-    const auto tA1 = std::chrono::high_resolution_clock::now();
+    int brickOf_(int x, int y, int z) const {
+        return ((z / brick_) * by_ + (y / brick_)) * bx_ + (x / brick_);
+    }
+
+    // 汚れた領域が今の格子に収まっているか。
+    bool regionsFitGrid_() const {
+        const Grid& g = res_.grid;
+        if (g.v.empty()) return false;
+        const Vec3 hi(g.origin.x + g.nx * g.cell,
+                      g.origin.y + g.ny * g.cell,
+                      g.origin.z + g.nz * g.cell);
+        for (const Aabb& a : dirtyRegions_) {
+            if (a.min.x < g.origin.x || a.min.y < g.origin.y || a.min.z < g.origin.z) return false;
+            if (a.max.x > hi.x || a.max.y > hi.y || a.max.z > hi.z) return false;
+        }
+        return true;
+    }
 
     // ── 実体を塗る ──
     //   ボクセル中心が OBB の中なら詰まっている扱い。
@@ -171,30 +282,26 @@ inline Result buildRooms(const std::vector<Obb>& boxes, float cell,
     //     薄い壁の抜けは膨張ではなく**格子を細かくして**防ぐ方が筋が良い。
     //     目安: cell は「いちばん薄い壁の厚み」と「いちばん狭い戸口の幅」の
     //     どちらよりも小さくすること。
-    const float grow = cell * 0.25f;
-    for (const Obb& b : boxes) {
+    //   x/y/z の範囲を絞って塗る（clip が非 null ならそこと交差した範囲だけ）。
+    void rasterize_(const Obb& b, const int* clip) {
+        Grid& g = res_.grid;
+        const float grow = g.cell * 0.25f;
         Obb fat = b;
         fat.halfExtents = fat.halfExtents + Vec3(grow, grow, grow);
-        // 走査範囲は膨らませた OBB の AABB。
-        Vec3 blo(1e30f, 1e30f, 1e30f), bhi(-1e30f, -1e30f, -1e30f);
-        for (int i = 0; i < 8; ++i) {
-            const float sx = (i & 1) ? 1.0f : -1.0f;
-            const float sy = (i & 2) ? 1.0f : -1.0f;
-            const float sz = (i & 4) ? 1.0f : -1.0f;
-            const Vec3 p = fat.center + fat.axisX * (fat.halfExtents.x * sx)
-                                      + fat.axisY * (fat.halfExtents.y * sy)
-                                      + fat.axisZ * (fat.halfExtents.z * sz);
-            blo = Vec3(std::min(blo.x, p.x), std::min(blo.y, p.y), std::min(blo.z, p.z));
-            bhi = Vec3(std::max(bhi.x, p.x), std::max(bhi.y, p.y), std::max(bhi.z, p.z));
-        }
+        const Aabb bb = obbBounds(fat);
         auto lohi = [&](float a, float b2, float o, int n, int& i0, int& i1) {
-            i0 = std::max(0, static_cast<int>(std::floor((a - o) / cell)));
-            i1 = std::min(n - 1, static_cast<int>(std::ceil((b2 - o) / cell)));
+            i0 = std::max(0, static_cast<int>(std::floor((a - o) / g.cell)));
+            i1 = std::min(n - 1, static_cast<int>(std::ceil((b2 - o) / g.cell)));
         };
         int x0, x1, y0, y1, z0, z1;
-        lohi(blo.x, bhi.x, g.origin.x, g.nx, x0, x1);
-        lohi(blo.y, bhi.y, g.origin.y, g.ny, y0, y1);
-        lohi(blo.z, bhi.z, g.origin.z, g.nz, z0, z1);
+        lohi(bb.min.x, bb.max.x, g.origin.x, g.nx, x0, x1);
+        lohi(bb.min.y, bb.max.y, g.origin.y, g.ny, y0, y1);
+        lohi(bb.min.z, bb.max.z, g.origin.z, g.nz, z0, z1);
+        if (clip) {
+            x0 = std::max(x0, clip[0]); x1 = std::min(x1, clip[1]);
+            y0 = std::max(y0, clip[2]); y1 = std::min(y1, clip[3]);
+            z0 = std::max(z0, clip[4]); z1 = std::min(z1, clip[5]);
+        }
         for (int z = z0; z <= z1; ++z)
             for (int y = y0; y <= y1; ++y)
                 for (int x = x0; x <= x1; ++x)
@@ -202,12 +309,7 @@ inline Result buildRooms(const std::vector<Obb>& boxes, float cell,
                         g.v[static_cast<std::size_t>(g.index(x, y, z))] = kSolid;
     }
 
-    const auto tF1 = std::chrono::high_resolution_clock::now();
-
-    // ── 空きの連結成分（6近傍）──
-    //   ★成分の voxel を控えてから採否を決める。塗ってから捨てると、そのラベルが
-    //     次の成分に再利用されて**別々の部屋が同じ番号になる**（一度これを踏んだ）。
-    //
+    // ── ブロック 1 個をラベリングする ──
     //   ★走査線(scanline)で塗る。1 ボクセルずつ積む素直な塗りつぶしは、取り出すたびに
     //     近傍 6 個を**バラバラの番地**で読み、そのぶんスタックにも積む。1 個 14.8ns
     //     掛かっていて、除算を消しても 11.4ns にしかならなかった＝演算ではなく
@@ -217,89 +319,340 @@ inline Result buildRooms(const std::vector<Obb>& boxes, float cell,
     //       ・重心と境界も区間ごとに O(1) で足せる（Σx = (xl+xr)*n/2）
     //     6近傍なので、隣の行は [xl,xr] の範囲だけ見ればよい（8近傍のような
     //     斜め漏れの補正が要らない）。
-    struct Run  { int i, n; };      // 線形添字の先頭と長さ
-    struct Seed { int x, y, z; };
-    std::vector<Seed> stack;
-    std::vector<Run>  runs;
-    const int nx = g.nx, ny = g.ny, nz = g.nz;
-    const int sy = nx, sz = nx * ny;
-    std::uint8_t* V = g.v.data();
+    void labelBrick_(int b) {
+        const Grid& g = res_.grid;
+        const int nx = g.nx, ny = g.ny;
+        const int sy = nx, sz = nx * ny;
+        const int bxi = b % bx_, byi = (b / bx_) % by_, bzi = b / (bx_ * by_);
+        const int X0 = bxi * brick_, X1 = std::min(g.nx, X0 + brick_) - 1;
+        const int Y0 = byi * brick_, Y1 = std::min(g.ny, Y0 + brick_) - 1;
+        const int Z0 = bzi * brick_, Z1 = std::min(g.nz, Z0 + brick_) - 1;
 
-    // 行 (y,z) の x∈[x0,x1] を走り、未訪問の区間の先頭を種として積む。
-    auto scanLine = [&](int x0, int x1, int y, int z) {
-        const int base = z * sz + y * sy;
-        int x = x0;
-        while (x <= x1) {
-            while (x <= x1 && V[base + x] != kUnlabeled) ++x;
-            if (x > x1) break;
-            stack.push_back(Seed{x, y, z});
-            while (x <= x1 && V[base + x] == kUnlabeled) ++x;
+        std::uint16_t* L = loc_.data();
+        const std::uint8_t* V = g.v.data();
+        // 下地：実体は kLocSolid、空きは kLocNone。
+        for (int z = Z0; z <= Z1; ++z)
+            for (int y = Y0; y <= Y1; ++y) {
+                const int base = z * sz + y * sy;
+                for (int x = X0; x <= X1; ++x)
+                    L[base + x] = (V[base + x] == kSolid) ? kLocSolid : kLocNone;
+            }
+
+        std::vector<LocalStat>& st = brickStat_[static_cast<std::size_t>(b)];
+        st.clear();
+
+        // 行 (y,z) の x∈[x0,x1] を走り、未訪問の区間の先頭を種として積む。
+        auto scanLine = [&](int x0, int x1, int y, int z) {
+            const int base = z * sz + y * sy;
+            int x = x0;
+            while (x <= x1) {
+                while (x <= x1 && L[base + x] != kLocNone) ++x;
+                if (x > x1) break;
+                seeds_.push_back(x); seedY_.push_back(y); seedZ_.push_back(z);
+                while (x <= x1 && L[base + x] == kLocNone) ++x;
+            }
+        };
+
+        for (int z = Z0; z <= Z1; ++z)
+        for (int y = Y0; y <= Y1; ++y) {
+            const int rowBase = z * sz + y * sy;
+            for (int x = X0; x <= X1; ++x) {
+                if (L[rowBase + x] != kLocNone) continue;
+                const std::uint16_t label = static_cast<std::uint16_t>(st.size());
+                LocalStat cur;
+                cur.miX = cur.maX = x; cur.miY = cur.maY = y; cur.miZ = cur.maZ = z;
+                seeds_.clear(); seedY_.clear(); seedZ_.clear();
+                seeds_.push_back(x); seedY_.push_back(y); seedZ_.push_back(z);
+                while (!seeds_.empty()) {
+                    const int sX = seeds_.back(), sY = seedY_.back(), sZ = seedZ_.back();
+                    seeds_.pop_back(); seedY_.pop_back(); seedZ_.pop_back();
+                    const int base = sZ * sz + sY * sy;
+                    if (L[base + sX] != kLocNone) continue;   // 先に別の区間に取られていた
+                    int xl = sX; while (xl > X0 && L[base + xl - 1] == kLocNone) --xl;
+                    int xr = sX; while (xr < X1 && L[base + xr + 1] == kLocNone) ++xr;
+                    const int n = xr - xl + 1;
+                    for (int i = xl; i <= xr; ++i) L[base + i] = label;
+                    cur.count += n;
+                    cur.sx += (static_cast<long long>(xl) + xr) * n / 2;  // (xl+xr)*n は必ず偶数
+                    cur.sy += static_cast<long long>(sY) * n;
+                    cur.sz += static_cast<long long>(sZ) * n;
+                    if (xl < cur.miX) cur.miX = xl;   if (xr > cur.maX) cur.maX = xr;
+                    if (sY < cur.miY) cur.miY = sY;   if (sY > cur.maY) cur.maY = sY;
+                    if (sZ < cur.miZ) cur.miZ = sZ;   if (sZ > cur.maZ) cur.maZ = sZ;
+                    if (xl == 0 || xr == g.nx - 1 || sY == 0 || sY == g.ny - 1
+                        || sZ == 0 || sZ == g.nz - 1) cur.touchesBoundary = true;
+                    if (sY > Y0) scanLine(xl, xr, sY - 1, sZ);
+                    if (sY < Y1) scanLine(xl, xr, sY + 1, sZ);
+                    if (sZ > Z0) scanLine(xl, xr, sY, sZ - 1);
+                    if (sZ < Z1) scanLine(xl, xr, sY, sZ + 1);
+                }
+                st.push_back(cur);
+            }
         }
-    };
-
-    std::uint8_t label = 0;
-    int start = 0;
-    for (int z = 0; z < nz; ++z)
-    for (int y = 0; y < ny; ++y)
-    for (int x = 0; x < nx; ++x, ++start) {
-        if (V[start] != kUnlabeled) continue;
-
-        stack.clear(); runs.clear();
-        stack.push_back(Seed{x, y, z});
-        bool touchesBoundary = false;
-        long long ax = 0, ay = 0, az = 0;
-        int count = 0;
-        int miX = nx, miY = ny, miZ = nz, maX = -1, maY = -1, maZ = -1;
-        while (!stack.empty()) {
-            const Seed s = stack.back(); stack.pop_back();
-            const int base = s.z * sz + s.y * sy;
-            if (V[base + s.x] != kUnlabeled) continue;   // 先に別の区間に取られていた
-            int xl = s.x; while (xl > 0      && V[base + xl - 1] == kUnlabeled) --xl;
-            int xr = s.x; while (xr < nx - 1 && V[base + xr + 1] == kUnlabeled) ++xr;
-            const int n = xr - xl + 1;
-            std::memset(V + base + xl, kOutside, static_cast<std::size_t>(n));  // 訪問済みの印（採否は後で）
-            runs.push_back(Run{base + xl, n});
-            count += n;
-            ax += (static_cast<long long>(xl) + xr) * n / 2;   // (xl+xr)*n は必ず偶数
-            ay += static_cast<long long>(s.y) * n;
-            az += static_cast<long long>(s.z) * n;
-            if (xl  < miX) miX = xl;   if (xr  > maX) maX = xr;
-            if (s.y < miY) miY = s.y;  if (s.y > maY) maY = s.y;
-            if (s.z < miZ) miZ = s.z;  if (s.z > maZ) maZ = s.z;
-            if (xl == 0 || xr == nx - 1 || s.y == 0 || s.y == ny - 1
-                || s.z == 0 || s.z == nz - 1) touchesBoundary = true;
-            if (s.y > 0)      scanLine(xl, xr, s.y - 1, s.z);
-            if (s.y < ny - 1) scanLine(xl, xr, s.y + 1, s.z);
-            if (s.z > 0)      scanLine(xl, xr, s.y, s.z - 1);
-            if (s.z < nz - 1) scanLine(xl, xr, s.y, s.z + 1);
-        }
-
-        // ★格子の外周に届いた成分は「外の世界」であって部屋ではない。
-        //   外側に 1 ボクセルの余白を取ってあるので、屋外や囲われていない空間は
-        //   必ずここへ落ちる。これで「閉じた空間かどうか」が判定できる。
-        if (touchesBoundary) { r.outsideVoxels += count; continue; }
-        if (count < minVoxels) { r.discarded++; continue; }
-        if (label >= kMaxRooms) { r.discarded++; continue; }   // 部屋番号を使い切った
-
-        for (const Run& rn : runs)
-            std::memset(V + rn.i, label, static_cast<std::size_t>(rn.n));
-        const float inv = 1.0f / static_cast<float>(count);
-        Room rm;
-        rm.voxels = count;
-        rm.centroid = Vec3(g.origin.x + (static_cast<float>(ax) * inv + 0.5f) * cell,
-                           g.origin.y + (static_cast<float>(ay) * inv + 0.5f) * cell,
-                           g.origin.z + (static_cast<float>(az) * inv + 0.5f) * cell);
-        rm.boundsMin = g.center(miX, miY, miZ);
-        rm.boundsMax = g.center(maX, maY, maZ);
-        r.rooms.push_back(rm);
-        ++label;
     }
-    const auto tL1 = std::chrono::high_resolution_clock::now();
-    r.msAlloc = std::chrono::duration<double, std::milli>(tA1 - tA0).count();
-    r.msFill  = std::chrono::duration<double, std::milli>(tF1 - tA1).count();
-    r.msLabel = std::chrono::duration<double, std::milli>(tL1 - tF1).count();
-    return r;
-}
+
+    // ── ブロック b の +X/+Y/+Z 面の対応表を作る ──
+    //   面の両側がどちらも空きなら「同じ空間」。同じ組み合わせが何度も出るので畳む。
+    void buildFace_(int b, int f) {
+        std::vector<std::uint32_t>& out = facePairs_[static_cast<std::size_t>(b) * 3 + f];
+        out.clear();
+        const Grid& g = res_.grid;
+        const int bxi = b % bx_, byi = (b / bx_) % by_, bzi = b / (bx_ * by_);
+        if (f == 0 && bxi + 1 >= bx_) return;
+        if (f == 1 && byi + 1 >= by_) return;
+        if (f == 2 && bzi + 1 >= bz_) return;
+        const int X0 = bxi * brick_, X1 = std::min(g.nx, X0 + brick_) - 1;
+        const int Y0 = byi * brick_, Y1 = std::min(g.ny, Y0 + brick_) - 1;
+        const int Z0 = bzi * brick_, Z1 = std::min(g.nz, Z0 + brick_) - 1;
+        const int sy = g.nx, sz = g.nx * g.ny;
+        const std::uint16_t* L = loc_.data();
+        const int step = (f == 0) ? 1 : (f == 1) ? sy : sz;
+
+        auto add = [&](int ia) {
+            const std::uint16_t la = L[ia], lb = L[ia + step];
+            if (la >= kLocNone || lb >= kLocNone) return;
+            out.push_back((static_cast<std::uint32_t>(la) << 16) | lb);
+        };
+        if (f == 0) {
+            for (int z = Z0; z <= Z1; ++z)
+                for (int y = Y0; y <= Y1; ++y) add(z * sz + y * sy + X1);
+        } else if (f == 1) {
+            for (int z = Z0; z <= Z1; ++z)
+                for (int x = X0; x <= X1; ++x) add(z * sz + Y1 * sy + x);
+        } else {
+            for (int y = Y0; y <= Y1; ++y)
+                for (int x = X0; x <= X1; ++x) add(Z1 * sz + y * sy + x);
+        }
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+    }
+
+    // ── 対応表を束ねて部屋にする ──
+    //   ここはブロックの中身ではなくローカル番号の総数に比例する（＝数千）。
+    //   ブロックが 1 個汚れただけでも毎回まるごとやり直してよい安さ。
+    void merge_() {
+        const int nb = bx_ * by_ * bz_;
+        first_.assign(static_cast<std::size_t>(nb) + 1, 0);
+        for (int b = 0; b < nb; ++b)
+            first_[static_cast<std::size_t>(b) + 1] =
+                first_[static_cast<std::size_t>(b)]
+                + static_cast<int>(brickStat_[static_cast<std::size_t>(b)].size());
+        const int total = first_[static_cast<std::size_t>(nb)];
+
+        parent_.resize(static_cast<std::size_t>(total));
+        for (int i = 0; i < total; ++i) parent_[static_cast<std::size_t>(i)] = i;
+
+        for (int b = 0; b < nb; ++b) {
+            const int bxi = b % bx_, byi = (b / bx_) % by_, bzi = b / (bx_ * by_);
+            const int nbr[3] = {
+                (bxi + 1 < bx_) ? b + 1             : -1,
+                (byi + 1 < by_) ? b + bx_           : -1,
+                (bzi + 1 < bz_) ? b + bx_ * by_     : -1,
+            };
+            for (int f = 0; f < 3; ++f) {
+                if (nbr[f] < 0) continue;
+                for (std::uint32_t p : facePairs_[static_cast<std::size_t>(b) * 3 + f])
+                    unite_(first_[static_cast<std::size_t>(b)] + static_cast<int>(p >> 16),
+                           first_[static_cast<std::size_t>(nbr[f])] + static_cast<int>(p & 0xFFFF));
+            }
+        }
+
+        // 代表ごとに集計をまとめる。
+        rootSlot_.assign(static_cast<std::size_t>(total), -1);
+        std::vector<LocalStat> agg;
+        for (int b = 0; b < nb; ++b) {
+            const std::vector<LocalStat>& st = brickStat_[static_cast<std::size_t>(b)];
+            for (int l = 0; l < static_cast<int>(st.size()); ++l) {
+                const int r = find_(first_[static_cast<std::size_t>(b)] + l);
+                int slot = rootSlot_[static_cast<std::size_t>(r)];
+                if (slot < 0) {
+                    slot = static_cast<int>(agg.size());
+                    rootSlot_[static_cast<std::size_t>(r)] = slot;
+                    agg.push_back(st[static_cast<std::size_t>(l)]);
+                    continue;
+                }
+                LocalStat& a = agg[static_cast<std::size_t>(slot)];
+                const LocalStat& s = st[static_cast<std::size_t>(l)];
+                a.count += s.count;
+                a.sx += s.sx; a.sy += s.sy; a.sz += s.sz;
+                a.miX = std::min(a.miX, s.miX); a.maX = std::max(a.maX, s.maX);
+                a.miY = std::min(a.miY, s.miY); a.maY = std::max(a.maY, s.maY);
+                a.miZ = std::min(a.miZ, s.miZ); a.maZ = std::max(a.maZ, s.maZ);
+                a.touchesBoundary = a.touchesBoundary || s.touchesBoundary;
+            }
+        }
+        // 代表の集計は「先に見つけた方のスロット」に足し込むが、経路半減で
+        // 代表が後から変わることはない（unite_ 後に find_ しているため）。
+
+        res_.rooms.clear();
+        res_.discarded = 0;
+        res_.outsideVoxels = 0;
+        roomOfSlot_.assign(agg.size(), -1);
+        const Grid& g = res_.grid;
+        for (std::size_t i = 0; i < agg.size(); ++i) {
+            const LocalStat& a = agg[i];
+            // ★格子の外周に届いた成分は「外の世界」であって部屋ではない。
+            //   外側に 1 ボクセルの余白を取ってあるので、屋外や囲われていない空間は
+            //   必ずここへ落ちる。これで「閉じた空間かどうか」が判定できる。
+            if (a.touchesBoundary) { res_.outsideVoxels += a.count; continue; }
+            if (a.count < minVoxels_) { res_.discarded++; continue; }
+            roomOfSlot_[i] = static_cast<int>(res_.rooms.size());
+            const float inv = 1.0f / static_cast<float>(a.count);
+            Room rm;
+            rm.voxels = a.count;
+            rm.centroid = Vec3(g.origin.x + (static_cast<float>(a.sx) * inv + 0.5f) * g.cell,
+                               g.origin.y + (static_cast<float>(a.sy) * inv + 0.5f) * g.cell,
+                               g.origin.z + (static_cast<float>(a.sz) * inv + 0.5f) * g.cell);
+            rm.boundsMin = g.center(a.miX, a.miY, a.miZ);
+            rm.boundsMax = g.center(a.maX, a.maY, a.maZ);
+            res_.rooms.push_back(rm);
+        }
+    }
+
+    // ── 全再構築 ──
+    void rebuildAll_(const std::vector<Obb>& boxes) {
+        res_ = Result();
+        loc_.clear(); brickStat_.clear(); facePairs_.clear();
+        first_.clear(); parent_.clear(); rootSlot_.clear(); roomOfSlot_.clear();
+        bx_ = by_ = bz_ = 0;
+        if (boxes.empty() || cell_ <= 1e-3f) return;
+
+        Vec3 lo(1e30f, 1e30f, 1e30f), hi(-1e30f, -1e30f, -1e30f);
+        for (const Obb& b : boxes) {
+            const Aabb bb = obbBounds(b);
+            lo = Vec3(std::min(lo.x, bb.min.x), std::min(lo.y, bb.min.y), std::min(lo.z, bb.min.z));
+            hi = Vec3(std::max(hi.x, bb.max.x), std::max(hi.y, bb.max.y), std::max(hi.z, bb.max.z));
+        }
+        // ★格子は形状の境界そのものではなく **1 ボクセルぶん外側**まで取る。
+        //   部屋の外側に空きの層があると「外の世界」がひとつの連結成分になり、
+        //   閉じた部屋と区別できる（外に繋がっている＝部屋ではない、と判定できる）。
+        lo = Vec3(lo.x - cell_, lo.y - cell_, lo.z - cell_);
+        hi = Vec3(hi.x + cell_, hi.y + cell_, hi.z + cell_);
+
+        Grid& g = res_.grid;
+        g.cell = cell_;
+        g.origin = lo;
+        auto dim = [&](float a, float b) {
+            return std::max(1, static_cast<int>(std::ceil((b - a) / g.cell)));
+        };
+        g.nx = dim(lo.x, hi.x); g.ny = dim(lo.y, hi.y); g.nz = dim(lo.z, hi.z);
+        // 総数が上限を超えるなら、収まるまで粗くする。
+        while (static_cast<std::size_t>(g.nx) * g.ny * g.nz > maxVoxels_) {
+            g.cell *= 1.5f;
+            g.nx = dim(lo.x, hi.x); g.ny = dim(lo.y, hi.y); g.nz = dim(lo.z, hi.z);
+        }
+
+        const auto tA0 = std::chrono::high_resolution_clock::now();
+        const std::size_t nv = static_cast<std::size_t>(g.nx) * g.ny * g.nz;
+        g.v.assign(nv, kEmpty);
+        loc_.assign(nv, kLocNone);
+        bx_ = (g.nx + brick_ - 1) / brick_;
+        by_ = (g.ny + brick_ - 1) / brick_;
+        bz_ = (g.nz + brick_ - 1) / brick_;
+        const int nb = bx_ * by_ * bz_;
+        brickStat_.assign(static_cast<std::size_t>(nb), {});
+        facePairs_.assign(static_cast<std::size_t>(nb) * 3, {});
+        const auto tA1 = std::chrono::high_resolution_clock::now();
+
+        for (const Obb& b : boxes) rasterize_(b, nullptr);
+        const auto tF1 = std::chrono::high_resolution_clock::now();
+
+        for (int b = 0; b < nb; ++b) labelBrick_(b);
+        for (int b = 0; b < nb; ++b) for (int f = 0; f < 3; ++f) buildFace_(b, f);
+        const auto tL1 = std::chrono::high_resolution_clock::now();
+
+        merge_();
+        const auto tM1 = std::chrono::high_resolution_clock::now();
+
+        res_.msAlloc = std::chrono::duration<double, std::milli>(tA1 - tA0).count();
+        res_.msFill  = std::chrono::duration<double, std::milli>(tF1 - tA1).count();
+        res_.msLabel = std::chrono::duration<double, std::milli>(tL1 - tF1).count();
+        res_.msMerge = std::chrono::duration<double, std::milli>(tM1 - tL1).count();
+        res_.dirtyBricks = 0;
+        res_.totalBricks = nb;
+    }
+
+    // ── 差分更新 ──
+    //   汚れた領域に触れるブロックだけ塗り直し、その面（自分の 3 面＋手前隣の 3 面）の
+    //   対応表を作り直して、union-find を張り直す。
+    void rebuildDirty_(const std::vector<Obb>& boxes) {
+        Grid& g = res_.grid;
+        const int nb = bx_ * by_ * bz_;
+        std::vector<std::uint8_t> hot(static_cast<std::size_t>(nb), 0);
+        int hotCount = 0;
+        for (const Aabb& a : dirtyRegions_) {
+            // 1 ボクセルぶん広げてから覆うブロックを拾う（膨張ぶんの取りこぼし防止）。
+            const int x0 = std::max(0, static_cast<int>(std::floor((a.min.x - g.origin.x) / g.cell)) - 1);
+            const int y0 = std::max(0, static_cast<int>(std::floor((a.min.y - g.origin.y) / g.cell)) - 1);
+            const int z0 = std::max(0, static_cast<int>(std::floor((a.min.z - g.origin.z) / g.cell)) - 1);
+            const int x1 = std::min(g.nx - 1, static_cast<int>(std::ceil((a.max.x - g.origin.x) / g.cell)) + 1);
+            const int y1 = std::min(g.ny - 1, static_cast<int>(std::ceil((a.max.y - g.origin.y) / g.cell)) + 1);
+            const int z1 = std::min(g.nz - 1, static_cast<int>(std::ceil((a.max.z - g.origin.z) / g.cell)) + 1);
+            if (x1 < x0 || y1 < y0 || z1 < z0) continue;
+            for (int bz = z0 / brick_; bz <= z1 / brick_; ++bz)
+            for (int by = y0 / brick_; by <= y1 / brick_; ++by)
+            for (int bxi = x0 / brick_; bxi <= x1 / brick_; ++bxi) {
+                const int b = (bz * by_ + by) * bx_ + bxi;
+                if (!hot[static_cast<std::size_t>(b)]) { hot[static_cast<std::size_t>(b)] = 1; ++hotCount; }
+            }
+        }
+
+        const auto tF0 = std::chrono::high_resolution_clock::now();
+        // 汚れたブロックの中身を白紙に戻してから、そこに掛かる箱だけを塗り直す。
+        for (int b = 0; b < nb; ++b) {
+            if (!hot[static_cast<std::size_t>(b)]) continue;
+            const int bxi = b % bx_, byi = (b / bx_) % by_, bzi = b / (bx_ * by_);
+            const int X0 = bxi * brick_, X1 = std::min(g.nx, X0 + brick_) - 1;
+            const int Y0 = byi * brick_, Y1 = std::min(g.ny, Y0 + brick_) - 1;
+            const int Z0 = bzi * brick_, Z1 = std::min(g.nz, Z0 + brick_) - 1;
+            for (int z = Z0; z <= Z1; ++z)
+                for (int y = Y0; y <= Y1; ++y)
+                    std::memset(g.v.data() + (z * g.nx * g.ny + y * g.nx + X0), kEmpty,
+                                static_cast<std::size_t>(X1 - X0 + 1));
+            const Vec3 wlo = Vec3(g.origin.x + X0 * g.cell,
+                                  g.origin.y + Y0 * g.cell,
+                                  g.origin.z + Z0 * g.cell);
+            const Vec3 whi = Vec3(g.origin.x + (X1 + 1) * g.cell,
+                                  g.origin.y + (Y1 + 1) * g.cell,
+                                  g.origin.z + (Z1 + 1) * g.cell);
+            const int clip[6] = { X0, X1, Y0, Y1, Z0, Z1 };
+            for (const Obb& box : boxes) {
+                const Aabb bb = obbBounds(box);
+                const float grow = g.cell * 0.25f;
+                if (bb.max.x + grow < wlo.x || bb.min.x - grow > whi.x) continue;
+                if (bb.max.y + grow < wlo.y || bb.min.y - grow > whi.y) continue;
+                if (bb.max.z + grow < wlo.z || bb.min.z - grow > whi.z) continue;
+                rasterize_(box, clip);
+            }
+        }
+        const auto tF1 = std::chrono::high_resolution_clock::now();
+
+        for (int b = 0; b < nb; ++b) if (hot[static_cast<std::size_t>(b)]) labelBrick_(b);
+        // 面は「自分の +面」と「手前隣の +面」の両方が影響を受ける。
+        for (int b = 0; b < nb; ++b) {
+            if (!hot[static_cast<std::size_t>(b)]) continue;
+            const int bxi = b % bx_, byi = (b / bx_) % by_, bzi = b / (bx_ * by_);
+            for (int f = 0; f < 3; ++f) buildFace_(b, f);
+            if (bxi > 0) buildFace_(b - 1, 0);
+            if (byi > 0) buildFace_(b - bx_, 1);
+            if (bzi > 0) buildFace_(b - bx_ * by_, 2);
+        }
+        const auto tL1 = std::chrono::high_resolution_clock::now();
+
+        merge_();
+        const auto tM1 = std::chrono::high_resolution_clock::now();
+
+        res_.msAlloc = 0.0;
+        res_.msFill  = std::chrono::duration<double, std::milli>(tF1 - tF0).count();
+        res_.msLabel = std::chrono::duration<double, std::milli>(tL1 - tF1).count();
+        res_.msMerge = std::chrono::duration<double, std::milli>(tM1 - tL1).count();
+        res_.dirtyBricks = hotCount;
+        res_.totalBricks = nb;
+    }
+
+    // 走査線の種（x,y,z を 3 本の配列で持つ。構造体より積み下ろしが軽い）。
+    std::vector<int> seeds_, seedY_, seedZ_;
+};
 
 }  // namespace rooms
 }  // namespace acoustic

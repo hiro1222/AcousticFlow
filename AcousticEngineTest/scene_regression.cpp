@@ -13,6 +13,7 @@
  *   テストが信用されなくなる。一方で関係が壊れるのは物理として明確な回帰なので、
  *   検出したいのはそちら。乱数を使う推定量（レイトレース）とも相性が良い。
  */
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -2630,24 +2631,68 @@ void diagnoseRoomDetection() {
                     c.name, n, c.want, (n == c.want) ? "  " : " ★", nx, ny, nz, cell, vol);
         AF_SceneDestroy(s);
     }
-    // ★作り直しのコスト。LOD/ストリーミングで形状が入れ替わるたびに走るので、
-    //   ここが許容できないなら八分木＋差分更新が要る。
-    std::printf("      作り直しのコスト（格子の刻みを変えて）:\n");
-    for (float cell : {0.5f, 0.25f, 0.15f, 0.1f}) {
-        AF_SceneHandle s = build(1.2f);
-        AF_SceneSetRoomCellSize(s, cell);
-        const auto t0 = std::chrono::high_resolution_clock::now();
-        const int n = AF_SceneRoomCount(s);              // 初回はここで構築される
-        const auto t1 = std::chrono::high_resolution_clock::now();
-        int nx = 0, ny = 0, nz = 0; float c2 = 0.0f;
-        AF_SceneRoomGridDims(s, &nx, &ny, &nz, &c2);
-        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        float ma = 0.0f, mf = 0.0f, ml = 0.0f;
-        AF_SceneRoomBuildTimes(s, &ma, &mf, &ml);
-        std::printf("        %.2fm  %3dx%3dx%3d = %7d ボクセル  %6.2f ms"
-                    "（確保 %.2f / 塗り %.2f / 連結 %.2f）  部屋 %d\n",
-                    cell, nx, ny, nz, nx * ny * nz, ms, ma, mf, ml, n);
-        AF_SceneDestroy(s);
+    // ★作り直しのコスト。LOD/ストリーミング/破壊で形状が入れ替わるたびに走る。
+    std::printf("      全再構築のコスト（格子の刻み × ブロック一辺）:\n");
+    for (int brick : {8, 16, 32}) {
+        for (float cell : {0.25f, 0.1f}) {
+            AF_SceneHandle s = build(1.2f);
+            AF_SceneSetRoomCellSize(s, cell);
+            AF_SceneSetRoomBrick(s, brick);
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            const int n = AF_SceneRoomCount(s);              // 初回はここで構築される
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            int nx = 0, ny = 0, nz = 0; float c2 = 0.0f;
+            AF_SceneRoomGridDims(s, &nx, &ny, &nz, &c2);
+            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            float ma = 0, mf = 0, ml = 0, mm = 0; int hot = 0, nb = 0;
+            AF_SceneRoomBuildTimes(s, &ma, &mf, &ml, &mm, &hot, &nb);
+            std::printf("        %.2fm ブロック%2d  %7d ボクセル / %5d ブロック  %6.2f ms"
+                        "（確保 %.2f / 塗り %.2f / 連結 %.2f / 併合 %.2f）  部屋 %d\n",
+                        cell, brick, nx * ny * nz, nb, ms, ma, mf, ml, mm, n);
+            AF_SceneDestroy(s);
+        }
+    }
+
+    // ★差分更新のコスト。ここが本題 ── 仕切りを 1 枚壊すと**全体の連結が変わる**
+    //   （2 部屋が 1 部屋になる）のに、塗り直すのは触れたブロックだけで済むこと。
+    //   合わせて、差分更新の結果が全再構築と一致することを体積で確かめる。
+    std::printf("      差分更新のコスト（仕切りを壊して 2 部屋 → 1 部屋）:\n");
+    auto volumes = [](AF_SceneHandle s) {
+        double t = 0.0;
+        for (int i = 0, n = AF_SceneRoomCount(s); i < n; ++i) {
+            float v = 0.0f; AF_SceneRoomInfo(s, i, &v, nullptr, nullptr, nullptr); t += v;
+        }
+        return t;
+    };
+    for (int brick : {8, 16, 32}) {
+        for (float cell : {0.25f, 0.1f}) {
+            AF_SceneHandle s = build(0.0f);                // 仕切り 1 枚（インスタンス 6）で分断
+            AF_SceneSetRoomCellSize(s, cell);
+            AF_SceneSetRoomBrick(s, brick);
+            const int before = AF_SceneRoomCount(s);       // 初回構築を済ませておく
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            AF_SceneSetInstanceActive(s, 6, 0);            // 仕切りが消える
+            const int after = AF_SceneRoomCount(s);
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            float ma = 0, mf = 0, ml = 0, mm = 0; int hot = 0, nb = 0;
+            AF_SceneRoomBuildTimes(s, &ma, &mf, &ml, &mm, &hot, &nb);
+            const double vInc = volumes(s);
+            // 同じ形状を最初から作った場合（＝全再構築）と突き合わせる。
+            AF_SceneHandle ref = build(0.0f);
+            AF_SceneSetRoomCellSize(ref, cell);
+            AF_SceneSetRoomBrick(ref, brick);
+            AF_SceneSetInstanceActive(ref, 6, 0);
+            const int refN = AF_SceneRoomCount(ref);
+            const double vRef = volumes(ref);
+            const bool same = (after == refN) && (std::fabs(vInc - vRef) < 0.5);
+            std::printf("        %.2fm ブロック%2d  %6.3f ms（塗り %.3f / 連結 %.3f / 併合 %.3f）"
+                        "  塗り直し %3d/%5d  部屋 %d→%d  体積 %.0f（全再構築 %.0f）%s\n",
+                        cell, brick, ms, mf, ml, mm, hot, nb, before, after, vInc, vRef,
+                        same ? "" : "  ★不一致");
+            AF_SceneDestroy(ref);
+            AF_SceneDestroy(s);
+        }
     }
 
     // 扉が閉まっても部屋は分かれないこと（扉は動くものなので静的に含めない）。
@@ -3424,6 +3469,97 @@ void testVoiceApi() {
 
 // ---------------------------------------------------------------- 頑健性
 // 不正入力で落ちない（移行中に呼び出し規約を変えるので、境界は明示的に守る）。
+// 部屋の差分更新は「触れたブロックだけ塗り直す」ので、塗り残し・番号の食い違い・
+// 面の対応表の張り忘れが**静かに**入り込む。全再構築と突き合わせて縛る。
+void testRoomIncremental() {
+    std::printf("\n[部屋] 差分更新が全再構築と一致するか\n");
+    const float h = 4.0f, t = 0.15f, hw = 6.0f, hd = 8.0f;
+    // 箱: 0 床 / 1 天井 / 2,3 左右壁 / 4,5 前後壁 / 6 仕切り / 7 隅の柱
+    auto build = [&]() {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-4.0f, h*0.5f, -4.0f), V(0.5f, h*0.5f, 0.5f),
+                               V(1,0,0), V(0,1,0), mat);
+        return s;
+    };
+    // 部屋数と体積の並びで比べる（番号の付き方まで一致する必要はない）。
+    auto snapshot = [](AF_SceneHandle s) {
+        std::vector<double> v;
+        for (int i = 0, n = AF_SceneRoomCount(s); i < n; ++i) {
+            float a = 0.0f; AF_SceneRoomInfo(s, i, &a, nullptr, nullptr, nullptr);
+            v.push_back(a);
+        }
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    auto same = [](const std::vector<double>& a, const std::vector<double>& b) {
+        if (a.size() != b.size()) return false;
+        for (std::size_t i = 0; i < a.size(); ++i)
+            if (std::fabs(a[i] - b[i]) > 0.5) return false;
+        return true;
+    };
+
+    for (int brick : {8, 16, 32}) {
+        char tag[64];
+        // ① 仕切りを降ろす＝2部屋が1部屋に繋がる（全体の連結が変わる最悪ケース）
+        {
+            AF_SceneHandle s = build(); AF_SceneSetRoomBrick(s, brick);
+            const int before = AF_SceneRoomCount(s);
+            AF_SceneSetInstanceActive(s, 6, 0);
+            AF_SceneHandle r = build(); AF_SceneSetRoomBrick(r, brick);
+            AF_SceneSetInstanceActive(r, 6, 0);
+            std::snprintf(tag, sizeof(tag), "[部屋] ブロック%d 仕切り除去が全再構築と一致", brick);
+            check(tag, before == 2 && AF_SceneRoomCount(s) == 1
+                       && same(snapshot(s), snapshot(r)));
+            AF_SceneDestroy(r); AF_SceneDestroy(s);
+        }
+        // ② 柱を動かす＝静的から外れる。**元居た場所**の塗り残しが出やすい。
+        {
+            AF_SceneHandle s = build(); AF_SceneSetRoomBrick(s, brick);
+            AF_SceneRoomCount(s);
+            AF_SceneUpdateInstance(s, 7, V(-4.0f, h*0.5f, -3.0f), V(0.5f, h*0.5f, 0.5f),
+                                   V(1,0,0), V(0,1,0));
+            AF_SceneHandle r = build(); AF_SceneSetRoomBrick(r, brick);
+            AF_SceneUpdateInstance(r, 7, V(-4.0f, h*0.5f, -3.0f), V(0.5f, h*0.5f, 0.5f),
+                                   V(1,0,0), V(0,1,0));
+            AF_SceneRoomCount(r);
+            std::snprintf(tag, sizeof(tag), "[部屋] ブロック%d 柱の移動が全再構築と一致", brick);
+            check(tag, same(snapshot(s), snapshot(r)));
+            AF_SceneDestroy(r); AF_SceneDestroy(s);
+        }
+        // ③ 降ろして戻す＝元に戻ること（塗り直しが冪等か）
+        {
+            AF_SceneHandle s = build(); AF_SceneSetRoomBrick(s, brick);
+            const std::vector<double> v0 = snapshot(s);
+            AF_SceneSetInstanceActive(s, 6, 0); AF_SceneRoomCount(s);
+            AF_SceneSetInstanceActive(s, 6, 1);
+            std::snprintf(tag, sizeof(tag), "[部屋] ブロック%d 降ろして戻すと元に戻る", brick);
+            check(tag, same(snapshot(s), v0));
+            AF_SceneDestroy(s);
+        }
+    }
+
+    // ④ 点の所属も差分更新で正しいこと（union-find を引き直せているか）。
+    {
+        AF_SceneHandle s = build();
+        const int a0 = AF_SceneRoomAt(s, V(0, 2.0f, -4.0f));
+        const int b0 = AF_SceneRoomAt(s, V(0, 2.0f,  4.0f));
+        check("[部屋] 仕切りの両側は別の部屋", a0 >= 0 && b0 >= 0 && a0 != b0);
+        AF_SceneSetInstanceActive(s, 6, 0);
+        const int a1 = AF_SceneRoomAt(s, V(0, 2.0f, -4.0f));
+        const int b1 = AF_SceneRoomAt(s, V(0, 2.0f,  4.0f));
+        check("[部屋] 仕切りを外すと同じ部屋になる", a1 >= 0 && a1 == b1);
+        AF_SceneDestroy(s);
+    }
+}
+
 void testRobustness() {
     std::printf("\n[頑健性] null / 不正引数\n");
     float g[kBands] = {};
@@ -3463,6 +3599,7 @@ int main() {
     testMesh();
     testDirectionalProbe();
     testSecondOrderDiffraction();
+    testRoomIncremental();
     diagnoseRoomDetection();
     diagnosePortalScope();
     diagnoseNonPlateBlocker();

@@ -319,9 +319,16 @@ ACOUSTIC_API void AF_SceneSetRoomCellSize(AF_SceneHandle scene, float meters);
 /* 検出に使った格子の寸法（診断用）。 */
 ACOUSTIC_API void AF_SceneRoomGridDims(AF_SceneHandle scene, int* nx, int* ny, int* nz,
                                        float* cell);
-/* 構築の段別所要時間(ms)。どこを削るべきかを数字で決めるため。 */
-ACOUSTIC_API void AF_SceneRoomBuildTimes(AF_SceneHandle scene, float* alloc,
-                                         float* fill, float* label);
+/* 構築の段別所要時間(ms)と、直近の更新で塗り直したブロック数。
+ * どこを削るべきかを推測でなく数字で決めるため。null 可。
+ * dirtyBricks が 0 なら全再構築、>0 なら差分更新。 */
+ACOUSTIC_API void AF_SceneRoomBuildTimes(AF_SceneHandle scene, float* alloc, float* fill,
+                                         float* label, float* merge,
+                                         int* dirtyBricks, int* totalBricks);
+
+/* 差分更新の粒度（ブロック一辺のボクセル数）。既定 16。変えると全再構築が走る。
+ * 小さいほど更新は局所的になるが、走査線の区間が切り詰められて全再構築が遅くなる。 */
+ACOUSTIC_API void AF_SceneSetRoomBrick(AF_SceneHandle scene, int voxels);
 
 /* ★試して却下した案の記録: 稜線探索で見つけた開口を「開口率最大のポータル」として
  *   評価する（ゲイン = 開口の広さだけ。前川の δ も開口積分も掛けない）。

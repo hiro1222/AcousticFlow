@@ -30,6 +30,7 @@
 #include "Core/maekawa.h"
 #include "Core/material.h"
 #include "Core/mesh_geom.h"
+#include "Core/room_graph.h"
 #include "Core/utd.h"
 #include "Core/vec3.h"
 
@@ -123,6 +124,12 @@ struct Instance {
     //   local→world の写像になる（mesh_geom.h 参照）。
     int geomId = -1;
     bool active = true;   // false のとき全走査からスキップ（LOD ストリーミング用）
+    // ★実行中に一度でも変換が更新されたか。部屋・開口の検出で「静的な形状」を
+    //   選ぶのに使う。扉のように動くものは部屋の仕切りではなく**開口を塞ぐもの**なので、
+    //   静的な塗り分けに入れてはいけない（入れると閉扉時に戸口が消えて、
+    //   「そこに開口がある」という情報が幾何から失われる）。
+    //   authoring ではなく**観測**で決まるのが利点。手続き生成でも自動で効く。
+    bool moved = false;
 };
 
 // レイ走査の結果。
@@ -177,6 +184,8 @@ public:
         inst.geomId = validMesh(geomId) ? geomId : -1;
         instances_.push_back(inst);
         bvhDirty_ = true;
+        // 新しい箱が置かれた領域だけ塗り直せばよい（格子から外れていれば中で全再構築に落ちる）。
+        roomBuilder_.touch(rooms::obbBounds(obb));
         return static_cast<int>(instances_.size()) - 1;
     }
 
@@ -228,19 +237,64 @@ public:
     // 範囲外 id は無視。
     void updateInstanceTransform(int instanceId, const Obb& obb) {
         if (!validInstance(instanceId)) return;
-        instances_[instanceId].obb = obb;
+        Instance& in = instances_[instanceId];
+        // 実際に動いたときだけ「動くもの」と記録する。ホストが毎フレーム同じ値を
+        //   押してくることがあるので、値の変化で判定する（呼ばれた回数では判定しない）。
+        const Obb& o = in.obb;
+        if (length(o.center - obb.center) > 1e-4f
+            || length(o.halfExtents - obb.halfExtents) > 1e-4f
+            || dot(o.axisX, obb.axisX) < 0.9999f
+            || dot(o.axisY, obb.axisY) < 0.9999f) {
+            // ★動いた瞬間に静的な塗り分けから外れるので、**元居た場所**を塗り直さないと
+            //   実体が残る。移動先も「そこには何も無い」を確定させるために渡す。
+            roomBuilder_.touch(rooms::obbBounds(o));
+            roomBuilder_.touch(rooms::obbBounds(obb));
+            in.moved = true;
+        }
+        in.obb = obb;
         bvhDirty_ = true;
+    }
+
+    // 【部屋の検出】静的な形状だけをボクセル化して、空きの連結成分を部屋とする。
+    //   幾何が変わったときだけ作り直す。毎フレーム呼んでも中で弾かれる。
+    //   変わった領域を rooms::Builder に伝えてあるので、触れたブロックだけ塗り直される。
+    const rooms::Result& roomGraph() const {
+        if (!roomBuilder_.dirty()) return roomBuilder_.result();
+        std::vector<Obb> statics;
+        statics.reserve(instances_.size());
+        for (const Instance& in : instances_) {
+            if (!in.active) continue;
+            // ★動くもの（扉など）は入れない。入れると閉扉時に戸口が塞がって
+            //   「そこに開口がある」という情報が幾何から消える。
+            if (in.moved) continue;
+            statics.push_back(in.obb);
+        }
+        return roomBuilder_.build(statics);
+    }
+    void setRoomCellSize(float m) { roomBuilder_.setCell(m); }
+    void setRoomBrick(int voxels) { roomBuilder_.setBrick(voxels); }
+    // 点がどの部屋にいるか。-1 なら部屋の外／実体の中。
+    int roomAt(const Vec3& p) const {
+        const rooms::Grid& g = roomGraph().grid;
+        if (g.v.empty()) return -1;
+        return roomBuilder_.roomAtVoxel(static_cast<int>((p.x - g.origin.x) / g.cell),
+                                        static_cast<int>((p.y - g.origin.y) / g.cell),
+                                        static_cast<int>((p.z - g.origin.z) / g.cell));
     }
 
     // インスタンスの有効/無効を切り替える。
     void setInstanceActive(int instanceId, bool active) {
         if (!validInstance(instanceId)) return;
+        // ★部屋の検出も作り直す。LOD/ストリーミングで壁が降りると自由空間の
+        //   つながり方が変わるので、古い結果を使い続けてはいけない。
+        if (instances_[instanceId].active != active)
+            roomBuilder_.touch(rooms::obbBounds(instances_[instanceId].obb));
         instances_[instanceId].active = active;
         bvhDirty_ = true;
     }
 
     // 全インスタンスを消す（材質テーブルは保持）。毎フレーム作り直す用途。
-    void clearInstances() { instances_.clear(); bvhDirty_ = true; }
+    void clearInstances() { instances_.clear(); bvhDirty_ = true; roomBuilder_.invalidateAll(); }
 
     // 材質もインスタンスも形状も全消し。
     void clearAll() {
@@ -4522,6 +4576,8 @@ private:
     mutable std::vector<BvhNode> bvhNodes_;    // BVH ノード列（lazy 構築）
     mutable std::vector<int> bvhOrder_;        // アクティブなインスタンス index の並び
     mutable bool bvhDirty_ = true;             // インスタンス変更で立つ再構築フラグ
+    // 部屋・開口の検出。幾何が変わった領域だけ塗り直す（毎フレームではない）。
+    mutable rooms::Builder roomBuilder_;
     mutable std::vector<DiffEdge> edgeCatalog_;  // キューブマップ由来のシルエット稜線
 };
 
