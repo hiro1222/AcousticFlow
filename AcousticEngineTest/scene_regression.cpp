@@ -560,8 +560,13 @@ void diagnoseShadowBoundary() {
         AF_SceneComputeDiffractionBandsUtd(s, V(x, 1.6f, -2), src, u, kBands);
         float fr[kBands] = {};
         const int frOk = AF_SceneMeasureApertureFresnel(s, V(x, 1.6f, -2), src, fr);
-        std::printf("      %8.2f  %6.3f  %6.3f   %6.3f  %6.3f   開口率 %d %6.3f %6.3f%s\n",
+        // ★δ も出す。開口率が滑らかなのに出力が飛ぶなら、原因は δ 側にある。
+        AF_Vector3 mid;
+        const float dlt = AF_SceneDiffractionPath(s, V(x, 1.6f, -2), src, &mid);
+        std::printf("      %8.2f  %6.3f  %6.3f   %6.3f  %6.3f   開口率 %d %6.3f %6.3f"
+                    "   δ=%6.3f 開口点(%5.2f,%5.2f,%5.2f)%s\n",
                     x, g[0], g[5], u[0], u[5], frOk, fr[0], fr[5],
+                    dlt, mid.x, mid.y, mid.z,
                     (std::fabs(x - 2.0f) < 0.13f) ? "  ← 影境界" : "");
         if (prevLow >= 0.0f) {
             const float jump = std::fabs(g[0] - prevLow);
@@ -2992,6 +2997,8 @@ void testDoorContinuity() {
     float prev = -1.0f, maxJump = 0.0f, jumpAt = 0.0f;
     float first = -1.0f, last = -1.0f;
     int silentCount = 0, total = 0;
+    float sweepSum[91] = {}, sweepOpen[91] = {};
+    int   sweepN[91] = {};
     // ★「扉が仕事をしているか」を測るための控え。
     //   隣接差だけを見ていたせいで、**変化を殺した実装がテストを通ってしまった**
     //   （定数関数は完全に連続なので当然）。開き角ごとの値と高域の開口率を残す。
@@ -3016,6 +3023,10 @@ void testDoorContinuity() {
         const float c = std::cos(th), sn = std::sin(th);
         AF_SceneAddInstanceBox(s, V(-0.6f + c * doorW * 0.5f, doorH * 0.5f, sn * doorW * 0.5f),
                                V(doorW * 0.5f, doorH * 0.5f, 0.03f), V(c, 0, sn), V(0, 1, 0), mat);
+        {   // 傾きを振って比べられるようにする（既定はエンジンの値）。
+            const char* c = std::getenv("AF_CONTRAST");
+            if (c) AF_SceneSetApertureContrast(s, static_cast<float>(std::atof(c)));
+        }
         // ★戸口をポータルとして置く。**出荷する経路で測る**ため。
         //   ポータルが無いと旧経路（前川＋開口積分）が走るが、そちらは
         //   「面のうちどこまで積分するか」に答えが無く、扉の効きが 1.9倍で頭打ちになる
@@ -3034,6 +3045,16 @@ void testDoorContinuity() {
         ++total;
         if (deg > 20.0f && sum < 1e-6f) ++silentCount;   // 十分開いてから無音は異常
 
+        // ★跳ぶ位置は事前に分からないので全角度を控えておき、最後に窓で出す。
+        //   15〜25°だけ出していたせいで、53°で跳んでいるのに中身が見えなかった。
+        if (deg >= 0.0f && deg <= 90.0f) {
+            const int di = static_cast<int>(deg + 0.5f);
+            if (di >= 0 && di < 91) {
+                sweepSum[di] = sum; sweepN[di] = n;
+                float fz[kBands] = {}; AF_Vector3 pcp = V(0,0,0);
+                sweepOpen[di] = AF_SceneMeasurePortal(s, 0, L, S, fz, &pcp) ? fz[0] : -1.0f;
+            }
+        }
         if (deg >= 15.0f && deg <= 25.0f)
             std::printf("        %4.0f°  開口 %d本  合計 %.4f  実測幅 %.4f\n",
                         deg, n, sum, AF_SceneMeasureSlitWidth(s, L, S));
@@ -3057,6 +3078,20 @@ void testDoorContinuity() {
         AF_SceneDestroy(s);
     }
 
+    // ★頭打ちが「幾何が開き切ったから」なのか「コントラストのクランプ」なのかを
+    //   分けるため、10°刻みで開口率と出力を並べる。開口率が上がり続けているのに
+    //   出力が 1.0 で止まっているなら、頭打ちを作っているのはクランプの方。
+    {
+        std::printf("        10°刻み（頭打ちの正体を見る）:\n");
+        for (int d = 0; d <= 90; d += 10)
+            std::printf("          %3d°  合計 %.4f  ポータル開口率125Hz %.4f\n",
+                        d, sweepSum[d], sweepOpen[d]);
+        const int j = static_cast<int>(jumpAt + 0.5f);
+        std::printf("        隣接差が最大の付近 (%d°):\n", j);
+        for (int d = std::max(0, j - 3); d <= std::min(90, j + 2); ++d)
+            std::printf("          %3d°  合計 %.4f  開口率 %.4f\n",
+                        d, sweepSum[d], sweepOpen[d]);
+    }
     char b[128];
     std::snprintf(b, sizeof(b), "(最大隣接差 %.4f @ %.0f° / 閉 %.4f → 全開 %.4f)",
                   maxJump, jumpAt, first, last);
