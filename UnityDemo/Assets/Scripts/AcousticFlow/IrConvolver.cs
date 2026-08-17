@@ -317,6 +317,22 @@ namespace AcousticFlow
         private float _irTimer;
         private AudioSource _src;
 
+        // ★C++ 経路(VoiceConvolver)と同時に有効にしない。
+        //   両方が OnAudioFilterRead を返すと、同じ音源が二重に鳴る（実際に踏んだ）。
+        //   AcousticFlowSceneDemo.SetDspPath は起動時と Y キーでしか呼ばれないので、
+        //   インスペクタでチェックを手で入れると排他が効かない。どこから有効にされても
+        //   不変条件（鳴らすのは常に片方だけ）が保たれるよう、ここで相手を降ろす。
+        //   ※ 同じ GameObject とは限らないので探索で拾う（OnEnable は滅多に呼ばれない）。
+        private void OnEnable()
+        {
+            int downed = 0;
+            foreach (var vc in FindObjectsByType<VoiceConvolver>(FindObjectsSortMode.None))
+                if (vc.enabled) { vc.enabled = false; downed++; }
+            if (downed > 0)
+                Debug.Log($"[IrConvolver] C# 経路を有効にしたので C++ 経路(VoiceConvolver) {downed} 個を"
+                          + "降ろしました（両方鳴らすと二重になります。Y キーで切り替え）");
+        }
+
         private void Awake()
         {
             _sampleRate = AudioSettings.outputSampleRate;
