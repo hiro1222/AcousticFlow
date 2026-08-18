@@ -4143,6 +4143,33 @@ public:
                 runEchogram(n);
             }
         }
+
+        // 初回で全段を走らせ終えたら、以後の位相をずらす。
+        if (!staggered_) { staggered_ = true; phaseStages_(); }
+    }
+
+    // 【段の位相をずらす】周期は変えず、走る**フレームをずらす**だけ。
+    //   全部 1 から始めると初回に全段が揃い、以後も周期の最小公倍数(12)ごとに全部揃う。
+    //   しかも既定ではカタログと早期反射が周期も位相も同じ(3)なので毎回必ず一緒に走る。
+    //   平均は同じでも「重い段が重なるフレーム」が最悪値を作るので、そこだけを崩す。
+    //   実行間隔は各段とも変わらない＝**品質は一切落ちない**。
+    //
+    //   既定（catalog=3 / diffSrc=2 / early=3 / role2=4）でのずらした後の並び:
+    //     回折二次(2)  2, 4, 6, 8, 10 …
+    //     早期反射(3)  3, 6, 9, 12 …
+    //     カタログ(3)  4, 7, 10, 13 …
+    //     エコグラム(4) 5, 9, 13, 17 …   ← いちばん重い(3.4ms)ので単独の回を増やす
+    //   同時に走るのは多くて 2 段。実測: 最悪 26.5ms → 20.5ms。
+    void phaseStages_() {
+        const int cat = (cfg_.catalogEveryN  > 0) ? cfg_.catalogEveryN  : 1;
+        const int dif = (cfg_.diffSrcEveryN  > 0) ? cfg_.diffSrcEveryN  : 1;
+        const int erl = (cfg_.earlyEveryN    > 0) ? cfg_.earlyEveryN    : 1;
+        const int rv  = (cfg_.role2EveryN    > 0) ? cfg_.role2EveryN    : 1;
+        // 「周期のうち何番目に走るか」を段ごとに変える。周期 1 の段はずらしようがない。
+        catalogCountdown_ = cat;
+        diffSrcCountdown_ = std::max(1, dif - 1);
+        earlyCountdown_   = std::max(1, erl - 1);
+        role2Countdown_   = rv;
     }
 
     // --- 結果取得（前回 update ぶん）---
@@ -4440,11 +4467,15 @@ private:
     UpdateConfig cfg_;
     Results results_;
     std::vector<Vec3> srcScratch_;
+    // ★初回は全段を走らせる。ホストが 1 フレーム目に空の結果を掴まないための契約
+    //   （「初回updateでエコグラムが埋まる」は回帰テストで縛ってある）。
+    //   そのうえで 2 回目以降の位相をずらす → phaseStages_()
     int role1Countdown_ = 1;
     int role2Countdown_ = 1;
     int earlyCountdown_ = 1;
     int diffSrcCountdown_ = 1;
     int catalogCountdown_ = 1;
+    bool staggered_ = false;
 
     bool validInstance(int id) const { return id >= 0 && id < instanceCount(); }
 
