@@ -265,6 +265,7 @@ namespace AcousticFlow
         private int _tailSamples;                    // 尾IRの長さ（どちらの方式でも共通）
         private ReverbTailIr _tailIr;
         private int _tailEchoVersion = -1;          // 最後に取り込んだエコグラムの版
+        private float[] _echoPerSrc;                // 自分の音源のエコグラム（使い回し）
         private volatile float _tailGain;           // D/R比から決めた尾の絶対ゲイン
         private float _splitMs = 120f;              // 早期↔後期の境目（RT60から毎回決める）
         private float[] _tailInMono;                // 畳み込み入力（モノラル dry）
@@ -557,8 +558,24 @@ namespace AcousticFlow
         {
             if (tailMode != TailMode.Measured || _tailIr == null) return;
             if (_tailConv == null && _tailConvNU == null) return;
+            // ★自分が担当する音源のエコグラムを引く。Status.EchogramBands は全音源の和
+            //   （部屋全体の響き＝RT60/wet の算出用）なので、尾に使うと別の部屋の音源まで
+            //   同じ形になる（実測: 減衰の形が 500ms 時点で 9.0dB 違う）。
             var bands = AcousticFlowSceneDemo.Status.EchogramBands;
             if (bands == null) return;   // 古いDLL＝帯域別が取れない。Fdn へフォールバックすべき状態。
+            {
+                var scene = AcousticFlowSceneDemo.SharedScene;
+                var tsEcho = MyTaps();
+                if (scene != null && scene.IsValid && tsEcho != null && tsEcho.EngineIndex >= 0)
+                {
+                    int nb2 = AcousticEngine.NumBands;
+                    int want = AcousticFlowSceneDemo.Status.EchogramBinCount;
+                    if (_echoPerSrc == null || _echoPerSrc.Length < want * nb2)
+                        _echoPerSrc = new float[Mathf.Max(1, want) * nb2];
+                    if (scene.GetEchogramBands(tsEcho.EngineIndex, _echoPerSrc, want) > 0)
+                        bands = _echoPerSrc;
+                }
+            }
             int ver = AcousticFlowSceneDemo.Status.EchogramVersion;
 
             // 尾の左右バランス（方向プローブ）。エコーグラムより速く変わるので、

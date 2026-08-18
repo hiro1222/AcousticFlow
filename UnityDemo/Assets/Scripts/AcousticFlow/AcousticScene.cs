@@ -482,10 +482,15 @@ namespace AcousticFlow
         }
 
         // 帯域別エコグラム（outBins は numBins*6 要素）。書けたビン数を返す。
-        public int GetEchogramBands(float[] outBins, int numBins)
+        //   index : 音源のエンジン内 index（SourceIndex で引いたもの）。
+        //           -1 で全音源の和＝部屋全体の響き。
+        //   ★音源ごとに持つ。別の部屋にいる音源は届く量も減衰の形も違う
+        //     （実測: 量で 10.0dB、形で 500ms 時点 9.0dB）。以前は 1 本に潰していたので、
+        //     響く部屋の音源も吸う部屋の音源も同じ尾で鳴っていた。
+        public int GetEchogramBands(int index, float[] outBins, int numBins)
         {
             if (_handle == IntPtr.Zero || _sourceRegistryMissing || outBins == null) return 0;
-            return Native.AF_SceneGetEchogramBands(_handle, outBins, numBins);
+            return Native.AF_SceneGetEchogramBands(_handle, index, outBins, numBins);
         }
 
         // ===== 部屋と開口（幾何から自動検出）=====

@@ -574,6 +574,10 @@ namespace AcousticFlow
             public int Count;
             public float ItdgMs;                    // 最初の反射までの相対遅延=ITDG
             public float SourceLevel;               // 反射込みの生存(0..1)。残響の送出量に使う
+            // エンジン内の音源 index（AF_SceneSourceIndex の戻り）。-1 は未登録。
+            //   畳み込み器が「自分の音源のエコグラム」を引くのに要る。
+            //   ホスト側の並び順とは別物なので、ここに控えて渡す。
+            public int EngineIndex = -1;
             // 【自由音場の直接レベル】距離減衰と空気吸収だけ。遮蔽を**含まない**。
             //   尾の絶対レベルの校正基準（tailGain = これ × √target）に使う。
             //   ★BandGain[0..5]（直接音タップ）を使ってはいけない。あれは遮蔽込みなので、
@@ -1501,7 +1505,9 @@ namespace AcousticFlow
                 // 段2: 計算はバッチ更新（内部レート）で済んでいるので、結果を受け取るだけ。
                 //   エンジン側が再計算していないフレームでは前回と同じ内容が返るので、
                 //   中身が変わったときだけ後段（IR再生成など）へ知らせる。
-                if (_scene.GetEchogramBands(_echogramBands, _echogram.Length) > 0)
+                // ここは部屋全体の響き（RT60/wet の算出用）なので全音源の和(-1)。
+                // 音源ごとの尾は各畳み込み器が自分の EngineIndex で引く。
+                if (_scene.GetEchogramBands(-1, _echogramBands, _echogram.Length) > 0)
                 {
                     // 広帯域エコグラム（RT60/wet 用）は帯域平均として導出する。
                     bool changed = false;
@@ -1759,6 +1765,8 @@ namespace AcousticFlow
 
             // 段3: 早期反射/回折二次音源はバッチ更新で計算済み。ここでは結果を受け取るだけ。
             int idx = _scene.SourceIndex(SourceId(si));
+            // 畳み込み器が「自分の音源のエコグラム」を引けるよう控えておく。
+            ts.EngineIndex = idx;
 
             // 回折の開口は直接タップの決定に要る（下記）ので先に取る。
             int df = _scene.GetDiffractionSources(idx, _tapDiffPos, _tapDiffGain);

@@ -311,7 +311,9 @@ namespace AcousticFlow
             IntPtr scene, int index, [In, Out] AFVector3[] outPos, [Out] float[] outGain, int maxSrc);
 
         [DllImport(Dll, CallingConvention = Cc)]
-        public static extern int AF_SceneGetEchogramBands(IntPtr scene, [Out] float[] outBins, int numBins);
+        // 音源 index のエコグラム。index=-1 で全音源の和（部屋全体の響き）。
+        public static extern int AF_SceneGetEchogramBands(IntPtr scene, int index,
+                                                          [Out] float[] outBins, int numBins);
 
         // ===== 部屋と開口（幾何から自動検出）=====
         // 静的な形状をボクセル化して自由空間を塗り分け、狭いくびれ（戸口）で部屋を分ける。

@@ -56,3 +56,4 @@ UnityDemo/Assets/StreamingAssets/WwiseBanks/*.bnk
 desktop.ini
 **/desktop.ini
 **/desktop.ini.meta
+build2/

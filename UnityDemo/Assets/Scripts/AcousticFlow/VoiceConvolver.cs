@@ -246,7 +246,9 @@ namespace AcousticFlow
                 if (scene != null && scene.IsValid && (echoVer != _tailEchoVersion || earChanged))
                 {
                     _tailEchoVersion = echoVer;
-                    int bins = scene.GetEchogramBands(_echo, _echo.Length / nb);
+                    // ★自分が担当する音源のエコグラムを引く。以前は全音源の和しか無かったので、
+                    //   別の部屋の音源も同じ尾で鳴っていた。
+                    int bins = scene.GetEchogramBands(ts.EngineIndex, _echo, _echo.Length / nb);
                     if (bins > 0)
                     {
                         // 尾の絶対レベルの基準になる直接音ゲイン。
