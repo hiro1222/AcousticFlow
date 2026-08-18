@@ -387,7 +387,7 @@ void testBatchUpdate() {
     // --- エコグラム: バッチ結果が従来クエリと一致 ---
     constexpr int kBins = 100;
     std::vector<float> batchEcho(kBins * kBands, 0.0f);
-    const int gotBins = AF_SceneGetEchogramBands(s, batchEcho.data(), kBins);
+    const int gotBins = AF_SceneGetEchogramBands(s, -1, batchEcho.data(), kBins);
     check("エコグラムのビン数が一致", gotBins == kBins);
 
     std::vector<float> refEcho(kBins * kBands, 0.0f);
@@ -433,7 +433,7 @@ void testUpdateRates() {
     // 1 フレーム目: 全部走る（カウンタ初期値 1）。
     AF_SceneUpdate(s, 0.016f);
     std::vector<float> e1(50 * kBands, 0.0f);
-    AF_SceneGetEchogramBands(s, e1.data(), 50);
+    AF_SceneGetEchogramBands(s, -1, e1.data(), 50);
     float sum1 = 0.0f;
     for (float v : e1) sum1 += v;
     check("初回updateでエコグラムが埋まる", sum1 > 0.0f);
@@ -443,7 +443,7 @@ void testUpdateRates() {
     AF_SceneSetSource(s, 1, V(4, 1.6f, 3));
     AF_SceneUpdate(s, 0.016f);
     std::vector<float> e2(50 * kBands, 0.0f);
-    AF_SceneGetEchogramBands(s, e2.data(), 50);
+    AF_SceneGetEchogramBands(s, -1, e2.data(), 50);
     bool unchanged = true;
     for (int i = 0; i < 50 * kBands; ++i) if (std::fabs(e1[i] - e2[i]) > 1e-9f) unchanged = false;
     check("role2EveryN=4 なので次フレームでは再計算されない", unchanged);
@@ -453,7 +453,7 @@ void testUpdateRates() {
     AF_SceneUpdate(s, 0.016f);
     AF_SceneUpdate(s, 0.016f);
     std::vector<float> e3(50 * kBands, 0.0f);
-    AF_SceneGetEchogramBands(s, e3.data(), 50);
+    AF_SceneGetEchogramBands(s, -1, e3.data(), 50);
     bool changed = false;
     for (int i = 0; i < 50 * kBands; ++i) if (std::fabs(e1[i] - e3[i]) > 1e-9f) changed = true;
     check("4フレーム後には再計算される", changed);
@@ -1627,7 +1627,7 @@ void diagnoseRoomCoupling() {
             AF_SceneUpdate(s, 1.0f / 60.0f);
 
             float echo[100 * kBands] = {};
-            const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+            const int bins = AF_SceneGetEchogramBands(s, -1, echo, 100);
             double sum = 0.0, late = 0.0;
             for (int i = 0; i < bins; ++i)
                 for (int b = 0; b < kBands; ++b) {
@@ -2863,7 +2863,7 @@ void diagnoseReverbSendWalk() {
         AF_SceneSetSource(s, 1, S);
         for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);   // 内部レートを流す
         float echo[100 * kBands] = {};
-        const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+        const int bins = AF_SceneGetEchogramBands(s, -1, echo, 100);
         std::vector<double> e(static_cast<std::size_t>(bins), 0.0);
         double peak = 0.0, total = 0.0;
         for (int i = 0; i < bins; ++i) {
@@ -2963,7 +2963,7 @@ void diagnoseReverbSendWalk() {
         AF_SceneSetSource(s, 1, S);
         for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
         float echo[100 * kBands] = {};
-        const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+        const int bins = AF_SceneGetEchogramBands(s, -1, echo, 100);
         double peak = 0.0;
         std::vector<double> e(static_cast<std::size_t>(bins), 0.0);
         for (int i = 0; i < bins; ++i) {
@@ -3014,7 +3014,7 @@ void diagnoseReverbSendWalk() {
             AF_SceneSetSource(s, 1, S);
             for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
             float echo[100 * kBands] = {};
-            const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+            const int bins = AF_SceneGetEchogramBands(s, -1, echo, 100);
             double peak = 0.0;
             std::vector<double> e(static_cast<std::size_t>(bins), 0.0);
             for (int i = 0; i < bins; ++i) {
@@ -3159,7 +3159,7 @@ void diagnosePillarTimbre() {
 
         // 3) 実際に耳へ届くスペクトル（エコグラムの帯域別総和）
         float echo[100 * kBands] = {};
-        const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+        const int bins = AF_SceneGetEchogramBands(s, -1, echo, 100);
         double* dst = (k == 0) ? bandNo : ((k == 1) ? bandYes : bandHard);
         for (int b = 0; b < kBands; ++b) {
             double sum = 0.0;
@@ -3245,7 +3245,7 @@ void diagnosePerSourceEchogram() {
     for (int k = 0; k < 3; ++k) {
         AF_SceneHandle s = build(k);
         float echo[100 * kBands] = {};
-        const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+        const int bins = AF_SceneGetEchogramBands(s, -1, echo, 100);
         std::vector<double> e(static_cast<std::size_t>(bins), 0.0);
         double peak = 0.0, sum = 0.0, late = 0.0;
         for (int i = 0; i < bins; ++i) {
@@ -3273,7 +3273,7 @@ void diagnosePerSourceEchogram() {
     for (int k = 0; k < 3; ++k) {
         AF_SceneHandle s = build(k);
         float echo[100 * kBands] = {};
-        const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+        const int bins = AF_SceneGetEchogramBands(s, -1, echo, 100);
         std::vector<double> e(static_cast<std::size_t>(bins), 0.0);
         double peak = 0.0;
         for (int i = 0; i < bins; ++i) {

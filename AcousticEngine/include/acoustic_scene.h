@@ -620,7 +620,14 @@ ACOUSTIC_API int AF_SceneGetDiffractionSources(AF_SceneHandle scene, int index,
                                                AF_Vector3* outPos, float* outGain, int maxSrc);
 
 /* 帯域別エコグラム。outBins[k*6 + b] に書き、書けたビン数を返す。 */
-ACOUSTIC_API int AF_SceneGetEchogramBands(AF_SceneHandle scene, float* outBins, int numBins);
+/* 帯域別エコグラム。音源 index のぶんを outBins[k*6 + b] に書き、書けたビン数を返す。
+ * index に -1 を渡すと全音源の和（部屋全体の響きを見る用）。
+ * ★音源ごとに持つ。以前は全音源を 1 本へ足していたので、響く部屋の音源と吸う部屋の
+ *   音源が同じ尾で鳴っていた（実測: 減衰の形が 500ms で 9.0dB 違うのに 1 本へ潰れ、
+ *   両方置くとどちらでもない中間になった）。レイ追跡はリスナーから 1 回で共有なので、
+ *   分けても計算は増えない（増えるのはメモリだけ）。 */
+ACOUSTIC_API int AF_SceneGetEchogramBands(AF_SceneHandle scene, int index,
+                                          float* outBins, int numBins);
 
 #ifdef __cplusplus
 }

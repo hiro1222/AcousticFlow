@@ -378,11 +378,20 @@ void AF_SceneComputeEchogramBands(AF_SceneHandle scene, AF_Vector3 listener,
                                   float binSeconds, float speedOfSound,
                                   int numRays, int maxBounces, float distanceRef) {
     Scene* s = asScene(scene);
-    if (!s || !sources || count <= 0) return;
+    if (!s || !sources || count <= 0 || !outBins || numBins <= 0) return;
     std::vector<Vec3> src(static_cast<size_t>(count));
     for (int i = 0; i < count; ++i) src[i] = toVec3(sources[i]);
-    s->computeEchogramBands(toVec3(listener), src.data(), count, outBins, numBins,
+    // ★computeEchogramBands は音源ごとの面（[音源][ビン][帯域]）を書くようになった。
+    //   この単発クエリの契約は「全音源まとめた 1 本」なので、内部で音源ぶん確保してから
+    //   足し込む。呼び手のバッファは numBins*6 のままでよい（そのまま渡すと溢れる）。
+    const std::size_t per = static_cast<std::size_t>(numBins) * kNumBands;
+    std::vector<float> tmp(per * static_cast<std::size_t>(count), 0.0f);
+    s->computeEchogramBands(toVec3(listener), src.data(), count, tmp.data(), numBins,
                             binSeconds, speedOfSound, numRays, maxBounces, distanceRef);
+    for (std::size_t i = 0; i < per; ++i) outBins[i] = 0.0f;
+    for (int j = 0; j < count; ++j)
+        for (std::size_t i = 0; i < per; ++i)
+            outBins[i] += tmp[static_cast<std::size_t>(j) * per + i];
 }
 
 int AF_SceneTraceReflectionPath(AF_SceneHandle scene, AF_Vector3 origin, AF_Vector3 dir,
@@ -543,9 +552,9 @@ int AF_SceneGetDiffractionSources(AF_SceneHandle scene, int index,
     return n;
 }
 
-int AF_SceneGetEchogramBands(AF_SceneHandle scene, float* outBins, int numBins) {
+int AF_SceneGetEchogramBands(AF_SceneHandle scene, int index, float* outBins, int numBins) {
     Scene* s = asScene(scene);
-    return s ? s->getEchogramBands(outBins, numBins) : 0;
+    return s ? s->getEchogramBands(index, outBins, numBins) : 0;
 }
 
 }  // extern "C"

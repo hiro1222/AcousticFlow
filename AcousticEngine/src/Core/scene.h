@@ -3748,7 +3748,7 @@ public:
                               int numRays, int maxBounces, float distanceRef) const {
         using namespace scene_detail;
         if (!outBins || numBins <= 0 || !sources || count <= 0) return;
-        for (int k = 0; k < numBins * kNumBands; ++k) outBins[k] = 0.0f;
+        for (size_t k = 0; k < static_cast<size_t>(numBins) * kNumBands * count; ++k) outBins[k] = 0.0f;
 
         const float kEps = 1e-3f;
         const float invC = (speedOfSound > 1e-3f) ? 1.0f / speedOfSound : 0.0f;
@@ -3762,10 +3762,17 @@ public:
         };
 
         // 帯域別にビンへ積む。energy6 は kNumBands 要素。
-        auto addBin = [&](float dist, const float* energy6, float scale) {
+        //   ★音源ごとに別の面へ積む。outBins のレイアウトは [音源][ビン][帯域]。
+        //     以前は全音源を同じ面へ足していたので、響く部屋の音源と吸う部屋の音源が
+        //     同じ尾になっていた（実測: 減衰の形が 500ms で 9.0dB 違うのに 1 本に潰れる）。
+        //     レイ追跡はリスナーから 1 回で共有なので、分けても**計算は増えない**
+        //     （音源ごとの computeTransmission は元から呼んでいる）。増えるのはメモリだけ。
+        const size_t srcStride = static_cast<size_t>(numBins) * kNumBands;
+        auto addBin = [&](int j, float dist, const float* energy6, float scale) {
             const int k = static_cast<int>(dist * invC * invBin);
             if (k < 0 || k >= numBins) return;
-            float* dst = outBins + static_cast<size_t>(k) * kNumBands;
+            float* dst = outBins + static_cast<size_t>(j) * srcStride
+                                 + static_cast<size_t>(k) * kNumBands;
             for (int b = 0; b < kNumBands; ++b) {
                 const float e = energy6[b] * scale;
                 if (e > 0.0f) dst[b] += e;
@@ -3777,7 +3784,7 @@ public:
             float g[kNumBands];
             computeTransmission(listener, sources[j], g);
             const float d = length(sources[j] - listener);
-            addBin(d, g, spreadEnergy(d));
+            addBin(j, d, g, spreadEnergy(d));
         }
 
         // 反射（共有レイ・尾が窓内に入るまでレイを伸ばす）。
@@ -3819,7 +3826,7 @@ public:
                         float e[kNumBands];
                         for (int b = 0; b < kNumBands; ++b) e[b] = carry[b] * refl[b] * seg[b];
                         // 広がり損失は「音源→反射点」の区間にだけ掛ける（総経路長ではない）。
-                        addBin(pathLen, e, inv * spreadEnergy(srcLeg));
+                        addBin(j, pathLen, e, inv * spreadEnergy(srcLeg));
                     }
                     for (int b = 0; b < kNumBands; ++b) carry[b] *= refl[b];
                     d = scatteredDir(d, hit.normal, scatteringMean(mat), rng);
@@ -4218,11 +4225,27 @@ public:
         return n;
     }
 
-    // 帯域別エコグラム。numBins*kNumBands 要素を書く。書けたビン数を返す。
-    int getEchogramBands(float* outBins, int numBins) const {
+    // 【帯域別エコグラム】音源 index のぶんを numBins*kNumBands 要素書く。書けたビン数を返す。
+    //   ★音源ごとに持つ。以前は全音源を 1 本に足していたので、響く部屋の音源と
+    //     吸う部屋の音源が同じ尾になっていた（実測: 減衰の形が 500ms で 9.0dB 違うのに
+    //     1 本へ潰れ、両方置くとどちらでもない中間になった）。
+    //     レイ追跡はリスナーから 1 回で共有なので、分けても計算は増えない。
+    //   index に -1 を渡すと全音源の和（従来の値）。部屋全体の響きを見る用。
+    int getEchogramBands(int index, float* outBins, int numBins) const {
         if (!outBins || numBins <= 0 || results_.echogramBins <= 0) return 0;
         const int n = std::min(numBins, results_.echogramBins);
-        for (int i = 0; i < n * kNumBands; ++i) outBins[i] = results_.echogram[static_cast<size_t>(i)];
+        const size_t stride = static_cast<size_t>(results_.echogramBins) * kNumBands;
+        if (index < 0) {
+            for (int i = 0; i < n * kNumBands; ++i) outBins[i] = 0.0f;
+            for (int j = 0; j < results_.count; ++j) {
+                const float* src = results_.echogram.data() + static_cast<size_t>(j) * stride;
+                for (int i = 0; i < n * kNumBands; ++i) outBins[i] += src[i];
+            }
+            return n;
+        }
+        if (!validResult(index)) return 0;
+        const float* src = results_.echogram.data() + static_cast<size_t>(index) * stride;
+        for (int i = 0; i < n * kNumBands; ++i) outBins[i] = src[i];
         return n;
     }
 
@@ -4249,7 +4272,7 @@ private:
         std::vector<int> diffCount;    // [count]
 
         int echogramBins = 0;
-        std::vector<float> echogram;   // [echogramBins*6]
+        std::vector<float> echogram;   // [count*echogramBins*6]（音源ごと）
 
         void resize(int n, const UpdateConfig& c) {
             const int eCap = (c.earlyTaps > 0) ? c.earlyTaps : 1;
@@ -4269,7 +4292,8 @@ private:
             diffPos.assign(static_cast<size_t>(n) * dCap, Vec3(0, 0, 0));
             diffGain.assign(static_cast<size_t>(n) * dCap, 0.0f);
             diffCount.assign(static_cast<size_t>(n), 0);
-            echogram.assign(static_cast<size_t>(std::max(0, c.echogramBins)) * kNumBands, 0.0f);
+            echogram.assign(static_cast<size_t>(n)
+                            * static_cast<size_t>(std::max(0, c.echogramBins)) * kNumBands, 0.0f);
         }
     };
 
@@ -4384,11 +4408,14 @@ private:
         };
         const float legSpread = spreadEnergy(legLen);
 
-        auto addBin = [&](float distFromSource, const float* e6, float extra) {
+        // ★本体と同じく音源ごとの面へ積む（レイアウトは [音源][ビン][帯域]）。
+        const size_t srcStride = static_cast<size_t>(numBins) * kNumBands;
+        auto addBin = [&](int j, float distFromSource, const float* e6, float extra) {
             const float total = distFromSource + legLen;      // ポータルまで＋こちらへ
             const int k = static_cast<int>(total * invC * invBin);
             if (k < 0 || k >= numBins) return;
-            float* dst = outBins + static_cast<size_t>(k) * kNumBands;
+            float* dst = outBins + static_cast<size_t>(j) * srcStride
+                                 + static_cast<size_t>(k) * kNumBands;
             for (int b = 0; b < kNumBands; ++b) {
                 const float v = e6[b] * extra * scale[b] * legSpread;
                 if (v > 0.0f) dst[b] += v;
@@ -4400,7 +4427,7 @@ private:
             float g[kNumBands];
             computeTransmission(origin, sources[j], g);
             const float d = length(sources[j] - origin);
-            addBin(d, g, spreadEnergy(d));
+            addBin(j, d, g, spreadEnergy(d));
         }
 
         // 奥側の半球だけへ撒いて、奥の部屋の反射を拾う。
@@ -4434,7 +4461,7 @@ private:
                         const float refl = clamp01(1.0f - mat.absorption[b] - mat.transmission[b]);
                         e[b] = carry[b] * refl * seg[b] / static_cast<float>(numRays);
                     }
-                    addBin(pathLen, e, spreadEnergy(pathLen));
+                    addBin(j, pathLen, e, spreadEnergy(pathLen));
                 }
                 for (int b = 0; b < kNumBands; ++b) {
                     const float refl = clamp01(1.0f - mat.absorption[b] - mat.transmission[b]);
