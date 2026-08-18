@@ -3,6 +3,7 @@
 // 方針は scene_regression.cpp と同じで、**絶対値ではなく関係**を確かめる。
 // ただし FFT だけは「素朴な DFT と一致する」という絶対の正解があるので、それで押さえる。
 // 移行は「Unity C# 版と同じ音が出る」ことが要件なので、各段で参照実装と突き合わせる。
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -1081,6 +1082,79 @@ void diagnoseBandResponse() {
 // **鳴らした結果の 尾/直接 が √target に一致する**のが設計の約束。
 // Unity の画面では 尾/直接 = 0.92 に対し 目標 4.09（13dB 未達）と出ていたので、
 // 鎖の端から端まで通して測り、どこでずれるのかを数字にする。
+// オーディオスレッド側のコスト。シーン側（ゲームスレッド）は scene_regression の
+// [1フレームの音響計算] で測っているが、畳み込み・HRTF・尾はオーディオスレッドで回るので
+// そちらは別に測らないと全体像にならない。
+//   基準: 48kHz・512 フレームのバッファ 1 個 = 10.67ms ぶんの音。
+//   render() がその何割で済むかが「1 音源あたりのオーディオ負荷」。
+void diagnoseDspCost() {
+    std::printf("\n[診断] オーディオスレッドのコスト（1 音源あたり）\n");
+    const int sr = 48000;
+    const int block = 512;
+    const double blockMs = 1000.0 * block / sr;
+
+    struct C { const char* name; bool hrtf; bool tail; int taps; };
+    const C cases[] = {
+        {"直接音のみ                ", false, false, 1},
+        {"＋早期反射 8 タップ       ", false, false, 8},
+        {"＋HRTF                    ", true,  false, 8},
+        {"＋後期尾 1.0s（全部入り） ", true,  true,  8},
+    };
+    std::printf("        構成                        1ブロック   実時間比   1音源の負荷\n");
+    for (const C& c : cases) {
+        af::dsp::VoiceRenderer::Config cfg;
+        cfg.sampleRate = sr;
+        cfg.maxFrames = block;
+        cfg.tailSeconds = 1.0f;
+        cfg.tapCrossfadeMs = 30.0f;
+        af::dsp::VoiceRenderer voice(cfg);
+        voice.setOutputGain(1.0f);
+
+        af::dsp::HrtfSet syn = af::dsp::HrtfSet::createSynthetic(sr, 5, 10);
+        if (c.hrtf) { voice.setHrtfSet(&syn); voice.setHrtfEnabled(true); }
+        else voice.setHrtfEnabled(false);
+        const float dirFwd[3] = {0.3f, 0.0f, 1.0f};
+        voice.setDirection(dirFwd, 57.0f);
+
+        std::vector<af::dsp::EarlyReflectConv::Tap> taps(static_cast<std::size_t>(c.taps));
+        for (int i = 0; i < c.taps; ++i) {
+            for (int b = 0; b < 6; ++b) taps[static_cast<std::size_t>(i)].g[b] = (i == 0) ? 1.0f : 0.35f;
+            taps[static_cast<std::size_t>(i)].delaySamples = i * 190;
+            taps[static_cast<std::size_t>(i)].gSpec = 1.0f;
+            taps[static_cast<std::size_t>(i)].gDiff = 0.0f;
+        }
+        voice.setTaps(taps.data(), c.taps);
+
+        if (c.tail) {
+            const int bins = 100;
+            std::vector<float> echo(static_cast<std::size_t>(bins) * 6, 0.0f);
+            for (int k = 0; k < bins; ++k)
+                for (int b = 0; b < 6; ++b)
+                    echo[static_cast<std::size_t>(k) * 6 + b] = std::pow(0.95f, static_cast<float>(k));
+            for (int it = 0; it < 12; ++it)
+                voice.rebuildTail(echo.data(), bins, 10.0f, 20.0f, 8.0f, 30.0f, 0.0f, 0.6f,
+                                  1.0f, 4.0f, nullptr, 0);
+        }
+
+        Rng rng;
+        std::vector<float> in(static_cast<std::size_t>(block));
+        std::vector<float> ol(static_cast<std::size_t>(block)), orr(static_cast<std::size_t>(block));
+        for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = rng.next() * 0.3f;
+
+        const int warm = 20, iters = 400;
+        for (int i = 0; i < warm; ++i) voice.render(in.data(), block, ol.data(), orr.data(), nullptr);
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) voice.render(in.data(), block, ol.data(), orr.data(), nullptr);
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+        std::printf("        %s  %6.3f ms   %6.1f 倍   %5.2f %%\n",
+                    c.name, ms, blockMs / ms, ms / blockMs * 100.0);
+    }
+    std::printf("      ※48kHz・512フレーム = 1 ブロック 10.67ms ぶんの音。\n"
+                "        「1音源の負荷」はオーディオスレッド 1 本に対する割合。\n"
+                "        GPU は engine 側で一切使っていない（GPU化は後回しと決めた通り）。\n");
+}
+
 void testTailCalibration() {
     std::printf("\n[尾の較正] 鳴らした結果が目標比に一致するか\n");
     const int sr = 48000;
@@ -1309,6 +1383,7 @@ int main() {
     testHrtfProcessor();
     testEarlyReflectConv();
     diagnoseBandResponse();
+    diagnoseDspCost();
     testTailCalibration();
     testVoiceRenderer();
 
