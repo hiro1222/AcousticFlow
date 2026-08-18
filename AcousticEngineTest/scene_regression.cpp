@@ -3204,6 +3204,104 @@ void diagnosePillarTimbre() {
 //   残響が直接音を上回ると定位は失われる。境目は臨界距離 rc=0.057√(V/RT60) で、
 //   これより遠いと残響優位。裸のコンクリ箱だと rc が 0.5m を切り、部屋のどこにいても
 //   残響優位＝定位が立たない。素材をどこまで吸わせれば実用になるかを数字で出す。
+// 別の部屋にいる音源は、別の尾を持つべきではないか。
+//   エコグラムは全音源を同じ配列へ積むので 1 本しか出ない（computeEchogramBands）。
+//   そこから作った IR を全音源が畳むので、響く部屋の音源も吸う部屋の音源も同じ尾になる。
+//   音源を 1 本ずつ置いて測れば「本来どれだけ違うはずか」が出る。
+void diagnosePerSourceEchogram() {
+    std::printf("\n[診断] 別の部屋の音源は別の尾を持つべきか\n");
+    const float h = 4.0f, t = 0.15f, hw = 6.0f, hd = 8.0f, doorW = 0.9f;
+    const float liveA[6] = {0.02f, 0.02f, 0.03f, 0.04f, 0.05f, 0.07f};
+    const float deadA[6] = {0.60f, 0.70f, 0.80f, 0.85f, 0.90f, 0.90f};
+    const float tr[6] = {0.000398f, 0.0001585f, 0.0000398f, 0.00001f, 0.00000251f, 0.000001f};
+    // which: 0=手前(響く)だけ / 1=奥(吸う)だけ / 2=両方
+    auto build = [&](int which) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mNear = AF_SceneAddMaterial(s, tr, liveA, nullptr, 6);
+        const int mFar  = AF_SceneAddMaterial(s, tr, deadA, nullptr, 6);
+        AF_SceneAddInstanceBox(s, V(-(hw + doorW*0.5f)*0.5f, h*0.5f, 0),
+                               V((hw - doorW*0.5f)*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mNear);
+        AF_SceneAddInstanceBox(s, V( (hw + doorW*0.5f)*0.5f, h*0.5f, 0),
+                               V((hw - doorW*0.5f)*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mNear);
+        for (int side = 0; side < 2; ++side) {
+            const float zc = (side == 0) ? -hd*0.5f : hd*0.5f;
+            const int mm = (side == 0) ? mNear : mFar;
+            AF_SceneAddInstanceBox(s, V(0, -t, zc),    V(hw, t, hd*0.5f), V(1,0,0), V(0,1,0), mm);
+            AF_SceneAddInstanceBox(s, V(0, h+t, zc),   V(hw, t, hd*0.5f), V(1,0,0), V(0,1,0), mm);
+            AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, zc), V(t, h*0.5f, hd*0.5f), V(1,0,0), V(0,1,0), mm);
+            AF_SceneAddInstanceBox(s, V( hw, h*0.5f, zc), V(t, h*0.5f, hd*0.5f), V(1,0,0), V(0,1,0), mm);
+        }
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mNear);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mFar);
+        AF_SceneSetListener(s, V(0, 1.6f, -4.0f));          // リスナーは手前（響く部屋）
+        if (which == 0 || which == 2) AF_SceneSetSource(s, 1, V(-2.0f, 1.6f, -5.0f));  // 手前
+        if (which == 1 || which == 2) AF_SceneSetSource(s, 2, V( 2.0f, 1.6f,  5.0f));  // 奥
+        for (int i = 0; i < 8; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+        return s;
+    };
+    const char* name[3] = {"手前(響く)の音源だけ", "奥(吸う)の音源だけ  ", "両方（今の作り）    "};
+    std::printf("        置いた音源            総和      RT60相当  後半(0.3s〜)の割合\n");
+    double rt[3] = {};
+    for (int k = 0; k < 3; ++k) {
+        AF_SceneHandle s = build(k);
+        float echo[100 * kBands] = {};
+        const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+        std::vector<double> e(static_cast<std::size_t>(bins), 0.0);
+        double peak = 0.0, sum = 0.0, late = 0.0;
+        for (int i = 0; i < bins; ++i) {
+            double v = 0.0;
+            for (int b = 0; b < kBands; ++b) v += echo[i * kBands + b];
+            v /= kBands;
+            e[static_cast<std::size_t>(i)] = v;
+            peak = std::max(peak, v);
+            sum += v;
+            if (i >= 30) late += v;
+        }
+        int tb = 0;
+        for (int i = 0; i < bins; ++i) if (e[static_cast<std::size_t>(i)] > peak * 0.001) tb = i;
+        rt[k] = (tb + 1) * 0.01;
+        std::printf("        %s %9.4f  %6.2f s   %5.1f %%\n",
+                    name[k], sum, rt[k], (sum > 1e-12) ? late / sum * 100.0 : 0.0);
+        AF_SceneDestroy(s);
+    }
+    (void)rt;
+    // ★RT60相当（-60dB を超える最後のビン）は窓の長さに縛られて鈍い。
+    //   尾IRは正規化されるので効くのは**形**。正規化した減衰カーブを直接比べる。
+    std::printf("      減衰の形（各々のピークで正規化した dB。形が同じなら同じ尾になる）\n");
+    std::printf("        置いた音源            50ms   100ms   200ms   300ms   500ms\n");
+    std::vector<std::vector<double>> curve(3);
+    for (int k = 0; k < 3; ++k) {
+        AF_SceneHandle s = build(k);
+        float echo[100 * kBands] = {};
+        const int bins = AF_SceneGetEchogramBands(s, echo, 100);
+        std::vector<double> e(static_cast<std::size_t>(bins), 0.0);
+        double peak = 0.0;
+        for (int i = 0; i < bins; ++i) {
+            double v = 0.0;
+            for (int b = 0; b < kBands; ++b) v += echo[i * kBands + b];
+            e[static_cast<std::size_t>(i)] = v / kBands;
+            peak = std::max(peak, e[static_cast<std::size_t>(i)]);
+        }
+        std::printf("        %s", name[k]);
+        for (int ms : {50, 100, 200, 300, 500}) {
+            const int bi = ms / 10;
+            const double v = (bi < bins) ? e[static_cast<std::size_t>(bi)] : 0.0;
+            const double db = 10.0 * std::log10(std::max(v, 1e-12) / std::max(peak, 1e-12));
+            curve[static_cast<std::size_t>(k)].push_back(db);
+            std::printf(" %6.1f ", db);
+        }
+        std::printf("\n");
+        AF_SceneDestroy(s);
+    }
+    double maxShape = 0.0;
+    for (std::size_t i = 0; i < curve[0].size() && i < curve[1].size(); ++i)
+        maxShape = std::max(maxShape, std::fabs(curve[0][i] - curve[1][i]));
+    std::printf("      → 形の差は最大 %.1f dB。総和（届く量）は %.1f 倍 = %.1f dB 違う。\n",
+                maxShape, 86.2001 / 8.5294, 10.0 * std::log10(86.2001 / 8.5294));
+    std::printf("        量は既に音源ごと（tailSrcLevel）で効かせている。形が同じなら\n"
+                "        尾IRの共有は妥当。形が違うなら部屋ごとに分ける必要がある。\n");
+}
+
 void diagnoseAbsorptionVsLocalization() {
     std::printf("\n[診断] 部屋の吸音率と定位（臨界距離）\n");
     const float h = 4.0f, t = 0.3f, hw = 6.0f, hd = 7.0f;
@@ -4692,6 +4790,7 @@ int main() {
     testRoomSegmentation();
     testRoomIncremental();
     diagnoseRoomDetection();
+    diagnosePerSourceEchogram();
     diagnoseAbsorptionVsLocalization();
     diagnoseShadowCliff();
     diagnoseNonDoorShapes();
