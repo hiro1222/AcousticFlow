@@ -1094,6 +1094,174 @@ void diagnoseBandResponse() {
 //   つまり**今でも全音源が同一の尾 IR を畳んでいて**、違うのは音量(tailGain)だけ。
 //   畳み込みは線形なので Σ(gi·xi) * h == Σ(gi·(xi * h)) のはずだが、
 //   分割畳み込みはブロック処理・FFT なので、実物で確かめないと言い切れない。
+// 尾の IR を差し替えた瞬間に、出力がどれだけ飛ぶか。
+//   分割畳み込みは過去の入力ブロックを保持しているので、IR を差し替えると
+//   「もう出ている尾」が別の IR で畳み直される。クロスフェードしていないので段差が出る。
+//   部屋を移る・扉が動く場面で実際に起きる。まず何 dB かを測ってから手を選ぶ。
+void diagnoseTailSwapDiscontinuity() {
+    std::printf("\n[診断] 尾の IR を差し替えた瞬間の段差\n");
+    const int sr = 48000;
+    const int block = 512;
+    af::dsp::VoiceRenderer::Config cfg;
+    cfg.sampleRate = sr;
+    cfg.maxFrames = block;
+    cfg.tailSeconds = 1.0f;
+    cfg.tapCrossfadeMs = 30.0f;
+
+    // 響く部屋 A → 吸う部屋 B（実測の 2 部屋に近い減衰差をつける）
+    const int bins = 100;
+    auto makeEcho = [&](float decay) {
+        std::vector<float> e(static_cast<std::size_t>(bins) * 6, 0.0f);
+        for (int k = 0; k < bins; ++k)
+            for (int b = 0; b < 6; ++b)
+                e[static_cast<std::size_t>(k) * 6 + b] = std::pow(decay, static_cast<float>(k));
+        return e;
+    };
+    const std::vector<float> echoA = makeEcho(0.97f);   // 長い尾
+    const std::vector<float> echoB = makeEcho(0.85f);   // 短い尾
+
+    // ★切り分けの要。差し替え後に動いた量が「人工物」なのか「移った先の部屋の正しい値」
+    //   なのかは、B 単独で暖機した定常値と比べないと言えない。尾 IR はエネルギー1に
+    //   正規化されるので、短い尾ほど同じエネルギーが短時間に集まり定常RMSは上がる。
+    auto steadyRmsOf = [&](const std::vector<float>& echo) {
+        af::dsp::VoiceRenderer v(cfg);
+        v.setOutputGain(1.0f);
+        v.setHrtfEnabled(false);
+        v.setTailLevel(1.0f);
+        v.setTailEnvelope(1.0f, 1.0f);
+        af::dsp::EarlyReflectConv::Tap t;
+        for (int b = 0; b < 6; ++b) t.g[b] = 0.0f;
+        t.delaySamples = 0; t.gSpec = 1.0f; t.gDiff = 0.0f;
+        v.setTaps(&t, 1);
+        for (int it = 0; it < 16; ++it)
+            v.rebuildTail(echo.data(), bins, 10.0f, 20.0f, 8.0f, 30.0f, 0.0f, 1.0f,
+                          1.0f, 4.0f, nullptr, 0);
+        Rng r;
+        std::vector<float> in(static_cast<std::size_t>(block));
+        std::vector<float> a(static_cast<std::size_t>(block)), b2(static_cast<std::size_t>(block));
+        double acc = 0.0;
+        for (int blk = 0; blk < 240; ++blk) {
+            for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = r.next() * 0.3f;
+            v.render(in.data(), block, a.data(), b2.data(), nullptr);
+            if (blk >= 232) {
+                double s = 0.0;
+                for (int i = 0; i < block; ++i)
+                    s += a[static_cast<std::size_t>(i)] * a[static_cast<std::size_t>(i)];
+                acc += std::sqrt(s / block) / 8.0;
+            }
+        }
+        return acc;
+    };
+    const double steadyA = steadyRmsOf(echoA);
+    const double steadyB = steadyRmsOf(echoB);
+    std::printf("        参考: 単独で暖機したときの定常RMS  響く部屋A %.5f / 吸う部屋B %.5f"
+                "（差 %.2f dB）\n",
+                steadyA, steadyB, 20.0 * std::log10(steadyB / steadyA));
+
+    // 差し替え後は 1 ブロックだけ見ても足りない（実際 +1blk は丸ごと旧 IR のままで
+    // 両者が一致する）。段ごとに取り込みのタイミングが違うので、尾の長さぶん追う。
+    // 基準は「移った先の部屋を単独で暖機した定常値」。そこから外れたぶんが人工物。
+    const int kAfter = 94;   // 1.0s ぶん ≒ 尾の全長
+    std::printf("        場面                比(尾/直接)   基準RMS  ピークdB  到達blk  収束blk  跳び/定常\n");
+
+    // ★1 ブロック(512サンプル)の RMS 推定は誤差 ±0.27dB あり、94 ブロック中の最大を
+    //   取ると偶然だけで 0.8dB に届く（対照群で実測した）。種を変えて平均し、
+    //   推定誤差を √kTrials ぶん落とさないと 2dB 級の人工物と区別が付かない。
+    const int kTrials = 8;
+    struct C { const char* name; bool change; };
+    const C cases[] = { {"同じ内容で差し替え", false},
+                        {"響く部屋→吸う部屋", true} };
+    for (const C& c : cases) {
+        std::vector<double> msAfter(static_cast<std::size_t>(kAfter), 0.0);
+        double stepRatio = 0.0;
+        float ratioBefore = 0.0f, ratioAfter = 0.0f;
+
+        for (int trial = 0; trial < kTrials; ++trial) {
+            af::dsp::VoiceRenderer voice(cfg);
+            voice.setOutputGain(1.0f);
+            voice.setHrtfEnabled(false);
+            voice.setTailLevel(1.0f);
+            voice.setTailEnvelope(1.0f, 1.0f);
+            // 直接音を切って尾だけ見る（段差を埋もれさせない）。
+            af::dsp::EarlyReflectConv::Tap tap;
+            for (int b = 0; b < 6; ++b) tap.g[b] = 0.0f;
+            tap.delaySamples = 0; tap.gSpec = 1.0f; tap.gDiff = 0.0f;
+            voice.setTaps(&tap, 1);
+            for (int it = 0; it < 16; ++it)
+                ratioBefore = voice.rebuildTail(echoA.data(), bins, 10.0f, 20.0f, 8.0f, 30.0f,
+                                                0.0f, 0.6f, 1.0f, 4.0f, nullptr, 0);
+
+            Rng rng;
+            rng.s = 12345u + static_cast<unsigned int>(trial) * 7919u;
+            std::vector<float> in(static_cast<std::size_t>(block));
+            std::vector<float> ol(static_cast<std::size_t>(block)), orr(static_cast<std::size_t>(block));
+
+            // ★暖機は tailSeconds を十分に超えるまで回す。尾の長さ(1.0s = 94ブロック)に
+            //   届かないうちに測ると、対照群まで 0.5dB 動いて段差と区別が付かない。
+            const int kWarm = 240, kSteadyFrom = 232;   // 240blk = 2.56s
+            double stepSteady = 0.0, prev = 0.0;
+            for (int blk = 0; blk < kWarm; ++blk) {
+                for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = rng.next() * 0.3f;
+                voice.render(in.data(), block, ol.data(), orr.data(), nullptr);
+                if (blk >= kSteadyFrom) {
+                    for (int i = 0; i < block; ++i) {
+                        const double v = ol[static_cast<std::size_t>(i)];
+                        stepSteady = std::max(stepSteady, std::fabs(v - prev));
+                        prev = v;
+                    }
+                } else {
+                    prev = ol[static_cast<std::size_t>(block) - 1];
+                }
+            }
+
+            // ここで差し替え（envAlpha=1 で即座に切り替わる）。
+            const std::vector<float>& next = c.change ? echoB : echoA;
+            ratioAfter = voice.rebuildTail(next.data(), bins, 10.0f, 20.0f, 8.0f, 30.0f,
+                                           0.0f, 1.0f, 1.0f, 4.0f, nullptr, 0);
+
+            double stepAfter = 0.0;
+            for (int k = 0; k < kAfter; ++k) {
+                for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = rng.next() * 0.3f;
+                voice.render(in.data(), block, ol.data(), orr.data(), nullptr);
+                double s = 0.0;
+                for (int i = 0; i < block; ++i) {
+                    const double v = ol[static_cast<std::size_t>(i)];
+                    s += v * v;
+                    stepAfter = std::max(stepAfter, std::fabs(v - prev));
+                    prev = v;
+                }
+                msAfter[static_cast<std::size_t>(k)] += (s / block) / kTrials;
+            }
+            stepRatio += (stepAfter / std::max(stepSteady, 1e-12)) / kTrials;
+        }
+
+        // 基準は「移った先の部屋を単独で暖機した定常値」。差し替えが理想的なら
+        // ここから動かないはずで、動いたぶんがそのまま人工物になる。
+        const double refRms = c.change ? steadyB : steadyA;
+        double worstDb = 0.0;
+        int peakBlk = 0;
+        std::vector<double> dbs(static_cast<std::size_t>(kAfter), 0.0);
+        for (int k = 0; k < kAfter; ++k) {
+            const double r = std::sqrt(msAfter[static_cast<std::size_t>(k)]);
+            const double db = 20.0 * std::log10(std::max(r, 1e-12) / std::max(refRms, 1e-12));
+            dbs[static_cast<std::size_t>(k)] = db;
+            if (std::fabs(db) > std::fabs(worstDb)) { worstDb = db; peakBlk = k + 1; }
+        }
+        // 収束＝以降ずっと ±0.5dB に収まる最初のブロック。
+        int settleBlk = kAfter + 1;
+        for (int k = kAfter - 1; k >= 0; --k) {
+            if (std::fabs(dbs[static_cast<std::size_t>(k)]) >= 0.5) break;
+            settleBlk = k + 1;
+        }
+
+        std::printf("        %s %7.2f→%-7.2f %8.5f %9.2f %8d %8d %10.2f\n",
+                    c.name, ratioBefore, ratioAfter, refRms, worstDb, peakBlk,
+                    settleBlk, stepRatio);
+    }
+    std::printf("      ※比(尾/直接) が動いていなければ、差し替えそのものが効いていない。\n"
+                "        跳び/定常 が 1.0 前後ならクリックは出ていない。\n");
+}
+
 void testSharedTailBusEquivalence() {
     std::printf("\n[尾] 音源ごとに畳む vs まとめて 1 回畳む\n");
     const int irLen = 24000;          // 0.5s @48k
@@ -1472,6 +1640,7 @@ int main() {
     testHrtfProcessor();
     testEarlyReflectConv();
     diagnoseBandResponse();
+    diagnoseTailSwapDiscontinuity();
     testSharedTailBusEquivalence();
     diagnoseDspCost();
     testTailCalibration();

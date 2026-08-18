@@ -91,6 +91,23 @@ public:
         float hrtfCrossoverHz = 700.0f;
         int tailFirstBlock = 64;     // 非一様分割の最小ブロック（＝尾の遅延）
         int tailCapBlock = 8192;
+        // 尾 IR を差し替えるときの並走クロスフェード(ms)。**既定 0＝無効**。
+        //
+        // ★これを有効にすると今は悪化する。実測（同じ内容で差し替えた対照ケース）:
+        //     無効(単一の器で差し替え)  ピーク +0.27 dB
+        //     有効(200ms 並走)          ピーク −3.26 dB   ← 凹む
+        //   原因は、新しい畳み込み器の**周波数領域遅延線(FDL)が空**なこと。
+        //   FDL には過去の入力ブロックが溜まっていて、それが無いと尾を出し切れない。
+        //   フェードイン中の新側が痩せているので、混ぜると凹む。
+        //
+        //   正しい直し方は「古い器の FDL を新しい器へ引き継ぐ」。FDL が持っているのは
+        //   変換済みの**入力**で IR とは無関係なので、そのまま移せば新側も最初から
+        //   完全な尾を出せる。ただし FDL はオーディオスレッド所有で setIr は制御スレッドなので、
+        //   受け渡しの設計（二重化か、次の runBlock で取り込むか）が要る。未対応。
+        //
+        // 単一の器での差し替えにも人工物はある（過去の入力が新 IR で畳み直され、
+        // +1.97dB のふくらみが 0.35 秒）。どちらも 2〜3dB 級で、まだ選ぶ根拠が無い。
+        float tailCrossfadeMs = 0.0f;
     };
 
     explicit VoiceRenderer(const Config& cfg)
@@ -102,8 +119,10 @@ public:
                                               : static_cast<int>(0.120f * sampleRate_),
                  cfg.tapCrossfadeMs),
           hrtf_(sampleRate_, cfg.hrtfCrossfadeMs, cfg.hrtfCrossoverHz),
-          tailConv_(tailSamples_, 2, cfg.tailFirstBlock, cfg.tailCapBlock, cfg.maxFrames),
+          tailConvA_(tailSamples_, 2, cfg.tailFirstBlock, cfg.tailCapBlock, cfg.maxFrames),
+          tailConvB_(tailSamples_, 2, cfg.tailFirstBlock, cfg.tailCapBlock, cfg.maxFrames),
           tailIr_(sampleRate_, tailSamples_, 2) {
+        tailXfadeLen_ = std::max(0, static_cast<int>(cfg.tailCrossfadeMs * 0.001f * sampleRate_));
         const float scatL[3] = {3.7f, 6.1f, 9.7f};
         const float scatR[3] = {4.3f, 7.3f, 11.3f};
         diffL_.init(scatL, 3, sampleRate_);
@@ -142,10 +161,34 @@ public:
         if (ratio <= 0.0f) { tailGain_ = 0.0f; return 0.0f; }
         const float* ir[2] = { tailIr_.ir(0), tailIr_.ir(1) };
         const int len[2] = { tailIr_.length(), tailIr_.length() };
-        tailConv_.setIr(ir, len);
+
+        // 【並走クロスフェード】新しい IR は**別の畳み込み器**へ入れ、古い方は自分の IR の
+        //   まま鳴らし続けて音量だけ落とす。
+        //   ★1 つの器で差し替えると、周波数領域遅延線に溜まっている**過去の入力**が
+        //     新しい IR で畳み直される。尾IRはエネルギー1に正規化されているので
+        //     本来レベルは動かないはず（実測: 響く部屋と吸う部屋の定常RMSは差 -0.08dB）
+        //     なのに、実測で **+1.97dB のふくらみが 0.35 秒続いた**。まるごと人工物。
+        //     並走なら過去の入力が新 IR に当たること自体が起きない。
+        //   コストはクロスフェード中だけ倍（0.205 → 0.41 ms/block）。
+        // ★入れ替えるのはクロスフェードが有効なときだけ。無効時に入れ替えると、
+        //   FDL（過去の入力）が空の器へ切り替わって尾が無音になる（実測 -227dB）。
+        if (tailXfadeLen_ > 0 && tailCur().hasIr()) {
+            // 役割を入れ替える。今鳴っている方が「古い側」になり、空いた方に新 IR を入れる。
+            // 進行中のクロスフェードは打ち切る（3 重に重ねない）。
+            tailGainOld_ = tailGain_;
+            tailUseB_ = !tailUseB_;
+            tailXfade_ = 0;
+            tailXfading_ = true;
+        }
+        tailCur().setIr(ir, len);
         // 尾IRはエネルギー1に正規化済み。絶対レベルは D/R 比から一意に決まる。
         tailGain_ = ReverbTailIr::calibrateGain(directGain, targetRatio);
         return ratio;
+    }
+
+    /// クロスフェードの長さ(ms)。0 で即差し替え（旧挙動）。
+    void setTailCrossfadeMs(float ms) {
+        tailXfadeLen_ = std::max(0, static_cast<int>(ms * 0.001f * sampleRate_));
     }
 
     void setOutputGain(float g) { outputGain_ = g; }
@@ -164,8 +207,8 @@ public:
     }
 
     const char* hrtfName() const { return hrtf_.setName(); }
-    int tailPartitions() const { return tailConv_.totalPartitions(); }
-    int tailLatency() const { return tailConv_.latency(); }
+    int tailPartitions() const { return tailCur().totalPartitions(); }
+    int tailLatency() const { return tailCur().latency(); }
 
     // ── オーディオスレッド ──
 
@@ -195,13 +238,29 @@ private:
         // ① 後期尾はブロック単位（周波数領域）。サンプルループより前に済ませる。
         std::fill(tailOutL_.begin(), tailOutL_.begin() + n, 0.0f);
         std::fill(tailOutR_.begin(), tailOutR_.begin() + n, 0.0f);
-        if (tailGain_ > 0.0f && tailConv_.hasIr()) {
-            float* dst[2] = { tailOutL_.data(), tailOutR_.data() };
-            // 尾の絶対レベル ＝ tailGain(= 自由音場の直接 × √target) × 好みの倍率 × 部屋への注入量。
-            //   ★以前はここに tailWet_ も掛けていたが、残響/直接比は tailGain の
-            //     √target で既に決まっており二重計上だった。C# 経路(IrConvolver)は
-            //     掛けていなかったので、同じシーンで C# の方が 3.9dB 響いていた。
-            tailConv_.processAdd(input, 0, n, dst, 0, tailGain_ * tailLevel_ * tailSrcLevel_);
+        // 尾の絶対レベル ＝ tailGain(= 自由音場の直接 × √target) × 好みの倍率 × 部屋への注入量。
+        //   ★ここに tailWet_ を掛けてはいけない。残響/直接比は tailGain の √target で
+        //     既に決まっており二重計上になる（C# 経路は掛けていなかったので 3.9dB 差が出た）。
+        const float lvl = tailLevel_ * tailSrcLevel_;
+        // クロスフェードの重み。等パワーではなく**等振幅**にする ── 新旧は同じ入力を
+        //   同じエネルギーの IR に通した相関のある信号なので、振幅で足して 1 になるのが正しい
+        //   （等パワーにすると混合中に +3dB 膨らむ）。
+        float wNew = 1.0f, wOld = 0.0f;
+        if (tailXfading_ && tailXfadeLen_ > 0) {
+            const float t = static_cast<float>(tailXfade_) / static_cast<float>(tailXfadeLen_);
+            wNew = clamp01(t);
+            wOld = 1.0f - wNew;
+        } else {
+            tailXfading_ = false;
+        }
+        float* dst[2] = { tailOutL_.data(), tailOutR_.data() };
+        if (tailGain_ > 0.0f && tailCur().hasIr() && wNew > 0.0f)
+            tailCur().processAdd(input, 0, n, dst, 0, tailGain_ * lvl * wNew);
+        if (tailXfading_ && tailGainOld_ > 0.0f && tailOld().hasIr() && wOld > 0.0f)
+            tailOld().processAdd(input, 0, n, dst, 0, tailGainOld_ * lvl * wOld);
+        if (tailXfading_) {
+            tailXfade_ += n;
+            if (tailXfade_ >= tailXfadeLen_) { tailXfading_ = false; tailXfade_ = 0; }
         }
 
         // ② HRTF はブロック境界で HRIR を取り込む（方向変化のクロスフェード開始）。
@@ -256,8 +315,20 @@ private:
 
     EarlyReflectConv early_;
     HrtfProcessor hrtf_;
-    NonUniformConvolver tailConv_;
+    // 並走クロスフェード用に 2 面持つ。役割は tailUseB_ で入れ替える
+    // （NonUniformConvolver は atomic を持つので swap できない）。
+    NonUniformConvolver tailConvA_;
+    NonUniformConvolver tailConvB_;
+    bool tailUseB_ = false;
+    NonUniformConvolver& tailCur() { return tailUseB_ ? tailConvB_ : tailConvA_; }
+    const NonUniformConvolver& tailCur() const { return tailUseB_ ? tailConvB_ : tailConvA_; }
+    NonUniformConvolver& tailOld() { return tailUseB_ ? tailConvA_ : tailConvB_; }
     ReverbTailIr tailIr_;
+    // クロスフェードの状態。既定 200ms（実測でふくらみが収まるのが 0.35 秒、到達が 0.1 秒）。
+    int   tailXfadeLen_ = 0;
+    int   tailXfade_ = 0;
+    bool  tailXfading_ = false;
+    float tailGainOld_ = 0.0f;
     AllpassChain diffL_, diffR_;
 
     std::vector<float> tailOutL_, tailOutR_;
