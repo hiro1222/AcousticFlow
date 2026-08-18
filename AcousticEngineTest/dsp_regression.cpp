@@ -1077,6 +1077,110 @@ void diagnoseBandResponse() {
     }
 }
 
+// 尾の絶対レベルは tailGain = 直接 × √target で決めている。つまり
+// **鳴らした結果の 尾/直接 が √target に一致する**のが設計の約束。
+// Unity の画面では 尾/直接 = 0.92 に対し 目標 4.09（13dB 未達）と出ていたので、
+// 鎖の端から端まで通して測り、どこでずれるのかを数字にする。
+void testTailCalibration() {
+    std::printf("\n[尾の較正] 鳴らした結果が目標比に一致するか\n");
+    const int sr = 48000;
+    af::dsp::VoiceRenderer::Config cfg;
+    cfg.sampleRate = sr;
+    cfg.maxFrames = 512;
+    cfg.tailSeconds = 0.5f;
+    cfg.tapCrossfadeMs = 1.0f;
+
+    // 直接音だけのタップ（反射なし）。これで 尾/直接 が素直に出る。
+    af::dsp::EarlyReflectConv::Tap tap;
+    for (int b = 0; b < 6; ++b) tap.g[b] = 1.0f;
+    tap.delaySamples = 0;
+    tap.gSpec = 1.0f; tap.gDiff = 0.0f;
+
+    // 指数減衰のエコグラム（帯域一様）。形は何でもよく、量は target が決める。
+    const int bins = 60;
+    const float binMs = 10.0f;
+    std::vector<float> echo(static_cast<std::size_t>(bins) * 6, 0.0f);
+    for (int k = 0; k < bins; ++k) {
+        const float e = std::pow(0.90f, static_cast<float>(k));
+        for (int b = 0; b < 6; ++b) echo[static_cast<std::size_t>(k) * 6 + b] = e;
+    }
+
+    std::printf("        目標比 target   目標 尾/直接(√target)   実測 尾/直接   ずれ(dB)\n");
+    double worst = 0.0;
+    for (float target : {0.25f, 1.0f, 4.0f, 16.0f}) {
+        af::dsp::VoiceRenderer voice(cfg);
+        voice.setOutputGain(1.0f);
+        voice.setHrtfEnabled(false);       // HRIR のゲインを混ぜない（較正だけを見る）
+        voice.setTailLevel(1.0f);
+        voice.setTailEnvelope(1.0f, 1.0f); // wet は尾に掛からない / srcLevel=1
+        voice.setTaps(&tap, 1);
+        // directGain=1 なので、鳴った 尾/直接 がそのまま √target と比べられる。
+        //   ・startMs は早期↔後期の境目。0 だと直接ビンと尾を切り分けられない。
+        //   ・envAlpha は更新をまたいだ時間平均なので、実使用と同じく数回呼んで落ち着かせる。
+        float ratio = 0.0f;
+        for (int it = 0; it < 12; ++it)
+            ratio = voice.rebuildTail(echo.data(), bins, binMs, 20.0f, 8.0f, 30.0f, 0.0f, 0.6f,
+                                      1.0f, target, nullptr, 0);
+        if (ratio <= 0.0f) std::printf("        （尾のエネルギー比が 0。エコグラムが空）\n");
+
+        const int n = 48000;
+        Rng rng;
+        std::vector<float> in(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) in[static_cast<std::size_t>(i)] = rng.next() * 0.3f;
+        std::vector<float> ol(static_cast<std::size_t>(n), 0.0f), orr(static_cast<std::size_t>(n), 0.0f);
+        af::dsp::VoiceRenderer::Metering m{};
+        voice.render(in.data(), n, ol.data(), orr.data(), &m);
+
+        const double want = std::sqrt(static_cast<double>(target));
+        const double got = (m.rmsDirect > 1e-9) ? m.rmsTail / m.rmsDirect : 0.0;
+        const double db = 20.0 * std::log10(std::max(got, 1e-9) / std::max(want, 1e-9));
+        worst = std::max(worst, std::fabs(db));
+        std::printf("        %8.2f       %8.2f              %8.2f      %+6.1f\n",
+                    target, want, got, db);
+    }
+    std::printf("      最大のずれ %.1f dB\n", worst);
+    check("[尾] 鳴らした 尾/直接 が目標(√target)に一致する（±2dB）", worst < 2.0);
+
+    // ★HRTF を通すと 尾/直接 がどれだけずれるか。
+    //   rmsDirect は HRTF を**通した後**、rmsTail は通していない。HRIR のゲインが 1 で
+    //   なければ、較正が正しくても表示上の比がずれる。Unity で 尾/直接 0.92 に対し
+    //   目標 4.09（-13dB）と出ていたのはここの疑いが濃い。
+    //   ★これは表示だけの問題ではない。尾は HRTF を通らないので、HRIR にゲインが
+    //     あれば直接音だけが持ち上がり、**実際に耳へ届く比も変わる**。
+    {
+        const float target = 4.0f;
+        double ratioNo = 0.0, ratioYes = 0.0;
+        for (int k = 0; k < 2; ++k) {
+            af::dsp::VoiceRenderer voice(cfg);
+            voice.setOutputGain(1.0f);
+            voice.setTailLevel(1.0f);
+            voice.setTailEnvelope(1.0f, 1.0f);
+            voice.setTaps(&tap, 1);
+            af::dsp::HrtfSet syn = af::dsp::HrtfSet::createSynthetic(sr, 5, 10);
+            if (k == 1) { voice.setHrtfSet(&syn); voice.setHrtfEnabled(true); }
+            else        { voice.setHrtfEnabled(false); }
+            const float dirFwd[3] = {0.0f, 0.0f, 1.0f};
+            voice.setDirection(dirFwd, 57.0f);
+            for (int it = 0; it < 12; ++it)
+                voice.rebuildTail(echo.data(), bins, binMs, 20.0f, 8.0f, 30.0f, 0.0f, 0.6f,
+                                  1.0f, target, nullptr, 0);
+            const int n = 48000;
+            Rng rng;
+            std::vector<float> in(static_cast<std::size_t>(n));
+            for (int i = 0; i < n; ++i) in[static_cast<std::size_t>(i)] = rng.next() * 0.3f;
+            std::vector<float> ol(static_cast<std::size_t>(n), 0.0f), orr(static_cast<std::size_t>(n), 0.0f);
+            af::dsp::VoiceRenderer::Metering m{};
+            voice.render(in.data(), n, ol.data(), orr.data(), &m);
+            const double r = (m.rmsDirect > 1e-9) ? m.rmsTail / m.rmsDirect : 0.0;
+            if (k == 0) ratioNo = r; else ratioYes = r;
+        }
+        const double shift = 20.0 * std::log10(std::max(ratioYes, 1e-9) / std::max(ratioNo, 1e-9));
+        std::printf("      HRTF OFF の 尾/直接 %.2f → ON %.2f（ずれ %+.1f dB）\n",
+                    ratioNo, ratioYes, shift);
+        check("[尾] HRTF を通しても 尾/直接 が大きく動かない（±3dB）", std::fabs(shift) < 3.0);
+    }
+}
+
 void testVoiceRenderer() {
     std::printf("\n[信号フロー] 部品の配線と段別の内訳\n");
 
@@ -1205,6 +1309,7 @@ int main() {
     testHrtfProcessor();
     testEarlyReflectConv();
     diagnoseBandResponse();
+    testTailCalibration();
     testVoiceRenderer();
 
     std::printf("\n----\n");
