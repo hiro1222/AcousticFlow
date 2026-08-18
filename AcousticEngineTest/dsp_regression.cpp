@@ -4,6 +4,7 @@
 // ただし FFT だけは「素朴な DFT と一致する」という絶対の正解があるので、それで押さえる。
 // 移行は「Unity C# 版と同じ音が出る」ことが要件なので、各段で参照実装と突き合わせる。
 #include <chrono>
+#include <memory>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -1087,6 +1088,94 @@ void diagnoseBandResponse() {
 // そちらは別に測らないと全体像にならない。
 //   基準: 48kHz・512 フレームのバッファ 1 個 = 10.67ms ぶんの音。
 //   render() がその何割で済むかが「1 音源あたりのオーディオ負荷」。
+// 尾を「音源ごとに畳む」のと「まとめて 1 回畳む」のが一致するか。
+//   エンジンのエコグラムは全音源まとめて 1 本しか作らない（computeEchogramBands は
+//   全音源を同じ配列へ積む）。尾のノイズも既定の種 12345 で全 VoiceRenderer 共通。
+//   つまり**今でも全音源が同一の尾 IR を畳んでいて**、違うのは音量(tailGain)だけ。
+//   畳み込みは線形なので Σ(gi·xi) * h == Σ(gi·(xi * h)) のはずだが、
+//   分割畳み込みはブロック処理・FFT なので、実物で確かめないと言い切れない。
+void testSharedTailBusEquivalence() {
+    std::printf("\n[尾] 音源ごとに畳む vs まとめて 1 回畳む\n");
+    const int irLen = 24000;          // 0.5s @48k
+    const int block = 512;
+    const int nSrc = 6;
+    const int nFrames = block * 24;
+
+    // 共有の尾 IR（減衰ノイズ、2ch）。
+    Rng irRng;
+    std::vector<float> hL(static_cast<std::size_t>(irLen)), hR(static_cast<std::size_t>(irLen));
+    for (int i = 0; i < irLen; ++i) {
+        const float env = std::pow(0.9997f, static_cast<float>(i));
+        hL[static_cast<std::size_t>(i)] = irRng.next() * env * 0.01f;
+        hR[static_cast<std::size_t>(i)] = irRng.next() * env * 0.01f;
+    }
+    const float* irPtr[2] = { hL.data(), hR.data() };
+    const int irLens[2] = { irLen, irLen };
+
+    // 音源ごとの信号と送出量。
+    Rng sRng;
+    std::vector<std::vector<float>> x(static_cast<std::size_t>(nSrc));
+    std::vector<float> gain(static_cast<std::size_t>(nSrc));
+    for (int s = 0; s < nSrc; ++s) {
+        x[static_cast<std::size_t>(s)].resize(static_cast<std::size_t>(nFrames));
+        for (int i = 0; i < nFrames; ++i)
+            x[static_cast<std::size_t>(s)][static_cast<std::size_t>(i)] = sRng.next() * 0.3f;
+        gain[static_cast<std::size_t>(s)] = 0.2f + 0.15f * static_cast<float>(s);
+    }
+
+    // A) 音源ごとに 1 本ずつ畳んで足す（今の作り）。
+    std::vector<float> aL(static_cast<std::size_t>(nFrames), 0.0f), aR(static_cast<std::size_t>(nFrames), 0.0f);
+    {
+        std::vector<std::unique_ptr<af::dsp::NonUniformConvolver>> convs;
+        for (int s = 0; s < nSrc; ++s) {
+            convs.emplace_back(new af::dsp::NonUniformConvolver(irLen, 2, 64, 8192, block));
+            convs.back()->setIr(irPtr, irLens);
+        }
+        for (int off = 0; off < nFrames; off += block) {
+            float* dst[2] = { aL.data(), aR.data() };
+            for (int s = 0; s < nSrc; ++s)
+                convs[static_cast<std::size_t>(s)]->processAdd(
+                    x[static_cast<std::size_t>(s)].data(), off, block, dst, off,
+                    gain[static_cast<std::size_t>(s)]);
+        }
+    }
+
+    // B) 送出量を掛けて足してから、1 本で畳む（共有バス）。
+    std::vector<float> bL(static_cast<std::size_t>(nFrames), 0.0f), bR(static_cast<std::size_t>(nFrames), 0.0f);
+    {
+        std::vector<float> mix(static_cast<std::size_t>(nFrames), 0.0f);
+        for (int s = 0; s < nSrc; ++s)
+            for (int i = 0; i < nFrames; ++i)
+                mix[static_cast<std::size_t>(i)] +=
+                    x[static_cast<std::size_t>(s)][static_cast<std::size_t>(i)]
+                    * gain[static_cast<std::size_t>(s)];
+        af::dsp::NonUniformConvolver conv(irLen, 2, 64, 8192, block);
+        conv.setIr(irPtr, irLens);
+        for (int off = 0; off < nFrames; off += block) {
+            float* dst[2] = { bL.data(), bR.data() };
+            conv.processAdd(mix.data(), off, block, dst, off, 1.0f);
+        }
+    }
+
+    // 突き合わせ。
+    double maxAbs = 0.0, sumA = 0.0, sumB = 0.0;
+    for (int i = 0; i < nFrames; ++i) {
+        maxAbs = std::max(maxAbs, static_cast<double>(std::fabs(
+            aL[static_cast<std::size_t>(i)] - bL[static_cast<std::size_t>(i)])));
+        maxAbs = std::max(maxAbs, static_cast<double>(std::fabs(
+            aR[static_cast<std::size_t>(i)] - bR[static_cast<std::size_t>(i)])));
+        sumA += static_cast<double>(aL[static_cast<std::size_t>(i)]) * aL[static_cast<std::size_t>(i)];
+        sumB += static_cast<double>(bL[static_cast<std::size_t>(i)]) * bL[static_cast<std::size_t>(i)];
+    }
+    const double rmsA = std::sqrt(sumA / nFrames), rmsB = std::sqrt(sumB / nFrames);
+    const double rel = (rmsA > 1e-12) ? maxAbs / rmsA : 0.0;
+    std::printf("        音源 %d 本 / %d フレーム\n", nSrc, nFrames);
+    std::printf("        個別に畳む RMS %.6f / まとめて畳む RMS %.6f\n", rmsA, rmsB);
+    std::printf("        最大の差 %.3e（RMS 比 %.2e ＝ %.1f dB 下）\n",
+                maxAbs, rel, 20.0 * std::log10(std::max(rel, 1e-12)));
+    check("[尾] 共有バスは音源ごとの畳み込みと一致する（-100dB 以下）", rel < 1e-5);
+}
+
 void diagnoseDspCost() {
     std::printf("\n[診断] オーディオスレッドのコスト（1 音源あたり）\n");
     const int sr = 48000;
@@ -1383,6 +1472,7 @@ int main() {
     testHrtfProcessor();
     testEarlyReflectConv();
     diagnoseBandResponse();
+    testSharedTailBusEquivalence();
     diagnoseDspCost();
     testTailCalibration();
     testVoiceRenderer();
