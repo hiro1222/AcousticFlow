@@ -3916,10 +3916,16 @@ void diagnoseShadowSpectrumJump() {
     // ★柱が細いと回折が常に透過より大きく、max(soft,dif) は回折側に張り付く。
     //   透過の 21dB 傾きが顔を出すのは**回折が弱くなる場所** ＝ 迂回が長い大きな壁の陰。
     //   ゲームシステムの報告は「柱や壁が塞いだ瞬間」なので、壁のほうも測る。
-    struct C { const char* name; bool doorway; float barrierHalfW; };
-    const C cases[] = { {"柱の陰へ歩く 幅1.2m（一般の稜線回折）  ", false, 0.6f},
-                        {"壁の陰へ歩く 幅6m（回折が弱い＝透過が勝つ）", false, 3.0f},
-                        {"戸口の陰へ歩く（自動ポータルが支配）  ", true,  0.0f} };
+    // ★ポータルの効きを見るには**同じ幾何で ON/OFF を比べる**しかない。
+    //   柱・壁とはそもそも形が違うので、あれは「障害物の種類の違い」であって
+    //   「ポータルの有無」ではなかった。戸口のまま自動生成を切り替える。
+    struct C { const char* name; bool doorway; float barrierHalfW; bool portal; };
+    const C cases[] = {
+        {"戸口の陰へ歩く ポータル**無し**        ", true,  0.0f, false},
+        {"戸口の陰へ歩く ポータル**有り**（自動）", true,  0.0f, true },
+        {"柱の陰へ歩く 幅1.2m（参考・開口でない）", false, 0.6f, false},
+        {"壁の陰へ歩く 幅6m （参考・開口でない）", false, 3.0f, false},
+    };
     for (const C& c : cases) {
         std::printf("      %s\n", c.name);
         std::printf("        x     125     500      4k    合計dB  傾き4k/125  Δ合計  Δ傾き\n");
@@ -3928,7 +3934,7 @@ void diagnoseShadowSpectrumJump() {
         for (float x = 0.0f; x <= (c.barrierHalfW >= 3.0f ? 9.0f : 2.4f); x += 0.1f) {
             AF_SceneHandle s = AF_SceneCreate();
             AF_SceneSetRoomCellSize(s, 0.2f);
-            if (c.doorway) AF_SceneSetAutoPortals(s, 1);
+            if (c.portal) AF_SceneSetAutoPortals(s, 1);
             const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
             AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
             AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
