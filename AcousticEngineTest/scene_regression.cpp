@@ -4250,6 +4250,84 @@ void testLCorridorScene() {
                 "        方向を持てるのが D と F の 1 本だけ ── ここが現実との差。\n");
 }
 
+// 【耳の報告】く字の廊下で「壁が横にかかった瞬間、音色が変わる」。
+//
+//   レンダのログで、角へ近づく途中に**回折タップの本数が 1 → 0 に落ちて**いた
+//   （z=-4.5 で 1 本、z=-3.1 で 0 本）。タップが消えると、そのタップが持っていた
+//   帯域の形ごと消えるので、合計のスペクトルが動く。
+//   生存ゲインの連続性（既存の検査）はタップの本数を見ていないので素通りする。
+//   ここでは**ホストが実際に鳴らすタップ**を数えて、本数が変わる位置と
+//   そのときスペクトルがどれだけ動くかを出す。
+void diagnoseCorridorTapDropout() {
+    std::printf("\n[耳の報告] く字の廊下で壁が横にかかる瞬間（回折タップの増減）\n");
+    const float w = 1.5f, h = 3.0f, t = 0.3f, aEnd = -12.0f, bEnd = 12.0f;
+    auto build = [&]() {
+        AF_SceneHandle sc = AF_SceneCreate();
+        AF_SceneSetRoomCellSize(sc, 0.25f);
+        const int mm = AF_SceneAddMaterial(sc, nullptr, nullptr, nullptr, 0);
+        auto bx = [&](float cx, float cy, float cz, float sx, float sy, float sz) {
+            AF_SceneAddInstanceBox(sc, V(cx, cy, cz), V(sx*0.5f, sy*0.5f, sz*0.5f),
+                                   V(1,0,0), V(0,1,0), mm);
+        };
+        bx(-w - t*0.5f, h*0.5f, (aEnd + w)*0.5f, t, h, w - aEnd + t);
+        bx( w + t*0.5f, h*0.5f, (aEnd - w)*0.5f, t, h, -w - aEnd);
+        bx((bEnd - w)*0.5f, h*0.5f,  w + t*0.5f, bEnd + w + t, h, t);
+        bx((bEnd + w)*0.5f, h*0.5f, -w - t*0.5f, bEnd - w, h, t);
+        bx(0.0f, h*0.5f, aEnd - t*0.5f, 2*w + 2*t, h, t);
+        bx(bEnd + t*0.5f, h*0.5f, 0.0f, t, h, 2*w + 2*t);
+        for (int k = 0; k < 2; ++k) {
+            const float ft = 0.3f;
+            const float y = (k == 0) ? -ft*0.5f : h + ft*0.5f;
+            bx(0.0f, y, (aEnd + w)*0.5f, 2*w + 2*t, ft, w - aEnd + t);
+            bx((bEnd - w)*0.5f, y, 0.0f, bEnd + w + t, ft, 2*w + 2*t);
+        }
+        return sc;
+    };
+    const AF_Vector3 S = V(bEnd - 2.0f, 1.6f, 0.0f);
+    std::printf("        z      回折本数  合計(D+F) 125    4k    傾き4k/125   Δ合計   Δ傾き\n");
+    int prevNd = -1; float prevTot = 0.0f, prevTilt = 0.0f; bool have = false;
+    double worstTot = 0.0, worstTilt = 0.0; float atTot = 0, atTilt = 0;
+    for (float z = -6.0f; z <= -1.0f; z += 0.1f) {
+        AF_SceneHandle s = build();
+        const AF_Vector3 L = V(0, 1.6f, z);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+        // ホストと同じ組み方: 直接(透過) ＋ 回折タップ。
+        float trans[kBands] = {}; float occFrac = 0.0f;
+        AF_SceneComputeSoftOcclusion(s, L, S, trans, kBands, &occFrac);
+        AF_Vector3 dp[8]; float dg[8]; float db[8*6];
+        const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+        float band[kBands] = {};
+        for (int b = 0; b < kBands; ++b) band[b] = trans[b];
+        for (int i = 0; i < nd; ++i)
+            for (int b = 0; b < kBands; ++b) band[b] += db[i*6+b] * occFrac;
+        float mean = 0.0f;
+        for (int b = 0; b < kBands; ++b) mean += band[b];
+        mean /= kBands;
+        const float tot = 20.0f * std::log10(std::max(mean, 1e-6f));
+        const float tilt = 20.0f * std::log10(std::max(band[5], 1e-6f)
+                                            / std::max(band[0], 1e-6f));
+        float dT = 0.0f, dL = 0.0f;
+        if (have) { dL = tot - prevTot; dT = tilt - prevTilt; }
+        const bool changed = (prevNd >= 0 && nd != prevNd);
+        std::printf("        %+5.1f    %d %s   %.4f %.4f   %7.2f   %+6.2f %+7.2f%s\n",
+                    z, nd, changed ? "★" : " ", band[0], band[5], tilt, dL, dT,
+                    changed ? "  ← 本数が変わった" : "");
+        if (have) {
+            if (std::fabs(dL) > worstTot)  { worstTot  = std::fabs(dL); atTot  = z; }
+            if (std::fabs(dT) > worstTilt) { worstTilt = std::fabs(dT); atTilt = z; }
+        }
+        prevNd = nd; prevTot = tot; prevTilt = tilt; have = true;
+        AF_SceneDestroy(s);
+    }
+    std::printf("        → 0.1m 刻みの最大 Δ:  合計 %.2f dB @ z=%+.1f  /  "
+                "**傾き %.2f dB @ z=%+.1f**\n", worstTot, atTot, worstTilt, atTilt);
+    std::printf("      ※既存の連続性検査は生存ゲイン（スカラ）を見ており、\n"
+                "        **タップの本数**は見ていない。本数が変わるとそのタップが持つ\n"
+                "        帯域の形ごと消えるので、合計のスペクトルが動く。\n");
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -6021,6 +6099,7 @@ int main() {
     testRoomIncremental();
     diagnoseRoomDetection();
     testLCorridorScene();
+    diagnoseCorridorTapDropout();
     diagnoseOpenApertureFraction();
     diagnoseShadowSpectrumJump();
     diagnoseOutdoorWithBuilding();
