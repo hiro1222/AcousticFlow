@@ -4210,10 +4210,44 @@ void testLCorridorScene() {
             }
             AF_SceneDestroy(s);
         }
-        std::printf("      ※wet が 1 に近いほど、聞こえている音のほとんどが後期残響。\n"
-                    "        後期残響は HRTF を通らず L/R バランスだけなので、そこでは\n"
-                    "        回折が運ぶ方向が薄まる ── 「回折の定位が分かりにくい」の正体。\n");
+        std::printf("      ※wet が 1 に近いほど、聞こえている音のほとんどが後期残響。\n");
     }
+
+    // ④ 【現実との差】現実は残響が強くても定位できる。
+    //   先行音効果（最初に届いた波面が定位を決める）と、残響そのものが持つ方向のため。
+    //   ではエンジンの何が方向を運んでいるのか ── 段ごとに数えて、
+    //   「方向を持てる段」と「持てない段」のエネルギー比を出す。
+    {
+        AF_SceneHandle s = build();
+        const AF_Vector3 L = V(0, 1.6f, aEnd + 2.0f);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 10; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+        const int idx = AF_SceneSourceIndex(s, 1);
+        AF_Vector3 pos[32]; float g6[32 * 6];
+        const int nEarly = (idx >= 0)
+            ? AF_SceneGetEarlyReflections(s, idx, pos, g6, 32) : 0;
+        AF_Vector3 dpos[16]; float dg[16];
+        const int nDiff = (idx >= 0)
+            ? AF_SceneGetDiffractionSources(s, idx, dpos, dg, 16) : 0;
+        double eEarly = 0.0;
+        for (int i = 0; i < nEarly; ++i)
+            for (int b = 0; b < 6; ++b) eEarly += (double)g6[i*6+b] * g6[i*6+b];
+        double eDiff = 0.0;
+        for (int i = 0; i < nDiff; ++i) eDiff += (double)dg[i] * dg[i];
+        std::printf("        【何が方向を運んでいるか】早期反射 %d 本（エネルギー和 %.4f）"
+                    " / 回折二次音源 %d 本（%.4f）\n", nEarly, eEarly, nDiff, eDiff);
+        std::printf("          段              方向の持ち方                     HRTF\n");
+        std::printf("          直接音 D        音源(見かけ)方向                  ○\n");
+        std::printf("          回折 F 最強1本  開口/角の方向                     ○（B1・C++のみ）\n");
+        std::printf("          回折 F 残り     等パワーパン                      ×\n");
+        std::printf("          早期反射 R %2d本  等パワーパン                      ×\n", nEarly);
+        std::printf("          後期尾          L/R バランスのみ（方向プローブ既定オフ）  ×\n");
+        AF_SceneDestroy(s);
+    }
+    std::printf("      ※現実で残響が強くても定位できるのは、先行音効果と\n"
+                "        **残響自体が方向を持つ**ため。エンジンは早期反射と尾に HRTF が無く、\n"
+                "        方向を持てるのが D と F の 1 本だけ ── ここが現実との差。\n");
 }
 
 void testOutdoorIsNotARoom() {
