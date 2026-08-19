@@ -4545,13 +4545,15 @@ void diagnoseApertureContrastChoice() {
 void diagnoseSlitPortalShadow() {
     std::printf("\n[調査] (B) で狭い隙間が塞がるか ── 矩形に何枚写っているか\n");
     const float t = 0.15f, h = 3.0f, hw = 8.0f;
-    std::printf("        隙間幅   (B)  回折125Hz  矩形に写った枚数  候補数\n");
-    for (int mode = 0; mode < 2; ++mode) {
-        for (float gap : {2.0f, 0.5f, 0.03f}) {
+    std::printf("        span   隙間幅   回折125Hz(F)  2m 比(dB)  写った枚数  候補\n");
+    for (float span : {0.0f, 0.5f, 1.0f, 2.0f, 4.0f}) {
+        float ref = 0.0f;
+        const int mode = (span > 0.0f) ? 1 : 0;
+        for (float gap : {2.0f, 0.5f, 0.1f, 0.03f}) {
             AF_SceneHandle s = AF_SceneCreate();
             const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
             AF_SceneSetEdgePortals(s, mode);
-            if (mode) AF_SceneSetEdgePortalSpan(s, 2.0f);
+            if (mode) AF_SceneSetEdgePortalSpan(s, span);
             AF_SceneAddInstanceBox(s, V(-hw * 0.5f, h * 0.5f, 0), V(hw * 0.5f, h * 0.5f, t),
                                    V(1,0,0), V(0,1,0), mat);
             AF_SceneAddInstanceBox(s, V(gap + (hw - gap) * 0.5f, h * 0.5f, 0),
@@ -4570,13 +4572,17 @@ void diagnoseSlitPortalShadow() {
             for (int i = 0; i < nd; ++i) lo += db[i*6+0];
             AF_Vector3 cp[32]; float cd[32];
             const int nc = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 32);
-            std::printf("        %5.2f m  %s   %.5f        %3d            %d\n",
-                        gap, mode ? "ON " : "OFF", lo, AF_SceneDebugPortalPolys(s), nc);
+            if (gap > 1.9f) ref = lo;
+            std::printf("        %-4s  %5.2f m   %.5f     %+7.1f      %3d       %d\n",
+                        mode ? "ON" : "OFF", gap, lo,
+                        20.0 * std::log10(std::max(lo, 1e-7f) / std::max(ref, 1e-7f)),
+                        AF_SceneDebugPortalPolys(s), nc);
             AF_SceneDestroy(s);
         }
+        std::printf("        %s\n", (span > 0.0f) ? "  ---" : "  --- 以下 (B) ON、span を振る");
     }
-    std::printf("      ※枚数が -1 なら開口積分が一度も走っていない（＝前川へ落ちている）。\n"
-                "        0 なら走ったが遮蔽物が 1 枚も写っていない。\n");
+    std::printf("      ※「2m 比」が幅の効き。125Hz(λ=2.7m) に対し 3cm はほぼ通さないはずなので、\n"
+                "        物理では -30dB 台が期待値。枚数 -1 は開口積分が走っていない（前川へ落ちた）。\n");
 }
 
 void testOutdoorIsNotARoom() {
