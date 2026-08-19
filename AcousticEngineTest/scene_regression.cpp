@@ -4475,6 +4475,70 @@ void diagnoseEdgePortalCalibration() {
                 "        δ とともに動くなら形が違う＝矩形の作り方を直す必要がある。\n");
 }
 
+// 【発注者の線引きへの回答】apertureContrast は「物理」か「演出」か。
+//
+//   線引き: 物理でやるのは「扉を開いた際の音の入ってきかた」と「音の反響」。それ以外は演出。
+//   apertureContrast は開口率を S 字に強調する写像で、**入ってきかたの量そのものではない**。
+//   同じファイルの apertureTimbre には「誇張は作品側の判断なので既定では掛けない」と
+//   書いてあるのに、こちらだけ既定 2.0 になっていた ── 食い違い。
+//   ここでは「どの値だと扉がどう聞こえるか」を出して、選べるようにする。
+void diagnoseApertureContrastChoice() {
+    std::printf("\n[線引き] apertureContrast は演出か ── 扉の開き角に対する効き\n");
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f;
+    const float hw = 6.0f, hd = 8.0f;
+    const float cs[] = {1.0f, 2.0f, 4.0f};
+    std::printf("        開き角   contrast=1.0（物理そのまま）  2.0（旧既定）  4.0（Unity が押す値）\n");
+    float full[3] = {0, 0, 0};
+    for (int pass = 0; pass < 2; ++pass) {
+        for (float deg = 0.0f; deg <= 90.01f; deg += 15.0f) {
+            float g[3] = {0, 0, 0};
+            for (int k = 0; k < 3; ++k) {
+                AF_SceneHandle s = AF_SceneCreate();
+                const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+                AF_SceneSetApertureContrast(s, cs[k]);
+                AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                                       V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+                AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                                       V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+                AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                                       V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+                AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+                AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+                AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+                AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+                AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+                AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+                const float th = deg * 3.14159265f / 180.0f;
+                const float c = std::cos(th), sn = std::sin(th);
+                AF_SceneAddInstanceBox(s, V(-0.6f + c*doorW*0.5f, doorH*0.5f, sn*doorW*0.5f),
+                                       V(doorW*0.5f, doorH*0.5f, 0.03f), V(c,0,sn), V(0,1,0), mat);
+                AF_SceneAddPortal(s, V(0, doorH*0.5f, 0), V(1,0,0), V(0,1,0), doorW*0.5f, doorH*0.5f);
+                const AF_Vector3 L = V(0, 1.6f, -4), S = V(-2.0f, 1.6f, 3.5f);
+                AF_SceneSetListener(s, L);
+                AF_SceneSetSource(s, 1, S);
+                for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+                // ★測るのは生存ゲインではなく**回折タップのゲイン**。
+                //   apertureContrast は F タップに掛かる写像で、生存ゲイン（スカラ）には
+                //   効かない。最初そちらを測って「3 値とも同じ」と出て気づいた。
+                AF_Vector3 dp[8]; float dgs[8]; float db[8*6];
+                const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dgs, db, 8);
+                float sum = 0.0f;
+                for (int i = 0; i < nd; ++i) sum += db[i*6+0];
+                g[k] = sum;
+                AF_SceneDestroy(s);
+            }
+            if (pass == 0) { if (deg > 89.0f) for (int k = 0; k < 3; ++k) full[k] = g[k]; continue; }
+            std::printf("         %4.0f°   %.4f (%+6.1f dB)   %.4f (%+6.1f dB)   %.4f (%+6.1f dB)\n",
+                        deg,
+                        g[0], 20.0 * std::log10(std::max(g[0],1e-6f)/std::max(full[0],1e-6f)),
+                        g[1], 20.0 * std::log10(std::max(g[1],1e-6f)/std::max(full[1],1e-6f)),
+                        g[2], 20.0 * std::log10(std::max(g[2],1e-6f)/std::max(full[2],1e-6f)));
+        }
+    }
+    std::printf("      ※dB は各々の全開を 0dB とした相対値＝**開ける手応え**。\n"
+                "        物理そのままが 1.0。2.0/4.0 は S 字で中央を急にした演出。\n");
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -6253,6 +6317,7 @@ int main() {
         diagnoseEdgePortalCalibration();
     }
     g_edgeSpan = 1.0f;
+    diagnoseApertureContrastChoice();
     diagnoseOpenApertureFraction();
     diagnoseShadowSpectrumJump();
     diagnoseOutdoorWithBuilding();
