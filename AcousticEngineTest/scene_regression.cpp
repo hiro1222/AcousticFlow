@@ -3217,6 +3217,53 @@ void diagnosePillarTimbre() {
 //   1 個しか置かれておらず、**N 本を同時に鳴らしたことが一度も無い**。
 //   しかも「音源ごとのエコグラム」を入れたばかりで index の対応が絡む。
 //   壊れているのではなく未検証なので、ここで縛る。
+// 屋外（地面だけ／壁で囲われていない）が部屋として検出されないこと。
+//   ゲーム側から「屋外の広い自由空間が巨大な 1 部屋になるのでは」という疑いが出た。
+//   部屋になると巨大な V から根拠のない尾が出る。ならないならフォールバック経路の話になる。
+void testOutdoorIsNotARoom() {
+    std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
+    const int m0 = 0;
+    struct C { const char* name; bool walls; bool ceiling; };
+    const C cases[] = {
+        {"地面だけ 90x90m          ", false, false},
+        {"地面＋腰高の塀(1.2m)     ", true,  false},
+        {"地面＋壁＋天井（＝部屋） ", true,  true},
+    };
+    for (const C& c : cases) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        (void)m0;
+        const float hw = 45.0f, t = 0.3f, h = 4.0f;
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hw), V(1,0,0), V(0,1,0), m);
+        if (c.walls) {
+            const float wh = c.ceiling ? h * 0.5f : 0.6f;   // 天井なしは腰高
+            AF_SceneAddInstanceBox(s, V(-hw, wh, 0), V(t, wh, hw), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V( hw, wh, 0), V(t, wh, hw), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, wh, -hw), V(hw, wh, t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, wh,  hw), V(hw, wh, t), V(1,0,0), V(0,1,0), m);
+        }
+        if (c.ceiling)
+            AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hw), V(1,0,0), V(0,1,0), m);
+        const int n = AF_SceneRoomCount(s);
+        const float vol = AF_SceneRoomVolumeAt(s, V(0, 1.6f, 0), 2.0f);
+        int nx = 0, ny = 0, nz = 0; float cell = 0.0f;
+        AF_SceneRoomGridDims(s, &nx, &ny, &nz, &cell);
+        std::printf("        %s 部屋 %d / 実効体積 %.0f m3 / 格子 %dx%dx%d @%.2fm\n",
+                    c.name, n, vol, nx, ny, nz, cell);
+        if (!c.ceiling) {
+            char tag[80];
+            std::snprintf(tag, sizeof(tag), "[部屋] %s は部屋にならない",
+                          c.walls ? "腰高の塀だけの屋外" : "地面だけの屋外");
+            check(tag, n == 0 && vol <= 1.0f);
+        } else {
+            check("[部屋] 壁と天井で囲えば部屋になる", n >= 1 && vol > 1.0f);
+        }
+        AF_SceneDestroy(s);
+    }
+    std::printf("      → 屋外は「外の世界」に落ちて部屋にならない（格子の外周に届く成分は部屋にしない）。\n"
+                "        つまり屋外の残響はフォールバック経路（外形箱の体積）が作っている。\n");
+}
+
 void testManySources() {
     std::printf("\n[多音源] 音源ごとの結果が混ざっていないか\n");
     const float h = 4.0f, t = 0.3f, hw = 9.0f, hd = 9.0f;
@@ -4943,6 +4990,7 @@ int main() {
     testRoomSegmentation();
     testRoomIncremental();
     diagnoseRoomDetection();
+    testOutdoorIsNotARoom();
     testManySources();
     diagnosePortalScopeGlobal();
     diagnosePerSourceEchogram();
