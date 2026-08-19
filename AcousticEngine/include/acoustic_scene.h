@@ -473,6 +473,20 @@ ACOUSTIC_API void AF_SceneSetRoomBrick(AF_SceneHandle scene, int voxels);
  * 開口という一般の量への写像なので、扉を特別視しない。 */
 ACOUSTIC_API void AF_SceneSetApertureContrast(AF_SceneHandle scene, float p);
 
+/* 開口の**音色の広がり**だけを開く指数。1.0=素通し（既定）。
+ *
+ * AF_SceneSetApertureContrast が「開閉で**音量**がどれだけ動くか」なのに対し、
+ * こちらは「開閉で**音色**がどれだけ動くか」。帯域平均を保つので音量には効かない。
+ *
+ *   f'[b] = m·(f[b]/m)^k   （m = 帯域平均。掛けたあと平均を元に戻す）
+ *
+ * これはエンジンであって作品ではないので、どれくらい芝居がかって聞こえるかは
+ * ホストが決められないといけない。物理から出るのは形で、どれだけ誇張するかは演出。
+ * 既定を 1.0（素通し）にしてあるのはそのため ── エンジンは形をそのまま出す。
+ *   ホラー寄りに濃くしたいなら 1.5〜2.5 あたり。平らにしたいなら 1 未満。
+ * 全帯域が同じ値のときは動かないので、「完全に閉じている／全開」は k で変わらない。 */
+ACOUSTIC_API void AF_SceneSetApertureTimbre(AF_SceneHandle scene, float k);
+
 /* BTM（有限楔の稜線積分）で回折の帯域ゲインを出す。0=従来（前川＋開口積分） / 1=BTM。既定 0。
  * ON では前川の δ 減衰も開口率も使わない（まとめて置き換わる。両方掛けると二重になる）。 */
 ACOUSTIC_API void AF_SceneSetUseBtm(AF_SceneHandle scene, int on);

@@ -463,6 +463,15 @@ namespace AcousticFlow
             if (_handle != IntPtr.Zero) Native.AF_SceneSetApertureContrast(_handle, p);
         }
 
+        // 開口の**音色**の広がり。1=素通し。音量には効かない（帯域平均を保つ）。
+        //   どれくらい芝居がかって聞こえるかは作品側の判断なので、外に出しておく。
+        public void SetApertureTimbre(float k)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneSetApertureTimbre(_handle, k); }
+            catch (System.Exception) { }   // 古い DLL。ABI 照合の側で警告が出る
+        }
+
         /// <summary>
         /// 回折を BTM（有限楔の稜線積分）で出す。
         /// ※検証途上。BTM 単体は 7 件中 6 件の性質チェックを通っているが、

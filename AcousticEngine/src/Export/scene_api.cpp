@@ -824,6 +824,11 @@ void AF_SceneSetApertureContrast(AF_SceneHandle scene, float p) {
     if (s) s->setApertureContrast(p);
 }
 
+void AF_SceneSetApertureTimbre(AF_SceneHandle scene, float k) {
+    Scene* s = asScene(scene);
+    if (s) s->setApertureTimbre(k);
+}
+
 void AF_SceneSetUseBtm(AF_SceneHandle scene, int on) {
     Scene* s = asScene(scene);
     if (s) s->setUseBtm(on);

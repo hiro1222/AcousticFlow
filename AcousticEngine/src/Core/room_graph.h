@@ -933,6 +933,20 @@ private:
             // 箱の中心だと斜めの口でずれる）。
             rc[domA] = atIdx(ap.center, domA);
             ap.rectCenter = Vec3(rc[0], rc[1], rc[2]);
+
+            // ── 縁を sub-voxel で詰める ──
+            //
+            //   voxel 化は「少しでも実体に重なったセル」を実体にするので、自由ボクセルの
+            //   範囲は実際の開口より最大 1 セル内側に出る。実測: 幅 0.900m の戸口が 0.750m。
+            //   ★その 17% は音量ではなく**扉の開き具合カーブの形**を変える。
+            //     正規化カーブが重ならない（ずれ 0.066 @ 20°）＝形が違う。
+            //     しかも狂うのは小角側 ── 開口率が 10° で 0.0207→0.0089（-7.3dB）。
+            //     「扉が少し開いた瞬間」がいちばん削れるので、コンセプトの中心が痩せる。
+            //   ★さらに誤差の量が戸口の格子上の位置で変わる。同じ扉を 5cm 動かすと
+            //     矩形が 1 セルぶん変わる ── 物理的に何も変わっていないのに音が変わるので、
+            //     「実行時に形状が変わる前提」という看板と食い違う。
+            //   → 外側 1 セルぶんだけ、実体との境目を二分探索で詰める。
+            refineRect_(ap, uA, vA, g.cell);
             res_.apertures.push_back(ap);
         }
         // 大きい順。残響の結合では効く口から順に見たい。
@@ -940,6 +954,53 @@ private:
                   [](const Aperture& a, const Aperture& b) { return a.area > b.area; });
         // 次回のために掃除（格子ぶんの配列なので持ち越さない）。
         for (int f = 0; f < nf; ++f) faceOf_[static_cast<std::size_t>(faceIdx_[f])] = -1;
+    }
+
+    /// 点が実体の中か。縁を詰めるときだけ使う（格子ではなく**元の箱**に問う）。
+    bool solidAt_(const Vec3& p) const {
+        for (const SolidBox& sb : boxes_)
+            if (pointInObb(p, sb.obb)) return true;
+        return false;
+    }
+
+    // 開口の矩形の 4 辺を、外側 1 セルぶんだけ実体との境目まで広げる。
+    //   前提: rectCenter は自由（開口の中）。そこから ±axisU / ±axisV へ探る。
+    //   ★広げるだけで縮めない。自由ボクセルの範囲は必ず真の開口の内側なので、
+    //     縮める方向の誤りは起きない。逆に外へ出しすぎると壁を開口に数えてしまうので、
+    //     1 セルで頭打ちにする（voxel 化の誤差はそれ以上にはならない）。
+    void refineRect_(Aperture& ap, int uA, int vA, float cell) {
+        (void)uA; (void)vA;
+        if (boxes_.empty() || cell <= 1e-4f) return;
+        // 中心が自由でなければ（斜めの口・L 字など）触らない。前提が崩れているので。
+        if (solidAt_(ap.rectCenter)) return;
+
+        auto edgeOut = [&](const Vec3& dir, float from) {
+            // from（自由）から外へ cell まで。境目までの追加ぶんを返す。
+            const Vec3 base = ap.rectCenter + dir * from;
+            if (!solidAt_(base)) {
+                // 現在の縁がまだ自由。境目は外にある。
+                if (!solidAt_(base + dir * cell)) return cell;      // 1 セル先も自由＝上限まで
+                float lo = 0.0f, hi = cell;
+                for (int it = 0; it < 12; ++it) {
+                    const float mid = 0.5f * (lo + hi);
+                    if (solidAt_(base + dir * mid)) hi = mid; else lo = mid;
+                }
+                return lo;
+            }
+            return 0.0f;   // 現在の縁が既に実体の中＝広げない
+        };
+
+        const float addU0 = edgeOut(ap.axisU * -1.0f, ap.halfU);
+        const float addU1 = edgeOut(ap.axisU,          ap.halfU);
+        const float addV0 = edgeOut(ap.axisV * -1.0f, ap.halfV);
+        const float addV1 = edgeOut(ap.axisV,          ap.halfV);
+
+        // 両側で違うぶんだけ中心もずれる。ここが左右差の残りを消す所でもある。
+        ap.rectCenter = ap.rectCenter
+                      + ap.axisU * ((addU1 - addU0) * 0.5f)
+                      + ap.axisV * ((addV1 - addV0) * 0.5f);
+        ap.halfU += (addU0 + addU1) * 0.5f;
+        ap.halfV += (addV0 + addV1) * 0.5f;
     }
 
     // ── ブロック 1 個をラベリングする ──

@@ -322,6 +322,18 @@ namespace AcousticFlow
                  + "開口という一般の量への写像なので、扉を特別視しない。")]
         [Range(1f, 12f)] public float apertureContrast = 4f;
 
+        [Tooltip("開口の**音色**の広がりを開く指数。1.0=素通し（既定＝物理そのまま）。\n\n"
+                 + "apertureContrast が『開閉で**音量**がどれだけ動くか』なのに対し、\n"
+                 + "こちらは『開閉で**音色**がどれだけ動くか』。帯域平均を保つので音量に効かない。\n"
+                 + "  f'[b] = m·(f[b]/m)^k  （m = 帯域平均。掛けたあと平均を戻す）\n\n"
+                 + "実測（半開き 35°の扉）: 音量は 0.1656 で不変のまま、4k/125 の傾きが\n"
+                 + "  k=0.5 → −3.15dB / k=1.0 → −6.31dB / k=1.8 → −11.35dB / k=2.5 → −15.77dB\n\n"
+                 + "★これはエンジンであって作品ではないので、どれくらい芝居がかって聞こえるかは\n"
+                 + "  作品側が決める。既定を 1.0 にしてあるのはそのため（決めごと #3：形は物理から\n"
+                 + "  採り、絶対値は演出で決める）。ホラー寄りに濃くするなら 1.5〜2.5 あたり。\n"
+                 + "全帯域が同じ値のときは動かないので、『完全に閉じている／全開』は k で変わらない。")]
+        [Range(0.2f, 4f)] public float apertureTimbre = 1f;
+
         [Tooltip("回折を BTM（有限楔の稜線積分）で出す。\n\n"
                  + "★検証途上。BTM 単体は性質チェック 7 件中 6 件を通っている\n"
                  + "（相反性は誤差ゼロ、深い影で前川と 1.1倍一致、影境界で総和が連続）が、\n"
@@ -1398,6 +1410,7 @@ namespace AcousticFlow
                         _scene.SetInstanceMaterial(o.instanceId, ResolveMaterialId(o));
                 }
             _scene.SetApertureContrast(apertureContrast);
+            _scene.SetApertureTimbre(apertureTimbre);
             _scene.SetApertureIsTransmission(apertureIsTransmission);
             _scene.SetUseBtm(useBtmDiffraction);
             // 部屋の検出設定。中で値の変化を見ているので、毎フレーム押しても作り直しは起きない。

@@ -64,8 +64,9 @@ typedef struct AF_VoiceConfig {
  *   1 : hrtfWeight 追加 / AF_VoiceSetDiffractionDirection 追加（B1）
  *   2 : AF_SceneRoomGridDegraded 追加（格子の降格をホストが検知できるように）
  *   3 : ポータルの自動生成（AF_SceneSetAutoPortals ほか）／AF_SceneGetPortal 追加（C1）
+ *   4 : AF_SceneSetApertureTimbre 追加（開口の音色を音量と独立に調整する口）
  */
-#define AF_ABI_VERSION 3
+#define AF_ABI_VERSION 4
 ACOUSTIC_API int AF_AbiVersion(void);
 
 typedef struct AF_VoiceTap {

@@ -444,7 +444,7 @@ namespace AcousticFlow
         //   DLL だけ古いまま C# を更新すると、AF_VoiceTap の長さが食い違って
         //   マーシャラが別の刻み幅で書き込む（44→48 バイトになった）。例外も出ずに
         //   タップの中身が化けるので、原因に辿り着けない。ここで止める。
-        public const int ExpectedAbiVersion = 3;
+        public const int ExpectedAbiVersion = 4;
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_AbiVersion();
 
@@ -510,6 +510,9 @@ namespace AcousticFlow
         // 量が足りない（実測で扉の全掃引が 1.3dB）。形を保ったまま幅だけを開く演出用。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneSetApertureContrast(IntPtr scene, float p);
+        // 開口の音色の広がり。1=素通し。音量には効かない（帯域平均を保つ）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetApertureTimbre(IntPtr scene, float k);
 
         // 開口を通る成分を「透過の一部」として扱う。開口を素通りする音は
         // 曲がりも壁抜けもしないので、前川の δ 減衰を払わせない。

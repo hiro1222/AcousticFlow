@@ -3704,6 +3704,89 @@ void diagnosePortalWidthVsDoorCurve() {
     }
 }
 
+// 【調整の口】開口の音色の広がりを、音量とは独立に動かせるか。
+//
+//   これはエンジンであって作品ではないので、「どれくらい芝居がかって聞こえるか」は
+//   ホストが決められないといけない。物理から出るのは形で、誇張の量は演出（決めごと #3）。
+//   ★ただし apertureContrast は**音量**カーブを動かすので、それとは別の口が要る。
+//     ここでは「音色は動くが音量は動かない」ことを数字で縛る。
+void testApertureTimbreKnob() {
+    std::printf("\n[調整] 開口の音色を音量と独立に動かせるか\n");
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f;
+    const float hw = 6.0f, hd = 8.0f;
+    const float deg = 35.0f;                       // 半開き。帯域差がいちばん出る辺り
+
+    auto measure = [&](float timbre, float* out6) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                               V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        const float th = deg * 3.14159265f / 180.0f;
+        const float c = std::cos(th), sn = std::sin(th);
+        AF_SceneAddInstanceBox(s, V(-0.6f + c * doorW * 0.5f, doorH * 0.5f, sn * doorW * 0.5f),
+                               V(doorW * 0.5f, doorH * 0.5f, 0.03f),
+                               V(c, 0, sn), V(0, 1, 0), mat);
+        const int pid = AF_SceneAddPortal(s, V(0, doorH*0.5f, 0), V(1,0,0), V(0,1,0),
+                                          doorW * 0.5f, doorH * 0.5f);
+        AF_SceneSetApertureTimbre(s, timbre);
+        const AF_Vector3 L = V(0, 1.6f, -4), S = V(-2.0f, 1.6f, 3.5f);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 3; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+        AF_Vector3 pp{};
+        AF_SceneMeasurePortal(s, pid, L, S, out6, &pp);
+        AF_SceneDestroy(s);
+    };
+
+    const float ks[] = {0.5f, 1.0f, 1.8f, 2.5f};
+    std::printf("        k     125     250     500      1k      2k      4k    "
+                "平均(音量)  4k/125(音色)\n");
+    float meanAt1 = 0.0f, tiltAt1 = 0.0f;
+    for (float k : ks) {
+        float f[kBands] = {};
+        measure(k, f);
+        float m = 0.0f;
+        for (int b = 0; b < kBands; ++b) m += f[b];
+        m /= kBands;
+        const float tilt = 20.0f * std::log10(std::max(f[5], 1e-6f) / std::max(f[0], 1e-6f));
+        std::printf("        %.1f  ", k);
+        for (int b = 0; b < kBands; ++b) std::printf(" %.4f", f[b]);
+        std::printf("   %.4f    %+.2f dB\n", m, tilt);
+        if (k == 1.0f) { meanAt1 = m; tiltAt1 = tilt; }
+    }
+    // 素通し(k=1)を基準に、音量が動かず音色だけ動くことを縛る。
+    for (float k : ks) {
+        if (k == 1.0f) continue;
+        float f[kBands] = {};
+        measure(k, f);
+        float m = 0.0f;
+        for (int b = 0; b < kBands; ++b) m += f[b];
+        m /= kBands;
+        const float tilt = 20.0f * std::log10(std::max(f[5], 1e-6f) / std::max(f[0], 1e-6f));
+        const double dLevel = 20.0 * std::log10(std::max(m, 1e-6f) / std::max(meanAt1, 1e-6f));
+        char tag[96];
+        std::snprintf(tag, sizeof(tag), "[調整] k=%.1f で音量が動かない（±0.5dB）", k);
+        check(tag, std::fabs(dLevel) <= 0.5);
+        std::snprintf(tag, sizeof(tag), "[調整] k=%.1f で音色が%s", k,
+                      (k > 1.0f) ? "濃くなる" : "薄くなる");
+        // 傾きは負（高域ほど通りにくい）。「濃い」＝**より負**なので絶対値で比べる。
+        check(tag, (k > 1.0f) ? (std::fabs(tilt) > std::fabs(tiltAt1) + 0.2f)
+                              : (std::fabs(tilt) < std::fabs(tiltAt1) - 0.2f));
+    }
+    std::printf("      ※既定は k=1.0（素通し）。エンジンは物理から出た形をそのまま出し、\n"
+                "        どれだけ誇張するかは作品側が決める（決めごと #3）。\n");
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -5479,6 +5562,7 @@ int main() {
     testAutoPortals();
     diagnosePortalLeftRightSymmetry();
     diagnosePortalWidthVsDoorCurve();
+    testApertureTimbreKnob();
     testManySources();
     diagnosePortalScopeGlobal();
     diagnosePerSourceEchogram();

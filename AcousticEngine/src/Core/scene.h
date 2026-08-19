@@ -1459,7 +1459,41 @@ public:
             outFrac6[b] = (denom > 1e-12)
                         ? static_cast<float>(std::min(1.0, numer / denom)) : 1.0f;
         }
+        applyApertureTimbre(outFrac6);
         return true;
+    }
+
+    // 開口の**音色の広がり**だけを動かす。平均（＝音量）は保つ。
+    //
+    //   ここはエンジンであってゲームではないので、「どれくらい芝居がかって聞こえるか」は
+    //   作品側が決められないといけない。物理から出るのは**形**で、どれだけ強調するかは演出
+    //   （決めごと #3）。ただし apertureContrast は音量カーブを動かすので、
+    //   「音色だけ濃くしたい」ができなかった。それを分けるのがこれ。
+    //
+    //     f'[b] = m · (f[b]/m)^k      m = 帯域平均、その後もう一度 m へ正規化
+    //
+    //   k=1 で素通し。k>1 で帯域差が開く（開いた扉がより明るく、閉じた扉がより暗く）。
+    //   k<1 で平ら（帯域差を消したい作品向け）。
+    //   ★平均を保つので、音量カーブ（apertureContrast の担当）とは独立に効く。
+    //   ★端点も保つ: 全帯域が同じ値なら f[b]/m = 1 なので何乗しても動かない。
+    //     つまり「完全に閉じている/完全に開いている」は k で動かない。
+    void applyApertureTimbre(float* f6) const {
+        if (apertureTimbre_ == 1.0f || !f6) return;
+        float m = 0.0f;
+        for (int b = 0; b < kNumBands; ++b) m += f6[b];
+        m /= static_cast<float>(kNumBands);
+        if (m <= 1e-6f) return;
+        float sum = 0.0f;
+        float tmp[kNumBands];
+        for (int b = 0; b < kNumBands; ++b) {
+            tmp[b] = m * std::pow(std::max(f6[b] / m, 1e-6f), apertureTimbre_);
+            sum += tmp[b];
+        }
+        if (sum <= 1e-9f) return;
+        // 平均を元に戻す（強調しても音量が動かないように）。
+        const float renorm = (m * static_cast<float>(kNumBands)) / sum;
+        for (int b = 0; b < kNumBands; ++b)
+            f6[b] = scene_detail::clamp01(tmp[b] * renorm);
     }
 
     const Portal& portal(int i) const { return portals_[static_cast<std::size_t>(i)]; }
@@ -2200,6 +2234,11 @@ public:
     ///   物理から出るのは形で、量は演出で決める（実測は参照であって目標ではない）。
     void setApertureContrast(float p) { apertureContrast_ = (p > 0.05f) ? p : 0.05f; }
     float apertureContrast() const { return apertureContrast_; }
+    /// 開口の音色の広がり。1 で素通し / >1 で帯域差を開く / <1 で平ら。
+    ///   apertureContrast が**音量**カーブを動かすのに対し、こちらは**音色**だけを動かす
+    ///   （帯域平均を保つので音量に効かない）。作品ごとの誇張はここで決める。
+    void setApertureTimbre(float k) { apertureTimbre_ = (k > 0.05f) ? k : 0.05f; }
+    float apertureTimbre() const { return apertureTimbre_; }
 
     /// BTM（有限楔の稜線積分）で回折の帯域ゲインを出す。既定 OFF（前川＋開口積分）。
     ///   ON にすると前川の δ 減衰も開口率も使わず、BTM の値がそのまま帯域ゲインになる。
@@ -4840,6 +4879,9 @@ private:
     //     p=2.0  20°で 0.0036 / 45°で 0.0648 / 90°で 0.8136  ← 採用
     //     p=3〜4 45°で -40dB 以下（半開きが無音）
     float apertureContrast_ = 2.0f;        // 開口率→音量の傾き（1=恒等）
+    // 開口の音色の広がり（1=素通し）。既定は素通し ── 物理から出る形をそのまま出す。
+    //   誇張は作品側の判断なので、エンジンの既定では掛けない（決めごと #3）。
+    float apertureTimbre_ = 1.0f;
     // ここで素通し(1.0)になる開口率。**全開のときの実測値**に合わせる。
     //   低域加重で畳んだ広帯域スカラは、全開の戸口で 0.278（帯域別 125Hz 0.408〜4kHz 0.094）。
     //   ここを大きく取ると全開でも 1.0 に届かず、幅を開いたつもりが全体が縮む
