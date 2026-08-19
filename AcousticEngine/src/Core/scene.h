@@ -691,6 +691,7 @@ public:
                 return o;
             }();
             auto crossesCore = [&](const Vec3& a, const Vec3& c) {
+                if (diffGateMask_ & 4) return false;   // 計測用: 芯の判定を切る
                 if (selfIsMesh) return false;   // 境界箱の芯は実形状と対応しない
                 float t0, t1;
                 return segmentObbPenetrationSpan(a, c, coreObb, t0, t1);
@@ -730,7 +731,7 @@ public:
                 //   （実測: 閉扉で δ が 0.05m ＝ 往復 2cm ぶんしか無かった）。
                 //   衝立の影境界では膨らませた点は空中なので、この判定に掛からない
                 //   （連続性 0.033 を壊さない）。
-                if (pointInsideOther(p, exceptInst, margin)) return false;
+                if (!(diffGateMask_ & 1) && pointInsideOther(p, exceptInst, margin)) return false;
                 // ★試して駄目だったもの: 「手前側の対になる縁が塞がれているなら奥へは
                 //   届いていない」（中心面で鏡映した点の可視性で判定）。
                 //   実測では幻が消えず、扉 10° の開き始めが 0 になる副作用だけ出た。
@@ -817,10 +818,10 @@ public:
                 }
                 if (isOccludedExcept(from, p, exceptInst)) return false;   // 他の障害物
                 // 可視判定そのものは「重みが 0 より大きいか」。重みの値は下で採る。
-                if (penNearWeight(from, p, p) <= 0.0f) return false;
+                if (!(diffGateMask_ & 2) && penNearWeight(from, p, p) <= 0.0f) return false;
                 if (!requireBothEnds) return true;
                 if (isOccludedExcept(p, to, exceptInst)) return false;
-                return penNearWeight(p, to, p) > 0.0f;
+                return (diffGateMask_ & 2) ? true : (penNearWeight(p, to, p) > 0.0f);
             };
 
             // ★回折点は「可視範囲に制約した g の最小点」。
@@ -1216,6 +1217,8 @@ public:
         return x * x * (3.0f - 2.0f * x);              // smoothstep（端で傾きも 0）
     }
     /// 支配が及ぶ距離(m)。矩形からこれだけ離れたら一般の回折に完全に戻る。
+    // 【計測用】回折の可視判定のゲートを個別に切る（bit0 pointInsideOther / bit1 penNearWeight / bit2 crossesCore）。
+    void setDiffractionGateMask(int m) { diffGateMask_ = m; }
     void setPortalGovernRange(float m) { portalGovernRange_ = std::max(0.05f, m); }
     float portalGovernRange() const { return portalGovernRange_; }
 
@@ -4921,6 +4924,10 @@ private:
     //   （0.40 にしていたときは実測で 0.0209 → 0.0155 まで落ちた）。
     float apertureContrastRef_ = 0.278f;
 
+    // 【計測用】回折の可視判定のゲートを個別に切る。0 = 全部有効（本番）。
+    //   bit0 pointInsideOther / bit1 penNearWeight / bit2 crossesCore
+    //   ★どのゲートが死角を作っているかを切り分けるためだけのもの。本番では 0。
+    int   diffGateMask_ = 0;
     float portalGovernRange_ = 1.0f;       // ポータルの支配が及ぶ距離(m)
     bool  autoPortals_ = false;            // 開口からポータルを自動生成するか
     float autoPortalMinArea_ = 0.25f;      // これ未満の口はポータルにしない(m2)

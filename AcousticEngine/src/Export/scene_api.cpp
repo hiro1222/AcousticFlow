@@ -651,6 +651,12 @@ int AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* outCenter,
     return 1;
 }
 
+/* 【計測用】回折の可視判定のゲートを個別に切る。0 = 全部有効（本番）。 */
+void AF_SceneSetDiffractionGateMask(AF_SceneHandle scene, int mask) {
+    Scene* s = asScene(scene);
+    if (s) s->setDiffractionGateMask(mask);
+}
+
 void AF_SceneSetPortalGovernRange(AF_SceneHandle scene, float meters) {
     Scene* s = asScene(scene);
     if (s) s->setPortalGovernRange(meters);

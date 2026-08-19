@@ -329,6 +329,11 @@ ACOUSTIC_API int  AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* ou
  * ★以前は「シーンに 1 枚でもポータルがあれば回折はポータルが全部決める」だった。
  *   自動生成すると全シーンがその状態になり、部屋の中央の柱の回り込みまで
  *   ポータルが答えることになる（実測 -3.3dB）。既定 1.0m。 */
+/* 【計測用】回折の可視判定のゲートを個別に切る。0 = 全部有効（本番）。
+ * bit0 pointInsideOther / bit1 penNearWeight / bit2 crossesCore
+ * どのゲートが死角を作っているかを切り分けるためだけの口。 */
+ACOUSTIC_API void AF_SceneSetDiffractionGateMask(AF_SceneHandle scene, int mask);
+
 ACOUSTIC_API void AF_SceneSetPortalGovernRange(AF_SceneHandle scene, float meters);
 
 /* ポータルがどれだけ開いているかを帯域別に測る。

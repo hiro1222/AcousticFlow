@@ -4355,8 +4355,40 @@ void diagnoseCorridorTapDropout() {
         AF_SceneDestroy(s);
     }
     std::printf("\n          （z=-3.95 → -3.55 の 41 点。切り替わり %d 回）\n", runs);
-    std::printf("      ※切り替わりが何度も起きるなら、判定が幾何の際どい所で\n"
-                "        ひっくり返っている＝数値的な knife-edge。\n");
+    std::printf("      ※きれいな帯で消えるなら数値誤差ではなく、幾何的な死角。\n");
+
+    // どのゲートが死角を作っているかを 1 つずつ切って確かめる。
+    //   bit0 pointInsideOther / bit1 penNearWeight / bit2 crossesCore
+    struct G { int mask; const char* name; };
+    const G gates[] = {
+        {0, "全部有効（本番）        "},
+        {1, "pointInsideOther を切る "},
+        {2, "penNearWeight を切る    "},
+        {4, "crossesCore を切る      "},
+        {7, "全部切る                "},
+    };
+    std::printf("        ゲートを 1 つずつ切って死角が消えるか（z=-6.0 → -1.0 の 51 点の候補数）:\n");
+    for (const G& g : gates) {
+        int dead = 0, flips = 0, pc = -1;
+        std::printf("          %s ", g.name);
+        for (float z = -6.0f; z <= -1.0f; z += 0.1f) {
+            AF_SceneHandle s = build();
+            AF_SceneSetDiffractionGateMask(s, g.mask);
+            const AF_Vector3 L = V(0, 1.6f, z);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+            AF_Vector3 cp[64]; float cd[64];
+            const int nc = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 64);
+            if (nc == 0) ++dead;
+            if (pc >= 0 && (nc == 0) != (pc == 0)) ++flips;
+            pc = nc;
+            std::printf("%c", (nc == 0) ? '.' : '#');
+            AF_SceneDestroy(s);
+        }
+        std::printf("  死角 %2d 点 / 切り替わり %d 回\n", dead, flips);
+    }
+    std::printf("      ※'#'=候補あり / '.'=死角。死角が消えたゲートが犯人。\n");
 }
 
 void testOutdoorIsNotARoom() {
