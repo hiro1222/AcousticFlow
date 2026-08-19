@@ -507,7 +507,10 @@ private:
     std::vector<int> first_;                          // ブロック → 通し番号の先頭（累積）
     mutable std::vector<int> parent_;                 // union-find
     std::vector<int> rootSlot_;                       // 通し番号 → 集計スロット (-1)
-    std::vector<int> roomOfSlot_;                     // 集計スロット → 部屋番号 (-1)
+    // 集計スロット → 部屋番号。-1 = 小さすぎて捨てた / kOutsideSlot = 外の世界。
+    //   外の世界は塗り戻しで**種として競争させる**ので、-1 とは区別が要る。
+    static constexpr int kOutsideSlot = -2;
+    std::vector<int> roomOfSlot_;
 
     // ── union-find（経路半減）──
     int find_(int i) const {
@@ -676,7 +679,11 @@ private:
                         const std::uint16_t l = L[base + x];
                         if (l >= kLocNone) continue;
                         const int r = roomOfGid_[static_cast<std::size_t>(f0 + l)];
-                        if (r < 0) continue;                 // 外の世界／小さすぎて捨てた
+                        // r >= 0 は部屋、kOutsideSlot は「外の世界」。**どちらも種にする。**
+                        //   外を種にしないと競争相手がいなくなり、屋外が部屋に吸われる。
+                        //   -1（小さすぎて捨てた成分）だけは種にしない ── あれは
+                        //   「隙間のノイズ」で、近くの部屋に配ってしまってよい。
+                        if (r == -1) continue;
                         R[base + x] = static_cast<std::int16_t>(r);
                         GD[base + x] = 0;
                     }
@@ -714,6 +721,11 @@ private:
         };
         sweep(nbFwd_(), true);
         sweep(nbBwd_(), false);
+
+        // 「外の世界」は競争のためだけに置いた種なので、ここで普通の「部屋なし」に均す。
+        //   以降の利用側（開口の抽出・roomAtVoxel・重み）は負値を一律に扱えばよい。
+        for (std::size_t i = 0; i < n; ++i)
+            if (R[i] == kOutsideSlot) R[i] = -1;
 
         // 体積・重心・境界は塗り戻した後の姿で取り直す（種だけの体積は実際より小さい）。
         const std::size_t nr = res_.rooms.size();
@@ -1189,7 +1201,17 @@ private:
             // ★格子の外周に届いた成分は「外の世界」であって部屋ではない。
             //   外側に 1 ボクセルの余白を取ってあるので、屋外や囲われていない空間は
             //   必ずここへ落ちる。これで「閉じた空間かどうか」が判定できる。
-            if (a.touchesBoundary) { res_.outsideVoxels += a.count; continue; }
+            // ★「外の世界」も**種として残す**（kOutsideSlot）。捨てて種にしないと、
+            //   塗り戻しに競争相手がいなくなり、屋外の空気が戸口を通って部屋に吸われる。
+            //   実測（地面46x70m＋建物20x18x8m・戸口1.1m）: 建物の中の実効体積が
+            //   設計 2880m3 に対して **11467m3（4.0倍）**、戸口の外 19m まで「部屋0」だった。
+            //   外を種にすれば、屋外ボクセルは外のほうが近いので吸われず、
+            //   境目は戸口の所で距離が釣り合う位置に**連続に**決まる。
+            if (a.touchesBoundary) {
+                res_.outsideVoxels += a.count;
+                roomOfSlot_[i] = kOutsideSlot;
+                continue;
+            }
             if (a.count < minVoxels_) { res_.discarded++; continue; }
             roomOfSlot_[i] = static_cast<int>(res_.rooms.size());
             const float inv = 1.0f / static_cast<float>(a.count);

@@ -3855,13 +3855,36 @@ void diagnoseOutdoorWithBuilding() {
         std::printf("          建物の外 room=%2d 実効V %8.0f m3  ← 0 でなければ屋外が部屋\n",
                     rOut, vOut);
         // 戸口から外へ何 m まで「部屋」が伸びているか。塗り戻しがどこまで吸うかを見る。
+        bool leaked = false;
         if (c.doorW > 0.0f) {
             std::printf("          戸口の外へ:");
             for (float d = 1.0f; d <= 20.0f; d += 3.0f) {
                 const AF_Vector3 p = V(0, 1.6f, -(rz + wt) - d);
-                std::printf("  %.0fm:room%d", d, AF_SceneRoomAt(s, p));
+                const int rr = AF_SceneRoomAt(s, p);
+                std::printf("  %.0fm:room%d", d, rr);
+                if (d >= 4.0f && rr >= 0) leaked = true;   // 戸口のすぐ外は連続性のため許す
             }
             std::printf("\n");
+        }
+        // ★戸口があっても、建物の中の実効体積は「閉じた建物」と同じでなければならない。
+        //   屋外を吸っていた頃は 2790 → 11467m3（4.0倍）になっていた。
+        const float design = 2.0f * rx * 2.0f * rz * rh;
+        // ★戸口が種半径の 2 倍より広いと、侵食で屋内と屋外の種が分かれない。
+        //   すると屋外と繋がった成分ごと「外の世界」に落ち、**部屋そのものが消える**。
+        //   これは未解決の設計判断（「開口が広すぎる空間は部屋か？」）なので、
+        //   合格扱いにせず、消えていることを表示だけする。
+        const bool pinchable = (c.doorW > 0.0f) && (c.doorW <= c.seed * 2.0f);
+        if (c.seed > 0.0f && (c.doorW <= 0.0f || pinchable)) {
+            char tag[96];
+            std::snprintf(tag, sizeof(tag), "[屋外] %s で建物の体積が設計どおり", c.name);
+            check(tag, vIn > design * 0.85f && vIn < design * 1.15f);
+            if (c.doorW > 0.0f) {
+                std::snprintf(tag, sizeof(tag), "[屋外] %s で屋外が部屋に吸われない", c.name);
+                check(tag, !leaked);
+            }
+        } else if (c.doorW > 0.0f && c.seed > 0.0f) {
+            std::printf("          ↑ 戸口 %.1fm > 種半径 %.1fm × 2 なので侵食で分かれず、"
+                        "部屋が消えている（未解決の設計判断）\n", c.doorW, c.seed);
         }
         AF_SceneDestroy(s);
     }
