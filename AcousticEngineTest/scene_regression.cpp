@@ -4539,6 +4539,46 @@ void diagnoseApertureContrastChoice() {
                 "        物理そのままが 1.0。2.0/4.0 は S 字で中央を急にした演出。\n");
 }
 
+// 【調査】(B) で狭い隙間が塞がらない件 ── 矩形に遮蔽物が写っているか。
+//   2m と 3cm が同値になるのは「幅を見ていない」印で、それは前川（δ だけの関数）の症状。
+//   つまり (B) の積分に落ちていない疑いがある。写った枚数を直接数える。
+void diagnoseSlitPortalShadow() {
+    std::printf("\n[調査] (B) で狭い隙間が塞がるか ── 矩形に何枚写っているか\n");
+    const float t = 0.15f, h = 3.0f, hw = 8.0f;
+    std::printf("        隙間幅   (B)  回折125Hz  矩形に写った枚数  候補数\n");
+    for (int mode = 0; mode < 2; ++mode) {
+        for (float gap : {2.0f, 0.5f, 0.03f}) {
+            AF_SceneHandle s = AF_SceneCreate();
+            const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+            AF_SceneSetEdgePortals(s, mode);
+            if (mode) AF_SceneSetEdgePortalSpan(s, 2.0f);
+            AF_SceneAddInstanceBox(s, V(-hw * 0.5f, h * 0.5f, 0), V(hw * 0.5f, h * 0.5f, t),
+                                   V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(gap + (hw - gap) * 0.5f, h * 0.5f, 0),
+                                   V((hw - gap) * 0.5f, h * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, 6), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, 6), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(-hw, h * 0.5f, 0), V(t, h * 0.5f, 6), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(hw, h * 0.5f, 0), V(t, h * 0.5f, 6), V(1,0,0), V(0,1,0), mat);
+            const AF_Vector3 L = V(-0.1f, 1.6f, -3.0f), S = V(-0.1f, 1.6f, 3.0f);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+            AF_Vector3 dp[8]; float dg[8]; float db[8*6];
+            const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+            float lo = 0.0f;
+            for (int i = 0; i < nd; ++i) lo += db[i*6+0];
+            AF_Vector3 cp[32]; float cd[32];
+            const int nc = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 32);
+            std::printf("        %5.2f m  %s   %.5f        %3d            %d\n",
+                        gap, mode ? "ON " : "OFF", lo, AF_SceneDebugPortalPolys(s), nc);
+            AF_SceneDestroy(s);
+        }
+    }
+    std::printf("      ※枚数が -1 なら開口積分が一度も走っていない（＝前川へ落ちている）。\n"
+                "        0 なら走ったが遮蔽物が 1 枚も写っていない。\n");
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -6318,6 +6358,7 @@ int main() {
     }
     g_edgeSpan = 1.0f;
     diagnoseApertureContrastChoice();
+    diagnoseSlitPortalShadow();
     diagnoseOpenApertureFraction();
     diagnoseShadowSpectrumJump();
     diagnoseOutdoorWithBuilding();

@@ -1277,6 +1277,8 @@ public:
     bool edgePortals() const { return edgePortals_; }
     /// 矩形の半幅をフレネル半径の何倍にするか。
     void setEdgePortalSpan(float k) { edgePortalSpan_ = std::max(0.25f, k); }
+    // 【計測用】直近の portalOpenBands で矩形に影として写った遮蔽物の枚数。-1 は未実行。
+    int dbgPortalPolys() const { return dbgPortalPolys_; }
 
     // ── 部屋グラフの開口からポータルを自動生成する ──
     //
@@ -1477,6 +1479,7 @@ public:
             }
         }
 
+        dbgPortalPolys_ = static_cast<int>(polys.size());   // 計測用: 矩形に写った遮蔽物の枚数
         // 行ごとに「影の和集合」の補集合＝開いている区間を出し、帯域ごとの核で積む。
         constexpr float kBandHz[kNumBands] = {125, 250, 500, 1000, 2000, 4000};
         constexpr int kRows = 32, kCols = 12;
@@ -5087,6 +5090,7 @@ private:
     //     1 倍 9.32dB（-20〜-29dB） / **2 倍 2.87dB（+2.2〜+5.0dB）** / 4 倍 2.71dB / 8 倍 3.19dB
     //   2 倍で形が合い、残りはほぼ一定のオフセット＝決めごと #3 の範囲。
     float edgePortalSpan_ = 2.0f;
+    mutable int dbgPortalPolys_ = -1;      // 計測用: 直近の portalOpenBands で矩形に写った枚数
     float portalGovernRange_ = 1.0f;       // ポータルの支配が及ぶ距離(m)
     bool  autoPortals_ = false;            // 開口からポータルを自動生成するか
     float autoPortalMinArea_ = 0.25f;      // これ未満の口はポータルにしない(m2)

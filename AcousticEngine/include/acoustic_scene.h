@@ -333,6 +333,9 @@ ACOUSTIC_API int  AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* ou
  * bit0 pointInsideOther / bit1 penNearWeight / bit2 crossesCore
  * どのゲートが死角を作っているかを切り分けるためだけの口。 */
 /* 【(B)】稜線からポータルを生成してフレネル積分する。既定 0（従来の前川＋開口積分）。 */
+/* 【計測用】直近の開口積分で矩形に写った遮蔽物の枚数。 */
+ACOUSTIC_API int AF_SceneDebugPortalPolys(AF_SceneHandle scene);
+
 ACOUSTIC_API void AF_SceneSetEdgePortals(AF_SceneHandle scene, int enable);
 ACOUSTIC_API void AF_SceneSetEdgePortalSpan(AF_SceneHandle scene, float k);
 
