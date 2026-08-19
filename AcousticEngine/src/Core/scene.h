@@ -5082,7 +5082,11 @@ private:
     float insideOtherScale_ = 0.08f;
     // (B) 稜線からポータルを生成してフレネル積分する。既定 OFF（従来経路）。
     bool  edgePortals_ = false;
-    float edgePortalSpan_ = 1.0f;          // 矩形の半幅 = これ × フレネル半径
+    // 矩形の半幅 = これ × フレネル半径。★1 倍では積分が切れて形が壊れる。
+    //   実測（衝立の陰を歩き、従来経路との比のばらつき＝形の一致度）:
+    //     1 倍 9.32dB（-20〜-29dB） / **2 倍 2.87dB（+2.2〜+5.0dB）** / 4 倍 2.71dB / 8 倍 3.19dB
+    //   2 倍で形が合い、残りはほぼ一定のオフセット＝決めごと #3 の範囲。
+    float edgePortalSpan_ = 2.0f;
     float portalGovernRange_ = 1.0f;       // ポータルの支配が及ぶ距離(m)
     bool  autoPortals_ = false;            // 開口からポータルを自動生成するか
     float autoPortalMinArea_ = 0.25f;      // これ未満の口はポータルにしない(m2)

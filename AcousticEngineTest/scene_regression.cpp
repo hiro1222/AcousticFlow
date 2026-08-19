@@ -4418,6 +4418,63 @@ void diagnoseCorridorTapDropout() {
     }
 }
 
+// 【(B) の較正】稜線ポータルと従来（前川＋開口積分）を、同じ配置で δ ごとに並べる。
+//   比がどこでも一定なら**ただの倍率**で、決めごと #3 の「絶対値は演出で決める」で片付く。
+//   δ とともに比が動くなら**形が違う**ので、矩形の作り方（大きさ・向き）を直す必要がある。
+static float g_edgeSpan = 1.0f;
+void diagnoseEdgePortalCalibration() {
+    std::printf("\n[(B)較正] 稜線ポータル vs 従来 ── 形が同じか、倍率だけか\n");
+    const float h = 4.0f, t = 0.3f, hw = 12.0f, hd = 10.0f;
+    auto build = [&](bool edgeP) {
+        AF_SceneHandle s = AF_SceneCreate();
+        AF_SceneSetRoomCellSize(s, 0.5f);
+        AF_SceneSetEdgePortals(s, edgeP ? 1 : 0);
+        if (edgeP) AF_SceneSetEdgePortalSpan(s, g_edgeSpan);
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        // 床と、有限の衝立 1 枚だけ（部屋にしない＝反射を混ぜない）。
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(3.0f, h*0.5f, 0.15f), V(1,0,0), V(0,1,0), m);
+        return s;
+    };
+    const AF_Vector3 S = V(0, 1.6f, 4.0f);
+    std::printf("        x     δ(m)    従来125   (B)125    比(dB)  |  従来4k    (B)4k     比(dB)\n");
+    double minR = 1e9, maxR = -1e9;
+    for (float x = 0.0f; x <= 2.8f; x += 0.4f) {
+        float gOld[kBands] = {}, gNew[kBands] = {};
+        float delta = -1.0f;
+        for (int k = 0; k < 2; ++k) {
+            AF_SceneHandle s = build(k == 1);
+            const AF_Vector3 L = V(x, 1.6f, -4.0f);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            for (int i = 0; i < 5; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+            AF_Vector3 dp[8]; float dg[8]; float db[8*6];
+            const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+            float* dst = (k == 0) ? gOld : gNew;
+            for (int i = 0; i < nd; ++i)
+                for (int b = 0; b < kBands; ++b) dst[b] += db[i*6+b];
+            if (k == 0) {
+                AF_Vector3 cp[32]; float cd[32];
+                const int nc = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 32);
+                for (int i = 0; i < nc; ++i)
+                    if (delta < 0.0f || cd[i] < delta) delta = cd[i];
+            }
+            AF_SceneDestroy(s);
+        }
+        const double r0 = 20.0 * std::log10(std::max(gNew[0],1e-6f)/std::max(gOld[0],1e-6f));
+        const double r5 = 20.0 * std::log10(std::max(gNew[5],1e-6f)/std::max(gOld[5],1e-6f));
+        std::printf("        %.1f  %6.3f  %.5f  %.5f  %+7.2f  |  %.5f  %.5f  %+7.2f\n",
+                    x, delta, gOld[0], gNew[0], r0, gOld[5], gNew[5], r5);
+        if (gOld[0] > 1e-5f && gNew[0] > 1e-7f) {
+            minR = std::min(minR, r0); maxR = std::max(maxR, r0);
+        }
+    }
+    std::printf("      → 125Hz の比のばらつき %.2f 〜 %.2f dB（幅 %.2f dB）\n",
+                minR, maxR, maxR - minR);
+    std::printf("      ※幅が小さければ**ただの倍率**＝決めごと #3 で片付く。\n"
+                "        δ とともに動くなら形が違う＝矩形の作り方を直す必要がある。\n");
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -6190,6 +6247,12 @@ int main() {
     diagnoseRoomDetection();
     testLCorridorScene();
     diagnoseCorridorTapDropout();
+    for (float sp : {1.0f, 2.0f, 4.0f, 8.0f}) {
+        g_edgeSpan = sp;
+        std::printf("\n  === 矩形の半幅 = フレネル半径 x %.0f ===", sp);
+        diagnoseEdgePortalCalibration();
+    }
+    g_edgeSpan = 1.0f;
     diagnoseOpenApertureFraction();
     diagnoseShadowSpectrumJump();
     diagnoseOutdoorWithBuilding();
