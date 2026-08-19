@@ -3891,6 +3891,96 @@ void diagnoseOutdoorWithBuilding() {
     std::printf("      ※屋外は「外の世界」に落ちるはず（格子の外周に届く成分は部屋にしない）。\n");
 }
 
+// 【B7】遮蔽境界で**スペクトル**が跳ぶか（ゲームシステムからの測定依頼）。
+//
+//   既存の回帰は「D⊕F の合計レベルが連続か」しか見ていない。合計が連続でも
+//   帯域ごとの傾きが振れれば「音色が跳ぶ」と聞こえる。そこを同じやり方で測る。
+//
+//   仕組みの見当（コードから）: 生存ゲインは帯域ごとに
+//       outGain[b] = max( 透過soft[b], 回折dif[b] )
+//   透過は質量則で **21dB の傾き**（Default: TL 31→52dB）、
+//   回折はポータルが支配していなければ diffractionFlat_ で**平坦**に均される。
+//   傾きが違う 2 本の max なので、**帯域ごとに乗り換わる位置がずれる**。
+//   高域は soft が小さいので早く回折へ、低域は遅く乗り換わる ＝ その間スペクトルが動く。
+//   ポータルが支配していれば dif はフレネル帯域積分（傾きを持つ）なので、
+//   soft と形が近く乗り換えが揃う ＝ 音色が跳ばない。その対比を数字で出す。
+void diagnoseShadowSpectrumJump() {
+    std::printf("\n[B7] 遮蔽境界でスペクトルが跳ぶか（合計レベルではなく傾きを見る）\n");
+    // ★部屋は広めに取る。狭いと**影境界が部屋の外に出て**リスナーが跨がないまま終わる。
+    //   影境界は 音源(0,+3) から遮蔽物の縁を通って z=-3 に落ちる位置 ＝ 縁の x の 2 倍。
+    //   最初 hw=8 で測ったら、跨ぐ前にリスナーが側壁へめり込んで -58dB の「崖」が出た。
+    //   あれは壁の中に入っただけで、B7 とは無関係。
+    const float h = 4.0f, t = 0.3f, hw = 16.0f, hd = 8.0f;
+
+    // 柱（開口ではない）と、戸口（ポータルが自動生成される）の 2 通り。
+    // ★柱が細いと回折が常に透過より大きく、max(soft,dif) は回折側に張り付く。
+    //   透過の 21dB 傾きが顔を出すのは**回折が弱くなる場所** ＝ 迂回が長い大きな壁の陰。
+    //   ゲームシステムの報告は「柱や壁が塞いだ瞬間」なので、壁のほうも測る。
+    struct C { const char* name; bool doorway; float barrierHalfW; };
+    const C cases[] = { {"柱の陰へ歩く 幅1.2m（一般の稜線回折）  ", false, 0.6f},
+                        {"壁の陰へ歩く 幅6m（回折が弱い＝透過が勝つ）", false, 3.0f},
+                        {"戸口の陰へ歩く（自動ポータルが支配）  ", true,  0.0f} };
+    for (const C& c : cases) {
+        std::printf("      %s\n", c.name);
+        std::printf("        x     125     500      4k    合計dB  傾き4k/125  Δ合計  Δ傾き\n");
+        float prevTot = 0.0f, prevTilt = 0.0f; bool have = false;
+        double worstTot = 0.0, worstTilt = 0.0; float atTot = 0, atTilt = 0;
+        for (float x = 0.0f; x <= (c.barrierHalfW >= 3.0f ? 9.0f : 2.4f); x += 0.1f) {
+            AF_SceneHandle s = AF_SceneCreate();
+            AF_SceneSetRoomCellSize(s, 0.2f);
+            if (c.doorway) AF_SceneSetAutoPortals(s, 1);
+            const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+            AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+            if (c.doorway) {
+                // z=0 を仕切って戸口 1.0m を空ける（部屋が 2 つに割れる）。
+                const float dw = 1.0f, sw = (hw + t - dw * 0.5f) * 0.5f, sc = dw * 0.5f + sw;
+                AF_SceneAddInstanceBox(s, V(-sc, h*0.5f, 0), V(sw, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+                AF_SceneAddInstanceBox(s, V( sc, h*0.5f, 0), V(sw, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+                AF_SceneAddInstanceBox(s, V(0, 2.2f + (h-2.2f)*0.5f, 0),
+                                       V(dw*0.5f, (h-2.2f)*0.5f, t), V(1,0,0), V(0,1,0), m);
+            } else {
+                // 遮蔽物 1 枚。幅は場合ごと・厚み 0.3m。
+                AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(c.barrierHalfW, h*0.5f, 0.15f),
+                                       V(1,0,0), V(0,1,0), m);
+            }
+            // リスナーを横へ動かして、見通し → 影 へ入る。
+            AF_SceneSetListener(s, V(x, 1.6f, -3.0f));
+            AF_SceneSetSource(s, 1, V(0, 1.6f, 3.0f));
+            for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+            float g[kBands] = {};
+            const int idx = AF_SceneSourceIndex(s, 1);
+            if (idx >= 0) AF_SceneGetSourceOcclusion(s, idx, g);
+            AF_SceneDestroy(s);
+
+            float mean = 0.0f;
+            for (int b = 0; b < kBands; ++b) mean += g[b];
+            mean /= kBands;
+            const float tot = 20.0f * std::log10(std::max(mean, 1e-6f));
+            const float tilt = 20.0f * std::log10(std::max(g[5], 1e-6f) / std::max(g[0], 1e-6f));
+            float dT = 0.0f, dL = 0.0f;
+            if (have) { dL = tot - prevTot; dT = tilt - prevTilt; }
+            std::printf("        %.1f  %.4f  %.4f  %.4f  %6.1f  %8.2f  %+6.2f %+7.2f\n",
+                        x, g[0], g[2], g[5], tot, tilt, dL, dT);
+            if (have) {
+                if (std::fabs(dL) > worstTot)  { worstTot  = std::fabs(dL); atTot  = x; }
+                if (std::fabs(dT) > worstTilt) { worstTilt = std::fabs(dT); atTilt = x; }
+            }
+            prevTot = tot; prevTilt = tilt; have = true;
+        }
+        std::printf("        → 0.1m 刻みの最大 Δ:  合計 %.2f dB @ x=%.1f  /  "
+                    "**傾き %.2f dB @ x=%.1f**\n", worstTot, atTot, worstTilt, atTilt);
+    }
+    std::printf("      ※合計が連続でも傾きが振れれば「音色が跳ぶ」と聞こえる。\n"
+                "        生存ゲインは帯域ごとに max(透過, 回折) を取っており、\n"
+                "        透過は 21dB 傾き・回折は（ポータル非支配なら）平坦なので、\n"
+                "        帯域ごとに乗り換わる位置がずれる。\n");
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -5661,6 +5751,7 @@ int main() {
     testRoomSegmentation();
     testRoomIncremental();
     diagnoseRoomDetection();
+    diagnoseShadowSpectrumJump();
     diagnoseOutdoorWithBuilding();
     testOutdoorIsNotARoom();
     testRoomGridDegradeDetect();
