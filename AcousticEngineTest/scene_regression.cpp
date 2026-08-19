@@ -3514,6 +3514,88 @@ void testAutoPortals() {
     }
 }
 
+// 【調査】同じ開口の右側と左側で、音量・音色が変わってしまう件。
+//
+//   正しい非対称と、不具合の非対称を分ける:
+//     ・経路長が変われば音量が変わる …… 正しい
+//     ・斜めから見ると開口が狭く見えて音色が変わる …… 正しい（フレネル）
+//     ・**左右対称な位置で違う値が出る** …… 不具合。鏡像は鏡像でなければならない
+//   ここでは 3 つ目だけを測る。シーンを x=0 に対して厳密に対称に組み、
+//   リスナーを ±x の鏡像位置に置いて、帯域ごとの差を見る。
+void diagnosePortalLeftRightSymmetry() {
+    std::printf("\n[調査] 同じ開口の左右で音量・音色が変わるか（鏡像の比較）\n");
+    const float h = 3.0f, t = 0.2f, hw = 6.0f, hd = 6.0f;
+    const float doorW = 0.9f, doorH = 2.0f;
+
+    auto build = [&](float cell, bool autoP) {
+        AF_SceneHandle s = AF_SceneCreate();
+        AF_SceneSetRoomCellSize(s, cell);
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        const float sw = (hw - doorW * 0.5f) * 0.5f;
+        const float sc = doorW * 0.5f + sw;
+        AF_SceneAddInstanceBox(s, V(-sc, h*0.5f, 0), V(sw, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( sc, h*0.5f, 0), V(sw, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        const float lh = (h - doorH) * 0.5f;
+        AF_SceneAddInstanceBox(s, V(0, doorH + lh, 0), V(doorW*0.5f, lh, t), V(1,0,0), V(0,1,0), m);
+        if (autoP) AF_SceneSetAutoPortals(s, 1);
+        else AF_SceneAddPortal(s, V(0, doorH*0.5f, 0), V(1,0,0), V(0,1,0),
+                               doorW*0.5f, doorH*0.5f);
+        return s;
+    };
+
+    struct Case { const char* name; float cell; bool autoP; };
+    const Case cases[] = {
+        {"手置き（x=0 に厳密対称）", 0.15f, false},
+        {"自動生成 セル 0.15m    ", 0.15f, true },
+        {"自動生成 セル 0.25m    ", 0.25f, true },
+    };
+    const float xs[] = {0.5f, 1.0f, 2.0f, 3.0f};
+    for (const Case& c : cases) {
+        // 自動生成された矩形が x=0 に対称かをまず見る。ずれていれば左右差の原因はこれ。
+        {
+            AF_SceneHandle s = build(c.cell, c.autoP);
+            AF_SceneSetListener(s, V(0, 1.5f, -2.0f));
+            AF_SceneSetSource(s, 1, V(0, 1.5f, 2.0f));
+            for (int i = 0; i < 5; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+            AF_Vector3 pc{}, pu{}, pv{}; float hu = 0.0f, hv = 0.0f;
+            AF_SceneGetPortal(s, 0, &pc, &pu, &pv, &hu, &hv);
+            std::printf("      %s  矩形 中心x %+.4f 幅 %.3f（x=0 からのずれ %.4f m）\n",
+                        c.name, pc.x, hu * 2.0f, std::fabs(pc.x));
+            AF_SceneDestroy(s);
+        }
+        double worst = 0.0; float worstX = 0.0f;
+        for (float x : xs) {
+            float g[2][kBands] = {};
+            for (int k = 0; k < 2; ++k) {
+                const float sx = (k == 0) ? -x : x;
+                AF_SceneHandle s = build(c.cell, c.autoP);
+                AF_SceneSetListener(s, V(sx, 1.5f, -2.5f));
+                AF_SceneSetSource(s, 1, V(0, 1.5f, 2.5f));   // 音源は開口の正面
+                for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+                const int idx = AF_SceneSourceIndex(s, 1);
+                if (idx >= 0) AF_SceneGetSourceOcclusion(s, idx, g[k]);
+                AF_SceneDestroy(s);
+            }
+            double d = 0.0;
+            for (int b = 0; b < kBands; ++b)
+                d = std::max(d, std::fabs(20.0 * std::log10(std::max(g[1][b], 1e-6f)
+                                                          / std::max(g[0][b], 1e-6f))));
+            std::printf("          x=%+.1f 対 %+.1f   左 125=%.4f 4k=%.4f / "
+                        "右 125=%.4f 4k=%.4f  → 差 %.2f dB\n",
+                        -x, x, g[0][0], g[0][5], g[1][0], g[1][5], d);
+            if (d > worst) { worst = d; worstX = x; }
+        }
+        std::printf("      → 鏡像どうしの差 最大 %.2f dB @ x=±%.1f\n", worst, worstX);
+    }
+    std::printf("      ※鏡像は鏡像でなければならない。0dB でないぶんは不具合。\n");
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -5287,6 +5369,7 @@ int main() {
     testOutdoorIsNotARoom();
     testRoomGridDegradeDetect();
     testAutoPortals();
+    diagnosePortalLeftRightSymmetry();
     testManySources();
     diagnosePortalScopeGlobal();
     diagnosePerSourceEchogram();

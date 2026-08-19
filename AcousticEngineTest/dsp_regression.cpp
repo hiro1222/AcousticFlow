@@ -1550,6 +1550,32 @@ void testDiffractionHrtf() {
     const int w0 = tapDelay - 8, w1 = tapDelay + 400;   // 回折タップの到来まわりだけ見る
     const float occluded = 0.001f;                       // 直接音は透過まで落ちている
 
+    // ── ⓪ HRTF そのものが左右対称か ──
+    //   B1 で回折タップが HRTF を通るようになったので、「同じ開口の右側と左側で音色が違う」
+    //   の原因候補に HRTF が加わった。本物のダミーヘッドなら左右の耳は厳密には同じでない。
+    //   → **実測 0.00dB。この kemar は左右対称化されている**ので原因ではない。
+    //     開口の左右差を追うときはここを除外してよい（この行はそのための証拠）。
+    {
+        const float az[] = {30.0f, 60.0f, 90.0f};
+        std::printf("        HRTF の左右差（鏡像の方向で HRIR のパワーを比べる）:\n          ");
+        for (float a : az) {
+            float dl[3], dr[3];
+            af::dsp::HrtfSet::angleToVector(-a, 0.0f, dl);
+            af::dsp::HrtfSet::angleToVector( a, 0.0f, dr);
+            const int il = set.nearestIndex(dl), ir = set.nearestIndex(dr);
+            // 左方向のときの「近い側の耳」＝左耳、右方向のときは右耳。鏡像なら等しいはず。
+            auto pw = [&](int idx, int ear) {
+                const float* hh = set.hrir(idx, ear);
+                double s = 0.0;
+                for (int k = 0; k < set.irLength(); ++k) s += (double)hh[k] * hh[k];
+                return s;
+            };
+            const double nearL = pw(il, 0), nearR = pw(ir, 1);
+            std::printf("±%.0f°:%+.2fdB ", a, 10.0 * std::log10(nearR / std::max(nearL, 1e-20)));
+        }
+        std::printf("\n");
+    }
+
     // ── ① ITD。右 60° の開口 ──
     //   等パワーパンは左右の**レベル差**しか作らない。同じ波形を定数倍しているだけなので
     //   両耳のずれは 0 サンプル。ここでは直接音を切って（深く遮蔽された状態）
