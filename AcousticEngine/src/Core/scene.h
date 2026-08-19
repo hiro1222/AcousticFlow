@@ -1385,7 +1385,9 @@ public:
             return true;
         };
         auto hullInto = [&](const float* px, const float* py, int m, Poly& out) {
-            int idx[8];
+            // ★近平面クリップで頂点が増えるので 8 では足りない（箱 8 ＋ 交点 12）。
+            int idx[24];
+            if (m > 24) m = 24;
             for (int i = 0; i < m; ++i) idx[i] = i;
             std::sort(idx, idx + m, [&](int a, int b2) {
                 return (px[a] != px[b2]) ? (px[a] < px[b2]) : (py[a] < py[b2]);
@@ -1393,7 +1395,7 @@ public:
             auto cr2 = [&](int o, int a, int b2) {
                 return (px[a] - px[o]) * (py[b2] - py[o]) - (py[a] - py[o]) * (px[b2] - px[o]);
             };
-            int st[18]; int k = 0;
+            int st[50]; int k = 0;
             for (int i = 0; i < m; ++i) {
                 while (k >= 2 && cr2(st[k - 2], st[k - 1], idx[i]) <= 0.0f) --k;
                 st[k++] = idx[i];
@@ -1470,18 +1472,63 @@ public:
                     polys.push_back(pg);
                 }
             } else {
+                // ★リスナーより後ろへ回り込む箱を**丸ごと捨てない**。
+                //
+                //   以前は頂点が 1 つでも後ろにあると `continue` していた。そのため
+                //   リスナーを跨いで伸びている床・天井・側壁が投影から丸ごと消え、
+                //   矩形の広い範囲が「開いている」と数えられていた。
+                //   実測（幅 8.1m の矩形・隙間 0.1m と 0.03m）:
+                //     分子/分母 = 0.453 と 0.454 ── 隙間は 1.2% しかないのに **45% が素通し**。
+                //     投影されたのは仕切り壁 2 枚だけで、床・天井・側壁は落ちていた。
+                //   戸口のポータルは矩形が枠の内側で小さいので表に出にくかったが、
+                //   同じ穴が空いている（斜めから見た戸口で手前へ伸びた壁が無視される）。
+                //
+                //   → 近平面で**クリップ**する。前にある頂点はそのまま、跨ぐ辺は交点を足す。
+                //     箱は凸なので、この点集合の凸包が正しい影になる。
                 const Obb& ob = inst.obb;
-                float px[8], py[8]; bool ok = true;
-                for (int i = 0; i < 8 && ok; ++i) {
+                Vec3 corner[8];
+                float sd[8];
+                for (int i = 0; i < 8; ++i) {
                     const float sx = (i & 1) ? 1.0f : -1.0f;
                     const float sy = (i & 2) ? 1.0f : -1.0f;
                     const float sz = (i & 4) ? 1.0f : -1.0f;
-                    ok = project(ob.center + ob.axisX * (ob.halfExtents.x * sx)
-                                           + ob.axisY * (ob.halfExtents.y * sy)
-                                           + ob.axisZ * (ob.halfExtents.z * sz), px[i], py[i]);
+                    corner[i] = ob.center + ob.axisX * (ob.halfExtents.x * sx)
+                                          + ob.axisY * (ob.halfExtents.y * sy)
+                                          + ob.axisZ * (ob.halfExtents.z * sz);
+                    // ★n はリスナー側を向けてあるので、遮蔽物は planeD と同じ符号側にいる。
+                    //   単純に dot>0 を「前」にすると全部落ちる（実際それで影が 0 枚になった）。
+                    sd[i] = dot(n, corner[i] - listener) * ((planeD >= 0.0f) ? 1.0f : -1.0f);
                 }
-                if (!ok) continue;
-                Poly pg; hullInto(px, py, 8, pg);
+                // ★近平面クリップは**稜線ポータルだけ**に掛ける。
+                //   戸口の矩形は「実在する穴」で、そこは長年かけて聴いて詰めてある。
+                //   クリップを入れると扉の低角側が塞がった（実測: 10°の開口率 0.0207 → 0.0000）。
+                //   239 件の検査では捕まらない＝耳でしか分からない変化なので、
+                //   出荷経路は触らない。稜線側は矩形が数メートルあり、床・天井を
+                //   落とすと 45%% が素通しになるのでクリップが要る。
+                const bool clipNear = pt.fresnelSized;
+                const float kNear = 1e-3f;
+                float px[24], py[24];
+                int m = 0;
+                bool allFront = true;
+                for (int i = 0; i < 8; ++i) if (sd[i] <= kNear) allFront = false;
+                if (!clipNear && !allFront) continue;      // 従来どおり箱ごと捨てる
+                for (int i = 0; i < 8 && m < 24; ++i)
+                    if (sd[i] > kNear && project(corner[i], px[m], py[m])) ++m;
+                // 箱の 12 辺。符号が変わる辺は近平面との交点を足す。
+                static const int kEdge[12][2] = {
+                    {0,1},{2,3},{4,5},{6,7}, {0,2},{1,3},{4,6},{5,7}, {0,4},{1,5},{2,6},{3,7}
+                };
+                for (int e = 0; clipNear && e < 12 && m < 24; ++e) {
+                    const int a = kEdge[e][0], b2 = kEdge[e][1];
+                    if ((sd[a] > kNear) == (sd[b2] > kNear)) continue;
+                    const float denom2 = sd[a] - sd[b2];
+                    if (std::fabs(denom2) < 1e-9f) continue;
+                    const float tt = (sd[a] - kNear) / denom2;
+                    const Vec3 q = corner[a] + (corner[b2] - corner[a]) * tt;
+                    if (project(q, px[m], py[m])) ++m;
+                }
+                if (m < 3) continue;      // 全部リスナーの後ろ＝影を落とさない
+                Poly pg; hullInto(px, py, m, pg);
                 if (pg.n >= 3) polys.push_back(pg);
             }
         }
