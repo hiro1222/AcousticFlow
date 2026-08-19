@@ -135,26 +135,22 @@ namespace AcousticFlow.EditorTools
                 "Portal_Gap の active を切ると、ポータル無し（標本化）との聴き比べになる。");
         }
 
-        // ── く字の廊下：戸口（ポータル）と曲がり角（純粋な回折）を 1 本の歩きで比べる ──
+        // ── く字の廊下：曲がり角だけ。**回折だけで定位が出るか**を確かめる ──
         //
-        //   この 2 つは**エンジンの中で別の経路**を通る。同じシーンに置いて、
-        //   同じ歩きで続けて出会えるようにしてある。
+        //   両端にリスナーと音源を置く。**扉も開口も置かない。**
+        //   直線では絶対に届かないので、聞こえる音はすべて角の縁を回り込んだもの。
         //
-        //     戸口 1.0m   … 幅が種半径 0.6m の 2 倍に満たないので部屋が割れる
-        //                   → 開口が立つ → ポータルが自動生成される
-        //                   → フレネル帯域積分（解析的・連続）が担当
-        //     曲がり角    … 廊下は 3m 幅のまま括れないので部屋は割れない
-        //                   → 開口は立たない → 一般の稜線回折（円盤の標本化）が担当
+        //   確かめたいのは音量ではなく**方向**:
+        //     ・音は「音源の方（壁の向こう）」ではなく「**曲がり角の方**」から聞こえるか
+        //     ・角へ歩くとその方向が連続に動くか（＝音の方へ進むと角に着く）
+        //     ・角を曲がった瞬間に像が飛ばないか
+        //   B1 で回折タップが HRTF を通るようになったので、ここが本題になった。
+        //   それ以前は回折が等パワーパンだけで、ITD も前後も無かった。
         //
-        //   実測の差（同じ戸口で自動生成の ON/OFF を比べたもの。0.1m 刻みの最大段差）:
-        //     ポータル無し  合計 4.08dB / 傾き 0.53dB   ← 段→踊り場→段 の階段
-        //     ポータル有り  合計 1.00dB / 傾き 0.18dB   ← 一定勾配の滑り台
-        //   耳で確かめたいのはこの**形の違い**。歩いて「動いた/止まった」が音に出るかを聴く。
-        //
-        //   音源は 2 つ。Y で C++/C# 経路、1/2 で音源の切り替え。
-        //     Door … 戸口の真向こう。戸口だけを通って届く
-        //     Bend … 曲がり角の先。角の縁を回り込むしかない
-        [MenuItem("AcousticFlow/Test Scenes/L-Corridor (く字の廊下: 戸口と曲がり角)")]
+        //   ★曲がり角は開口ではない。廊下は 3m 幅のまま括れないので部屋は割れず、
+        //     ポータルは生えない ＝ 一般の稜線回折が担当する。**そこが狙い。**
+        //     戸口／ポータルの検証は Test_DiffractionGap と Test_SwingDoor が持つ。
+        [MenuItem("AcousticFlow/Test Scenes/L-Corridor (く字の廊下: 回折だけの定位)")]
         public static void LCorridor()
         {
             var scene = NewScene();
@@ -163,9 +159,6 @@ namespace AcousticFlow.EditorTools
             const float t = 0.3f;      // 壁厚
             const float aEnd = -12f;   // 手前の脚の端（Z）
             const float bEnd = 12f;    // 奥の脚の端（X）
-            const float doorZ = -5f;   // 戸口の位置（Z）
-            const float doorW = 1.0f;  // 戸口の幅
-            const float doorH = 2.2f;  // 戸口の高さ
 
             // 手前の脚: x∈[-w,w], z∈[aEnd, w] ／ 奥の脚: x∈[-w,bEnd], z∈[-w,w]
             //   角は括れていないので部屋は割れない ＝ 開口が立たない ＝ 純粋な回折。
@@ -190,31 +183,19 @@ namespace AcousticFlow.EditorTools
                         new Vector3(bEnd + w + t, ft, 2*w + 2*t));
             }
 
-            // 戸口。廊下を仕切って幅 1.0m だけ空ける（両袖＋まぐさ）。
-            //   幅 1.0m < 種半径 0.6m × 2 なので**ここで部屋が割れ、開口が自動生成される**。
-            float jambW = w - doorW * 0.5f;                 // 片袖の幅 0.5m
-            MakeBox("Door_JambL", new Vector3(-(doorW*0.5f + jambW*0.5f), h*0.5f, doorZ),
-                    new Vector3(jambW, h, t));
-            MakeBox("Door_JambR", new Vector3( (doorW*0.5f + jambW*0.5f), h*0.5f, doorZ),
-                    new Vector3(jambW, h, t));
-            MakeBox("Door_Lintel", new Vector3(0f, doorH + (h - doorH)*0.5f, doorZ),
-                    new Vector3(doorW, h - doorH, t));
-
-            var listener = MakeListener(new Vector3(0f, 1.6f, -9f));   // 戸口の手前
-            // Door … 戸口の真向こう（戸口だけを通って届く）
-            // Bend … 曲がり角の先（角の縁を回り込むしかない）
-            var srcs = AddDemo(listener, new Vector3(1.0f, 1.6f, -2f),
-                               AcousticMaterialPreset.Concrete, new[] { "Door", "Bend" });
-            srcs[1].position = new Vector3(9f, 1.6f, 0f);
+            // 両端にリスナーと音源。**あいだに扉も開口も無い。**
+            //   直線は必ず角の内側の壁を突くので、届く音はすべて回折。
+            var listener = MakeListener(new Vector3(0f, 1.6f, aEnd + 2f));   // 手前の脚の奥
+            AddDemo(listener, new Vector3(bEnd - 2f, 1.6f, 0f),              // 奥の脚の奥
+                    AcousticMaterialPreset.Concrete);
 
             Save(scene, "Test_LCorridor.unity",
-                "く字の廊下: 戸口(1.0m)と曲がり角(2m幅)を 1 本の歩きで比べる。" +
-                "戸口は幅が種半径の2倍未満なので部屋が割れ、開口が立ってポータルが自動生成される" +
-                "（フレネル帯域積分＝解析的で連続）。曲がり角は括れないので開口が立たず、" +
-                "一般の稜線回折（円盤の標本化＝1/N の階段）が担当する。" +
-                "音源 Door は戸口越し、Bend は角の先。W/S で前後に歩き、" +
-                "同じ 0.1m でも段差の出方が違うことを聴く。" +
-                "autoPortals を切ると戸口側もポータル無しになり、階段が出る。");
+                "く字の廊下（回折だけの定位）: 両端にリスナーと音源。扉も開口も無い。" +
+                "直線は角の内壁で必ず塞がれるので、聞こえるのは角を回り込んだ音だけ。" +
+                "確かめるのは音量ではなく**方向** ── 音は音源の方（壁の向こう）ではなく" +
+                "『曲がり角の方』から聞こえるか、角へ歩くとその方向が連続に動くか、" +
+                "曲がった瞬間に像が飛ばないか。W/A/S/D で歩いて、角に着いたら奥の脚へ曲がる。" +
+                "曲がり角は開口ではないのでポータルは生えない（一般の稜線回折が担当）。");
         }
 
         // ── スイングドア：開き角で「直接聞こえる範囲」が連続的に変わる ──

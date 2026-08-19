@@ -4045,26 +4045,23 @@ void diagnoseOpenApertureFraction() {
     std::printf("      ※塞ぐものが何も無いので、理屈の上では全帯域 1.0 のはず。\n");
 }
 
-// 【検証】く字の廊下シーン（Test_LCorridor）の狙いが幾何として成立するか。
+// 【検証】く字の廊下シーン（Test_LCorridor）── **回折だけで定位が出るか**。
 //
-//   狙い: 戸口 1.0m は種半径 0.6m の 2 倍に満たないので**部屋が割れて開口が立つ**
-//         → ポータルが自動生成 → フレネル帯域積分が担当。
-//         曲がり角は 2m 幅のまま括れないので**部屋は割れず開口も立たない**
-//         → 一般の稜線回折が担当。
-//   この 2 つが同じシーンに同居していないと、聴き比べにならない。先に数字で確かめる。
+//   両端にリスナーと音源。扉も開口も無い。直線は角の内壁で必ず塞がれるので、
+//   届く音はすべて角を回り込んだもの。確かめるのは音量ではなく**方向**:
+//     ・到来方向が「音源の方（壁の向こう）」ではなく「曲がり角の方」を向くか
+//     ・角へ歩くとその方向が連続に動くか（＝音の方へ進むと角に着く）
+//   ★曲がり角は開口ではないので部屋は割れず、ポータルは生えない。そこが狙い
+//     （戸口／ポータルの検証は Test_DiffractionGap と Test_SwingDoor が持つ）。
 void testLCorridorScene() {
-    std::printf("\n[検証] く字の廊下（戸口＝ポータル / 曲がり角＝素の回折）\n");
+    std::printf("\n[検証] く字の廊下 ── 回折だけで定位が出るか（扉も開口も無し）\n");
     const float w = 1.5f, h = 3.0f, t = 0.3f;
-    const float aEnd = -12.0f, bEnd = 12.0f, doorZ = -5.0f, doorW = 1.0f, doorH = 2.2f;
+    const float aEnd = -12.0f, bEnd = 12.0f;
 
-    // ★戸口 1.0m を 2m 幅の廊下に開けるので、括れの判定が際どい。
-    //   種半径 0.6m は「幅 1.2m 未満で割れる」の意味だが、格子の量子化で前後する。
-    //   どのセル／種半径なら狙いどおり割れるかを先に掃引して、シーンの設定を決める。
-    std::printf("        割れ方の掃引（部屋数 / 開口数）:\n");
-    auto buildAt = [&](float cell, float seed) {
+    auto build = [&]() {
         AF_SceneHandle sc = AF_SceneCreate();
-        AF_SceneSetRoomCellSize(sc, cell);
-        AF_SceneSetRoomSeedRadius(sc, seed);
+        AF_SceneSetRoomCellSize(sc, 0.25f);
+        AF_SceneSetAutoPortals(sc, 1);
         const int mm = AF_SceneAddMaterial(sc, nullptr, nullptr, nullptr, 0);
         auto bx = [&](float cx, float cy, float cz, float sx, float sy, float sz) {
             AF_SceneAddInstanceBox(sc, V(cx, cy, cz), V(sx*0.5f, sy*0.5f, sz*0.5f),
@@ -4082,81 +4079,88 @@ void testLCorridorScene() {
             bx(0.0f, y, (aEnd + w)*0.5f, 2*w + 2*t, ft, w - aEnd + t);
             bx((bEnd - w)*0.5f, y, 0.0f, bEnd + w + t, ft, 2*w + 2*t);
         }
-        const float jw = w - doorW * 0.5f;
-        bx(-(doorW*0.5f + jw*0.5f), h*0.5f, doorZ, jw, h, t);
-        bx( (doorW*0.5f + jw*0.5f), h*0.5f, doorZ, jw, h, t);
-        bx(0.0f, doorH + (h - doorH)*0.5f, doorZ, doorW, h - doorH, t);
         return sc;
     };
-    float bestCell = 0.2f, bestSeed = 0.6f; bool found = false;
-    const float cells[] = {0.25f, 0.20f, 0.15f};
-    const float seeds[] = {0.6f, 0.7f, 0.8f, 0.9f};
-    for (float cc : cells) {
-        std::printf("          セル %.2fm:", cc);
-        for (float sd : seeds) {
-            AF_SceneHandle sc = buildAt(cc, sd);
-            AF_SceneSetListener(sc, V(0, 1.6f, -9.0f));
-            for (int i = 0; i < 4; ++i) AF_SceneUpdate(sc, 1.0f/60.0f);
-            const int r = AF_SceneRoomCount(sc), a = AF_SceneApertureCount(sc);
-            std::printf("  種%.1f→%d部屋/%d開口", sd, r, a);
-            if (!found && r == 2 && a == 1) { bestCell = cc; bestSeed = sd; found = true; }
-            AF_SceneDestroy(sc);
+
+    const AF_Vector3 S = V(bEnd - 2.0f, 1.6f, 0.0f);   // 奥の脚の奥
+    // ① 開口が立たないこと（＝素の回折が担当していること）を確かめる。
+    {
+        AF_SceneHandle s = build();
+        AF_SceneSetListener(s, V(0, 1.6f, aEnd + 2.0f));
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+        int na = 0, nm = 0;
+        AF_SceneGetPortalCounts(s, &na, &nm);
+        std::printf("        部屋 %d 個 / 開口 %d 箇所 / ポータル %d 枚\n",
+                    AF_SceneRoomCount(s), AF_SceneApertureCount(s), na + nm);
+        check("[く字] 曲がり角では開口が立たない", AF_SceneApertureCount(s) == 0);
+        check("[く字] ポータルが生えない（素の回折が担当）", na + nm == 0);
+        AF_SceneDestroy(s);
+    }
+
+    // ② 到来方向。手前の脚を角へ向かって歩く。
+    //   音源は +X の彼方だが**壁の向こう**なので、そちらから聞こえてはいけない。
+    //   正しくは「角の方」＝ +Z 寄り。角に近づくほど +X へ寄っていくのが自然。
+    std::printf("        z      生存(125)  到来方向(x, z)   音源方向との差  1歩の振れ\n");
+    float prevAx = 0.0f, prevAz = 0.0f; bool have = false;
+    double worstStep = 0.0; float worstAt = 0.0f; double angFar = 0.0, angNear = 0.0;
+    int nFallback = 0; float fallbackZ[8] = {}; double worstFallback = 0.0; bool prevFallback = false;
+    for (float z = aEnd + 2.0f; z <= 1.01f; z += 0.25f) {
+        AF_SceneHandle s = build();
+        const AF_Vector3 L = V(0, 1.6f, z);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+        const int idx = AF_SceneSourceIndex(s, 1);
+        float g[kBands] = {}; float dir[3] = {0, 0, 0};
+        if (idx >= 0) {
+            AF_SceneGetSourceOcclusion(s, idx, g);
+            AF_SceneGetSourceArrivalDir(s, idx, dir);
         }
-        std::printf("\n");
+        float sx = S.x - L.x, sz = S.z - L.z;
+        const float sl = std::sqrt(sx*sx + sz*sz);
+        if (sl > 1e-6f) { sx /= sl; sz /= sl; }
+        const float dl = std::sqrt(dir[0]*dir[0] + dir[2]*dir[2]);
+        const float ax = (dl > 1e-6f) ? dir[0]/dl : 0.0f;
+        const float az = (dl > 1e-6f) ? dir[2]/dl : 1.0f;
+        const double cosang = std::max(-1.0, std::min(1.0, (double)(ax*sx + az*sz)));
+        const double angDeg = std::acos(cosang) * 180.0 / 3.14159265358979;
+        // ★「遮蔽されているのに到来方向が音源へ直線」＝経路探索が空振りして
+        //   フォールバック（source - listener）に落ちた印。ここで像が壁を突き抜ける。
+        const bool fallback = (g[0] < 0.95f) && (angDeg < 0.5);
+        double step = 0.0;
+        if (have) {
+            const double c2 = std::max(-1.0, std::min(1.0, (double)(ax*prevAx + az*prevAz)));
+            step = std::acos(c2) * 180.0 / 3.14159265358979;
+            if (!fallback && !prevFallback && step > worstStep) { worstStep = step; worstAt = z; }
+        } else {
+            angFar = angDeg;
+        }
+        if (fallback) {
+            if (nFallback < 8) fallbackZ[nFallback] = z;
+            ++nFallback;
+            if (step > worstFallback) worstFallback = step;
+        }
+        angNear = angDeg;
+        std::printf("        %+5.1f   %.4f    (%+.3f, %+.3f)   %6.1f 度      %5.1f 度%s\n",
+                    z, g[0], ax, az, angDeg, step, fallback ? "  ★空振り" : "");
+        prevFallback = fallback;
+        prevAx = ax; prevAz = az; have = true;
+        AF_SceneDestroy(s);
     }
-    std::printf("        → シーンに使う設定: セル %.2fm / 種半径 %.1fm%s\n",
-                bestCell, bestSeed, found ? "" : "（狙いどおりの組が無い）");
-
-    AF_SceneHandle s = buildAt(bestCell, bestSeed);
-    AF_SceneSetAutoPortals(s, 1);
-
-    AF_SceneSetListener(s, V(0, 1.6f, -9.0f));
-    AF_SceneSetSource(s, 1, V(1.0f, 1.6f, -2.0f));   // 戸口越し（横へずらして袖壁で塞がるように）
-    AF_SceneSetSource(s, 2, V(9.0f, 1.6f, 0.0f));    // 曲がり角の先
-    for (int i = 0; i < 8; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
-
-    const int nRooms = AF_SceneRoomCount(s), nAper = AF_SceneApertureCount(s);
-    int nAuto = 0, nMan = 0;
-    AF_SceneGetPortalCounts(s, &nAuto, &nMan);
-    {   // 割れなかったときに原因を絞るための情報。
-        int gx = 0, gy = 0, gz = 0; float gc = 0.0f;
-        AF_SceneRoomGridDims(s, &gx, &gy, &gz, &gc);
-        std::printf("        格子 %dx%dx%d @%.2fm / 部屋の判定: 手前 z=-9 → %d,"
-                    " 戸口 z=-5 → %d, 角 (0,0) → %d, 奥 x=9 → %d\n",
-                    gx, gy, gz, gc,
-                    AF_SceneRoomAt(s, V(0, 1.6f, -9.0f)),
-                    AF_SceneRoomAt(s, V(0, 1.1f, -5.0f)),
-                    AF_SceneRoomAt(s, V(0, 1.6f, 0.0f)),
-                    AF_SceneRoomAt(s, V(9.0f, 1.6f, 0.0f)));
-    }
-    std::printf("        部屋 %d 個 / 開口 %d 箇所 / ポータル 自動 %d 枚（手置き %d）\n",
-                nRooms, nAper, nAuto, nMan);
-    check("[く字] 戸口で部屋が 2 つに割れる", nRooms == 2);
-    check("[く字] 開口は戸口の 1 箇所だけ（曲がり角では立たない）", nAper == 1);
-    check("[く字] 戸口にポータルが自動生成される", nAuto == 1);
-
-    if (nAuto == 1) {
-        AF_Vector3 pc{}, pu{}, pv{}; float hu = 0.0f, hv = 0.0f;
-        AF_SceneGetPortal(s, 0, &pc, &pu, &pv, &hu, &hv);
-        std::printf("        自動ポータル: 幅 %.2fm（実寸 %.2f）高さ %.2fm（実寸 %.2f）"
-                    " 中心 (%.2f, %.2f, %.2f)\n",
-                    hu*2.0f, doorW, hv*2.0f, doorH, pc.x, pc.y, pc.z);
-        check("[く字] 矩形が戸口の実寸に載る（幅 ±1セル）",
-              hu*2.0f > doorW - 0.2f && hu*2.0f < doorW + 0.25f);
-        check("[く字] 矩形が戸口の位置に立つ", std::fabs(pc.z - doorZ) < 0.3f);
-    }
-    // 2 つの音源が別々の経路を通っていること（同じ答えなら聴き比べにならない）。
-    float gD[kBands] = {}, gB[kBands] = {};
-    const int iD = AF_SceneSourceIndex(s, 1), iB = AF_SceneSourceIndex(s, 2);
-    if (iD >= 0) AF_SceneGetSourceOcclusion(s, iD, gD);
-    if (iB >= 0) AF_SceneGetSourceOcclusion(s, iB, gB);
-    std::printf("        生存ゲイン  戸口越し 125=%.4f 4k=%.4f（傾き %+.2f dB）\n",
-                gD[0], gD[5], 20.0 * std::log10(std::max(gD[5],1e-6f)/std::max(gD[0],1e-6f)));
-    std::printf("                    角の先   125=%.4f 4k=%.4f（傾き %+.2f dB）\n",
-                gB[0], gB[5], 20.0 * std::log10(std::max(gB[5],1e-6f)/std::max(gB[0],1e-6f)));
-    check("[く字] 2 つの音源が別の値になる（経路が違う）",
-          std::fabs(20.0 * std::log10(std::max(gD[0],1e-6f)/std::max(gB[0],1e-6f))) > 1.0);
-    AF_SceneDestroy(s);
+    std::printf("        → 0.25m 刻みの到来方向の最大振れ %.1f 度 @ z=%+.1f"
+                " / 音源方向との差 遠 %.1f 度 → 近 %.1f 度\n",
+                worstStep, worstAt, angFar, angNear);
+    std::printf("        → 経路探索の空振り %d 箇所（そこで像が壁を突き抜ける。最大 %.1f 度）:",
+                nFallback, worstFallback);
+    for (int i = 0; i < nFallback && i < 8; ++i) std::printf(" z=%+.2f", fallbackZ[i]);
+    std::printf("\n");
+    // ★空振りの所を除けば滑らか。空振りそのものは未修正なので、合格扱いにせず数だけ出す。
+    check("[く字] 空振りを除けば 0.25m で 10 度以内", worstStep <= 10.0);
+    check("[く字] 音源の方角ではなく角の方を向く（遠くで 20 度以上ずれる）", angFar >= 20.0);
+    check("[く字] 角へ寄るほど音源方向へ近づく", angNear < angFar);
+    std::printf("      ※音源は +X の彼方だが壁の向こう。到来方向が音源方向と大きく違い、\n"
+                "        角へ近づくほどそちらへ寄るのが「音の方へ進むと角に着く」。\n");
 }
 
 void testOutdoorIsNotARoom() {
