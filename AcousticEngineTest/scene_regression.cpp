@@ -3987,6 +3987,64 @@ void diagnoseShadowSpectrumJump() {
                 "        帯域ごとに乗り換わる位置がずれる。\n");
 }
 
+// 【目標】「全開の開口は開口率 1.0 で鳴るべき」── 素通しの開口が何を返すかを切り分ける。
+//
+//   実測では、実寸ぴったりの矩形は扉を 90°開いても 0.8512 止まりだった。
+//   矩形を狭めるほど 1.0 に近づく（0.80m で 1.0000）ので、
+//   「全開」と「それ以上」の区別が付かない一方、正しい寸法だと 15% 損している。
+//   まず**扉を一枚も置かない**素通しの開口で測り、
+//     1.0 なら → 0.8512 の犯人は扉の板（90°でも縁が残る）
+//     1.0 未満 → フレネル積分の正規化そのものが 1.0 に届かない
+//   を分ける。
+void diagnoseOpenApertureFraction() {
+    std::printf("\n[目標] 素通しの開口は開口率 1.0 を返すか（扉を置かない）\n");
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f;
+    const float hw = 6.0f, hd = 8.0f;
+
+    // 見通しの角度を変えて測る。矩形の中心を通る線／端を通る線／外れる線。
+    struct P { const char* name; float lx, lz, sx, sz; };
+    const P places[] = {
+        {"正対（線が矩形の中心を通る）  ",  0.0f, -4.0f,  0.0f, 3.5f},
+        {"やや斜め（線が矩形の中を通る）",  0.3f, -4.0f, -0.3f, 3.5f},
+        {"斜め（線が矩形の外へ外れる） ",  0.0f, -4.0f, -2.0f, 3.5f},
+        {"真横（線が壁を突く）        ",  2.5f, -4.0f, -2.5f, 3.5f},
+    };
+    // 矩形の幅を振る。実寸／狭い／広い。
+    const float scales[] = {1.00f, 0.83f, 1.20f};
+    for (float sc : scales) {
+        std::printf("      矩形 幅 %.2fm（実寸比 %.2f）\n", doorW * sc, sc);
+        for (const P& p : places) {
+            AF_SceneHandle s = AF_SceneCreate();
+            const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+            // 仕切り（z=0）に戸口だけ空ける。**扉の板は置かない。**
+            AF_SceneAddInstanceBox(s, V(-(hw + doorW*0.5f) * 0.5f, h*0.5f, 0),
+                                   V((hw - doorW*0.5f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V((hw + doorW*0.5f) * 0.5f, h*0.5f, 0),
+                                   V((hw - doorW*0.5f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                                   V(doorW*0.5f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            const int pid = AF_SceneAddPortal(s, V(0, doorH*0.5f, 0), V(1,0,0), V(0,1,0),
+                                              doorW * 0.5f * sc, doorH * 0.5f);
+            const AF_Vector3 L = V(p.lx, 1.6f, p.lz), S = V(p.sx, 1.6f, p.sz);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            for (int i = 0; i < 3; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+            float f[kBands] = {}; AF_Vector3 pp{};
+            AF_SceneMeasurePortal(s, pid, L, S, f, &pp);
+            std::printf("        %s 開口率 125=%.4f 500=%.4f 4k=%.4f\n",
+                        p.name, f[0], f[2], f[5]);
+            AF_SceneDestroy(s);
+        }
+    }
+    std::printf("      ※塞ぐものが何も無いので、理屈の上では全帯域 1.0 のはず。\n");
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -5757,6 +5815,7 @@ int main() {
     testRoomSegmentation();
     testRoomIncremental();
     diagnoseRoomDetection();
+    diagnoseOpenApertureFraction();
     diagnoseShadowSpectrumJump();
     diagnoseOutdoorWithBuilding();
     testOutdoorIsNotARoom();
