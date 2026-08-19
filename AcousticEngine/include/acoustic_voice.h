@@ -64,9 +64,10 @@ typedef struct AF_VoiceConfig {
  *   1 : hrtfWeight 追加 / AF_VoiceSetDiffractionDirection 追加（B1）
  *   2 : AF_SceneRoomGridDegraded 追加（格子の降格をホストが検知できるように）
  *   3 : ポータルの自動生成（AF_SceneSetAutoPortals ほか）／AF_SceneGetPortal 追加（C1）
- *   4 : AF_SceneSetApertureTimbre 追加（開口の音色を音量と独立に調整する口）
+  *   4 : AF_SceneSetApertureTimbre 追加（開口の音色を音量と独立に調整する口）
+ *   5 : AF_VoiceTap に dir 追加（反射タップの軽量な両耳化）
  */
-#define AF_ABI_VERSION 4
+#define AF_ABI_VERSION 5
 ACOUSTIC_API int AF_AbiVersion(void);
 
 typedef struct AF_VoiceTap {
@@ -79,6 +80,11 @@ typedef struct AF_VoiceTap {
      * 直接音(index 0)には効かない ── あちらは従来どおり AF_VoiceSetDirection の方向で
      * 常に HRTF を通る。★ホスト側の構造体（C# AFVoiceTap）と並びを合わせること。 */
     float hrtfWeight;
+    /* 到来方向（リスナー座標系）。反射タップの**軽量な両耳化**（ITD ＋ 帯域別 ILD）に使う。
+     * 全て 0 なら方向なしとみなし、従来どおり panL/panR で鳴る。
+     * ★フル HRTF を通すのは直接音と hrtfWeight>0 のタップだけ。多数の反射に
+     *   HRIR を畳み込むと重い（HRTF 1 本 +0.102ms/block に対し、こちらは 7 本で +0.043ms）。*/
+    float dirX, dirY, dirZ;
 } AF_VoiceTap;
 
 /* 段別の計測（直前の Render ブロックの RMS）。内訳が読めないと調整できないので分けて返す。 */

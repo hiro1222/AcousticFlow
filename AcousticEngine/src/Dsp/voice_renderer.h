@@ -140,10 +140,49 @@ public:
 
     // ── 制御スレッド ──
 
-    void setTaps(const EarlyReflectConv::Tap* taps, int count) { early_.setTaps(taps, count); }
+    /// タップを差し替える。方向を持つタップには**軽量な両耳化**（ITD ＋ 帯域別 ILD）を
+    /// ここで焼き込む。HRTF セットを持っているのがこの層なので、変換はここで行う。
+    ///   ★反射を 1 本ずつ HRIR で畳み込むと重い（HRTF 1 本 0.05〜0.12ms/block）。
+    ///     タップは元から「小数遅延＋6帯域ゲイン」なので、耳ごとに 2 組持てば
+    ///     畳み込みを増やさずに ITD と ILD が載る。
+    void setTaps(const EarlyReflectConv::Tap* taps, int count) {
+        if (!taps || count <= 0 || !earCues_ || !hrtfSet_ || !hrtfSet_->hasEarBands()) {
+            early_.setTaps(taps, count);
+            return;
+        }
+        tapScratch_.assign(taps, taps + count);
+        for (int i = 1; i < count; ++i) {           // index 0 は直接音＝フル HRTF が担当
+            EarlyReflectConv::Tap& d = tapScratch_[static_cast<std::size_t>(i)];
+            if (!d.dirValid || d.hrtfWeight > 0.0f) continue;   // 方向なし／HRTF バス行き
+            const int idx = hrtfSet_->nearestIndex(d.dir);
+            if (idx < 0) continue;
+            const float* gl = hrtfSet_->earBandGains(idx, 0);
+            const float* gr = hrtfSet_->earBandGains(idx, 1);
+            if (!gl || !gr) continue;
+            // ITD は「音源が右なら右耳が先＝負」の規約（hrtf_set.h）。
+            //   遅延は**遅れて届く側**に足す。右が先なら遅れるのは**左耳**。
+            //   ★ここを逆にすると、右から来る音の左耳が先に鳴る＝像が左へ行く。
+            //     実測で右60°の ITD が +479us（本来 -479us）になって気づいた。
+            const float itd = hrtfSet_->itdSecondsScaled(idx, headCm_);
+            const float samp = itd * static_cast<float>(sampleRate_);
+            d.earDelay[0] = (samp < 0.0f) ? -samp : 0.0f;   // 右が先 → 左耳が遅れる
+            d.earDelay[1] = (samp > 0.0f) ? samp : 0.0f;    // 左が先 → 右耳が遅れる
+            for (int b = 0; b < EarlyReflectConv::kNumBands; ++b) {
+                d.earGain[0][b] = gl[b];
+                d.earGain[1][b] = gr[b];
+            }
+            d.earUse = true;
+        }
+        early_.setTaps(tapScratch_.data(), count);
+    }
+
+    /// 反射タップの軽量な両耳化。既定 ON。切ると従来の等パワーパンに戻る（A/B 用）。
+    void setEarCuesEnabled(bool on) { earCues_ = on; }
+    bool earCuesEnabled() const { return earCues_; }
 
     /// HRTF データセットを差し替える。set は呼び手が生存を保証する。
     void setHrtfSet(const HrtfSet* set) {
+        hrtfSet_ = set;
         hrtf_.setHrtfSet(set);
         hrtfDif_.setHrtfSet(set);
         // 回折バスだけ、パンと同じ音量になるように平均ゲインを揃える。
@@ -160,6 +199,7 @@ public:
     }
     void setHrtfEnabled(bool on) { hrtfEnabled_ = on; }
     void setDirection(const float dirListenerLocal[3], float headCircumferenceCm) {
+        headCm_ = headCircumferenceCm;      // 反射タップの ITD もこの頭囲で作る
         hrtf_.setDirection(dirListenerLocal, headCircumferenceCm);
     }
 
@@ -374,6 +414,11 @@ private:
     std::vector<float> tailOutL_, tailOutR_;
 
     bool hrtfEnabled_ = true;
+    // 反射タップの軽量な両耳化（ITD ＋ 帯域別 ILD）。HRTF セットから焼き込む。
+    const HrtfSet* hrtfSet_ = nullptr;
+    bool  earCues_ = true;
+    float headCm_ = 57.0f;
+    std::vector<EarlyReflectConv::Tap> tapScratch_;
     float difNorm_ = 1.0f;      // 回折バスをパンと同音量に揃える係数（setHrtfSet で決まる）
     float outputGain_ = 0.6f;
     float tailGain_ = 0.0f;

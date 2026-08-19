@@ -1350,14 +1350,16 @@ void diagnoseDspCost() {
     const int block = 512;
     const double blockMs = 1000.0 * block / sr;
 
-    struct C { const char* name; bool hrtf; bool tail; int taps; bool difHrtf; };
+    struct C { const char* name; bool hrtf; bool tail; int taps; bool difHrtf; bool ear; };
     const C cases[] = {
-        {"直接音のみ                ", false, false, 1, false},
-        {"＋早期反射 8 タップ       ", false, false, 8, false},
-        {"＋HRTF                    ", true,  false, 8, false},
-        {"＋後期尾 1.0s（全部入り） ", true,  true,  8, false},
+        {"直接音のみ                ", false, false, 1, false, false},
+        {"＋早期反射 8 タップ       ", false, false, 8, false, false},
+        {"＋HRTF                    ", true,  false, 8, false, false},
+        {"＋後期尾 1.0s（全部入り） ", true,  true,  8, false, false},
         // B1。遮蔽されている間だけ回る（見通せていれば回折タップが無いので 1 段上と同じ）。
-        {"＋回折の HRTF（遮蔽時）   ", true,  true,  8, true},
+        {"＋回折の HRTF（遮蔽時）   ", true,  true,  8, true,  false},
+        // 反射タップの軽量な両耳化。畳み込みは増えず、リングをもう一度読むぶんだけ。
+        {"＋反射の両耳化（ITD＋ILD）", true,  true,  8, true,  true },
     };
     std::printf("        構成                        1ブロック   実時間比   1音源の負荷\n");
     for (const C& c : cases) {
@@ -1372,6 +1374,7 @@ void diagnoseDspCost() {
         af::dsp::HrtfSet syn = af::dsp::HrtfSet::createSynthetic(sr, 5, 10);
         if (c.hrtf) { voice.setHrtfSet(&syn); voice.setHrtfEnabled(true); }
         else voice.setHrtfEnabled(false);
+        voice.setEarCuesEnabled(c.ear);
         const float dirFwd[3] = {0.3f, 0.0f, 1.0f};
         voice.setDirection(dirFwd, 57.0f);
 
@@ -1383,6 +1386,11 @@ void diagnoseDspCost() {
             taps[static_cast<std::size_t>(i)].gDiff = 0.0f;
         }
         if (c.difHrtf && c.taps > 1) {
+            if (c.ear) for (int i = 1; i < c.taps; ++i) {
+                const float az = -60.0f + 120.0f * (float)i / (float)std::max(1, c.taps - 1);
+                af::dsp::HrtfSet::angleToVector(az, 0.0f, taps[(std::size_t)i].dir);
+                taps[(std::size_t)i].dirValid = true;
+            }
             taps[1].hrtfWeight = 1.0f;           // 回折タップ 1 本を HRTF に載せる
             const float dirAp[3] = {1.0f, 0.0f, 0.2f};
             voice.setDiffractionDirection(dirAp, 57.0f);
@@ -1701,6 +1709,122 @@ void testDiffractionHrtf() {
     }
 }
 
+// 【反射タップの軽量な両耳化】ITD ＋ 帯域別 ILD が、畳み込みを増やさずに載るか。
+//
+//   く字の廊下の実測で、方向を運べるエネルギーの大半が早期反射側にあり
+//   （早期反射 16.24 対 回折二次音源 0.0070 ＝ 2300 倍）、そこが等パワーパンだった。
+//   反射を 1 本ずつ HRIR で畳み込むと重い（HRTF 1 本 0.05〜0.12ms/block）ので、
+//   HRIR から ITD と帯域別 ILD だけを抜いてタップに載せる。
+void testTapEarCues() {
+    std::printf("\n[反射の両耳化] ITD と帯域別 ILD が畳み込み無しで載るか\n");
+    const int block = 512;
+    af::dsp::HrtfSet real;
+    bool haveReal = false;
+    const char* kPaths[] = {
+        "UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "../UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "../../UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "../../../UnityDemo/Assets/StreamingAssets/kemar.afhr",
+    };
+    for (const char* p : kPaths)
+        if (af::dsp::HrtfSet::loadFromFile(p, real) && real.isValid()) { haveReal = true; break; }
+    af::dsp::HrtfSet syn = af::dsp::HrtfSet::createSynthetic(48000, 5, 10);
+    const af::dsp::HrtfSet& set = haveReal ? real : syn;
+    const int sr = set.sampleRate();
+    check("[反射] HRTF から耳ごとの帯域ゲインが作れる", set.hasEarBands());
+
+    const int tapDelay = 240, frames = 2048;
+    struct Out { std::vector<float> l, r; };
+    auto render = [&](float azDeg, bool ear) {
+        af::dsp::VoiceRenderer::Config cfg;
+        cfg.sampleRate = sr; cfg.maxFrames = block;
+        cfg.tailSeconds = 0.25f; cfg.tapCrossfadeMs = 30.0f;
+        af::dsp::VoiceRenderer v(cfg);
+        v.setOutputGain(1.0f);
+        v.setHrtfSet(&set);
+        v.setHrtfEnabled(true);
+        v.setEarCuesEnabled(ear);
+        const float fwd[3] = {0, 0, 1};
+        v.setDirection(fwd, 57.0f);
+        af::dsp::EarlyReflectConv::Tap taps[2];
+        for (int b = 0; b < 6; ++b) taps[0].g[b] = 0.0f;      // 直接音は鳴らさない
+        taps[0].delaySamples = 0;
+        for (int b = 0; b < 6; ++b) taps[1].g[b] = 1.0f;      // 反射タップ 1 本だけ
+        taps[1].delaySamples = tapDelay;
+        af::dsp::HrtfSet::angleToVector(azDeg, 0.0f, taps[1].dir);
+        taps[1].dirValid = true;
+        // 等パワーパン（従来）も同じ方向で作る。
+        const float lateral = std::sin(azDeg * 3.14159265f / 180.0f);
+        const float tt = (lateral + 1.0f) * 0.5f;
+        taps[1].panL = std::sqrt(1.0f - tt);
+        taps[1].panR = std::sqrt(tt);
+        v.setTaps(taps, 2);
+        std::vector<float> zero(static_cast<std::size_t>(block), 0.0f);
+        std::vector<float> tl(static_cast<std::size_t>(block)), tr(static_cast<std::size_t>(block));
+        for (int i = 0; i < 8; ++i) v.render(zero.data(), block, tl.data(), tr.data(), nullptr);
+        Out o;
+        o.l.assign(static_cast<std::size_t>(frames), 0.0f);
+        o.r.assign(static_cast<std::size_t>(frames), 0.0f);
+        std::vector<float> in(static_cast<std::size_t>(frames), 0.0f);
+        in[0] = 1.0f;
+        v.render(in.data(), frames, o.l.data(), o.r.data(), nullptr);
+        return o;
+    };
+    auto itdSamples = [](const Out& o, int from, int to) {
+        int bestLag = 0; double best = -1e18;
+        for (int lag = -80; lag <= 80; ++lag) {
+            double s = 0.0;
+            for (int i = from; i < to; ++i) {
+                const int j = i + lag;
+                if (j < 0 || j >= (int)o.r.size()) continue;
+                s += (double)o.l[(std::size_t)i] * o.r[(std::size_t)j];
+            }
+            if (s > best) { best = s; bestLag = lag; }
+        }
+        return bestLag;
+    };
+    auto rms2 = [](const Out& o, int from, int to) {
+        double s = 0.0;
+        for (int i = from; i < to; ++i)
+            s += (double)o.l[(std::size_t)i]*o.l[(std::size_t)i]
+               + (double)o.r[(std::size_t)i]*o.r[(std::size_t)i];
+        return std::sqrt(s / (2.0 * (to - from)));
+    };
+    const int w0 = tapDelay - 40, w1 = tapDelay + 400;
+    const float azs[] = {30.0f, 60.0f, 90.0f};
+    std::printf("        方位   パンのみ ITD   両耳化 ITD      総量の差\n");
+    for (float az : azs) {
+        const Out pan = render(az, false);
+        const Out ear = render(az, true);
+        const int lp = itdSamples(pan, w0, w1), le = itdSamples(ear, w0, w1);
+        const double db = 20.0 * std::log10(std::max(rms2(ear, w0, w1), 1e-12)
+                                          / std::max(rms2(pan, w0, w1), 1e-12));
+        std::printf("        右%2.0f°   %+3d samp (%+5.0fus)  %+3d samp (%+5.0fus)  %+.2f dB\n",
+                    az, lp, 1e6*lp/sr, le, 1e6*le/sr, db);
+        if (az == 60.0f) {
+            check("[反射] 等パワーパンには ITD が無い", lp == 0);
+            check("[反射] 両耳化で ITD が出る（右耳が先）",
+                  1e6*le/sr <= -250.0 && 1e6*le/sr >= -1100.0);
+            check("[反射] 総量が動かない（±3dB 以内）", std::fabs(db) <= 3.0);
+        }
+    }
+    // 前後は載らない（ITD/ILD は円錐の曖昧さを解けない）。そこは主役の 1 本が持つ。
+    {
+        const Out f = render(0.0f, true), b = render(180.0f, true);
+        double d = 0.0, n = 0.0;
+        for (int i = w0; i < w1; ++i) {
+            const double dl = (double)f.l[(std::size_t)i] - b.l[(std::size_t)i];
+            const double dr = (double)f.r[(std::size_t)i] - b.r[(std::size_t)i];
+            d += dl*dl + dr*dr;
+            n += (double)f.l[(std::size_t)i]*f.l[(std::size_t)i]
+               + (double)f.r[(std::size_t)i]*f.r[(std::size_t)i];
+        }
+        const double rel = (n > 1e-20) ? std::sqrt(d / n) : 0.0;
+        std::printf("        前 vs 後の差 %.4f（%.1f dB）── 載らないのは承知の上。\n",
+                    rel, 20.0 * std::log10(std::max(rel, 1e-9)));
+    }
+}
+
 void testTailCalibration() {
     std::printf("\n[尾の較正] 鳴らした結果が目標比に一致するか\n");
     const int sr = 48000;
@@ -1933,6 +2057,7 @@ int main() {
     testSharedTailBusEquivalence();
     diagnoseDspCost();
     testDiffractionHrtf();
+    testTapEarCues();
     testTailCalibration();
     testVoiceRenderer();
 

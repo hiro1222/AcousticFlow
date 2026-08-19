@@ -69,6 +69,26 @@ public:
         //   ★呼び出し側は 0/1 で渡してよい。切り替えの連続性はタップ補間が受け持つ
         //     （乗り換え中は両方が中間値になり、片方がフェードアウトしながら他方が入る）。
         float hrtfWeight = 0.0f;
+
+        // ── 軽量な両耳化（ITD ＋ 帯域別 ILD）──
+        //
+        //   反射タップを 1 本ずつ HRIR で畳み込むと重い（HRTF 1 本 0.05〜0.12ms/block、
+        //   反射 4 本で音源あたり +0.2〜0.47ms。しかも反射は常に鳴っている）。
+        //   タップは元から「小数遅延 ＋ 6 帯域ゲイン」なので、それを**耳ごとに 2 組**
+        //   持つだけで ITD と ILD が載る ── 畳み込みは増えない。
+        //   ★実測（く字の廊下）では、方向を運べるエネルギーの大半が早期反射側にあり
+        //     （早期反射 16.24 対 回折二次音源 0.0070 ＝ 2300 倍）、そこが
+        //     等パワーパンのままだった。少数の強いタップだけ HRTF に載せても届かない。
+        //   ★前後・上下は載らない（ITD/ILD は円錐の曖昧さを解けない）。そこは
+        //     直接音と最強の回折タップがフル HRTF を通るので、そちらが持つ。
+        //   earUse=false なら panL/panR の従来どおり。
+        bool  earUse = false;
+        float earDelay[2] = {0.0f, 0.0f};        // 耳ごとの追加遅延(サンプル)。ITD
+        float earGain[2][kNumBands] = {{1,1,1,1,1,1}, {1,1,1,1,1,1}};
+        // 到来方向（リスナー座標系）。呼び出し側はこれだけ渡せばよく、
+        // 上の 3 つは VoiceRenderer が HRTF セットから埋める。
+        float dir[3] = {0.0f, 0.0f, 1.0f};
+        bool  dirValid = false;
     };
 
     /// maxDelaySamples : 履歴リングの長さの目安（早期↔後期の境目ぶん）
@@ -217,6 +237,41 @@ public:
             const float gSpec = a.gSpec + (b.gSpec - a.gSpec) * t;
             outDiffuse += tv * gDiff;
             const float sp = tv * gSpec;
+
+            // ── 軽量な両耳化 ──
+            //   耳ごとに「遅延をずらして読み直し、帯域ゲインを変える」だけ。
+            //   畳み込みは増えず、リングをもう一度読むぶんで済む。
+            //   ★index 0（直接音）と HRTF バスに載せたタップはここを通さない。
+            //     あちらはフル HRTF が担当なので、二重に方向を付けることになる。
+            if (a.earUse && k != 0) {
+                bool skipPan = true;
+                if (hrtfActive) {
+                    const float hw = a.hrtfW + (b.hrtfW - a.hrtfW) * t;
+                    if (hw > 0.0f) skipPan = false;      // HRTF バス側が担当
+                }
+                if (skipPan) {
+                    for (int e = 0; e < 2; ++e) {
+                        const float ed = a.earDelay[e] + (b.earDelay[e] - a.earDelay[e]) * t;
+                        const float dl = delay + ed;
+                        const int e0 = static_cast<int>(dl);
+                        const float ef = dl - static_cast<float>(e0);
+                        const int ep0 = (wp - e0) & ringMask_;
+                        const int ep1 = (wp - e0 - 1) & ringMask_;
+                        float ev = 0.0f;
+                        for (int bd = 0; bd < kNumBands; ++bd) {
+                            const float g = a.g[bd] + (b.g[bd] - a.g[bd]) * t;
+                            if (g == 0.0f) continue;
+                            const float eg = a.earGain[e][bd]
+                                           + (b.earGain[e][bd] - a.earGain[e][bd]) * t;
+                            const float s0 = ring_[bandIndex(bd, ep0)];
+                            const float s1 = ring_[bandIndex(bd, ep1)];
+                            ev += g * eg * (s0 + ef * (s1 - s0));
+                        }
+                        if (e == 0) outL += ev * gSpec; else outR += ev * gSpec;
+                    }
+                    continue;      // パンは通さない（両耳ぶんは上で出した）
+                }
+            }
             // index 0 は必ず直接音（呼び出し側の並び順）。
             if (k == 0) {
                 outDirect = sp;
@@ -302,6 +357,9 @@ private:
         float panL = 0.70710678f, panR = 0.70710678f;
         float gSpec = 1.0f, gDiff = 0.0f;
         float hrtfW = 0.0f;
+        bool  earUse = false;
+        float earDelay[2] = {0.0f, 0.0f};
+        float earGain[2][kNumBands] = {{1,1,1,1,1,1}, {1,1,1,1,1,1}};
 
         static RtTap from(const Tap& t) {
             RtTap r;
@@ -310,6 +368,11 @@ private:
             r.panL = t.panL; r.panR = t.panR;
             r.gSpec = t.gSpec; r.gDiff = t.gDiff;
             r.hrtfW = t.hrtfWeight;
+            r.earUse = t.earUse;
+            for (int e = 0; e < 2; ++e) {
+                r.earDelay[e] = t.earDelay[e];
+                for (int b = 0; b < kNumBands; ++b) r.earGain[e][b] = t.earGain[e][b];
+            }
             return r;
         }
         void setGain(float v) { for (int b = 0; b < kNumBands; ++b) g[b] = v; }
@@ -338,6 +401,11 @@ private:
             a.gSpec += (b.gSpec - a.gSpec) * t;
             a.gDiff += (b.gDiff - a.gDiff) * t;
             a.hrtfW += (b.hrtfW - a.hrtfW) * t;
+            for (int e = 0; e < 2; ++e) {
+                a.earDelay[e] += (b.earDelay[e] - a.earDelay[e]) * t;
+                for (int k = 0; k < kNumBands; ++k)
+                    a.earGain[e][k] += (b.earGain[e][k] - a.earGain[e][k]) * t;
+            }
         }
         lerping_ = false;
     }

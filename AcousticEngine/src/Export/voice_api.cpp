@@ -108,6 +108,9 @@ void AF_VoiceSetTaps(AF_VoiceHandle voice, const AF_VoiceTap* taps, int count) {
         else { d.gSpec = src.gSpec; d.gDiff = src.gDiff; }
         d.hrtfWeight = (src.hrtfWeight < 0.0f) ? 0.0f
                      : (src.hrtfWeight > 1.0f) ? 1.0f : src.hrtfWeight;
+        // 到来方向。全て 0 なら方向なし（従来どおりパンで鳴る）。
+        d.dir[0] = src.dirX; d.dir[1] = src.dirY; d.dir[2] = src.dirZ;
+        d.dirValid = (src.dirX * src.dirX + src.dirY * src.dirY + src.dirZ * src.dirZ) > 1e-8f;
     }
     v->setTaps(s.data(), count);
 }

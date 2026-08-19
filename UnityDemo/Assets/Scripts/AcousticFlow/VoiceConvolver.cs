@@ -235,6 +235,12 @@ namespace AcousticFlow
                 // 【B1】選ばれた回折タップだけ HRTF バスへ。切り替えの連続性は
                 //   エンジン側のタップ補間（30ms）が受け持つので、ここは 0/1 でよい。
                 t.hrtfWeight = (i == ts.HrtfTapIndex) ? 1f : 0f;
+                // 到来方向。反射/回折タップの軽量な両耳化（ITD＋帯域別ILD）に使う。
+                //   直接音(index 0)はフル HRTF が担当なので渡さない。
+                if (i > 0) {
+                    Vector3 dl = ts.DirLocal[i];
+                    t.dirX = dl.x; t.dirY = dl.y; t.dirZ = dl.z;
+                }
                 _taps[i] = t;
             }
             Native.AF_VoiceSetTaps(_voice, _taps, n);

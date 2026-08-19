@@ -657,6 +657,10 @@ namespace AcousticFlow
             public readonly float[] PanR = new float[MaxTaps];
             public readonly char[] Type = new char[MaxTaps];    // 'D'直接 / 'R'反射 / 'F'回折
             public readonly Vector3[] Arrival = new Vector3[MaxTaps];   // 到来点（世界座標）
+            // 到来方向（リスナー座標系）。反射タップの軽量な両耳化（ITD＋帯域別ILD）に使う。
+            //   ★フル HRTF を通すのは直接音と最強の回折タップだけ。多数の反射に HRIR を
+            //     畳み込むと重い（HRTF 1 本 +0.102ms/block に対し、こちらは 7 本で +0.043ms）。
+            public readonly Vector3[] DirLocal = new Vector3[MaxTaps];
         }
 
         private SourceTaps[] _taps;     // 音源ごと（_sources と同じ長さ）
@@ -2106,6 +2110,12 @@ namespace AcousticFlow
             ComputePan(arrival, out ts.PanL[n], out ts.PanR[n]);
             ts.Type[n] = type; ts.DelayMs[n] = delayMs;
             ts.Arrival[n] = arrival;                // B1: HRTF に載せる開口を選ぶのに要る
+            if (listener != null) {
+                Vector3 wd = arrival - listener.position;
+                ts.DirLocal[n] = (wd.sqrMagnitude > 1e-8f)
+                               ? listener.InverseTransformDirection(wd.normalized)
+                               : Vector3.forward;
+            }
         }
 
 

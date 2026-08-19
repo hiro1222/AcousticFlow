@@ -328,6 +328,92 @@ private:
         for (int i = 0; i < n; ++i)
             angleToVector(az_[static_cast<std::size_t>(i)], el_[static_cast<std::size_t>(i)],
                           &dirVec_[static_cast<std::size_t>(i) * 3]);
+        buildEarBands_();
+    }
+
+    // ── 軽量な両耳化のための前計算 ──
+    //
+    //   反射タップを 1 本ずつ HRIR で畳み込むと重い（HRTF 1 本で 0.05〜0.12 ms/block、
+    //   反射 4 本なら音源あたり +0.2〜0.47 ms。しかも反射は常に鳴っている）。
+    //   そこで HRIR から**主要な 2 つの手がかりだけ**を抜き出してタップに載せる:
+    //     ・ITD          … 耳ごとの遅延差（低域の定位を決める）
+    //     ・帯域別 ILD   … 耳ごとの 6 帯域ゲイン（頭部の影。高域の定位を決める）
+    //   タップは元から「小数遅延 ＋ 6 帯域ゲイン」で鳴っているので、
+    //   それを耳ごとに 2 組持つだけで済む ── 畳み込みは増えない。
+    //
+    //   ★捨てるのは耳介が作る細かいスペクトルの谷＝**前後・上下の判別**。
+    //     そこは主役の 1 本（直接音・最強の回折タップ）がフル HRTF を通るので
+    //     そちらが持つ。多数の反射に要るのは「どちらの壁から返ってきたか」で、
+    //     それは ITD と ILD で足りる。役割を分ける。
+    ///   帯域は EarlyReflectConv と同じ分割（177/354/707/1414/2828 Hz）にしてある。
+    ///   合わせないと、同じ音を別の帯域割りで測ることになる。
+public:
+    const float* earBandGains(int index, int ear) const {
+        if (earBand_.empty() || index < 0 || index >= directionCount()) return nullptr;
+        return earBand_.data() + (static_cast<std::size_t>(index) * 2 + ear) * 6;
+    }
+    bool hasEarBands() const { return !earBand_.empty(); }
+
+private:
+
+    void buildEarBands_() {
+        const int n = directionCount();
+        earBand_.assign(static_cast<std::size_t>(n) * 2 * 6, 0.0f);
+        if (n <= 0 || irLength_ <= 0) { earBand_.clear(); return; }
+        // EarlyReflectConv と同じ交差周波数。1 次のカスケードで低域を抜き取っていく。
+        static const float kCrossHz[5] = {177.0f, 354.0f, 707.0f, 1414.0f, 2828.0f};
+        struct Bq {
+            float b0 = 0, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
+            void set(float fc, float fs) {
+                const float w0 = 2.0f * 3.14159265358979323846f * fc / fs;
+                const float cw = std::cos(w0), sw = std::sin(w0);
+                const float al = sw / (2.0f * 0.70710678f);
+                b0 = (1.0f - cw) * 0.5f; b1 = 1.0f - cw; b2 = (1.0f - cw) * 0.5f;
+                const float a0 = 1.0f + al; a1 = -2.0f * cw; a2 = 1.0f - al;
+                b0 /= a0; b1 /= a0; b2 /= a0; a1 /= a0; a2 /= a0;
+            }
+            void reset() { z1 = z2 = 0.0f; }
+            float run(float x) {
+                const float y = b0 * x + z1;
+                z1 = b1 * x - a1 * y + z2;
+                z2 = b2 * x - a2 * y;
+                return y;
+            }
+        };
+        Bq f[5];
+        for (int i = 0; i < 5; ++i) f[i].set(kCrossHz[i], static_cast<float>(sampleRate_));
+        // 各方向・各耳の HRIR を 6 帯域へ分け、帯域ごとのエネルギーを取る。
+        double meanPow[6] = {0, 0, 0, 0, 0, 0};
+        for (int i = 0; i < n; ++i)
+            for (int e = 0; e < 2; ++e) {
+                const float* hh = hrir_.data() + hrirOffset(i, e);
+                for (int k = 0; k < 5; ++k) f[k].reset();
+                double acc[6] = {0, 0, 0, 0, 0, 0};
+                for (int s = 0; s < irLength_; ++s) {
+                    float rest = hh[s];
+                    for (int b = 0; b < 5; ++b) {
+                        const float lo = f[b].run(rest);
+                        acc[b] += static_cast<double>(lo) * lo;
+                        rest -= lo;
+                    }
+                    acc[5] += static_cast<double>(rest) * rest;
+                }
+                float* dst = earBand_.data() + (static_cast<std::size_t>(i) * 2 + e) * 6;
+                for (int b = 0; b < 6; ++b) {
+                    dst[b] = static_cast<float>(std::sqrt(acc[b]));   // 振幅
+                    meanPow[b] += acc[b];
+                }
+            }
+        // ★方向で平均したときのゲインを 1 に揃える。揃えないと、等パワーパンから
+        //   載せ替えただけで反射の音量が変わる（B1 で回折バスに掛けたのと同じ理由。
+        //   あちらは実測 +3.2dB だった）。**方向ごとのばらつきは残す** ── あれが手がかり。
+        for (int b = 0; b < 6; ++b) {
+            const double m = meanPow[b] / static_cast<double>(n);   // 左右合わせて 1 になる基準
+            const float inv = (m > 1e-20) ? static_cast<float>(1.0 / std::sqrt(m)) : 1.0f;
+            for (int i = 0; i < n; ++i)
+                for (int e = 0; e < 2; ++e)
+                    earBand_[(static_cast<std::size_t>(i) * 2 + e) * 6 + b] *= inv;
+        }
     }
 
     std::string name_ = "(none)";
@@ -340,6 +426,8 @@ private:
     std::vector<float> hrir_;     // 立ち上がりを揃えた HRIR [dir][ear][irLength]
     std::vector<float> itdSec_;   // 各方向の ITD（秒）。正=右耳が遅い（＝音源が左）
     std::vector<float> dirVec_;   // 検索用の単位ベクトル [dir][3]
+    // 軽量な両耳化用: 方向×耳×6帯域の振幅ゲイン（方向平均が 1 になるよう正規化済み）。
+    std::vector<float> earBand_;  // [(dir*2 + ear)*6 + band]
 };
 
 }  // namespace dsp

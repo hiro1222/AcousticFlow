@@ -444,7 +444,7 @@ namespace AcousticFlow
         //   DLL だけ古いまま C# を更新すると、AF_VoiceTap の長さが食い違って
         //   マーシャラが別の刻み幅で書き込む（44→48 バイトになった）。例外も出ずに
         //   タップの中身が化けるので、原因に辿り着けない。ここで止める。
-        public const int ExpectedAbiVersion = 4;
+        public const int ExpectedAbiVersion = 5;
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_AbiVersion();
 
