@@ -399,7 +399,10 @@ namespace AcousticFlow
             public int tailCapBlock;
         }
 
-        // index 0 は必ず直接音にすること（HRTF はこれだけに掛かる）。
+        // index 0 は必ず直接音にすること（AF_VoiceSetDirection の方向で HRTF に通る）。
+        // それ以外のタップは hrtfWeight=1 にすると HRTF バスへ載る
+        // （方向は AF_VoiceSetDiffractionDirection で別に渡す）。
+        // ★並びは C 側の AF_VoiceTap と一致させること。
         [StructLayout(LayoutKind.Sequential)]
         public struct AFVoiceTap
         {
@@ -407,6 +410,7 @@ namespace AcousticFlow
             public float g0, g1, g2, g3, g4, g5;
             public float panL, panR;
             public float gSpec, gDiff;
+            public float hrtfWeight;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -414,6 +418,14 @@ namespace AcousticFlow
         {
             public float rmsDirect, rmsEarly, rmsScatter, rmsTail, rmsOut;
         }
+
+        // C ABI の版。**構造体を変えたら C 側の AF_ABI_VERSION と一緒に上げること。**
+        //   DLL だけ古いまま C# を更新すると、AF_VoiceTap の長さが食い違って
+        //   マーシャラが別の刻み幅で書き込む（44→48 バイトになった）。例外も出ずに
+        //   タップの中身が化けるので、原因に辿り着けない。ここで止める。
+        public const int ExpectedAbiVersion = 1;
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_AbiVersion();
 
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern IntPtr AF_HrtfLoadFile(string path);
@@ -439,6 +451,10 @@ namespace AcousticFlow
         public static extern void AF_VoiceSetHrtfEnabled(IntPtr voice, int enabled);
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_VoiceSetDirection(IntPtr voice, AFVector3 dir, float headCm);
+        // 回折バス（hrtfWeight>0 のタップ）の到来方向。直接音とは別方向を持つ。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetDiffractionDirection(IntPtr voice, AFVector3 dir,
+                                                                  float headCm);
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern float AF_VoiceRebuildTail(IntPtr voice,
             [In] float[] echoBands, int binCount, float binMs, float startMs, float fadeMs,
@@ -607,5 +623,38 @@ namespace AcousticFlow
 
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AcousticEngine_RenderAudio();
+
+        // ── ABI の照合 ──
+        //
+        //   配置されている DLL が C# と同じ版か確かめる。違えば false を返し、
+        //   呼び出し側は音を鳴らさない。**黙って化けるより止めたほうがよい**。
+        //   （A1 で「人手で同期する約束は守られない」を学んだので、機械に照合させる）
+        private static int _abiState;   // 0=未確認 / 1=一致 / -1=不一致
+        public static bool CheckAbi()
+        {
+            if (_abiState != 0) return _abiState > 0;
+            int got = -1;
+            try { got = AF_AbiVersion(); }
+            catch (System.Exception)
+            {
+                // エントリポイントが無い＝AF_AbiVersion より前の DLL。
+                _abiState = -1;
+                UnityEngine.Debug.LogError(
+                    "[AcousticFlow] DLL が古すぎます（AF_AbiVersion がありません）。"
+                    + "Unity を閉じて AcousticEngine.dll を差し替えてください。"
+                    + "このまま鳴らすと AF_VoiceTap の長さが食い違ってタップが化けます。");
+                return false;
+            }
+            if (got != ExpectedAbiVersion)
+            {
+                _abiState = -1;
+                UnityEngine.Debug.LogError(
+                    $"[AcousticFlow] DLL の ABI 版が違います（DLL {got} / C# {ExpectedAbiVersion}）。"
+                    + "Unity を閉じて AcousticEngine.dll を差し替えてください。");
+                return false;
+            }
+            _abiState = 1;
+            return true;
+        }
     }
 }

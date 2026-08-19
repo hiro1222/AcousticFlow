@@ -1350,12 +1350,14 @@ void diagnoseDspCost() {
     const int block = 512;
     const double blockMs = 1000.0 * block / sr;
 
-    struct C { const char* name; bool hrtf; bool tail; int taps; };
+    struct C { const char* name; bool hrtf; bool tail; int taps; bool difHrtf; };
     const C cases[] = {
-        {"直接音のみ                ", false, false, 1},
-        {"＋早期反射 8 タップ       ", false, false, 8},
-        {"＋HRTF                    ", true,  false, 8},
-        {"＋後期尾 1.0s（全部入り） ", true,  true,  8},
+        {"直接音のみ                ", false, false, 1, false},
+        {"＋早期反射 8 タップ       ", false, false, 8, false},
+        {"＋HRTF                    ", true,  false, 8, false},
+        {"＋後期尾 1.0s（全部入り） ", true,  true,  8, false},
+        // B1。遮蔽されている間だけ回る（見通せていれば回折タップが無いので 1 段上と同じ）。
+        {"＋回折の HRTF（遮蔽時）   ", true,  true,  8, true},
     };
     std::printf("        構成                        1ブロック   実時間比   1音源の負荷\n");
     for (const C& c : cases) {
@@ -1379,6 +1381,11 @@ void diagnoseDspCost() {
             taps[static_cast<std::size_t>(i)].delaySamples = i * 190;
             taps[static_cast<std::size_t>(i)].gSpec = 1.0f;
             taps[static_cast<std::size_t>(i)].gDiff = 0.0f;
+        }
+        if (c.difHrtf && c.taps > 1) {
+            taps[1].hrtfWeight = 1.0f;           // 回折タップ 1 本を HRTF に載せる
+            const float dirAp[3] = {1.0f, 0.0f, 0.2f};
+            voice.setDiffractionDirection(dirAp, 57.0f);
         }
         voice.setTaps(taps.data(), c.taps);
 
@@ -1410,6 +1417,262 @@ void diagnoseDspCost() {
     std::printf("      ※48kHz・512フレーム = 1 ブロック 10.67ms ぶんの音。\n"
                 "        「1音源の負荷」はオーディオスレッド 1 本に対する割合。\n"
                 "        GPU は engine 側で一切使っていない（GPU化は後回しと決めた通り）。\n");
+}
+
+// 【B1】回折タップの HRTF。
+//
+//   遮蔽されると直接音タップは材質の透過まで落ちる（コンクリなら 1e-4 級）。
+//   HRTF が掛かっているのがその直接音だけだと、**実際に聞こえている音のほうに
+//   定位の手がかりが無い**という状態になる。実エネルギーを運ぶのは開口を
+//   回り込んだ回折タップで、そちらは L/R バランスだけ ── ITD なし・前後の区別なし。
+//
+//   「回折が運ぶのは開口の方向」「音の方へ進むと穴に着く」はコンセプトの中心なので、
+//   ここが立たないと壁の向こう・柱の陰という中心動作が成立しない。
+//
+//   ★却下済みの「ソフト遮蔽に回折の床を足す」とは別物。あれはエネルギーを足して
+//     二重計上になった話で、こちらは**同じエネルギーの空間化を変えるだけ**。
+//     エネルギーが動いていないことは下の「総量」で測る。
+void testDiffractionHrtf() {
+    std::printf("\n[B1] 回折タップの HRTF\n");
+    const int block = 512;
+    const int tapDelay = 240;
+
+    // ★実測の KEMAR を使う。合成 HRTF は**球体頭モデル**で、方向依存は
+    //   lateral = sin(az)·cos(el) しか無い ── つまり前(az=0)と後(az=180)が
+    //   完全に同一の HRIR になる。前後の区別は耳介の形が作るので、
+    //   合成セットでは原理的に測れない（実測: 前後差 -115dB ＝ 数値誤差だけ）。
+    af::dsp::HrtfSet real;
+    bool haveReal = false;
+    const char* kPaths[] = {
+        "UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "../UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "../../UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "../../../UnityDemo/Assets/StreamingAssets/kemar.afhr",
+    };
+    for (const char* p : kPaths)
+        if (af::dsp::HrtfSet::loadFromFile(p, real) && real.isValid()) { haveReal = true; break; }
+
+    af::dsp::HrtfSet syn = af::dsp::HrtfSet::createSynthetic(48000, 5, 10);
+    const af::dsp::HrtfSet& set = haveReal ? real : syn;
+    const int sr = set.sampleRate();
+    std::printf("        HRTF: %s（%d 方向 / %d タップ / %d Hz / 平均パワーゲイン %.2f"
+                " = 等パワーパン比 %+.1f dB）\n",
+                set.name().c_str(), set.directionCount(), set.irLength(), sr,
+                static_cast<double>(set.meanPowerGain()),
+                10.0 * std::log10(std::max(1e-9f, set.meanPowerGain())));
+
+    // 遮蔽された場面を作る: 直接音は透過まで落ち、回折タップがエネルギーを運ぶ。
+    //   dirDirect  : 音源の方向（壁の向こう）。前
+    //   dirDiff    : 開口の方向。ここを振って測る
+    //   hrtfWeight : 0=従来（等パワーパンだけ） / 1=B1（HRTF に載せる）
+    struct Out { std::vector<float> l, r; };
+    auto renderCase = [&](float azDiffDeg, float weight, float panL, float panR,
+                          float directGain, int frames) {
+        af::dsp::VoiceRenderer::Config cfg;
+        cfg.sampleRate = sr;
+        cfg.maxFrames = block;
+        cfg.tailSeconds = 0.25f;
+        cfg.tapCrossfadeMs = 30.0f;
+        af::dsp::VoiceRenderer v(cfg);
+        v.setOutputGain(1.0f);
+        v.setHrtfSet(&set);
+        v.setHrtfEnabled(true);
+
+        const float dirDirect[3] = {0.0f, 0.0f, 1.0f};       // 音源は正面（壁の向こう）
+        v.setDirection(dirDirect, 57.0f);
+        float dirDiff[3];
+        af::dsp::HrtfSet::angleToVector(azDiffDeg, 0.0f, dirDiff);
+        v.setDiffractionDirection(dirDiff, 57.0f);
+
+        af::dsp::EarlyReflectConv::Tap taps[2];
+        for (int b = 0; b < 6; ++b) taps[0].g[b] = directGain;   // 直接音（透過ぶん）
+        taps[0].delaySamples = 0;
+        taps[0].gSpec = 1.0f; taps[0].gDiff = 0.0f;
+        for (int b = 0; b < 6; ++b) taps[1].g[b] = 1.0f;         // 回折タップ
+        taps[1].delaySamples = tapDelay;
+        taps[1].gSpec = 1.0f; taps[1].gDiff = 0.0f;
+        taps[1].panL = panL; taps[1].panR = panR;
+        taps[1].hrtfWeight = weight;
+        v.setTaps(taps, 2);
+
+        // 暖機：タップ補間 30ms と HRTF の方向クロスフェード 12ms を無音で終わらせる。
+        //   ここを飛ばすと過渡の途中を測ることになる。
+        std::vector<float> zero(static_cast<std::size_t>(block), 0.0f);
+        std::vector<float> tl(static_cast<std::size_t>(block)), tr(static_cast<std::size_t>(block));
+        for (int i = 0; i < 8; ++i) v.render(zero.data(), block, tl.data(), tr.data(), nullptr);
+
+        Out o;
+        o.l.assign(static_cast<std::size_t>(frames), 0.0f);
+        o.r.assign(static_cast<std::size_t>(frames), 0.0f);
+        std::vector<float> in(static_cast<std::size_t>(frames), 0.0f);
+        in[0] = 1.0f;                                            // インパルス
+        v.render(in.data(), frames, o.l.data(), o.r.data(), nullptr);
+        return o;
+    };
+
+    // L と R の相互相関がいちばん高くなるずれ（サンプル）。ITD の実測値。
+    //   argmax|x| だと HRIR の山に引っ張られて量子化するので、相関で取る。
+    auto itdSamples = [](const Out& o, int from, int to) {
+        int bestLag = 0;
+        double best = -1e18;
+        for (int lag = -80; lag <= 80; ++lag) {
+            double s = 0.0;
+            for (int i = from; i < to; ++i) {
+                const int j = i + lag;
+                if (j < 0 || j >= static_cast<int>(o.r.size())) continue;
+                s += static_cast<double>(o.l[static_cast<std::size_t>(i)])
+                   * static_cast<double>(o.r[static_cast<std::size_t>(j)]);
+            }
+            if (s > best) { best = s; bestLag = lag; }
+        }
+        return bestLag;
+    };
+    auto rms2 = [](const Out& o, int from, int to) {
+        double s = 0.0;
+        for (int i = from; i < to; ++i)
+            s += static_cast<double>(o.l[static_cast<std::size_t>(i)]) * o.l[static_cast<std::size_t>(i)]
+               + static_cast<double>(o.r[static_cast<std::size_t>(i)]) * o.r[static_cast<std::size_t>(i)];
+        return std::sqrt(s / (2.0 * (to - from)));
+    };
+    auto diffRms = [](const Out& a, const Out& b, int from, int to) {
+        double s = 0.0;
+        for (int i = from; i < to; ++i) {
+            const double dl = static_cast<double>(a.l[static_cast<std::size_t>(i)])
+                            - b.l[static_cast<std::size_t>(i)];
+            const double dr = static_cast<double>(a.r[static_cast<std::size_t>(i)])
+                            - b.r[static_cast<std::size_t>(i)];
+            s += dl * dl + dr * dr;
+        }
+        return std::sqrt(s / (2.0 * (to - from)));
+    };
+
+    const int frames = 2048;
+    const int w0 = tapDelay - 8, w1 = tapDelay + 400;   // 回折タップの到来まわりだけ見る
+    const float occluded = 0.001f;                       // 直接音は透過まで落ちている
+
+    // ── ① ITD。右 60° の開口 ──
+    //   等パワーパンは左右の**レベル差**しか作らない。同じ波形を定数倍しているだけなので
+    //   両耳のずれは 0 サンプル。ここでは直接音を切って（深く遮蔽された状態）
+    //   回折タップだけを鳴らし、混入を無くして測る。
+    //   ★90° ちょうどだと等パワーパンで左が完全に無音になり、相関の分母が消えて
+    //     測定そのものが成立しない。60° にしてある。
+    {
+        const float lateral = 0.8660254f;                    // sin(60°)
+        const float t60 = (lateral + 1.0f) * 0.5f;
+        const float panL60 = std::sqrt(1.0f - t60), panR60 = std::sqrt(t60);
+        const Out pan = renderCase(60.0f, 0.0f, panL60, panR60, 0.0f, frames);
+        const Out hrtf = renderCase(60.0f, 1.0f, panL60, panR60, 0.0f, frames);
+        const int lagPan = itdSamples(pan, w0, w1);
+        const int lagHrtf = itdSamples(hrtf, w0, w1);
+        const double usPan = 1e6 * lagPan / sr;
+        const double usHrtf = 1e6 * lagHrtf / sr;
+        std::printf("        右60°の開口   ITD  パンのみ %+4d samp (%+6.0f us)"
+                    " → HRTF %+4d samp (%+6.0f us)\n", lagPan, usPan, lagHrtf, usHrtf);
+        check("[B1] 等パワーパンには ITD が無い", lagPan == 0);
+        // 右から来るので右耳が先。相関 L[i]·R[i+lag] は**負のラグ**で最大になる。
+        // 右 60°・頭囲 57cm なら 400〜700us 級。
+        check("[B1] HRTF を載せると ITD が出る（右耳が先）",
+              usHrtf <= -250.0 && usHrtf >= -1100.0);
+    }
+
+    // ── ② 前後の区別 ──
+    //   正面と真後ろは左右軸への投影が同じ（x=0）なので、パンでは**完全に同じ音**になる。
+    {
+        const float panC = 0.70710678f;
+        const Out panF = renderCase(0.0f, 0.0f, panC, panC, occluded, frames);
+        const Out panB = renderCase(180.0f, 0.0f, panC, panC, occluded, frames);
+        const Out hrF = renderCase(0.0f, 1.0f, panC, panC, occluded, frames);
+        const Out hrB = renderCase(180.0f, 1.0f, panC, panC, occluded, frames);
+        const double panDiff = diffRms(panF, panB, w0, w1) / rms2(panF, w0, w1);
+        const double hrDiff = diffRms(hrF, hrB, w0, w1) / rms2(hrF, w0, w1);
+        std::printf("        前 vs 後      差   パンのみ %.4f (%.1f dB) → HRTF %.4f (%.1f dB)\n",
+                    panDiff, 20.0 * std::log10(std::max(panDiff, 1e-9)),
+                    hrDiff, 20.0 * std::log10(std::max(hrDiff, 1e-9)));
+        check("[B1] パンだけでは前後が区別できない", panDiff < 1e-6);
+        if (haveReal) {
+            check("[B1] HRTF を載せると前後が別の音になる", hrDiff > 0.05);
+        } else {
+            std::printf("      ※合成HRTF（球体頭）は耳介を持たないので前後が同一。"
+                        "この検査は kemar.afhr がある時だけ意味を持つ。\n");
+        }
+    }
+
+    // ── ③ エネルギーを足していないこと ──
+    //   却下済みの「回折の床を足す」との違いはここ。空間化を変えただけで総量は動かない。
+    {
+        const float panL90 = 0.0f, panR90 = 1.0f;
+        const Out pan = renderCase(90.0f, 0.0f, panL90, panR90, occluded, frames);
+        const Out hrtf = renderCase(90.0f, 1.0f, panL90, panR90, occluded, frames);
+        const double db = 20.0 * std::log10(rms2(hrtf, w0, w1) / rms2(pan, w0, w1));
+        std::printf("        総量          パンのみ→HRTF  %+.2f dB\n", db);
+        check("[B1] 総エネルギーが動かない（±3dB 以内）", std::fabs(db) <= 3.0);
+    }
+
+    // ── ④ 直接音の方向を汚していないこと ──
+    //   1 本の HrtfProcessor は方向を 1 つしか持てない。直接音の方向を回折で
+    //   上書きすると、開けた場所（遮蔽なし）の定位が壊れる。別インスタンスである根拠。
+    {
+        const float panC = 0.70710678f;
+        // 直接音だけ鳴らす（回折タップのゲインは同じだが hrtfWeight=1 で右 90°）。
+        //   直接音は正面なので L/R がほぼ等しくなるはず。
+        const Out o = renderCase(90.0f, 1.0f, panC, panC, 1.0f, frames);
+        double eL = 0.0, eR = 0.0;
+        for (int i = 0; i < tapDelay - 16; ++i) {     // 回折タップが届く前＝直接音だけの区間
+            eL += static_cast<double>(o.l[static_cast<std::size_t>(i)]) * o.l[static_cast<std::size_t>(i)];
+            eR += static_cast<double>(o.r[static_cast<std::size_t>(i)]) * o.r[static_cast<std::size_t>(i)];
+        }
+        const double balDb = 10.0 * std::log10(std::max(eR, 1e-20) / std::max(eL, 1e-20));
+        // 回折タップの区間は右に寄っているはず。
+        double dL = 0.0, dR = 0.0;
+        for (int i = w0; i < w1; ++i) {
+            dL += static_cast<double>(o.l[static_cast<std::size_t>(i)]) * o.l[static_cast<std::size_t>(i)];
+            dR += static_cast<double>(o.r[static_cast<std::size_t>(i)]) * o.r[static_cast<std::size_t>(i)];
+        }
+        const double difDb = 10.0 * std::log10(std::max(dR, 1e-20) / std::max(dL, 1e-20));
+        std::printf("        方向の独立    直接音(正面) R/L %+.2f dB / 回折(右90°) R/L %+.2f dB\n",
+                    balDb, difDb);
+        check("[B1] 直接音は正面のまま（回折の方向に引っぱられない）", std::fabs(balDb) < 3.0);
+        check("[B1] 回折タップは右へ寄る", difDb > 4.0);
+    }
+
+    // ── ⑤ 載っているタップが無いときは HRTF を回さない ──
+    //   HrtfProcessor は入力が 0 でも IR 長ぶんを毎サンプル畳む。見通せている間ずっと
+    //   空回しすると、何も鳴っていないのにコストだけ払い続けることになる。
+    {
+        af::dsp::EarlyReflectConv conv(sr, 4096, 30.0f);
+        af::dsp::EarlyReflectConv::Tap t[2];
+        for (int b = 0; b < 6; ++b) { t[0].g[b] = 1.0f; t[1].g[b] = 0.5f; }
+        t[1].delaySamples = 100;
+        float l, r, d, dir, hm;
+        conv.setTaps(t, 2);
+        conv.beginBlock();
+        conv.processSample(1.0f, true, l, r, d, dir, hm);
+        check("[B1] 回折タップが無ければバスは立たない", !conv.hasHrtfBus());
+        t[1].hrtfWeight = 1.0f;
+        conv.setTaps(t, 2);
+        conv.beginBlock();
+        conv.processSample(1.0f, true, l, r, d, dir, hm);
+        check("[B1] 回折タップを載せるとバスが立つ", conv.hasHrtfBus());
+    }
+
+    // ── ⑥ 乗り換えの連続性 ──
+    //   開口が 2 つあって強さが入れ替わるとき、載せ替えが 1 フレームで起きると段差になる。
+    //   タップ補間（30ms）が weight も一緒に動かしているかを、重みを 0→1 に振って測る。
+    {
+        const float panC = 0.70710678f;
+        double prev = -1e9, worst = 0.0;
+        std::printf("        乗り換え      重み ");
+        for (int k = 0; k <= 4; ++k) {
+            const float w = k * 0.25f;
+            const Out o = renderCase(90.0f, w, panC, panC, occluded, frames);
+            const double lv = 20.0 * std::log10(std::max(rms2(o, w0, w1), 1e-12));
+            std::printf("%.2f:%.1fdB ", static_cast<double>(w), lv);
+            if (prev > -900.0) worst = std::max(worst, std::fabs(lv - prev));
+            prev = lv;
+        }
+        std::printf("\n                      重み 0.25 刻みの最大段差 %.2f dB\n", worst);
+        check("[B1] 重みを振っても段差が出ない（0.25 刻みで 2dB 以内）", worst <= 2.0);
+    }
 }
 
 void testTailCalibration() {
@@ -1643,6 +1906,7 @@ int main() {
     diagnoseTailSwapDiscontinuity();
     testSharedTailBusEquivalence();
     diagnoseDspCost();
+    testDiffractionHrtf();
     testTailCalibration();
     testVoiceRenderer();
 

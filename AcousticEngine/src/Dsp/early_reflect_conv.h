@@ -61,6 +61,14 @@ public:
         float panL = 0.70710678f, panR = 0.70710678f;
         float gSpec = 1.0f;    // √(1-s) 鏡面（方向つき）
         float gDiff = 0.0f;    // √s     拡散（方向を失った成分）
+        // このタップを HRTF バスへ載せる割合。0=パンのまま / 1=丸ごと HRTF。
+        //   直接音(index 0)は従来どおり outDirect へ出るので、ここは使わない。
+        //   遮蔽されると直接音は材質の透過まで落ち、実エネルギーを運ぶのは回折タップになる。
+        //   そのとき HRTF が掛かっているのが直接音だけだと、**聞こえている音のほうに
+        //   ITD も前後の手がかりも無い**。開口の方向を運ぶタップにこそ掛ける必要がある。
+        //   ★呼び出し側は 0/1 で渡してよい。切り替えの連続性はタップ補間が受け持つ
+        //     （乗り換え中は両方が中間値になり、片方がフェードアウトしながら他方が入る）。
+        float hrtfWeight = 0.0f;
     };
 
     /// maxDelaySamples : 履歴リングの長さの目安（早期↔後期の境目ぶん）
@@ -89,6 +97,8 @@ public:
         return !from_.empty() || pending_.load(std::memory_order_acquire) != nullptr;
     }
     int liveTapCount() const { return static_cast<int>(from_.size()); }
+    /// HRTF バスに載っているタップがあるか（無ければ呼び出し側は HRTF を回さなくてよい）。
+    bool hasHrtfBus() const { return hrtfBus_; }
     /// 診断用: 補間の終端(to_)における i 番目のタップの低域ゲインと遅延。
     float debugTargetGain(int i) const {
         return (i >= 0 && i < static_cast<int>(to_.size())) ? to_[static_cast<std::size_t>(i)].g[0] : -1.0f;
@@ -153,6 +163,7 @@ public:
 
         lerpPos_ = 0;
         lerping_ = true;
+        updateHrtfBus();
         delete retired_.exchange(p, std::memory_order_acq_rel);
     }
 
@@ -160,8 +171,10 @@ public:
     ///   outL/outR   : 鏡面成分（直接音は hrtfActive のとき含まれない）
     ///   outDiffuse  : 拡散送り（呼び出し側の拡散器へ）
     ///   outDirect   : 直接音タップのモノラル値（HRTF で両耳化する用）
+    ///   outHrtfMono : hrtfWeight>0 のタップのモノラル和（**別方向の** HRTF で両耳化する用）
     void processSample(float x, bool hrtfActive,
-                       float& outL, float& outR, float& outDiffuse, float& outDirect) {
+                       float& outL, float& outR, float& outDiffuse, float& outDirect,
+                       float& outHrtfMono) {
         // 6 帯域に分ける。低域を抜き取った残りを次へ送るので、足すと元に戻る。
         const int wp = writePos_ & ringMask_;
         float rest = x;
@@ -172,7 +185,7 @@ public:
         }
         ring_[bandIndex(kNumBands - 1, wp)] = rest;
 
-        outL = 0.0f; outR = 0.0f; outDiffuse = 0.0f; outDirect = 0.0f;
+        outL = 0.0f; outR = 0.0f; outDiffuse = 0.0f; outDirect = 0.0f; outHrtfMono = 0.0f;
 
         // 補間の進み具合。0..1。
         //   ★from_ は「補間の出発点」で不変。進捗はここでだけ読む。
@@ -209,8 +222,20 @@ public:
                 outDirect = sp;
                 if (hrtfActive) continue;   // 両耳化は呼び出し側に任せる
             }
-            outL += sp * (a.panL + (b.panL - a.panL) * t);
-            outR += sp * (a.panR + (b.panR - a.panR) * t);
+            float pan = 1.0f;
+            if (hrtfActive) {
+                // HRTF バスへ回すぶんを抜く。残り(1-hw)はこれまでどおりパンで出す。
+                //   乗り換え中だけ 0<hw<1 になり、両経路に割れる。HRTF もパンも
+                //   おおむねエネルギーを保つので、その間の総量はほぼ動かない。
+                const float hw = a.hrtfW + (b.hrtfW - a.hrtfW) * t;
+                if (hw > 0.0f) {
+                    outHrtfMono += sp * hw;
+                    pan = 1.0f - hw;
+                    if (pan <= 0.0f) continue;
+                }
+            }
+            outL += sp * pan * (a.panL + (b.panL - a.panL) * t);
+            outR += sp * pan * (a.panR + (b.panR - a.panR) * t);
         }
 
         if (lerping_ && ++lerpPos_ >= lerpLen_) {
@@ -226,6 +251,7 @@ public:
             }
             from_.resize(keep);
             to_ = from_;
+            updateHrtfBus();      // 落ちきったタップが捨てられた＝バスが空になったかもしれない
         }
         ++writePos_;
     }
@@ -234,16 +260,18 @@ public:
     /// 直接音は hrtfActive のとき outDirectMono へ書き出すので、呼び出し側が HRTF に通す。
     void processAdd(const float* input, int inOffset, int n, bool hrtfActive,
                     float* outL, float* outR, int outOffset, float gain,
-                    float* outDiffuse = nullptr, float* outDirectMono = nullptr) {
+                    float* outDiffuse = nullptr, float* outDirectMono = nullptr,
+                    float* outHrtfMono = nullptr) {
         if (!input || !outL || !outR) return;
         beginBlock();
         for (int i = 0; i < n; ++i) {
-            float l, r, d, dir;
-            processSample(input[inOffset + i], hrtfActive, l, r, d, dir);
+            float l, r, d, dir, hm;
+            processSample(input[inOffset + i], hrtfActive, l, r, d, dir, hm);
             outL[outOffset + i] += l * gain;
             outR[outOffset + i] += r * gain;
             if (outDiffuse) outDiffuse[i] = d;
             if (outDirectMono) outDirectMono[i] = dir;
+            if (outHrtfMono) outHrtfMono[i] = hm;
         }
     }
 
@@ -273,6 +301,7 @@ private:
         float g[kNumBands] = {0, 0, 0, 0, 0, 0};
         float panL = 0.70710678f, panR = 0.70710678f;
         float gSpec = 1.0f, gDiff = 0.0f;
+        float hrtfW = 0.0f;
 
         static RtTap from(const Tap& t) {
             RtTap r;
@@ -280,6 +309,7 @@ private:
             for (int b = 0; b < kNumBands; ++b) r.g[b] = t.g[b];
             r.panL = t.panL; r.panR = t.panR;
             r.gSpec = t.gSpec; r.gDiff = t.gDiff;
+            r.hrtfW = t.hrtfWeight;
             return r;
         }
         void setGain(float v) { for (int b = 0; b < kNumBands; ++b) g[b] = v; }
@@ -307,8 +337,22 @@ private:
             a.panR += (b.panR - a.panR) * t;
             a.gSpec += (b.gSpec - a.gSpec) * t;
             a.gDiff += (b.gDiff - a.gDiff) * t;
+            a.hrtfW += (b.hrtfW - a.hrtfW) * t;
         }
         lerping_ = false;
+    }
+
+    // HRTF バスに載っているタップがあるか。無ければ呼び出し側が HRTF 1 本ぶんを丸ごと省ける
+    //   （HrtfProcessor は入力が 0 でも 139 タップ × 2 耳を毎サンプル畳むので、
+    //     見通せている間ずっと空回しさせると +16% を払い続けることになる）。
+    void updateHrtfBus() {
+        hrtfBus_ = false;
+        for (std::size_t i = 1; i < to_.size(); ++i) {          // index 0 は直接音なので見ない
+            if (to_[i].hrtfW > 0.0f && !to_[i].silent()) { hrtfBus_ = true; return; }
+            if (i < from_.size() && from_[i].hrtfW > 0.0f && !from_[i].silent()) {
+                hrtfBus_ = true; return;
+            }
+        }
     }
 
     // RBJ バイカッド（直接形II転置）。
@@ -350,6 +394,7 @@ private:
     std::atomic<TapSet*> pending_{nullptr};
     std::atomic<TapSet*> retired_{nullptr};
     bool lerping_ = false;
+    bool hrtfBus_ = false;
     int lerpPos_ = 0, lerpLen_ = 1;
 };
 

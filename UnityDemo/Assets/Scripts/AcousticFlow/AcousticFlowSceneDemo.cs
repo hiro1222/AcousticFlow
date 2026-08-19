@@ -165,6 +165,23 @@ namespace AcousticFlow
                  + "上げすぎると『どこから来ているか』が分からなくなる。")]
         [Range(0f, 24f)] public float diffractionHighCutDb = 0f;
 
+        [Tooltip("【B1】いちばん強い回折タップを HRTF に載せる。\n\n"
+                 + "遮蔽されると直接音タップは材質の透過まで落ちるので、実際に耳へ届いている\n"
+                 + "エネルギーは開口を回り込んだ回折タップが運んでいる。HRTF が直接音にしか\n"
+                 + "掛かっていないと、**聞こえている音のほうに定位の手がかりが無い**\n"
+                 + "（ITD なし・前後の区別なし・上下なし）。\n\n"
+                 + "実測(kemar): 等パワーパンの ITD 0us → HRTF で -1000us（右60°）。\n"
+                 + "  前後の差 パンのみ -180dB（＝完全に同一）→ HRTF -1.2dB。\n"
+                 + "コスト: 遮蔽されている間だけ +0.117ms/block（1音源 2.80%→3.89%）。\n"
+                 + "  見通せていれば回折タップが無いので 0。")]
+        public bool diffractionHrtf = true;
+
+        [Tooltip("開口を乗り換えるときのヒステリシス(dB)。\n\n"
+                 + "強さが拮抗した 2 つの開口の間で毎フレーム選択が入れ替わると、\n"
+                 + "HRTF の方向が左右に振れて像が暴れる。今載せている開口をこの dB ぶん\n"
+                 + "上回るまで乗り換えない。0 で無効（＝毎フレーム最強を選ぶ）。")]
+        [Range(0f, 12f)] public float diffractionHrtfMarginDb = 2f;
+
         [Header("後期残響の方向づけ（方向プローブ）※既定オフ・下記参照")]
         [Tooltip("リスナー位置から全方向へレイを撒き、『どちらから残響が返るか』を測って"
                  + "尾の左右バランスに反映する。\n\n"
@@ -589,12 +606,25 @@ namespace AcousticFlow
             public float FreeFieldDirect = 1f;
             public Vector3 DirectDirLocal = Vector3.forward;   // HRTF 用の到来方向
 
+            // 【B1】HRTF に載せる回折タップ。-1 = 無し（＝見通せている／回折が無い）。
+            //   遮蔽されると直接音タップは材質の透過まで落ちるので、実際に耳へ届く
+            //   エネルギーは回折タップが運ぶ。そちらに ITD と前後の手がかりが無いと、
+            //   「音の方へ進むと穴に着く」が成立しない。
+            //   ★1 本だけなのはコストのため（HRTF 1 本で +0.117ms/block）。
+            //     いちばん強い開口に載せれば、体験上いちばん効くところが埋まる。
+            public int HrtfTapIndex = -1;
+            public Vector3 HrtfTapDirLocal = Vector3.forward;
+            // 乗り換えのヒステリシス用。前フレームに載せていた開口の位置（世界座標）。
+            public Vector3 HrtfPrevArrival;
+            public bool HrtfHasPrev;
+
             public readonly float[] DelayMs = new float[MaxTaps];
             public readonly float[] Gain = new float[MaxTaps];
             public readonly float[] BandGain = new float[MaxTaps * AcousticEngine.NumBands];
             public readonly float[] PanL = new float[MaxTaps];
             public readonly float[] PanR = new float[MaxTaps];
             public readonly char[] Type = new char[MaxTaps];    // 'D'直接 / 'R'反射 / 'F'回折
+            public readonly Vector3[] Arrival = new Vector3[MaxTaps];   // 到来点（世界座標）
         }
 
         private SourceTaps[] _taps;     // 音源ごと（_sources と同じ長さ）
@@ -1895,6 +1925,55 @@ namespace AcousticFlow
                 if (w.sqrMagnitude > 1e-8f)
                     ts.DirectDirLocal = listener.InverseTransformDirection(w.normalized);
             }
+
+            SelectDiffractionHrtfTap(ts, n);
+        }
+
+        // 【B1】HRTF に載せる回折タップを 1 本選ぶ。
+        //
+        //   ★毎フレーム単純に「いちばん強い 1 本」を選ぶと、強さが拮抗した 2 つの開口の
+        //     間で選択が振動する。そのたびに HRTF の方向が飛んで像が左右に暴れるので、
+        //     いま載せている開口を marginDb ぶん上回るまで乗り換えない。
+        //   ★index ではなく**到来点の位置**で「同じ開口か」を判定する。タップの並び順は
+        //     フレーム間で保証されていないので、index で覚えると別の開口に化ける
+        //     （エンジン側のタップ対応付けが遅延で行っているのと同じ理由）。
+        private void SelectDiffractionHrtfTap(SourceTaps ts, int count)
+        {
+            ts.HrtfTapIndex = -1;
+            if (!diffractionHrtf || listener == null) { ts.HrtfHasPrev = false; return; }
+
+            int best = -1;      float bestG = 0f;
+            int keep = -1;      float keepG = 0f;
+            const float kSameApertureDist = 1.5f;   // これ以内なら「同じ開口」とみなす
+            float nearest = kSameApertureDist * kSameApertureDist;
+            for (int i = 0; i < count; i++)
+            {
+                if (ts.Type[i] != 'F') continue;
+                float g = ts.Gain[i];
+                if (g <= 0f) continue;
+                if (g > bestG) { bestG = g; best = i; }
+                if (ts.HrtfHasPrev)
+                {
+                    float d2 = (ts.Arrival[i] - ts.HrtfPrevArrival).sqrMagnitude;
+                    if (d2 < nearest) { nearest = d2; keep = i; keepG = g; }
+                }
+            }
+            if (best < 0) { ts.HrtfHasPrev = false; return; }
+
+            int pick = best;
+            if (keep >= 0 && keep != best && diffractionHrtfMarginDb > 0f)
+            {
+                // 乗り換えるのは、新しい候補が今の開口を margin ぶん上回ったときだけ。
+                float marginLin = Mathf.Pow(10f, diffractionHrtfMarginDb / 20f);
+                if (bestG < keepG * marginLin) pick = keep;
+            }
+
+            ts.HrtfTapIndex = pick;
+            ts.HrtfPrevArrival = ts.Arrival[pick];
+            ts.HrtfHasPrev = true;
+            Vector3 w = ts.Arrival[pick] - listener.position;
+            if (w.sqrMagnitude > 1e-8f)
+                ts.HrtfTapDirLocal = listener.InverseTransformDirection(w.normalized);
         }
 
         // 6帯域の単純平均（広帯域ゲイン表示用）。
@@ -1982,6 +2061,7 @@ namespace AcousticFlow
             ts.Gain[n] = sum / nb;                  // 広帯域（プロット/表示用）
             ComputePan(arrival, out ts.PanL[n], out ts.PanR[n]);
             ts.Type[n] = type; ts.DelayMs[n] = delayMs;
+            ts.Arrival[n] = arrival;                // B1: HRTF に載せる開口を選ぶのに要る
         }
 
 

@@ -45,6 +45,26 @@ public:
     int directionCount() const { return static_cast<int>(az_.size()); }
     bool isValid() const { return directionCount() > 0 && irLength_ > 0; }
 
+    /// 全方向を平均した HRIR のパワーゲイン（Σh² の左右合計を方向で平均）。
+    ///   等パワーパンは総パワー 1 なので、これで割ると
+    ///   「パンから HRTF へ載せ替えても音量が変わらない」状態になる。
+    ///   ★方向ごとのばらつきは**割らない**。あれが頭部の影＝定位の手がかりそのもの。
+    ///     平均だけを 1 に揃える。
+    ///   実測(kemar 710方向/139タップ): 2.11 ＝ 載せ替えるだけで +3.2dB 持ち上がる。
+    float meanPowerGain() const {
+        const int n = directionCount();
+        if (n <= 0 || irLength_ <= 0) return 1.0f;
+        double acc = 0.0;
+        for (int i = 0; i < n; ++i)
+            for (int e = 0; e < 2; ++e) {
+                const float* h = hrir_.data() + hrirOffset(i, e);
+                for (int k = 0; k < irLength_; ++k)
+                    acc += static_cast<double>(h[k]) * static_cast<double>(h[k]);
+            }
+        const double m = acc / n;
+        return (m > 1e-12) ? static_cast<float>(m) : 1.0f;
+    }
+
     /// このデータセットが測定された頭のサイズ（ITD スケールの基準）。
     /// 実測データの頭囲が不明な場合は成人平均 57cm を仮定する。
     float referenceHeadCircumferenceCm() const { return refHeadCm_; }

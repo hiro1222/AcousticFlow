@@ -56,11 +56,26 @@ typedef struct AF_VoiceConfig {
  *   gain6      : 125/250/500/1k/2k/4kHz の 6 帯域ゲイン
  *   panL/panR  : 等パワーパン（HRTF 有効時、index 0 では使われない）
  *   gSpec/gDiff: 鏡面 √(1-s) / 拡散 √s。AF_VoiceScatterSplit で作れる */
+/* ABI の版。**AF_VoiceTap など C ABI の構造体を変えたら必ず上げること。**
+ *
+ * これが無いと、DLL だけ古いまま C# を更新したときに構造体の長さが食い違い、
+ * マーシャラが別の刻み幅で書き込む（AF_VoiceTap は 44→48 バイトになった）。
+ * 例外も出ずにタップの中身が化けるので、原因に辿り着けない。
+ *   1 : hrtfWeight 追加 / AF_VoiceSetDiffractionDirection 追加（B1）
+ */
+#define AF_ABI_VERSION 1
+ACOUSTIC_API int AF_AbiVersion(void);
+
 typedef struct AF_VoiceTap {
     int   delaySamples;
     float gain6[6];
     float panL, panR;
     float gSpec, gDiff;
+    /* このタップを HRTF に載せる割合（0=パンのまま / 1=丸ごと HRTF）。
+     * 到来方向は AF_VoiceSetDiffractionDirection で別に渡す。
+     * 直接音(index 0)には効かない ── あちらは従来どおり AF_VoiceSetDirection の方向で
+     * 常に HRTF を通る。★ホスト側の構造体（C# AFVoiceTap）と並びを合わせること。 */
+    float hrtfWeight;
 } AF_VoiceTap;
 
 /* 段別の計測（直前の Render ブロックの RMS）。内訳が読めないと調整できないので分けて返す。 */
@@ -91,6 +106,13 @@ ACOUSTIC_API void AF_VoiceSetHrtfEnabled(AF_VoiceHandle voice, int enabled);
  * ITD は頭のサイズにほぼ比例するので、ここが個人最適化で最も効く。 */
 ACOUSTIC_API void AF_VoiceSetDirection(AF_VoiceHandle voice, AF_Vector3 dirListenerLocal,
                                        float headCircumferenceCm);
+
+/* 回折バス（hrtfWeight>0 のタップ）の到来方向。直接音とは別方向を持つ。
+ * 遮蔽されると直接音は材質の透過まで落ち、実エネルギーは開口を回り込んだ成分が運ぶ。
+ * その成分に ITD と前後・上下の手がかりを載せるための口。 */
+ACOUSTIC_API void AF_VoiceSetDiffractionDirection(AF_VoiceHandle voice,
+                                                  AF_Vector3 dirListenerLocal,
+                                                  float headCircumferenceCm);
 
 /* 実測エコグラムから後期尾を組み直す。戻り値は 尾/直接 のエネルギー比（0 なら尾なし）。
  *   echoBands[k*6+b] : 時間ビン k・帯域 b のエネルギー

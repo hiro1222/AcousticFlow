@@ -119,6 +119,7 @@ public:
                                               : static_cast<int>(0.120f * sampleRate_),
                  cfg.tapCrossfadeMs),
           hrtf_(sampleRate_, cfg.hrtfCrossfadeMs, cfg.hrtfCrossoverHz),
+          hrtfDif_(sampleRate_, cfg.hrtfCrossfadeMs, cfg.hrtfCrossoverHz),
           tailConvA_(tailSamples_, 2, cfg.tailFirstBlock, cfg.tailCapBlock, cfg.maxFrames),
           tailConvB_(tailSamples_, 2, cfg.tailFirstBlock, cfg.tailCapBlock, cfg.maxFrames),
           tailIr_(sampleRate_, tailSamples_, 2) {
@@ -142,10 +143,33 @@ public:
     void setTaps(const EarlyReflectConv::Tap* taps, int count) { early_.setTaps(taps, count); }
 
     /// HRTF データセットを差し替える。set は呼び手が生存を保証する。
-    void setHrtfSet(const HrtfSet* set) { hrtf_.setHrtfSet(set); }
+    void setHrtfSet(const HrtfSet* set) {
+        hrtf_.setHrtfSet(set);
+        hrtfDif_.setHrtfSet(set);
+        // 回折バスだけ、パンと同じ音量になるように平均ゲインを揃える。
+        //   HRIR の絶対ゲインは測定系の都合で決まっていて、kemar は等パワーパンより
+        //   **+3.2dB 大きい**（実測: 平均パワーゲイン 2.11）。補正しないと
+        //   「回折タップを HRTF に載せた」だけで回折が 3dB 持ち上がり、
+        //   D⊕F の混ぜ合わせ（occFrac の連続クロスフェード）が壊れる。
+        //   補正後の残りは方向ごとのばらつき（実測: 右90°で +1.75dB）＝頭部の影そのもの。
+        //   ★B1 は**同じエネルギーの空間化を変えるだけ**という約束なので、ここは揃える。
+        //   ★直接音側(hrtf_)には掛けない。あちらは元からこのゲインで鳴っていて、
+        //     尾の較正も残響比もその音量を前提に決まっている。触ると出荷音が動く。
+        difNorm_ = (set && set->isValid())
+                 ? 1.0f / std::sqrt(std::max(1e-6f, set->meanPowerGain())) : 1.0f;
+    }
     void setHrtfEnabled(bool on) { hrtfEnabled_ = on; }
     void setDirection(const float dirListenerLocal[3], float headCircumferenceCm) {
         hrtf_.setDirection(dirListenerLocal, headCircumferenceCm);
+    }
+
+    /// 回折バス（hrtfWeight>0 のタップ）の到来方向。直接音とは**別の方向**を持つ。
+    ///   遮蔽されているとき、直接音は壁の向こうの音源方向を指したまま材質の透過まで落ち、
+    ///   実際に耳へ届くのは開口を回り込んだ成分になる。その成分の方向がこれ。
+    ///   ★別インスタンスなのは、1 本の HrtfProcessor が持てる方向が 1 つだからで、
+    ///     直接音の方向を回折の方向で上書きすると、開けた場所での定位が壊れる。
+    void setDiffractionDirection(const float dirListenerLocal[3], float headCircumferenceCm) {
+        hrtfDif_.setDirection(dirListenerLocal, headCircumferenceCm);
     }
 
     /// 実測エコグラムから後期尾を組み直す。戻り値は 尾/直接 のエネルギー比。
@@ -265,14 +289,19 @@ private:
 
         // ② HRTF はブロック境界で HRIR を取り込む（方向変化のクロスフェード開始）。
         const bool hrtfActive = hrtfEnabled_ && hrtf_.isReady();
+        // 回折バスは**載っているタップがあるときだけ**回す。HrtfProcessor は入力が 0 でも
+        //   IR 長ぶんを毎サンプル畳むので、見通せている間ずっと空回しすると
+        //   何も鳴っていないのにコストだけ +16% 払い続けることになる。
+        const bool difActive = hrtfActive && early_.hasHrtfBus() && hrtfDif_.isReady();
         if (hrtfActive) hrtf_.beginBlock();
+        if (difActive) hrtfDif_.beginBlock();
         early_.beginBlock();
 
         for (int f = 0; f < n; ++f) {
             const float dry = input[f];
 
-            float l, r, scatSend, directMono;
-            early_.processSample(dry, hrtfActive, l, r, scatSend, directMono);
+            float l, r, scatSend, directMono, difMono;
+            early_.processSample(dry, hrtfActive, l, r, scatSend, directMono, difMono);
 
             // 直接音を HRTF で両耳化して足す（パンの代わり）。
             float dirL = 0.0f, dirR = 0.0f;
@@ -283,6 +312,14 @@ private:
                 // HRTF 無効時、直接音は early_ 側でパン済み。計測用に切り分けられないので
                 // モノラル値をそのまま両耳ぶんとして数える。
                 dirL = dirR = directMono * 0.70710678f;
+            }
+
+            // 回折バスを**別方向の** HRTF で両耳化して足す。
+            //   これは早期成分なので m.rmsEarly に入る（下の eL/eR に含まれる）。
+            if (difActive) {
+                float dfL = 0.0f, dfR = 0.0f;
+                hrtfDif_.processSample(difMono, dfL, dfR);
+                l += dfL * difNorm_; r += dfR * difNorm_;
             }
 
             m.rmsDirect += (dirL * dirL + dirR * dirR) * 0.5f;
@@ -315,6 +352,9 @@ private:
 
     EarlyReflectConv early_;
     HrtfProcessor hrtf_;
+    // 回折バス用の 2 本目。方向が違うので別インスタンスが要る。
+    //   回折タップが 1 本も無いフレームでは回さない（下の difActive）。
+    HrtfProcessor hrtfDif_;
     // 並走クロスフェード用に 2 面持つ。役割は tailUseB_ で入れ替える
     // （NonUniformConvolver は atomic を持つので swap できない）。
     NonUniformConvolver tailConvA_;
@@ -334,6 +374,7 @@ private:
     std::vector<float> tailOutL_, tailOutR_;
 
     bool hrtfEnabled_ = true;
+    float difNorm_ = 1.0f;      // 回折バスをパンと同音量に揃える係数（setHrtfSet で決まる）
     float outputGain_ = 0.6f;
     float tailGain_ = 0.0f;
     float tailLevel_ = 1.0f;

@@ -113,6 +113,10 @@ namespace AcousticFlow
 
         private void Awake()
         {
+            // 配置されている DLL が C# と同じ版か確かめる。違えば鳴らさない。
+            //   AF_VoiceTap の長さが食い違うと、例外も出さずにタップの中身が化ける。
+            if (!Native.CheckAbi()) return;
+
             _sampleRate = AudioSettings.outputSampleRate;
             AudioSettings.GetDSPBufferSize(out int bufLen, out _);
 
@@ -191,6 +195,13 @@ namespace AcousticFlow
             Vector3 d = ts.DirectDirLocal;
             Native.AF_VoiceSetDirection(_voice, new AFVector3(d), headCircumferenceCm);
 
+            // 【B1】回折バスの到来方向＝開口の方向。直接音とは別に持つ。
+            //   直接音は壁の向こうの音源を指したまま透過まで落ち、実エネルギーは
+            //   開口を回り込んだ成分が運ぶ。その成分に定位の手がかりを載せる。
+            if (ts.HrtfTapIndex >= 0)
+                Native.AF_VoiceSetDiffractionDirection(
+                    _voice, new AFVector3(ts.HrtfTapDirLocal), headCircumferenceCm);
+
             // 尾の掛かり方。開けた場所は wet が小さく、壁裏では srcLevel が小さくなる。
             _wet = Mathf.Clamp01(AcousticFlowSceneDemo.Status.Wet);
             _srcLevel = (ts.SourceLevel > 0f) ? ts.SourceLevel : 1f;
@@ -221,6 +232,9 @@ namespace AcousticFlow
                 else
                     Native.AF_VoiceScatterSplit(
                         ts.DelayMs[i], mix, scatterAmount, 1f, out t.gSpec, out t.gDiff);
+                // 【B1】選ばれた回折タップだけ HRTF バスへ。切り替えの連続性は
+                //   エンジン側のタップ補間（30ms）が受け持つので、ここは 0/1 でよい。
+                t.hrtfWeight = (i == ts.HrtfTapIndex) ? 1f : 0f;
                 _taps[i] = t;
             }
             Native.AF_VoiceSetTaps(_voice, _taps, n);

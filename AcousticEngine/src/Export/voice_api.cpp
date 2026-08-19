@@ -34,6 +34,10 @@ int orDefault(int v, int def) { return (v > 0) ? v : def; }
 
 }  // namespace
 
+// ================================================================ ABI
+
+int AF_AbiVersion(void) { return AF_ABI_VERSION; }
+
 // ================================================================ HRTF
 
 AF_HrtfHandle AF_HrtfLoadFile(const char* path) {
@@ -102,6 +106,8 @@ void AF_VoiceSetTaps(AF_VoiceHandle voice, const AF_VoiceTap* taps, int count) {
         // 未設定（両方 0）なら鏡面 100% として扱う。呼び出し側が散乱を使わない場合の既定。
         if (src.gSpec == 0.0f && src.gDiff == 0.0f) { d.gSpec = 1.0f; d.gDiff = 0.0f; }
         else { d.gSpec = src.gSpec; d.gDiff = src.gDiff; }
+        d.hrtfWeight = (src.hrtfWeight < 0.0f) ? 0.0f
+                     : (src.hrtfWeight > 1.0f) ? 1.0f : src.hrtfWeight;
     }
     v->setTaps(s.data(), count);
 }
@@ -130,6 +136,14 @@ void AF_VoiceSetDirection(AF_VoiceHandle voice, AF_Vector3 dir, float headCircum
     if (!v) return;
     const float d[3] = {dir.x, dir.y, dir.z};
     v->setDirection(d, headCircumferenceCm);
+}
+
+void AF_VoiceSetDiffractionDirection(AF_VoiceHandle voice, AF_Vector3 dir,
+                                     float headCircumferenceCm) {
+    af::dsp::VoiceRenderer* v = asVoice(voice);
+    if (!v) return;
+    const float d[3] = {dir.x, dir.y, dir.z};
+    v->setDiffractionDirection(d, headCircumferenceCm);
 }
 
 float AF_VoiceRebuildTail(AF_VoiceHandle voice,
