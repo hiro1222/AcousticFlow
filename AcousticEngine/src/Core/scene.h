@@ -1351,8 +1351,41 @@ public:
                             + std::fabs(dot(ob.axisZ, n)) * ob.halfExtents.z;
             return (d + ext) < -0.01f;      // 完全に奥側
         };
+        // ★開口に**入り込んでいる物だけ**が塞ぐ。矩形の外にしか無い物は参加させない。
+        //
+        //   遮蔽はリスナー視点の「影」で測っているので、**戸口の枠が自分の開口を塞ぐ**。
+        //   壁には厚みがあり、その奥側の面が遠近で内側へ寄って矩形の縁に食い込む。
+        //   実測（扉を一枚も置かない素通しの戸口・幅 1.20m の矩形）:
+        //     正対 0.9655 / 斜め 0.9651 / 真横 0.8490 ── **塞ぐものが無いのに 1.0 に届かない**
+        //   検算: リスナー z=-4、矩形 z=0、袖壁の奥面 z=+0.15 → 投影倍率 4/4.15 = 0.96386、
+        //         u = 0.6×0.96386 = 0.5783 ＝ 片側 0.0217m の食い込み ＝ 幅の 3.6%。
+        //   しかも斜めから見るほど悪化するので、**立ち位置で「全開」の基準値が動いていた**。
+        //
+        //   判定は矩形の座標系での広がり(u,v)が矩形と重なるか。枠は縁で接するだけなので
+        //   余裕を付けて外れる。閉じた扉は矩形を覆うので入るし、80°開いた扉も板が
+        //   矩形をかすめる間は入る。
+        //   ★却下済みの「断面で測る」とは別物。あれは**量の測り方**の話（斜めの薄い板が
+        //     断面に現れない）で、こちらは**参加者の選び方**。入った物の量は従来どおり影で測る。
+        const float kEdgeMargin = 0.01f;
+        auto entersAperture = [&](const Obb& ob) {
+            float uMin = 1e30f, uMax = -1e30f, vMin = 1e30f, vMax = -1e30f;
+            for (int i = 0; i < 8; ++i) {
+                const float sx = (i & 1) ? 1.0f : -1.0f;
+                const float sy = (i & 2) ? 1.0f : -1.0f;
+                const float sz = (i & 4) ? 1.0f : -1.0f;
+                const Vec3 q = ob.center + ob.axisX * (ob.halfExtents.x * sx)
+                                         + ob.axisY * (ob.halfExtents.y * sy)
+                                         + ob.axisZ * (ob.halfExtents.z * sz);
+                const float qu = dot(q - pt.center, u), qv = dot(q - pt.center, v);
+                uMin = std::min(uMin, qu); uMax = std::max(uMax, qu);
+                vMin = std::min(vMin, qv); vMax = std::max(vMax, qv);
+            }
+            const float hu = pt.halfU - kEdgeMargin, hv = pt.halfV - kEdgeMargin;
+            return (uMax > -hu && uMin < hu) && (vMax > -hv && vMin < hv);
+        };
         for (const Instance& inst : instances_) {
             if (!inst.active || beyondPortal(inst.obb)) continue;
+            if (!entersAperture(inst.obb)) continue;
             if (inst.geomId >= 0 && inst.geomId < static_cast<int>(meshes_.size())
                 && meshes_[static_cast<std::size_t>(inst.geomId)].used) {
                 const MeshGeometry& g = meshes_[static_cast<std::size_t>(inst.geomId)];
