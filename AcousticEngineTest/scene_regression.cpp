@@ -3212,6 +3212,108 @@ void diagnosePillarTimbre() {
 //   computeDirectSoft は `if (!portals_.empty())` で分岐していて、シーンに 1 枚でも
 //   ポータルがあると前川の回折経路へ**一度も来なくなる**。判定がシーン全体になっている。
 //   本来の関心は「その経路をポータルが覆っているか」のはず。
+// 音源を多数登録したときに、音源ごとの結果が本当に別物になっているか。
+//   ホストは source + extraSources で N 音源ぶんのタップを作るが、デモには畳み込み器が
+//   1 個しか置かれておらず、**N 本を同時に鳴らしたことが一度も無い**。
+//   しかも「音源ごとのエコグラム」を入れたばかりで index の対応が絡む。
+//   壊れているのではなく未検証なので、ここで縛る。
+void testManySources() {
+    std::printf("\n[多音源] 音源ごとの結果が混ざっていないか\n");
+    const float h = 4.0f, t = 0.3f, hw = 9.0f, hd = 9.0f;
+    AF_SceneHandle s = AF_SceneCreate();
+    const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    AF_SceneAddInstanceBox(s, V(0, -t, 0),    V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, h+t, 0),   V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+    // 何本かの経路だけを塞ぐ衝立（音源ごとに条件を変えるため）。
+    AF_SceneAddInstanceBox(s, V(-4.0f, h*0.5f, 0), V(2.0f, h*0.5f, 0.3f), V(1,0,0), V(0,1,0), m);
+
+    const int N = 8;
+    AF_SceneSetListener(s, V(0, 1.6f, -6.0f));
+    for (int i = 0; i < N; ++i) {
+        // 半分は衝立の裏（x<0 側）、半分は見通せる側に置く。
+        const float x = (i < N/2) ? (-7.0f + i * 1.5f) : (2.0f + (i - N/2) * 1.5f);
+        AF_SceneSetSource(s, static_cast<unsigned long long>(100 + i), V(x, 1.6f, 4.0f));
+    }
+    for (int k = 0; k < 8; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+
+    // ① id → index が全部引けること
+    int idx[N]; bool allIdx = true;
+    for (int i = 0; i < N; ++i) {
+        idx[i] = AF_SceneSourceIndex(s, static_cast<unsigned long long>(100 + i));
+        if (idx[i] < 0) allIdx = false;
+    }
+    check("[多音源] 全音源の id → index が引ける", allIdx);
+
+    // ② 生存ゲインが音源ごとに違うこと（同じ値が返ってきたら取り違えている）
+    float occ[N][kBands] = {};
+    int distinct = 0;
+    for (int i = 0; i < N; ++i) {
+        if (idx[i] >= 0) AF_SceneGetSourceOcclusion(s, idx[i], occ[i]);
+        bool uniq = true;
+        for (int j = 0; j < i; ++j)
+            if (std::fabs(occ[i][0] - occ[j][0]) < 1e-6f) { uniq = false; break; }
+        if (uniq) ++distinct;
+    }
+    // ★見通せる位置の音源は生存 1.000 で揃うのが**正しい**。全部バラバラを要求しない。
+    //   ここで見たいのは「取り違えていないか」なので、遮られた側と見通せる側が
+    //   きちんと分かれることを縛る。
+    float lo = 1e9f, hi = -1e9f;
+    for (int i = 0; i < N; ++i) { lo = std::min(lo, occ[i][0]); hi = std::max(hi, occ[i][0]); }
+    std::printf("      生存ゲイン(125Hz) 音源ごと:");
+    for (int i = 0; i < N; ++i) std::printf(" %.3f", occ[i][0]);
+    std::printf("   相異なる値 %d/%d（最小 %.3f 最大 %.3f）\n", distinct, N, lo, hi);
+    check("[多音源] 遮られた音源と見通せる音源が分かれる", distinct >= 3 && hi > lo * 1.5f);
+
+    // ③ エコグラムが音源ごとに別物であること（今日入れた変更の実地確認）
+    std::vector<float> e(100 * kBands);
+    double total[N] = {};
+    int echoDistinct = 0;
+    for (int i = 0; i < N; ++i) {
+        const int bins = AF_SceneGetEchogramBands(s, idx[i], e.data(), 100);
+        double sum = 0.0;
+        for (int k = 0; k < bins * kBands; ++k) sum += e[static_cast<std::size_t>(k)];
+        total[i] = sum;
+        bool uniq = true;
+        for (int j = 0; j < i; ++j)
+            if (std::fabs(total[i] - total[j]) < 1e-9) { uniq = false; break; }
+        if (uniq) ++echoDistinct;
+    }
+    std::printf("      エコグラム総和 音源ごと:");
+    for (int i = 0; i < N; ++i) std::printf(" %.2f", total[i]);
+    std::printf("   相異なる値 %d/%d\n", echoDistinct, N);
+    check("[多音源] エコグラムが音源ごとに異なる", echoDistinct >= N - 1);
+
+    // ④ 全音源の和(-1) が個別の和と一致すること
+    double sumAll = 0.0;
+    {
+        const int bins = AF_SceneGetEchogramBands(s, -1, e.data(), 100);
+        for (int k = 0; k < bins * kBands; ++k) sumAll += e[static_cast<std::size_t>(k)];
+    }
+    double sumEach = 0.0;
+    for (int i = 0; i < N; ++i) sumEach += total[i];
+    std::printf("      全音源の和 %.2f / 個別の合計 %.2f（差 %.3f%%）\n",
+                sumAll, sumEach, std::fabs(sumAll - sumEach) / std::max(sumEach, 1e-9) * 100.0);
+    check("[多音源] index=-1 が個別の合計と一致",
+          std::fabs(sumAll - sumEach) < sumEach * 0.001);
+
+    // ⑤ 早期反射・回折二次音源も音源ごとに取れること
+    int erTotal = 0, dfTotal = 0;
+    for (int i = 0; i < N; ++i) {
+        AF_Vector3 pos[16]; float g6[16 * kBands];
+        erTotal += (idx[i] >= 0) ? AF_SceneGetEarlyReflections(s, idx[i], pos, g6, 16) : 0;
+        AF_Vector3 dp[8]; float dg[8];
+        dfTotal += (idx[i] >= 0) ? AF_SceneGetDiffractionSources(s, idx[i], dp, dg, 8) : 0;
+    }
+    std::printf("      早期反射 合計 %d 本 / 回折二次音源 合計 %d 本\n", erTotal, dfTotal);
+    check("[多音源] 早期反射が音源ぶん取れる", erTotal >= N);
+
+    AF_SceneDestroy(s);
+}
+
 void diagnosePortalScopeGlobal() {
     std::printf("\n[診断] 無関係なポータルが他の場所の回折を殺していないか\n");
     const float h = 4.0f, t = 0.3f, hw = 8.0f, hd = 8.0f;
@@ -4841,6 +4943,7 @@ int main() {
     testRoomSegmentation();
     testRoomIncremental();
     diagnoseRoomDetection();
+    testManySources();
     diagnosePortalScopeGlobal();
     diagnosePerSourceEchogram();
     diagnoseAbsorptionVsLocalization();
