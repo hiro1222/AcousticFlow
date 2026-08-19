@@ -4311,8 +4311,17 @@ void diagnoseCorridorTapDropout() {
         float dT = 0.0f, dL = 0.0f;
         if (have) { dL = tot - prevTot; dT = tilt - prevTilt; }
         const bool changed = (prevNd >= 0 && nd != prevNd);
-        std::printf("        %+5.1f    %d %s   %.4f %.4f   %7.2f   %+6.2f %+7.2f%s\n",
+        // どの段で落ちているかの切り分け:
+        //   候補が 0        → 稜線の探索（tryEdge の見通し判定）で落ちている
+        //   候補>0 で本数 0 → クラスタ化か重み（apertureWeight）で落ちている
+        AF_Vector3 cp[64]; float cd[64];
+        const int nCand = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 64);
+        float minDelta = 1e9f;
+        for (int i = 0; i < nCand; ++i) minDelta = std::min(minDelta, cd[i]);
+        std::printf("        %+5.1f    %d %s   %.4f %.4f   %7.2f   %+6.2f %+7.2f"
+                    "   候補%2d 最小δ%6.2f%s\n",
                     z, nd, changed ? "★" : " ", band[0], band[5], tilt, dL, dT,
+                    nCand, (nCand > 0) ? minDelta : -1.0f,
                     changed ? "  ← 本数が変わった" : "");
         if (have) {
             if (std::fabs(dL) > worstTot)  { worstTot  = std::fabs(dL); atTot  = z; }
@@ -4326,6 +4335,28 @@ void diagnoseCorridorTapDropout() {
     std::printf("      ※既存の連続性検査は生存ゲイン（スカラ）を見ており、\n"
                 "        **タップの本数**は見ていない。本数が変わるとそのタップが持つ\n"
                 "        帯域の形ごと消えるので、合計のスペクトルが動く。\n");
+
+    // 落ちる位置の周りを 1cm 刻みで見る。
+    //   数 mm で出たり消えたりするなら**数値的な knife-edge**（判定が幾何の際どい所で
+    //   ひっくり返っている）。一定の区間で消えるなら幾何的な理由がある。
+    std::printf("        落ちる位置の周りを 1cm 刻みで（候補数 / 最小δ）:\n          ");
+    int runs = 0; int prevC = -1;
+    for (float z = -3.95f; z <= -3.55f; z += 0.01f) {
+        AF_SceneHandle s = build();
+        const AF_Vector3 L = V(0, 1.6f, z);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+        AF_Vector3 cp[64]; float cd[64];
+        const int nc = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 64);
+        if (prevC >= 0 && nc != prevC) ++runs;
+        prevC = nc;
+        std::printf("%d", nc);
+        AF_SceneDestroy(s);
+    }
+    std::printf("\n          （z=-3.95 → -3.55 の 41 点。切り替わり %d 回）\n", runs);
+    std::printf("      ※切り替わりが何度も起きるなら、判定が幾何の際どい所で\n"
+                "        ひっくり返っている＝数値的な knife-edge。\n");
 }
 
 void testOutdoorIsNotARoom() {
