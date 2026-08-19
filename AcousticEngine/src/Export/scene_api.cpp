@@ -656,6 +656,14 @@ int AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* outCenter,
  * 1 点で回折を表すのをやめる ── 隙間の幅も角の死角も、矩形の中で影が落ちることで
  * 自動的に解ける。ナイフエッジ回折の厳密解はもともとこの形の積分。 */
 /* 【計測用】直近の開口積分で矩形に写った遮蔽物の枚数。-1 は未実行。 */
+void AF_SceneDebugPortalIntegral(AF_SceneHandle scene, double* numer, double* denom, float* limU) {
+    Scene* s = asScene(scene);
+    if (!s) return;
+    if (numer) *numer = s->dbgNumer();
+    if (denom) *denom = s->dbgDenom();
+    if (limU)  *limU  = s->dbgLimU();
+}
+
 int AF_SceneDebugPortalPolys(AF_SceneHandle scene) {
     Scene* s = asScene(scene);
     return s ? s->dbgPortalPolys() : -1;

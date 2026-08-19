@@ -4612,6 +4612,10 @@ void diagnoseSlitPortalShadow() {
                         i, dp[i].x, dp[i].y, dp[i].z, db[i*6+0], db[i*6+5]);
         AF_Vector3 cp[32]; float cd[32];
         const int nc = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 32);
+        double nmr = 0, dnm = 0; float lu = 0;
+        AF_SceneDebugPortalIntegral(s, &nmr, &dnm, &lu);
+        std::printf("            125Hz の積分: 分子 %.6f / 分母 %.6f = %.6f  範囲 ±%.3fm\n",
+                    nmr, dnm, (dnm > 1e-12) ? nmr/dnm : -1.0, lu);
         std::printf("            候補 %d 個:", nc);
         for (int i = 0; i < nc && i < 6; ++i)
             std::printf("  (%+.2f,%+.2f,%+.2f)δ%.2f", cp[i].x, cp[i].y, cp[i].z, cd[i]);

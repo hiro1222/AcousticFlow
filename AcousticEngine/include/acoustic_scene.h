@@ -335,6 +335,8 @@ ACOUSTIC_API int  AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* ou
 /* 【(B)】稜線からポータルを生成してフレネル積分する。既定 0（従来の前川＋開口積分）。 */
 /* 【計測用】直近の開口積分で矩形に写った遮蔽物の枚数。 */
 ACOUSTIC_API int AF_SceneDebugPortalPolys(AF_SceneHandle scene);
+/* 【計測用】直近の開口積分の 125Hz の分子・分母・積分範囲。 */
+ACOUSTIC_API void AF_SceneDebugPortalIntegral(AF_SceneHandle scene, double* numer, double* denom, float* limU);
 
 ACOUSTIC_API void AF_SceneSetEdgePortals(AF_SceneHandle scene, int enable);
 ACOUSTIC_API void AF_SceneSetEdgePortalSpan(AF_SceneHandle scene, float k);

@@ -1283,6 +1283,9 @@ public:
     void setEdgePortalSpan(float k) { edgePortalSpan_ = std::max(0.25f, k); }
     // 【計測用】直近の portalOpenBands で矩形に影として写った遮蔽物の枚数。-1 は未実行。
     int dbgPortalPolys() const { return dbgPortalPolys_; }
+    double dbgNumer() const { return dbgNumer_; }
+    double dbgDenom() const { return dbgDenom_; }
+    float  dbgLimU() const { return dbgLimU_; }
 
     // ── 部屋グラフの開口からポータルを自動生成する ──
     //
@@ -1582,6 +1585,7 @@ public:
                     numer += integ(lo, hi, y);
                 }
             }
+            if (b == 0) { dbgNumer_ = numer; dbgDenom_ = denom; dbgLimU_ = limU; }
             outFrac6[b] = (denom > 1e-12)
                         ? static_cast<float>(std::min(1.0, numer / denom)) : 1.0f;
         }
@@ -5121,6 +5125,8 @@ private:
     //     1 倍 9.32dB（-20〜-29dB） / **2 倍 2.87dB（+2.2〜+5.0dB）** / 4 倍 2.71dB / 8 倍 3.19dB
     //   2 倍で形が合い、残りはほぼ一定のオフセット＝決めごと #3 の範囲。
     float edgePortalSpan_ = 2.0f;
+    mutable double dbgNumer_ = 0.0, dbgDenom_ = 0.0;   // 計測用: 125Hz の分子・分母
+    mutable float  dbgLimU_ = 0.0f;                    // 計測用: 125Hz の積分範囲
     mutable int dbgPortalPolys_ = -1;      // 計測用: 直近の portalOpenBands で矩形に写った枚数
     float portalGovernRange_ = 1.0f;       // ポータルの支配が及ぶ距離(m)
     bool  autoPortals_ = false;            // 開口からポータルを自動生成するか
