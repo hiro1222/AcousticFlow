@@ -141,6 +141,11 @@ void AF_VoiceSetDirection(AF_VoiceHandle voice, AF_Vector3 dir, float headCircum
     v->setDirection(d, headCircumferenceCm);
 }
 
+void AF_VoiceSetEarCues(AF_VoiceHandle voice, int enabled) {
+    af::dsp::VoiceRenderer* v = asVoice(voice);
+    if (v) v->setEarCuesEnabled(enabled != 0);
+}
+
 void AF_VoiceSetDiffractionDirection(AF_VoiceHandle voice, AF_Vector3 dir,
                                      float headCircumferenceCm) {
     af::dsp::VoiceRenderer* v = asVoice(voice);

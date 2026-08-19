@@ -80,7 +80,232 @@ float broadband(const float g[6]) {
 
 }  // namespace
 
+// ── く字の廊下を歩く（回折だけの定位を耳で確かめる）──
+//
+//   Unity を開かずに聴けるようにするためのモード。扉も開口も無く、
+//   両端にリスナーと音源。直線は角の内壁で必ず塞がれるので、届く音は全部回折。
+//   リスナーが手前の脚を角へ歩き、角を曲がって音源へ近づく。
+//
+//   ★早期反射も鳴らす。実測では方向を運べるエネルギーの大半がそちらにあり
+//     （早期反射 16.24 対 回折二次音源 0.0070）、そこを外すと聴く意味がない。
+//   ★A/B のために ear0 を渡すと反射タップの軽量な両耳化を切れる
+//     （＝等パワーパンだけの従来の鳴り方）。同じ歩きで 2 本作って聴き比べる。
+int renderCorridor(const char* outPath, bool earCues, bool useClick) {
+    std::printf("=== く字の廊下を歩く（回折だけの定位）===\n");
+    std::printf("  反射タップの両耳化: %s\n",
+                earCues ? "ON（ITD＋帯域別ILD）" : "OFF（等パワーパンだけ）");
+
+    const float w = 1.5f, h = 3.0f, t = 0.3f, aEnd = -12.0f, bEnd = 12.0f;
+    AF_SceneHandle s = AF_SceneCreate();
+    AF_SceneSetRoomCellSize(s, 0.25f);
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    auto bx = [&](float cx, float cy, float cz, float sx, float sy, float sz) {
+        AF_SceneAddInstanceBox(s, V(cx, cy, cz), V(sx * 0.5f, sy * 0.5f, sz * 0.5f),
+                               V(1, 0, 0), V(0, 1, 0), mat);
+    };
+    bx(-w - t * 0.5f, h * 0.5f, (aEnd + w) * 0.5f, t, h, w - aEnd + t);
+    bx( w + t * 0.5f, h * 0.5f, (aEnd - w) * 0.5f, t, h, -w - aEnd);
+    bx((bEnd - w) * 0.5f, h * 0.5f,  w + t * 0.5f, bEnd + w + t, h, t);
+    bx((bEnd + w) * 0.5f, h * 0.5f, -w - t * 0.5f, bEnd - w, h, t);
+    bx(0.0f, h * 0.5f, aEnd - t * 0.5f, 2 * w + 2 * t, h, t);
+    bx(bEnd + t * 0.5f, h * 0.5f, 0.0f, t, h, 2 * w + 2 * t);
+    for (int k = 0; k < 2; ++k) {
+        const float ft = 0.3f;
+        const float y = (k == 0) ? -ft * 0.5f : h + ft * 0.5f;
+        bx(0.0f, y, (aEnd + w) * 0.5f, 2 * w + 2 * t, ft, w - aEnd + t);
+        bx((bEnd - w) * 0.5f, y, 0.0f, bEnd + w + t, ft, 2 * w + 2 * t);
+    }
+    const AF_Vector3 S = V(bEnd - 2.0f, 1.6f, 0.0f);
+    AF_SceneSetSource(s, 1, S);
+    AF_SceneSetApertureSpread(s, 3);
+
+    AF_VoiceConfig cfg{};
+    cfg.sampleRate = kSampleRate;
+    cfg.maxFrames = kBlock;
+    cfg.tailSeconds = 1.2f;
+    AF_VoiceHandle voice = AF_VoiceCreate(&cfg);
+    AF_VoiceSetOutputGain(voice, 0.6f);
+    // ★実測 HRTF を使う。合成（球体頭）は前後が同一で、定位を聴く目的に合わない。
+    AF_HrtfHandle hrtf = AF_HrtfLoadFile("UnityDemo/Assets/StreamingAssets/kemar.afhr");
+    if (!hrtf) hrtf = AF_HrtfLoadFile("../UnityDemo/Assets/StreamingAssets/kemar.afhr");
+    if (!hrtf) hrtf = AF_HrtfLoadFile("../../UnityDemo/Assets/StreamingAssets/kemar.afhr");
+    if (hrtf) {
+        char nm[64];
+        AF_HrtfGetName(hrtf, nm, 64);
+        std::printf("  HRTF: %s\n", nm);
+    } else {
+        hrtf = AF_HrtfCreateSynthetic(kSampleRate);
+        std::printf("  HRTF: 合成（kemar が見つからず）\n");
+    }
+    AF_VoiceSetHrtf(voice, hrtf);
+    AF_VoiceSetHrtfEnabled(voice, 1);
+    AF_VoiceSetEarCues(voice, earCues ? 1 : 0);
+
+    const float seconds = 18.0f;
+    const int total = static_cast<int>(seconds * kSampleRate);
+    std::vector<float> outL(static_cast<std::size_t>(total), 0.0f);
+    std::vector<float> outR(static_cast<std::size_t>(total), 0.0f);
+    std::vector<float> dry(kBlock), bl(kBlock), br(kBlock);
+    std::vector<float> echo(200 * 6, 0.0f);
+    const float binMs = 5.0f;
+    unsigned int rs = 22222u;
+    float pink = 0.0f;
+
+    std::printf("  手前の脚を角へ歩き、角を曲がって音源へ近づきます（%.0f 秒）\n", seconds);
+    int pos = 0, blockIndex = 0;
+    while (pos < total) {
+        const int n = std::min(kBlock, total - pos);
+        const float u = static_cast<float>(pos) / static_cast<float>(total);
+        // 前半: z を aEnd+2 → 0 へ（角まで）。後半: x を 0 → bEnd-4 へ（音源へ）。
+        AF_Vector3 L;
+        if (u < 0.55f) {
+            const float a = u / 0.55f;
+            L = V(0.0f, 1.6f, (aEnd + 2.0f) * (1.0f - a));
+        } else {
+            const float a = (u - 0.55f) / 0.45f;
+            L = V((bEnd - 4.0f) * a, 1.6f, 0.0f);
+        }
+        AF_SceneSetListener(s, L);
+        AF_SceneUpdate(s, static_cast<float>(n) / kSampleRate);
+        const int idx = AF_SceneSourceIndex(s, 1);
+
+        AF_VoiceTap taps[16] = {};
+        int nTaps = 0;
+        float trans[6] = {};
+        float occFrac = 0.0f;
+        AF_SceneComputeSoftOcclusion(s, L, S, trans, 6, &occFrac);
+        const float dd = std::sqrt((S.x - L.x) * (S.x - L.x) + (S.y - L.y) * (S.y - L.y)
+                                 + (S.z - L.z) * (S.z - L.z));
+        const float distGain = 4.0f / std::max(dd, 4.0f);
+        for (int b = 0; b < 6; ++b) taps[0].gain6[b] = trans[b] * distGain;
+        taps[0].panL = taps[0].panR = 0.70710678f;
+        nTaps = 1;
+
+        // 回折タップ。最強の 1 本はフル HRTF に載せる（B1）。
+        AF_Vector3 dp[8];
+        float dg[8];
+        float db[8 * 6];
+        const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+        int bestDiff = -1;
+        float bestG = 0.0f;
+        for (int i = 0; i < nd && nTaps < 16; ++i) {
+            const float dx = dp[i].x - L.x, dy = dp[i].y - L.y, dz = dp[i].z - L.z;
+            const float plen = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const float at = 4.0f / std::max(plen, 4.0f);
+            float sum = 0.0f;
+            for (int b = 0; b < 6; ++b) {
+                taps[nTaps].gain6[b] = db[i * 6 + b] * occFrac * at;
+                sum += taps[nTaps].gain6[b];
+            }
+            const float inv = (plen > 1e-4f) ? 1.0f / plen : 0.0f;
+            taps[nTaps].dirX = dx * inv;
+            taps[nTaps].dirY = dy * inv;
+            taps[nTaps].dirZ = dz * inv;
+            const float xr = (dx * inv + 1.0f) * 0.5f;
+            taps[nTaps].panL = std::sqrt(1.0f - xr);
+            taps[nTaps].panR = std::sqrt(xr);
+            const float relMs = (plen - dd) / kSpeedOfSound * 1000.0f;
+            taps[nTaps].delaySamples =
+                std::max(0, static_cast<int>(relMs * 0.001f * kSampleRate));
+            AF_VoiceScatterSplit(relMs, 25.0f, 0.0f, 1.0f,
+                                 &taps[nTaps].gSpec, &taps[nTaps].gDiff);
+            if (sum > bestG) { bestG = sum; bestDiff = nTaps; }
+            ++nTaps;
+        }
+        if (bestDiff >= 0) {
+            taps[bestDiff].hrtfWeight = 1.0f;
+            AF_VoiceSetDiffractionDirection(
+                voice, V(taps[bestDiff].dirX, taps[bestDiff].dirY, taps[bestDiff].dirZ), 57.0f);
+        }
+
+        // ★早期反射。ここに方向エネルギーの大半がある。
+        AF_Vector3 ep[16];
+        float eg6[16 * 6];
+        const int ne = (idx >= 0) ? AF_SceneGetEarlyReflections(s, idx, ep, eg6, 16) : 0;
+        for (int i = 0; i < ne && nTaps < 16; ++i) {
+            const float dx = ep[i].x - L.x, dy = ep[i].y - L.y, dz = ep[i].z - L.z;
+            const float plen = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const float at = 4.0f / std::max(plen, 4.0f);
+            for (int b = 0; b < 6; ++b) taps[nTaps].gain6[b] = eg6[i * 6 + b] * at * 0.35f;
+            const float inv = (plen > 1e-4f) ? 1.0f / plen : 0.0f;
+            taps[nTaps].dirX = dx * inv;
+            taps[nTaps].dirY = dy * inv;
+            taps[nTaps].dirZ = dz * inv;
+            const float xr = (dx * inv + 1.0f) * 0.5f;
+            taps[nTaps].panL = std::sqrt(1.0f - xr);
+            taps[nTaps].panR = std::sqrt(xr);
+            const float relMs = (plen - dd) / kSpeedOfSound * 1000.0f;
+            taps[nTaps].delaySamples =
+                std::max(0, static_cast<int>(relMs * 0.001f * kSampleRate));
+            AF_VoiceScatterSplit(relMs, 25.0f, 0.3f, 1.0f,
+                                 &taps[nTaps].gSpec, &taps[nTaps].gDiff);
+            ++nTaps;
+        }
+        AF_VoiceSetTaps(voice, taps, nTaps);
+
+        float ad[3] = {0, 0, 1};
+        if (idx >= 0) AF_SceneGetSourceArrivalDir(s, idx, ad);
+        AF_VoiceSetDirection(voice, V(ad[0], ad[1], ad[2]), 57.0f);
+
+        if ((blockIndex % 16) == 0) {
+            const AF_Vector3 srcArr[1] = { S };
+            AF_SceneComputeEchogramBands(s, L, srcArr, 1, echo.data(), 200,
+                                         binMs * 0.001f, kSpeedOfSound, 512, 12, 4.0f);
+            float dGain = 0.0f;
+            for (int i = 0; i < nTaps; ++i) dGain += broadband(taps[i].gain6);
+            AF_VoiceRebuildTail(voice, echo.data(), 200, binMs, 25.0f, 8.0f,
+                                30.0f, 0.0f, 0.6f, dGain, 0.6f, nullptr, 0);
+        }
+
+        for (int i = 0; i < n; ++i) {
+            if (useClick) {
+                const int period = static_cast<int>(kSampleRate * 0.4f);
+                const int ph = (pos + i) % period;
+                dry[static_cast<std::size_t>(i)] =
+                    (ph < 64) ? std::exp(-ph * 0.06f) * 0.9f : 0.0f;
+            } else {
+                rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5;
+                const float wn = static_cast<int>(rs) * (1.0f / 2147483648.0f);
+                pink += 0.03f * (wn - pink);
+                dry[static_cast<std::size_t>(i)] = (pink * 3.0f + wn * 0.15f) * 0.5f;
+            }
+        }
+        AF_VoiceRender(voice, dry.data(), n, bl.data(), br.data(), nullptr);
+        for (int i = 0; i < n; ++i) {
+            outL[static_cast<std::size_t>(pos + i)] = bl[static_cast<std::size_t>(i)];
+            outR[static_cast<std::size_t>(pos + i)] = br[static_cast<std::size_t>(i)];
+        }
+        if ((blockIndex % 128) == 0)
+            std::printf("    %5.1f 秒  位置 (%5.1f, %5.1f)  回折 %d本  反射 %d本\n",
+                        static_cast<float>(pos) / kSampleRate, L.x, L.z, nd, ne);
+        pos += n;
+        ++blockIndex;
+    }
+    AF_VoiceDestroy(voice);
+    AF_HrtfDestroy(hrtf);
+    AF_SceneDestroy(s);
+    if (!writeWav(outPath, outL, outR, kSampleRate)) {
+        std::printf("[FAIL] 書き出せませんでした: %s\n", outPath);
+        return 1;
+    }
+    std::printf("[OK] 書き出しました: %s (%.1f 秒)\n", outPath, seconds);
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    // corridor … く字の廊下を歩く（回折だけの定位を耳で確かめる）。Unity 不要。
+    //   AfRenderWav corridor <出力> [ear0] [click]
+    //     ear0  … 反射タップの両耳化を切る（従来の等パワーパンだけ）。A/B 用
+    //     click … ドライ信号を過渡音にする（反射の粒が見える。ノイズは粒を隠す）
+    if (argc > 1 && std::string(argv[1]) == "corridor") {
+        const char* out = (argc > 2) ? argv[2] : "corridor.wav";
+        bool ear = true, clk = false;
+        for (int a = 3; a < argc; ++a) {
+            if (std::string(argv[a]) == "ear0") ear = false;
+            if (std::string(argv[a]) == "click") clk = true;
+        }
+        return renderCorridor(out, ear, clk);
+    }
     const char* outPath = (argc > 1) ? argv[1] : "door_sweep.wav";
     // 第2引数に btm を渡すと回折を BTM（有限楔の稜線積分）で出す。鳴らし比べ用。
     const bool useBtm = (argc > 2) && std::string(argv[2]) == "btm";

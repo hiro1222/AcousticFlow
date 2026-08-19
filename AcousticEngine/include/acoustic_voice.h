@@ -143,6 +143,12 @@ ACOUSTIC_API void AF_VoiceSetScatterDiffusion(AF_VoiceHandle voice, float g);
 /* wet は開けた場所ほど小さく、srcLevel は壁裏で小さくなる（尾を絞る）。 */
 ACOUSTIC_API void AF_VoiceSetTailEnvelope(AF_VoiceHandle voice, float wet, float srcLevel);
 
+/* 反射タップの軽量な両耳化（ITD ＋ 帯域別 ILD）。既定 ON。
+ * 切ると従来の等パワーパンに戻る（A/B 用）。
+ * ★フル HRTF を通すのは直接音と hrtfWeight>0 のタップだけ。多数の反射に HRIR を
+ *   畳み込むと重い（HRTF 1 本 +0.102ms/block に対し、こちらは 7 本で +0.043ms）。*/
+ACOUSTIC_API void AF_VoiceSetEarCues(AF_VoiceHandle voice, int enabled);
+
 /* 診断用。 */
 ACOUSTIC_API int AF_VoiceTailPartitions(AF_VoiceHandle voice);
 ACOUSTIC_API int AF_VoiceTailLatency(AF_VoiceHandle voice);
