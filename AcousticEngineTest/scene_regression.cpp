@@ -3220,6 +3220,50 @@ void diagnosePillarTimbre() {
 // 屋外（地面だけ／壁で囲われていない）が部屋として検出されないこと。
 //   ゲーム側から「屋外の広い自由空間が巨大な 1 部屋になるのでは」という疑いが出た。
 //   部屋になると巨大な V から根拠のない尾が出る。ならないならフォールバック経路の話になる。
+// 格子が上限に当たって黙って粗くなる件。
+//
+//   格子は**登録された全ボックスの AABB 全体**を覆うので、広い地面を 1 枚置くだけで
+//   指定したセルが無視される。0.25m → 0.375m に降格すると、0.9m の戸口を割るのに要る
+//   「幅 = 半径×2」の余裕が無くなり、**部屋がそこで割れなくなる**。
+//   音の結果（別の部屋の残響が乗るかどうか）が変わるのに何も出ないので、
+//   ホストが検知できる口を用意した ── その口が実際に立つことを縛る。
+void testRoomGridDegradeDetect() {
+    std::printf("\n[部屋] 格子が上限で粗くなったことを検知できるか\n");
+    struct C { const char* name; float half; float h; float cell; bool wantDegrade; };
+    const C cases[] = {
+        {"25x25m・天井 4m   0.25m 指定", 12.5f,  4.0f, 0.25f, false},
+        // ゲーム側の神殿と同じ規模（90x90m の地面・天井 10m）。実際にここで降格していた。
+        {"90x90m・天井 10m  0.25m 指定", 45.0f, 10.0f, 0.25f, true },
+    };
+    for (const C& c : cases) {
+        AF_SceneHandle s = AF_SceneCreate();
+        AF_SceneSetRoomCellSize(s, c.cell);
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        // 地面＋壁＋天井で囲う。
+        const float t = 0.3f, h = c.h;
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(c.half, t, c.half), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(c.half, t, c.half), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-c.half, h*0.5f, 0), V(t, h*0.5f, c.half), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( c.half, h*0.5f, 0), V(t, h*0.5f, c.half), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -c.half), V(c.half, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  c.half), V(c.half, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+
+        float req = 0.0f, act = 0.0f; double nv = 0.0, maxv = 0.0;
+        const int bad = AF_SceneRoomGridDegraded(s, &req, &act, &nv, &maxv);
+        std::printf("        %s  要求 %.3fm → 実際 %.3fm / %.0f ボクセル（上限 %.0f）%s\n",
+                    c.name, req, act, nv, maxv, bad ? "  ★降格" : "");
+        char tag[96];
+        std::snprintf(tag, sizeof(tag), "[部屋] %s の降格判定",
+                      c.wantDegrade ? "広すぎる格子" : "収まる格子");
+        check(tag, (bad != 0) == c.wantDegrade);
+        if (c.wantDegrade) check("[部屋] 降格したら実セルが要求より大きい", act > req * 1.001f);
+        else               check("[部屋] 収まっていれば実セル＝要求", act <= req * 1.001f);
+        AF_SceneDestroy(s);
+    }
+    std::printf("      → 降格すると 幅 実セル×2 未満の戸口で部屋が割れなくなる。\n"
+                "        ホストは AF_SceneRoomGridDegraded で気づいて警告すること。\n");
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -4991,6 +5035,7 @@ int main() {
     testRoomIncremental();
     diagnoseRoomDetection();
     testOutdoorIsNotARoom();
+    testRoomGridDegradeDetect();
     testManySources();
     diagnosePortalScopeGlobal();
     diagnosePerSourceEchogram();

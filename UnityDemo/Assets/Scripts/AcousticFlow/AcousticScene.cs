@@ -595,6 +595,35 @@ namespace AcousticFlow
             if (_handle != IntPtr.Zero) Native.AF_SceneSetRoomCellSize(_handle, meters);
         }
 
+        // 格子が上限に当たって粗くなっていたら **1 度だけ** 警告する。
+        //
+        //   ★格子は登録された全ボックスの AABB 全体を覆う。総ボクセル数が上限（400万）を
+        //     超えると、収まるまでセルが 1.5 倍ずつ粗くなる ── つまり
+        //     **広い地面を 1 枚置くだけで SetRoomCellSize が黙って無視される**。
+        //     0.25m → 0.375m の降格で 0.9m の戸口が割れなくなり、部屋が繋がったまま
+        //     鳴る（＝別の部屋の残響が乗る）。音の結果が変わるのに何も出ないので、
+        //     気づけるのは「なんか変」だけになる。ここで数字にして出す。
+        //   ★直し方は「音響用の形状を遊ぶ範囲だけに絞る」。見た目の地面は
+        //     コライダーを付けなければ格子に入らない。
+        private bool _gridWarned;
+        public void CheckRoomGridDegraded()
+        {
+            if (_handle == IntPtr.Zero || _gridWarned) return;
+            int bad;
+            float req, act; double nv, maxv;
+            try { bad = Native.AF_SceneRoomGridDegraded(_handle, out req, out act, out nv, out maxv); }
+            catch (System.Exception) { return; }   // 古い DLL。ABI 照合の側で警告が出る
+            if (bad == 0) return;
+            _gridWarned = true;
+            UnityEngine.Debug.LogWarning(
+                $"[AcousticScene] 部屋グラフの格子が粗くなりました: 要求 {req:0.###}m → 実際 {act:0.###}m"
+                + $"（{nv:N0} / 上限 {maxv:N0} ボクセル）。\n"
+                + $"  幅 {act * 2f:0.##}m 未満の戸口では部屋が割れません"
+                + "（部屋が繋がったまま鳴る＝別の部屋の残響が乗る）。\n"
+                + "  音響用の形状を遊ぶ範囲だけに絞ってください"
+                + "（見た目の地面はコライダーを外せば格子に入りません）。");
+        }
+
         // 部屋を戸口で割る半径(m)。幅がこの 2 倍に満たないくびれで部屋が分かれる。
         public void SetRoomSeedRadius(float meters)
         {

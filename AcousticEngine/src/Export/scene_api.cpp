@@ -660,6 +660,21 @@ void AF_SceneSetRoomCellSize(AF_SceneHandle scene, float meters) {
     if (s) s->setRoomCellSize(meters);
 }
 
+int AF_SceneRoomGridDegraded(AF_SceneHandle scene, float* outRequested, float* outActual,
+                             double* outVoxels, double* outMaxVoxels) {
+    Scene* s = asScene(scene);
+    if (!s) return 0;
+    const auto& g = s->roomGraph().grid;
+    const float req = s->roomCellRequested();
+    const double nv = static_cast<double>(g.nx) * g.ny * g.nz;
+    if (outRequested)  *outRequested  = req;
+    if (outActual)     *outActual     = g.cell;
+    if (outVoxels)     *outVoxels     = nv;
+    if (outMaxVoxels)  *outMaxVoxels  = static_cast<double>(s->roomMaxVoxels());
+    // 1.5 倍ずつしか粗くならないので、少しでも大きければ降格している。
+    return (g.cell > req * 1.001f) ? 1 : 0;
+}
+
 void AF_SceneRoomGridDims(AF_SceneHandle scene, int* nx, int* ny, int* nz, float* cell) {
     Scene* s = asScene(scene);
     if (!s) return;

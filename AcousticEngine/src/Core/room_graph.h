@@ -322,7 +322,13 @@ public:
     void setCell(float m) {
         if (m > 1e-3f && m != cell_) { cell_ = m; needFull_ = true; }
     }
+    /// 呼び出し側が**要求した**セル。実際に使われた値は result().grid.cell。
+    ///   総ボクセル数が maxVoxels() を超えると、収まるまで 1.5 倍ずつ粗くするので
+    ///   両者は食い違うことがある。**その降格は音の結果を変える**（戸口の幅を
+    ///   数ボクセルで割れなくなると、部屋がそこで割れなくなる）ので、
+    ///   ホストは 2 つを比べて気づけるようにしてある。
     float cell() const { return cell_; }
+    std::size_t maxVoxels() const { return maxVoxels_; }
 
     // これ未満の連結成分は部屋として扱わない（隙間のノイズを捨てる）。
     void setMinVoxels(int n) {
@@ -1124,6 +1130,11 @@ private:
         };
         g.nx = dim(lo.x, hi.x); g.ny = dim(lo.y, hi.y); g.nz = dim(lo.z, hi.z);
         // 総数が上限を超えるなら、収まるまで粗くする。
+        //   ★これは**黙って起きる**。格子は登録された全ボックスの AABB 全体を覆うので、
+        //     広い地面を 1 枚置くだけで要求したセルが無視される。
+        //     0.25m 指定が 0.375m に降格すると、0.9m の戸口を割るのに必要な
+        //     「幅 = 半径×2」の余裕が無くなって**部屋が割れなくなる**（§11 の目安）。
+        //     ホストが気づけるよう、要求値 cell_ は残してある（cell() で読める）。
         while (static_cast<std::size_t>(g.nx) * g.ny * g.nz > maxVoxels_) {
             g.cell *= 1.5f;
             g.nx = dim(lo.x, hi.x); g.ny = dim(lo.y, hi.y); g.nz = dim(lo.z, hi.z);

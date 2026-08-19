@@ -377,6 +377,11 @@ namespace AcousticFlow
         // ボクセル一辺(m)。既定 0.25。細かいほど狭い戸口を見分けられるがコストが増える。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneSetRoomCellSize(IntPtr scene, float meters);
+        // 格子が上限に当たって粗くなっていないか。戻り値 1 で降格あり。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneRoomGridDegraded(IntPtr scene, out float requested,
+                                                          out float actual, out double voxels,
+                                                          out double maxVoxels);
 
         // 部屋を戸口で割る半径(m)。既定 0.6。幅がこの 2 倍に満たないくびれで部屋が分かれる。
         [DllImport(Dll, CallingConvention = Cc)]
@@ -423,7 +428,7 @@ namespace AcousticFlow
         //   DLL だけ古いまま C# を更新すると、AF_VoiceTap の長さが食い違って
         //   マーシャラが別の刻み幅で書き込む（44→48 バイトになった）。例外も出ずに
         //   タップの中身が化けるので、原因に辿り着けない。ここで止める。
-        public const int ExpectedAbiVersion = 1;
+        public const int ExpectedAbiVersion = 2;
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_AbiVersion();
 

@@ -1384,6 +1384,10 @@ namespace AcousticFlow
             _scene.SetRoomCellSize(roomCellSize);
             _scene.SetRoomSeedRadius(roomSeedRadius);
             _scene.Update(Time.deltaTime);
+            // 格子が上限に当たって粗くなっていたら警告する（中で 1 度だけ出す）。
+            //   広い地面を 1 枚置くだけで roomCellSize が黙って無視されるので、
+            //   気づけないと「部屋が割れていない」ことに最後まで気づかない。
+            _scene.CheckRoomGridDegraded();
 
             // 3-b) 音源ごとの帯域別生存と到来方向を受け取る。
             for (int i = 0; i < _sources.Length; i++)

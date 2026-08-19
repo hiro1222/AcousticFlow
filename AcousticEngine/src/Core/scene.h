@@ -277,6 +277,9 @@ public:
         return roomBuilder_.build(statics);
     }
     void setRoomCellSize(float m) { roomBuilder_.setCell(m); }
+    /// 要求したセル（実際に使われた値は roomGraph().grid.cell）。
+    float roomCellRequested() const { return roomBuilder_.cell(); }
+    std::size_t roomMaxVoxels() const { return roomBuilder_.maxVoxels(); }
     void setRoomBrick(int voxels) { roomBuilder_.setBrick(voxels); }
     void setRoomSeedRadius(float m) { roomBuilder_.setSeedRadius(m); }
     void setRoomChamferFull(bool on) { roomBuilder_.setChamferFull(on); }

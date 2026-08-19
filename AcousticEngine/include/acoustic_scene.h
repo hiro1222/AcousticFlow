@@ -329,6 +329,22 @@ ACOUSTIC_API int  AF_SceneRoomInfo(AF_SceneHandle scene, int room, float* outVol
 /* ボクセル一辺(m)。戸口の幅を数ボクセルで割れる大きさにすること（既定 0.25）。 */
 ACOUSTIC_API void AF_SceneSetRoomCellSize(AF_SceneHandle scene, float meters);
 /* 検出に使った格子の寸法（診断用）。 */
+/* 格子が上限に当たって粗くなっていないかを調べる。戻り値 1 で降格あり。
+ *
+ * 格子は**登録された全ボックスの AABB 全体**を覆う。総ボクセル数が上限
+ * （既定 400 万）を超えると、収まるまでセルを 1.5 倍ずつ粗くする。
+ * つまり広い地面を 1 枚置くだけで AF_SceneSetRoomCellSize が黙って無視される。
+ * 0.25m → 0.375m に降格すると 0.9m の戸口で部屋が割れなくなるので、
+ * **音の結果が変わるのに何も出ない**。ホストはこれを見て警告すること。
+ *   outRequested : 要求したセル(m)
+ *   outActual    : 実際に使われたセル(m)
+ *   outVoxels    : 実際の総ボクセル数
+ *   outMaxVoxels : 上限
+ * いずれも NULL 可。 */
+ACOUSTIC_API int AF_SceneRoomGridDegraded(AF_SceneHandle scene, float* outRequested,
+                                          float* outActual, double* outVoxels,
+                                          double* outMaxVoxels);
+
 ACOUSTIC_API void AF_SceneRoomGridDims(AF_SceneHandle scene, int* nx, int* ny, int* nz,
                                        float* cell);
 /* 構築の段別所要時間(ms)と、直近の更新で塗り直したブロック数。
