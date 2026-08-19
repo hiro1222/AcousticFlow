@@ -111,13 +111,110 @@ namespace AcousticFlow.EditorTools
             MakeBox("Partition_R", new Vector3(gapR + rightW * 0.5f, height * 0.5f, wallZ),
                     new Vector3(rightW, height, thick));
 
+            // ★開口にポータルを置く。**部屋グラフの自動生成では拾えない**開口なので手置き。
+            //   自動生成は「戸口で部屋が割れた所」に生える。ここは開口が 2m あり、
+            //   種半径 0.6m の侵食では括れないので部屋が 1 つのままで、開口が立たない。
+            //   ポータルを置くとフレネル帯域積分が担当し、円盤の標本化（1/N の階段）から
+            //   解析的で連続な開口率へ変わる。実測（同じ戸口で自動生成の ON/OFF を比較）:
+            //     0.1m 刻みの最大段差  合計 4.08 → 1.00 dB / 傾き 0.53 → 0.18 dB
+            //   有無を聴き比べたいときは AcousticPortal.active を切る。
+            var portalGo = new GameObject("Portal_Gap");
+            portalGo.transform.position = new Vector3((gapL + gapR) * 0.5f, height * 0.5f, wallZ);
+            portalGo.transform.rotation = Quaternion.identity;   // forward=+Z が開口の法線
+            var portal = portalGo.AddComponent<AcousticPortal>();
+            portal.width = gapR - gapL;      // 2m
+            portal.height = height;          // 床から天井まで（仕切りは全高なので開口も全高）
+
             // 音源は仕切りの奥・左寄り。開口の正面を外してあるので、必ず回折で回り込む必要がある。
             var srcPos = new Vector3(-3f, 1.6f, 2f);
             AddDemo(listener, srcPos, AcousticMaterialPreset.Concrete);
             Save(scene, "Test_DiffractionGap.unity",
                 "回折(開口): 仕切りの右に2mの開口。音源は奥の左側なので直接は必ず遮蔽される。" +
                 "A/Dで左右に動くと開口の縁を回り込む回折が変化する。" +
-                "影境界を跨ぐとき段差なく連続に変わるかを確認する。");
+                "影境界を跨ぐとき段差なく連続に変わるかを確認する。" +
+                "Portal_Gap の active を切ると、ポータル無し（標本化）との聴き比べになる。");
+        }
+
+        // ── く字の廊下：戸口（ポータル）と曲がり角（純粋な回折）を 1 本の歩きで比べる ──
+        //
+        //   この 2 つは**エンジンの中で別の経路**を通る。同じシーンに置いて、
+        //   同じ歩きで続けて出会えるようにしてある。
+        //
+        //     戸口 1.0m   … 幅が種半径 0.6m の 2 倍に満たないので部屋が割れる
+        //                   → 開口が立つ → ポータルが自動生成される
+        //                   → フレネル帯域積分（解析的・連続）が担当
+        //     曲がり角    … 廊下は 3m 幅のまま括れないので部屋は割れない
+        //                   → 開口は立たない → 一般の稜線回折（円盤の標本化）が担当
+        //
+        //   実測の差（同じ戸口で自動生成の ON/OFF を比べたもの。0.1m 刻みの最大段差）:
+        //     ポータル無し  合計 4.08dB / 傾き 0.53dB   ← 段→踊り場→段 の階段
+        //     ポータル有り  合計 1.00dB / 傾き 0.18dB   ← 一定勾配の滑り台
+        //   耳で確かめたいのはこの**形の違い**。歩いて「動いた/止まった」が音に出るかを聴く。
+        //
+        //   音源は 2 つ。Y で C++/C# 経路、1/2 で音源の切り替え。
+        //     Door … 戸口の真向こう。戸口だけを通って届く
+        //     Bend … 曲がり角の先。角の縁を回り込むしかない
+        [MenuItem("AcousticFlow/Test Scenes/L-Corridor (く字の廊下: 戸口と曲がり角)")]
+        public static void LCorridor()
+        {
+            var scene = NewScene();
+            const float w = 1.5f;      // 廊下の半幅（内寸 3m）
+            const float h = 3.0f;      // 天井高
+            const float t = 0.3f;      // 壁厚
+            const float aEnd = -12f;   // 手前の脚の端（Z）
+            const float bEnd = 12f;    // 奥の脚の端（X）
+            const float doorZ = -5f;   // 戸口の位置（Z）
+            const float doorW = 1.0f;  // 戸口の幅
+            const float doorH = 2.2f;  // 戸口の高さ
+
+            // 手前の脚: x∈[-w,w], z∈[aEnd, w] ／ 奥の脚: x∈[-w,bEnd], z∈[-w,w]
+            //   角は括れていないので部屋は割れない ＝ 開口が立たない ＝ 純粋な回折。
+            MakeBox("Wall_A_Left",  new Vector3(-w - t*0.5f, h*0.5f, (aEnd + w)*0.5f),
+                    new Vector3(t, h, w - aEnd + t));
+            MakeBox("Wall_A_Right", new Vector3( w + t*0.5f, h*0.5f, (aEnd - w)*0.5f),
+                    new Vector3(t, h, -w - aEnd));
+            MakeBox("Wall_B_Far",   new Vector3((bEnd - w)*0.5f, h*0.5f,  w + t*0.5f),
+                    new Vector3(bEnd + w + t, h, t));
+            MakeBox("Wall_B_Near",  new Vector3((bEnd + w)*0.5f, h*0.5f, -w - t*0.5f),
+                    new Vector3(bEnd - w, h, t));
+            MakeBox("Cap_A", new Vector3(0f, h*0.5f, aEnd - t*0.5f), new Vector3(2*w + 2*t, h, t));
+            MakeBox("Cap_B", new Vector3(bEnd + t*0.5f, h*0.5f, 0f), new Vector3(t, h, 2*w + 2*t));
+            // 床と天井は脚ごとに 2 枚ずつ。角で重なるが問題ない。
+            for (int k = 0; k < 2; k++) {
+                const float ft = 0.3f;
+                float y = (k == 0) ? -ft*0.5f : h + ft*0.5f;
+                string s = (k == 0) ? "Floor" : "Ceil";
+                MakeBox(s + "_A", new Vector3(0f, y, (aEnd + w)*0.5f),
+                        new Vector3(2*w + 2*t, ft, w - aEnd + t));
+                MakeBox(s + "_B", new Vector3((bEnd - w)*0.5f, y, 0f),
+                        new Vector3(bEnd + w + t, ft, 2*w + 2*t));
+            }
+
+            // 戸口。廊下を仕切って幅 1.0m だけ空ける（両袖＋まぐさ）。
+            //   幅 1.0m < 種半径 0.6m × 2 なので**ここで部屋が割れ、開口が自動生成される**。
+            float jambW = w - doorW * 0.5f;                 // 片袖の幅 0.5m
+            MakeBox("Door_JambL", new Vector3(-(doorW*0.5f + jambW*0.5f), h*0.5f, doorZ),
+                    new Vector3(jambW, h, t));
+            MakeBox("Door_JambR", new Vector3( (doorW*0.5f + jambW*0.5f), h*0.5f, doorZ),
+                    new Vector3(jambW, h, t));
+            MakeBox("Door_Lintel", new Vector3(0f, doorH + (h - doorH)*0.5f, doorZ),
+                    new Vector3(doorW, h - doorH, t));
+
+            var listener = MakeListener(new Vector3(0f, 1.6f, -9f));   // 戸口の手前
+            // Door … 戸口の真向こう（戸口だけを通って届く）
+            // Bend … 曲がり角の先（角の縁を回り込むしかない）
+            var srcs = AddDemo(listener, new Vector3(1.0f, 1.6f, -2f),
+                               AcousticMaterialPreset.Concrete, new[] { "Door", "Bend" });
+            srcs[1].position = new Vector3(9f, 1.6f, 0f);
+
+            Save(scene, "Test_LCorridor.unity",
+                "く字の廊下: 戸口(1.0m)と曲がり角(2m幅)を 1 本の歩きで比べる。" +
+                "戸口は幅が種半径の2倍未満なので部屋が割れ、開口が立ってポータルが自動生成される" +
+                "（フレネル帯域積分＝解析的で連続）。曲がり角は括れないので開口が立たず、" +
+                "一般の稜線回折（円盤の標本化＝1/N の階段）が担当する。" +
+                "音源 Door は戸口越し、Bend は角の先。W/S で前後に歩き、" +
+                "同じ 0.1m でも段差の出方が違うことを聴く。" +
+                "autoPortals を切ると戸口側もポータル無しになり、階段が出る。");
         }
 
         // ── スイングドア：開き角で「直接聞こえる範囲」が連続的に変わる ──

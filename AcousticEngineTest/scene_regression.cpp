@@ -4045,6 +4045,120 @@ void diagnoseOpenApertureFraction() {
     std::printf("      ※塞ぐものが何も無いので、理屈の上では全帯域 1.0 のはず。\n");
 }
 
+// 【検証】く字の廊下シーン（Test_LCorridor）の狙いが幾何として成立するか。
+//
+//   狙い: 戸口 1.0m は種半径 0.6m の 2 倍に満たないので**部屋が割れて開口が立つ**
+//         → ポータルが自動生成 → フレネル帯域積分が担当。
+//         曲がり角は 2m 幅のまま括れないので**部屋は割れず開口も立たない**
+//         → 一般の稜線回折が担当。
+//   この 2 つが同じシーンに同居していないと、聴き比べにならない。先に数字で確かめる。
+void testLCorridorScene() {
+    std::printf("\n[検証] く字の廊下（戸口＝ポータル / 曲がり角＝素の回折）\n");
+    const float w = 1.5f, h = 3.0f, t = 0.3f;
+    const float aEnd = -12.0f, bEnd = 12.0f, doorZ = -5.0f, doorW = 1.0f, doorH = 2.2f;
+
+    // ★戸口 1.0m を 2m 幅の廊下に開けるので、括れの判定が際どい。
+    //   種半径 0.6m は「幅 1.2m 未満で割れる」の意味だが、格子の量子化で前後する。
+    //   どのセル／種半径なら狙いどおり割れるかを先に掃引して、シーンの設定を決める。
+    std::printf("        割れ方の掃引（部屋数 / 開口数）:\n");
+    auto buildAt = [&](float cell, float seed) {
+        AF_SceneHandle sc = AF_SceneCreate();
+        AF_SceneSetRoomCellSize(sc, cell);
+        AF_SceneSetRoomSeedRadius(sc, seed);
+        const int mm = AF_SceneAddMaterial(sc, nullptr, nullptr, nullptr, 0);
+        auto bx = [&](float cx, float cy, float cz, float sx, float sy, float sz) {
+            AF_SceneAddInstanceBox(sc, V(cx, cy, cz), V(sx*0.5f, sy*0.5f, sz*0.5f),
+                                   V(1,0,0), V(0,1,0), mm);
+        };
+        bx(-w - t*0.5f, h*0.5f, (aEnd + w)*0.5f, t, h, w - aEnd + t);
+        bx( w + t*0.5f, h*0.5f, (aEnd - w)*0.5f, t, h, -w - aEnd);
+        bx((bEnd - w)*0.5f, h*0.5f,  w + t*0.5f, bEnd + w + t, h, t);
+        bx((bEnd + w)*0.5f, h*0.5f, -w - t*0.5f, bEnd - w, h, t);
+        bx(0.0f, h*0.5f, aEnd - t*0.5f, 2*w + 2*t, h, t);
+        bx(bEnd + t*0.5f, h*0.5f, 0.0f, t, h, 2*w + 2*t);
+        for (int k = 0; k < 2; ++k) {
+            const float ft = 0.3f;
+            const float y = (k == 0) ? -ft*0.5f : h + ft*0.5f;
+            bx(0.0f, y, (aEnd + w)*0.5f, 2*w + 2*t, ft, w - aEnd + t);
+            bx((bEnd - w)*0.5f, y, 0.0f, bEnd + w + t, ft, 2*w + 2*t);
+        }
+        const float jw = w - doorW * 0.5f;
+        bx(-(doorW*0.5f + jw*0.5f), h*0.5f, doorZ, jw, h, t);
+        bx( (doorW*0.5f + jw*0.5f), h*0.5f, doorZ, jw, h, t);
+        bx(0.0f, doorH + (h - doorH)*0.5f, doorZ, doorW, h - doorH, t);
+        return sc;
+    };
+    float bestCell = 0.2f, bestSeed = 0.6f; bool found = false;
+    const float cells[] = {0.25f, 0.20f, 0.15f};
+    const float seeds[] = {0.6f, 0.7f, 0.8f, 0.9f};
+    for (float cc : cells) {
+        std::printf("          セル %.2fm:", cc);
+        for (float sd : seeds) {
+            AF_SceneHandle sc = buildAt(cc, sd);
+            AF_SceneSetListener(sc, V(0, 1.6f, -9.0f));
+            for (int i = 0; i < 4; ++i) AF_SceneUpdate(sc, 1.0f/60.0f);
+            const int r = AF_SceneRoomCount(sc), a = AF_SceneApertureCount(sc);
+            std::printf("  種%.1f→%d部屋/%d開口", sd, r, a);
+            if (!found && r == 2 && a == 1) { bestCell = cc; bestSeed = sd; found = true; }
+            AF_SceneDestroy(sc);
+        }
+        std::printf("\n");
+    }
+    std::printf("        → シーンに使う設定: セル %.2fm / 種半径 %.1fm%s\n",
+                bestCell, bestSeed, found ? "" : "（狙いどおりの組が無い）");
+
+    AF_SceneHandle s = buildAt(bestCell, bestSeed);
+    AF_SceneSetAutoPortals(s, 1);
+
+    AF_SceneSetListener(s, V(0, 1.6f, -9.0f));
+    AF_SceneSetSource(s, 1, V(1.0f, 1.6f, -2.0f));   // 戸口越し（横へずらして袖壁で塞がるように）
+    AF_SceneSetSource(s, 2, V(9.0f, 1.6f, 0.0f));    // 曲がり角の先
+    for (int i = 0; i < 8; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+
+    const int nRooms = AF_SceneRoomCount(s), nAper = AF_SceneApertureCount(s);
+    int nAuto = 0, nMan = 0;
+    AF_SceneGetPortalCounts(s, &nAuto, &nMan);
+    {   // 割れなかったときに原因を絞るための情報。
+        int gx = 0, gy = 0, gz = 0; float gc = 0.0f;
+        AF_SceneRoomGridDims(s, &gx, &gy, &gz, &gc);
+        std::printf("        格子 %dx%dx%d @%.2fm / 部屋の判定: 手前 z=-9 → %d,"
+                    " 戸口 z=-5 → %d, 角 (0,0) → %d, 奥 x=9 → %d\n",
+                    gx, gy, gz, gc,
+                    AF_SceneRoomAt(s, V(0, 1.6f, -9.0f)),
+                    AF_SceneRoomAt(s, V(0, 1.1f, -5.0f)),
+                    AF_SceneRoomAt(s, V(0, 1.6f, 0.0f)),
+                    AF_SceneRoomAt(s, V(9.0f, 1.6f, 0.0f)));
+    }
+    std::printf("        部屋 %d 個 / 開口 %d 箇所 / ポータル 自動 %d 枚（手置き %d）\n",
+                nRooms, nAper, nAuto, nMan);
+    check("[く字] 戸口で部屋が 2 つに割れる", nRooms == 2);
+    check("[く字] 開口は戸口の 1 箇所だけ（曲がり角では立たない）", nAper == 1);
+    check("[く字] 戸口にポータルが自動生成される", nAuto == 1);
+
+    if (nAuto == 1) {
+        AF_Vector3 pc{}, pu{}, pv{}; float hu = 0.0f, hv = 0.0f;
+        AF_SceneGetPortal(s, 0, &pc, &pu, &pv, &hu, &hv);
+        std::printf("        自動ポータル: 幅 %.2fm（実寸 %.2f）高さ %.2fm（実寸 %.2f）"
+                    " 中心 (%.2f, %.2f, %.2f)\n",
+                    hu*2.0f, doorW, hv*2.0f, doorH, pc.x, pc.y, pc.z);
+        check("[く字] 矩形が戸口の実寸に載る（幅 ±1セル）",
+              hu*2.0f > doorW - 0.2f && hu*2.0f < doorW + 0.25f);
+        check("[く字] 矩形が戸口の位置に立つ", std::fabs(pc.z - doorZ) < 0.3f);
+    }
+    // 2 つの音源が別々の経路を通っていること（同じ答えなら聴き比べにならない）。
+    float gD[kBands] = {}, gB[kBands] = {};
+    const int iD = AF_SceneSourceIndex(s, 1), iB = AF_SceneSourceIndex(s, 2);
+    if (iD >= 0) AF_SceneGetSourceOcclusion(s, iD, gD);
+    if (iB >= 0) AF_SceneGetSourceOcclusion(s, iB, gB);
+    std::printf("        生存ゲイン  戸口越し 125=%.4f 4k=%.4f（傾き %+.2f dB）\n",
+                gD[0], gD[5], 20.0 * std::log10(std::max(gD[5],1e-6f)/std::max(gD[0],1e-6f)));
+    std::printf("                    角の先   125=%.4f 4k=%.4f（傾き %+.2f dB）\n",
+                gB[0], gB[5], 20.0 * std::log10(std::max(gB[5],1e-6f)/std::max(gB[0],1e-6f)));
+    check("[く字] 2 つの音源が別の値になる（経路が違う）",
+          std::fabs(20.0 * std::log10(std::max(gD[0],1e-6f)/std::max(gB[0],1e-6f))) > 1.0);
+    AF_SceneDestroy(s);
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -5815,6 +5929,7 @@ int main() {
     testRoomSegmentation();
     testRoomIncremental();
     diagnoseRoomDetection();
+    testLCorridorScene();
     diagnoseOpenApertureFraction();
     diagnoseShadowSpectrumJump();
     diagnoseOutdoorWithBuilding();
