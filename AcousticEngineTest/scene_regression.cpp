@@ -3208,6 +3208,57 @@ void diagnosePillarTimbre() {
 //   エコグラムは全音源を同じ配列へ積むので 1 本しか出ない（computeEchogramBands）。
 //   そこから作った IR を全音源が畳むので、響く部屋の音源も吸う部屋の音源も同じ尾になる。
 //   音源を 1 本ずつ置いて測れば「本来どれだけ違うはずか」が出る。
+// 無関係な場所にポータルを 1 枚置くだけで、他の場所の回折が変わってしまわないか。
+//   computeDirectSoft は `if (!portals_.empty())` で分岐していて、シーンに 1 枚でも
+//   ポータルがあると前川の回折経路へ**一度も来なくなる**。判定がシーン全体になっている。
+//   本来の関心は「その経路をポータルが覆っているか」のはず。
+void diagnosePortalScopeGlobal() {
+    std::printf("\n[診断] 無関係なポータルが他の場所の回折を殺していないか\n");
+    const float h = 4.0f, t = 0.3f, hw = 8.0f, hd = 8.0f;
+    // 部屋の中央に柱。リスナーと音源はその両側（回折で回り込む）。
+    // ポータルは**遠くの壁**に置く。経路とは無関係。
+    // ★壁をよく吸わせる。反射込みの生存で見るので、反射が強いと回折の差が薄まる
+    //   （既定壁だと 0.7dB しか出ず、効果を見誤る）。
+    const float deadA[6] = {0.95f, 0.95f, 0.95f, 0.95f, 0.95f, 0.95f};
+    auto build = [&](bool withFarPortal) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, deadA, nullptr, 6);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),    V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0),   V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        // 経路を塞ぐ柱（z=0 に幅 2.4m）
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(1.2f, h*0.5f, 0.3f), V(1,0,0), V(0,1,0), m);
+        if (withFarPortal) {
+            // 部屋の隅（x=+7, z=+7）に小さなポータル。経路(x=0 付近)とは無関係。
+            AF_SceneAddPortal(s, V(7.0f, 1.2f, 7.0f), V(1,0,0), V(0,1,0), 0.45f, 1.0f);
+        }
+        return s;
+    };
+    const AF_Vector3 L = V(0, 1.6f, -4.0f), S = V(0, 1.6f, 4.0f);
+    const char* bandName[6] = {"125", "250", "500", " 1k", " 2k", " 4k"};
+    float g[2][kBands] = {};
+    for (int k = 0; k < 2; ++k) {
+        AF_SceneHandle s = build(k == 1);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+        const int idx = AF_SceneSourceIndex(s, 1);
+        if (idx >= 0) AF_SceneGetSourceOcclusion(s, idx, g[k]);
+        std::printf("      %s  生存ゲイン", (k == 0) ? "ポータルなし    " : "遠くにポータル1枚");
+        for (int b = 0; b < kBands; ++b) std::printf(" %s=%.4f", bandName[b], g[k][b]);
+        std::printf("\n");
+        AF_SceneDestroy(s);
+    }
+    double worst = 0.0;
+    for (int b = 0; b < kBands; ++b)
+        worst = std::max(worst, std::fabs(20.0 * std::log10(std::max(g[1][b], 1e-6f)
+                                                          / std::max(g[0][b], 1e-6f))));
+    std::printf("      → 差 最大 %.1f dB。経路と無関係なポータルなので **0 dB が正しい**。\n", worst);
+}
+
 void diagnosePerSourceEchogram() {
     std::printf("\n[診断] 別の部屋の音源は別の尾を持つべきか\n");
     const float h = 4.0f, t = 0.15f, hw = 6.0f, hd = 8.0f, doorW = 0.9f;
@@ -4790,6 +4841,7 @@ int main() {
     testRoomSegmentation();
     testRoomIncremental();
     diagnoseRoomDetection();
+    diagnosePortalScopeGlobal();
     diagnosePerSourceEchogram();
     diagnoseAbsorptionVsLocalization();
     diagnoseShadowCliff();
