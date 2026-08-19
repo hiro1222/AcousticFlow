@@ -3787,6 +3787,87 @@ void testApertureTimbreKnob() {
                 "        どれだけ誇張するかは作品側が決める（決めごと #3）。\n");
 }
 
+// 【ゲー側からの確認依頼】「地面の板 + 閉じた建物」が同居したとき、屋外の空気が
+//   部屋として立っていないか。
+//
+//   testOutdoorIsNotARoom は 地面だけ／地面＋塀／地面＋壁＋天井 を見ているが、
+//   **建物と屋外が同じシーンに居るとき**を見ていなかった。実機（神殿）では
+//   リスナーが建物の外に居るのに「部屋0 に 100%」「実効V 22398m³」と出ており、
+//   これは地面 46×70m × 高さ 8.65m の空気から建物を引いた量にほぼ一致する。
+void diagnoseOutdoorWithBuilding() {
+    std::printf("\n[調査] 地面の板 + 閉じた建物 ── 屋外が部屋になっていないか\n");
+    // 実機（神殿）に寄せる: 音響用の地面 46x70m、主室 20x18x8m。
+    const float gx = 23.0f, gz = 35.0f, gt = 0.2f;      // 地面の板（半寸法）
+    const float rx = 10.0f, rz = 9.0f, rh = 8.0f, wt = 0.3f;  // 建物の内寸/高さ/壁厚
+    // ★戸口の有無で分ける。相手のシーンは開口 4275 箇所＝穴が空いている。
+    //   閉じた建物だと屋外は行き止まりだが、戸口があると屋外の空気が
+    //   建物の中の種まで**繋がる**。塗り戻しがそこを通れるなら、
+    //   「外の世界」として捨てたはずのボクセルが部屋に吸われる。
+    struct C { const char* name; float cell; float seed; float doorW; };
+    const C cases[] = {
+        {"閉じた建物   セル0.25/種0.6", 0.25f, 0.6f, 0.0f},
+        {"戸口 1.1m    セル0.25/種0.6", 0.25f, 0.6f, 1.1f},
+        {"戸口 1.1m    セル0.25/種0.0", 0.25f, 0.0f, 1.1f},
+        {"戸口 3.0m    セル0.25/種0.6", 0.25f, 0.6f, 3.0f},
+    };
+    for (const C& c : cases) {
+        AF_SceneHandle s = AF_SceneCreate();
+        AF_SceneSetRoomCellSize(s, c.cell);
+        AF_SceneSetRoomSeedRadius(s, c.seed);
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        // 広い地面の板 1 枚。
+        AF_SceneAddInstanceBox(s, V(0, -gt, 0), V(gx, gt, gz), V(1,0,0), V(0,1,0), m);
+        // 建物（壁 4 枚＋天井）。−Z 側の壁にだけ戸口を空ける。
+        AF_SceneAddInstanceBox(s, V(-rx-wt, rh*0.5f, 0), V(wt, rh*0.5f, rz+wt), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( rx+wt, rh*0.5f, 0), V(wt, rh*0.5f, rz+wt), V(1,0,0), V(0,1,0), m);
+        if (c.doorW <= 0.0f) {
+            AF_SceneAddInstanceBox(s, V(0, rh*0.5f, -rz-wt), V(rx+wt, rh*0.5f, wt),
+                                   V(1,0,0), V(0,1,0), m);
+        } else {
+            const float dh = 2.2f;                       // 戸口の高さ
+            const float sw = (rx + wt - c.doorW * 0.5f) * 0.5f;
+            const float sc = c.doorW * 0.5f + sw;
+            AF_SceneAddInstanceBox(s, V(-sc, rh*0.5f, -rz-wt), V(sw, rh*0.5f, wt),
+                                   V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V( sc, rh*0.5f, -rz-wt), V(sw, rh*0.5f, wt),
+                                   V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, dh + (rh - dh) * 0.5f, -rz-wt),
+                                   V(c.doorW * 0.5f, (rh - dh) * 0.5f, wt), V(1,0,0), V(0,1,0), m);
+        }
+        AF_SceneAddInstanceBox(s, V(0, rh*0.5f,  rz+wt), V(rx+wt, rh*0.5f, wt), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, rh+wt, 0), V(rx+wt, wt, rz+wt), V(1,0,0), V(0,1,0), m);
+
+        const int nRooms = AF_SceneRoomCount(s);
+        const int nAper  = AF_SceneApertureCount(s);
+        int nx = 0, ny = 0, nz = 0; float cell = 0.0f;
+        AF_SceneRoomGridDims(s, &nx, &ny, &nz, &cell);
+        // 建物の中（部屋のはず）と、建物の外（部屋であってはならない）。
+        const AF_Vector3 pIn  = V(0, 1.6f, 0);
+        const AF_Vector3 pOut = V(0, 1.6f, gz - 4.0f);     // 建物のはるか外・地面の上
+        const float vIn  = AF_SceneRoomVolumeAt(s, pIn, 2.0f);
+        const float vOut = AF_SceneRoomVolumeAt(s, pOut, 2.0f);
+        const int rIn  = AF_SceneRoomAt(s, pIn);
+        const int rOut = AF_SceneRoomAt(s, pOut);
+        std::printf("      %s  格子 %dx%dx%d @%.2fm / 部屋 %d 個 / 開口 %d 箇所\n",
+                    c.name, nx, ny, nz, cell, nRooms, nAper);
+        std::printf("          建物の中 room=%2d 実効V %8.0f m3（設計 %.0f）\n",
+                    rIn, vIn, 2.0f * rx * 2.0f * rz * rh);
+        std::printf("          建物の外 room=%2d 実効V %8.0f m3  ← 0 でなければ屋外が部屋\n",
+                    rOut, vOut);
+        // 戸口から外へ何 m まで「部屋」が伸びているか。塗り戻しがどこまで吸うかを見る。
+        if (c.doorW > 0.0f) {
+            std::printf("          戸口の外へ:");
+            for (float d = 1.0f; d <= 20.0f; d += 3.0f) {
+                const AF_Vector3 p = V(0, 1.6f, -(rz + wt) - d);
+                std::printf("  %.0fm:room%d", d, AF_SceneRoomAt(s, p));
+            }
+            std::printf("\n");
+        }
+        AF_SceneDestroy(s);
+    }
+    std::printf("      ※屋外は「外の世界」に落ちるはず（格子の外周に届く成分は部屋にしない）。\n");
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -5557,6 +5638,7 @@ int main() {
     testRoomSegmentation();
     testRoomIncremental();
     diagnoseRoomDetection();
+    diagnoseOutdoorWithBuilding();
     testOutdoorIsNotARoom();
     testRoomGridDegradeDetect();
     testAutoPortals();
