@@ -300,6 +300,37 @@ ACOUSTIC_API void AF_SceneUpdatePortal(AF_SceneHandle scene, int id, AF_Vector3 
                                        AF_Vector3 axisU, AF_Vector3 axisV,
                                        float halfU, float halfV);
 
+/* 【自動生成】部屋グラフの開口からポータルを作る。
+ *
+ * 「ここが開口である」という同じ事実を、エンジンが自動で持っているのに人がもう一度
+ * 置き直していた。置き忘れるとフレネル帯域積分が一度も走らず、戸口がただの幾何の
+ * 隙間として処理される ── **静かに劣化して気づく手段が無い**のがいちばん悪い。
+ *
+ * 手置きのポータルは消えない。自動生成ぶんだけがリストの末尾で入れ替わる。
+ * 幾何が変わって部屋グラフが作り直されると自動で追随する。 */
+ACOUSTIC_API void AF_SceneSetAutoPortals(AF_SceneHandle scene, int enable);
+/* これ未満の断面積(m2)の開口はポータルにしない。格子の量子化ノイズで
+ * ありもしない戸口が並ぶのを防ぐ。既定 0.25 m2。 */
+ACOUSTIC_API void AF_SceneSetAutoPortalMinArea(AF_SceneHandle scene, float m2);
+/* outAuto / outManual に内訳を書く（NULL 可）。戻り値は合計。
+ * 並びは [手置き ... , 自動生成 ...]。自動生成ぶんは末尾に固まっている。 */
+ACOUSTIC_API int  AF_SceneGetPortalCounts(AF_SceneHandle scene, int* outAuto, int* outManual);
+
+/* ポータル 1 枚の矩形を読み出す。戻り値 0 で範囲外。
+ * 自動生成が戸口を正しく見つけたかは**見れば分かる**ようにしておきたいので、
+ * ホストがギズモを描けるようにする（音で気づくのは難しい）。 */
+ACOUSTIC_API int  AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* outCenter,
+                                    AF_Vector3* outAxisU, AF_Vector3* outAxisV,
+                                    float* outHalfU, float* outHalfV);
+
+/* ポータルの「支配が及ぶ距離」(m)。矩形と経路の距離がこれを超えたら、
+ * 回折は一般の稜線探索に完全に戻る。あいだは滑らかに混ざる。
+ *
+ * ★以前は「シーンに 1 枚でもポータルがあれば回折はポータルが全部決める」だった。
+ *   自動生成すると全シーンがその状態になり、部屋の中央の柱の回り込みまで
+ *   ポータルが答えることになる（実測 -3.3dB）。既定 1.0m。 */
+ACOUSTIC_API void AF_SceneSetPortalGovernRange(AF_SceneHandle scene, float meters);
+
 /* ポータルがどれだけ開いているかを帯域別に測る。
  *   outFrac6 : 帯域ごとに通る割合(0..1)。完全に塞がれれば 0、素通しなら 1。
  *   outPoint : 開いている部分の重み付き重心（定位に使う）。

@@ -1179,6 +1179,90 @@ public:
     int portalCount() const { return static_cast<int>(portals_.size()); }
     void clearPortals() { portals_.clear(); }
 
+    // ── ポータルの「支配の強さ」 ──
+    //
+    //   この経路をこのポータルがどれだけ支配しているか(0..1)。1 なら答えはポータルが
+    //   決め、0 なら一般の稜線回折に任せる。あいだは混ぜる。
+    //
+    //   ★以前は「ポータルが 1 枚でもシーンにあれば、回折はポータルが全部決める」
+    //     だった（`if (!portals_.empty())`）。ポータルを手で置く前提なら実害が
+    //     出にくかったが、**開口から自動生成すると全シーンがその状態になる**。
+    //     実測: 部屋の隅に無関係なポータルを 1 枚置くだけで、部屋の中央の柱の
+    //     回り込みが **-3.3dB**。柱の陰はコンセプトの中心動作なので、これは通せない。
+    //
+    //   ★かといって「線分が矩形を通るか」の二値で切り替えるのは**却下済み**。
+    //     開口率そのものは連続なのに使い方が二値になって崖が出る
+    //     （実測: 音源を横へ 5cm 動かしただけで 8.8dB 落ちた）。
+    //     そこで**矩形と線分の距離**という連続量にして、範囲内で滑らかに 1→0 へ落とす。
+    //     距離は 3 通りの候補（面との交点・線分の両端）の最小で、いずれも連続。
+    float portalGovern(const Portal& pt, const Vec3& a, const Vec3& b) const {
+        const Vec3 n = normalized(cross(pt.axisU, pt.axisV));
+        const Vec3 d = b - a;
+        const float den = dot(n, d);
+        float tHit = 0.0f;
+        if (std::fabs(den) > 1e-6f) tHit = dot(n, pt.center - a) / den;
+        tHit = scene_detail::clamp01(tHit);
+        auto distAt = [&](float t) {
+            const Vec3 p = a + d * t;
+            const Vec3 r = p - pt.center;
+            const float u = std::max(-pt.halfU, std::min(pt.halfU, dot(r, pt.axisU)));
+            const float v = std::max(-pt.halfV, std::min(pt.halfV, dot(r, pt.axisV)));
+            return length(p - (pt.center + pt.axisU * u + pt.axisV * v));
+        };
+        const float dist = std::min(distAt(tHit), std::min(distAt(0.0f), distAt(1.0f)));
+        if (dist <= 0.0f) return 1.0f;
+        if (dist >= portalGovernRange_) return 0.0f;
+        const float x = 1.0f - dist / portalGovernRange_;
+        return x * x * (3.0f - 2.0f * x);              // smoothstep（端で傾きも 0）
+    }
+    /// 支配が及ぶ距離(m)。矩形からこれだけ離れたら一般の回折に完全に戻る。
+    void setPortalGovernRange(float m) { portalGovernRange_ = std::max(0.05f, m); }
+    float portalGovernRange() const { return portalGovernRange_; }
+
+    // ── 部屋グラフの開口からポータルを自動生成する ──
+    //
+    //   「ここが開口である」という同じ事実を、エンジンが自動で持っているのに
+    //   人がもう一度置き直していた（決めごと #1）。置き忘れると
+    //   フレネル帯域積分が一度も走らず、戸口がただの幾何の隙間として処理される。
+    //   **静かに劣化して気づく手段が無い**のがいちばん悪い。
+    //
+    //   ★手置きを消さない。自動ぶんだけを入れ替える。人が「ここは特別」と置いた
+    //     矩形（枠の内側ぴったりなど）のほうが正確なことがあるので、上書き用に残す。
+    //   ★小さすぎる口は作らない。格子の量子化ノイズ（セル 1〜2 個の隙間）まで
+    //     ポータルにすると、ありもしない戸口が並ぶ。
+    void setAutoPortals(bool on) { autoPortals_ = on; }
+    bool autoPortals() const { return autoPortals_; }
+    void setAutoPortalMinArea(float m2) { autoPortalMinArea_ = std::max(0.0f, m2); }
+    float autoPortalMinArea() const { return autoPortalMinArea_; }
+    int autoPortalCount() const { return autoPortalCount_; }
+
+    /// 手置きのポータルの数（自動生成ぶんを除く）。
+    int manualPortalCount() const {
+        return static_cast<int>(portals_.size()) - autoPortalCount_;
+    }
+
+    void rebuildAutoPortals() {
+        // 自動ぶんは末尾に固めてあるので、そこだけ捨てる。
+        if (autoPortalCount_ > 0) {
+            portals_.resize(portals_.size() - static_cast<std::size_t>(autoPortalCount_));
+            autoPortalCount_ = 0;
+        }
+        if (!autoPortals_) return;
+        const rooms::Result& rr = roomGraph();
+        for (const rooms::Aperture& ap : rr.apertures) {
+            if (ap.area < autoPortalMinArea_) continue;
+            if (ap.halfU <= 1e-3f || ap.halfV <= 1e-3f) continue;
+            Portal p;
+            p.center = ap.rectCenter;
+            p.axisU = ap.axisU;
+            p.axisV = ap.axisV;
+            p.halfU = ap.halfU;
+            p.halfV = ap.halfV;
+            portals_.push_back(p);
+            ++autoPortalCount_;
+        }
+    }
+
     // ポータルがどれだけ開いているかを帯域別に測る。
     //   outFrac6 : 帯域ごとの「通る割合」(0..1)。矩形が完全に塞がれれば 0、素通しなら 1。
     //   outPoint : 開いている部分の重み付き重心（ワールド）。**定位に使う**。
@@ -3295,22 +3379,36 @@ public:
         //   回折が −39dB の床を作り、そこから上は材質が効かなくなる
         //   （実測: 壁の裏だけ 500Hz 以上が扉と同じ 0.0115 に張り付いていた）。
         //   ポータルが閉じている(f=0)なら回り込みも 0 でなければ辻褄が合わない。
+        // 【支配の強さで混ぜる】この経路を支配しているポータルがあれば、その割合だけ
+        //   ポータルの答えを採り、残りは一般の稜線回折に任せる。
+        //   ★以前は `if (!portals_.empty())` ＝ シーンに 1 枚でもあれば全部ポータル、
+        //     だった。開口から自動生成するとシーン中がその状態になり、
+        //     部屋の中央の柱の回り込みまでポータルが答えることになる（実測 -3.3dB）。
+        //   ★「線分が矩形を通るか」の二値切り替えは却下済み（8.8dB の崖）。
+        //     portalGovern は矩形と線分の距離から作った連続量なので崖にならない。
+        //   ★支配下では**混ぜずに置き換える**のが要点。旧経路を足すと、閉じた扉の所で
+        //     経路が無いのに回折が -39dB の床を作り、そこから上は材質が効かなくなる
+        //     （実測: 壁の裏だけ 500Hz 以上が扉と同じ 0.0115 に張り付いた）。
+        //     ポータルが閉じている(f=0)なら回り込みも 0 でなければ辻褄が合わない。
+        //     w=1 の所では (1-w)=0 なので旧経路は完全に消える。
+        float wPortalMax = 0.0f;
+        float difPortal[kNumBands] = {0, 0, 0, 0, 0, 0};
         if (!portals_.empty()) {
-            // ポータルを置いたシーンでは、開口経由の音はポータルだけが決める。
-            //   ★「直線が矩形を横切るか」で使う／使わないを切り替えてはいけない。
-            //     開口率そのものは連続なのに、**使い方が二値**になって崖が出る
-            //     （実測: 音源を横へ 5cm 動かしただけで 8.8dB 落ち、その後
-            //      +6.6 / -2.4 / -3.6 dB と暴れた。開口率は 0.9656 で平らなまま）。
-            //     耳には「急に音が小さくなる」と聞こえる。
-            //   常に全ポータルを測り、最も通るものを採る。開口率はゾーンの中心を
-            //   矩形内へ丸めているので、線が外れても連続に落ちる。
-            for (int b = 0; b < kNumBands; ++b) dif[b] = 0.0f;
             for (const Portal& pt : portals_) {
                 if (!pt.active) continue;
+                const float w = portalGovern(pt, listener, source);
+                if (w <= 0.0f) continue;
                 float pf[kNumBands]; Vec3 cp(0, 0, 0);
                 if (!portalCoupling(pt, listener, source, pf, &cp)) continue;
-                for (int b = 0; b < kNumBands; ++b) dif[b] = std::max(dif[b], pf[b]);
+                // 支配の弱いポータルは答えも弱く数える。入ってきた瞬間に
+                // 跳ばないようにするため（w は 0 から連続に立ち上がる）。
+                for (int b = 0; b < kNumBands; ++b)
+                    difPortal[b] = std::max(difPortal[b], pf[b] * w);
+                wPortalMax = std::max(wPortalMax, w);
             }
+        }
+        if (wPortalMax >= 1.0f) {
+            for (int b = 0; b < kNumBands; ++b) dif[b] = difPortal[b];
         } else {
             diffractionContinuous(listener, source, centerOcc, dif);
 
@@ -3340,6 +3438,11 @@ public:
                 mean /= static_cast<float>(kNumBands);
                 for (int b = 0; b < kNumBands; ++b) dif[b] = mean;
             }
+            // 部分的に支配されている領域では混ぜる。difPortal には w が畳んであるので、
+            // 残り (1-w) を一般の回折が埋める。w=0 なら丸ごと一般の回折＝従来どおり。
+            if (wPortalMax > 0.0f)
+                for (int b = 0; b < kNumBands; ++b)
+                    dif[b] = difPortal[b] + (1.0f - wPortalMax) * dif[b];
         }
 
         // 迂回余剰長 δ（ステアの重み付けに使う）。非遮蔽=0 / 迂回路なし=大。
@@ -3485,24 +3588,32 @@ public:
         //      暴れた。開口率は 0.9656 で平らなまま）。耳には「急に小さくなる」と聞こえる。
         //     全ポータルを測って最も通るものを採る。開口率はゾーンの中心を矩形内へ
         //     丸めているので、線が外れても連続に落ちる。
+        //   ★ここも「シーンに 1 枚でもあれば全部ポータル」ではなく**支配の強さで混ぜる**。
+        //     自動生成すると全シーンにポータルが並ぶので、無関係な口が遠くにあるだけで
+        //     透過の測り方が置き換わってしまう。portalGovern は矩形と線分の距離から
+        //     作った連続量なので、離れれば滑らかに従来の標本化へ戻る。
         if (!portals_.empty()) {
             float best[kNumBands] = {0, 0, 0, 0, 0, 0};
-            bool anyPortal = false;
+            float wMax = 0.0f;
             for (const Portal& pt : portals_) {
                 if (!pt.active) continue;
+                const float w = portalGovern(pt, listener, source);
+                if (w <= 0.0f) continue;
                 float f[kNumBands]; Vec3 cp(0, 0, 0);
                 if (!portalCoupling(pt, listener, source, f, &cp)) continue;
                 for (int b = 0; b < kNumBands; ++b) best[b] = std::max(best[b], f[b]);
-                anyPortal = true;
+                wMax = std::max(wMax, w);
             }
-            if (anyPortal) {
+            if (wMax > 0.0f) {
                 const float binv = (blockedN > 0) ? 1.0f / static_cast<float>(blockedN) : 0.0f;
                 for (int b = 0; b < kNumBands; ++b) {
                     // 遮られている標本が1つも無ければ素通し扱い（塞ぐものが無い）。
                     const float blocked = (blockedN > 0) ? clamp01(blockedAcc[b] * binv) : 1.0f;
-                    outTrans[b] = std::sqrt(clamp01(best[b] + (1.0f - best[b]) * blocked));
+                    const float viaPortal = clamp01(best[b] + (1.0f - best[b]) * blocked);
+                    const float sampled = outTrans[b] * outTrans[b];   // 振幅→エネルギー
+                    outTrans[b] = std::sqrt(clamp01(wMax * viaPortal + (1.0f - wMax) * sampled));
                 }
-                outOccFrac = clamp01(1.0f - outTrans[0]);
+                outOccFrac = clamp01(wMax * (1.0f - outTrans[0]) + (1.0f - wMax) * outOccFrac);
             }
         }
     }
@@ -4106,6 +4217,10 @@ public:
 
     // 毎フレーム 1 発。内部レートに従って各役割を実行し、結果を results_ に置く。
     void update(float /*dt*/) {
+        // 部屋グラフが作り直されたなら、自動生成ポータルも作り直す。
+        //   roomGraph() は中で dirty を見ているので毎フレーム呼んでも構築は走らない。
+        if (autoPortals_ && roomBuilder_.dirty()) { roomGraph(); rebuildAutoPortals(); }
+
         const int n = sourceCount();
         results_.resize(n, cfg_);
         if (n == 0) return;
@@ -4710,6 +4825,10 @@ private:
     //   （0.40 にしていたときは実測で 0.0209 → 0.0155 まで落ちた）。
     float apertureContrastRef_ = 0.278f;
 
+    float portalGovernRange_ = 1.0f;       // ポータルの支配が及ぶ距離(m)
+    bool  autoPortals_ = false;            // 開口からポータルを自動生成するか
+    float autoPortalMinArea_ = 0.25f;      // これ未満の口はポータルにしない(m2)
+    int   autoPortalCount_ = 0;            // portals_ の末尾のうち自動生成ぶん
     std::vector<Portal> portals_;          // ホストが置く開口の矩形（トポロジはホストの担当）
     bool  useBtm_ = false;                 // BTM 経路（既定 OFF）
     float btmWedgeAngle_ = 4.712389f;      // 1.5π＝箱の凸稜線

@@ -3264,6 +3264,256 @@ void testRoomGridDegradeDetect() {
                 "        ホストは AF_SceneRoomGridDegraded で気づいて警告すること。\n");
 }
 
+// 【C1】部屋グラフの開口からポータルを自動生成する。
+//
+//   「ここが開口である」という同じ事実を、エンジンが自動で持っているのに人が
+//   もう一度置き直していた。置き忘れるとフレネル帯域積分が一度も走らず、
+//   戸口がただの幾何の隙間として処理される ── **静かに劣化して気づけない**。
+//
+//   ★自動生成そのものより、「ポータルが増えても無関係な場所の回折が変わらない」
+//     ほうが重要。以前は 1 枚でもあればシーン中の回折をポータルが支配していたので、
+//     自動生成した瞬間に柱の陰（コンセプトの中心動作）が壊れる。
+void testAutoPortals() {
+    std::printf("\n[C1] 開口からポータルを自動生成する\n");
+    const float h = 3.0f, t = 0.2f, hw = 5.0f, hd = 5.0f;
+    const float doorW = 0.9f, doorH = 2.0f;
+
+    // 2 部屋（z<0 と z>0）を仕切り、幅 0.9m・高さ 2.0m の戸口を空ける。
+    //   仕切りは「左の袖・右の袖・戸口の上のまぐさ」の 3 枚で作る。
+    auto build = [&](bool pillar) {
+        AF_SceneHandle s = AF_SceneCreate();
+        AF_SceneSetRoomCellSize(s, 0.15f);
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        // 仕切り（z=0）。戸口は x∈[-0.45, +0.45], y∈[0, 2.0]
+        const float sideW = (hw - doorW * 0.5f) * 0.5f;
+        const float sideC = doorW * 0.5f + sideW;
+        AF_SceneAddInstanceBox(s, V(-sideC, h*0.5f, 0), V(sideW, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( sideC, h*0.5f, 0), V(sideW, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        const float lintelH = (h - doorH) * 0.5f;
+        AF_SceneAddInstanceBox(s, V(0, doorH + lintelH, 0), V(doorW*0.5f, lintelH, t),
+                               V(1,0,0), V(0,1,0), m);
+        if (pillar)   // 部屋 A（z<0）の中に柱。開口とは無関係な回折源
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, -3.0f), V(0.9f, h*0.5f, 0.25f),
+                                   V(1,0,0), V(0,1,0), m);
+        return s;
+    };
+
+    // ── ① 自動生成された矩形が戸口の実寸に合うか ──
+    {
+        AF_SceneHandle s = build(false);
+        AF_SceneSetAutoPortals(s, 1);
+        AF_SceneSetListener(s, V(0, 1.5f, -2.0f));
+        AF_SceneSetSource(s, 1, V(0, 1.5f, 2.0f));
+        for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+        int nAuto = 0, nMan = 0;
+        const int nTot = AF_SceneGetPortalCounts(s, &nAuto, &nMan);
+        std::printf("        部屋 %d 個 / 開口 %d 個 → ポータル 合計 %d（自動 %d / 手置き %d）\n",
+                    AF_SceneRoomCount(s), AF_SceneApertureCount(s), nTot, nAuto, nMan);
+        check("[C1] 開口からポータルが生える", nAuto >= 1);
+        check("[C1] 手置きは 0 のまま", nMan == 0);
+
+        // 矩形の寸法。格子 0.15m なのでセル 1 個ぶんの誤差は許す。
+        float area = 0.0f; AF_Vector3 c{}, nrm{}; int ra = -1, rb = -1;
+        if (AF_SceneApertureInfo(s, 0, &area, &c, &nrm, &ra, &rb)) {
+            std::printf("        開口0: 面積 %.2f m2（実寸 %.2f）中心 (%.2f, %.2f, %.2f) "
+                        "法線 (%.2f, %.2f, %.2f)\n",
+                        area, doorW * doorH, c.x, c.y, c.z, nrm.x, nrm.y, nrm.z);
+            check("[C1] 開口の面積が戸口の実寸に近い（±30%）",
+                  area > doorW * doorH * 0.7f && area < doorW * doorH * 1.3f);
+        }
+        // 自動生成された矩形そのもの。ホストがギズモで確かめられるように読み出せる。
+        AF_Vector3 pc{}, pu{}, pv{}; float hu = 0.0f, hv = 0.0f;
+        if (AF_SceneGetPortal(s, 0, &pc, &pu, &pv, &hu, &hv)) {
+            std::printf("        自動ポータル0: 幅 %.2fm（実寸 %.2f）高さ %.2fm（実寸 %.2f）"
+                        " 中心 (%.2f, %.2f, %.2f)\n",
+                        hu * 2.0f, doorW, hv * 2.0f, doorH, pc.x, pc.y, pc.z);
+            // 格子 0.15m。face 中心の外接箱＋セル 1 個ぶんなので、実寸に対して
+            // セル 1 個ぶんまでの膨らみは許す。
+            check("[C1] 矩形の幅が戸口の実寸に近い（+1セル以内）",
+                  hu * 2.0f >= doorW - 0.15f && hu * 2.0f <= doorW + 0.30f);
+            check("[C1] 矩形の高さが戸口の実寸に近い（+1セル以内）",
+                  hv * 2.0f >= doorH - 0.15f && hv * 2.0f <= doorH + 0.30f);
+        }
+        AF_SceneDestroy(s);
+    }
+
+    // ── ② ポータルが増えても、無関係な柱の回り込みが変わらないか ──
+    //   ここが C1 の関門。以前は「シーンに 1 枚でもあれば回折はポータルが全部決める」
+    //   だったので、自動生成した瞬間に柱の陰が壊れた（実測 -3.3dB）。
+    {
+        const AF_Vector3 L = V(0, 1.5f, -4.2f), S = V(0, 1.5f, -1.8f);  // 柱(z=-3)を挟む
+        float g[2][kBands] = {};
+        for (int k = 0; k < 2; ++k) {
+            AF_SceneHandle s = build(true);
+            AF_SceneSetAutoPortals(s, k);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+            const int idx = AF_SceneSourceIndex(s, 1);
+            if (idx >= 0) AF_SceneGetSourceOcclusion(s, idx, g[k]);
+            int na = 0; AF_SceneGetPortalCounts(s, &na, nullptr);
+            std::printf("        柱の陰  自動生成 %s（ポータル %d 枚）  125=%.4f 1k=%.4f 4k=%.4f\n",
+                        k ? "ON " : "OFF", na, g[k][0], g[k][3], g[k][5]);
+            AF_SceneDestroy(s);
+        }
+        double worst = 0.0;
+        for (int b = 0; b < kBands; ++b)
+            worst = std::max(worst, std::fabs(20.0 * std::log10(std::max(g[1][b], 1e-6f)
+                                                              / std::max(g[0][b], 1e-6f))));
+        std::printf("        → 差 最大 %.2f dB（開口と無関係な経路なので 0dB が正しい）\n", worst);
+        check("[C1] 自動生成しても無関係な柱の回り込みが動かない（1dB 以内）", worst <= 1.0);
+    }
+
+    // ── ③ 戸口越しでは自動ポータルが手置きと同じ働きをするか ──
+    //   手で戸口の実寸に置いた矩形と、自動生成した矩形を比べる。
+    {
+        // ★直線が戸口を素通りしない配置にすること。L(2,-2)→S(-2,2) だと z=0 を x=0 で
+        //   横切る＝戸口のど真ん中で、遮蔽が起きずポータルの出番が無い（実測 0.97）。
+        //   同じ x に置いて、直線が仕切りの壁に当たるようにする。
+        const AF_Vector3 L = V(2.0f, 1.5f, -2.0f), S = V(2.0f, 1.5f, 2.0f);
+        float g[3][kBands] = {};
+        const char* name[3] = {"ポータル無し", "手置き（実寸）", "自動生成    "};
+        for (int k = 0; k < 3; ++k) {
+            AF_SceneHandle s = build(false);
+            if (k == 1)
+                AF_SceneAddPortal(s, V(0, doorH*0.5f, 0), V(1,0,0), V(0,1,0),
+                                  doorW*0.5f, doorH*0.5f);
+            if (k == 2) AF_SceneSetAutoPortals(s, 1);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+            const int idx = AF_SceneSourceIndex(s, 1);
+            if (idx >= 0) AF_SceneGetSourceOcclusion(s, idx, g[k]);
+            std::printf("        戸口越し %s  125=%.4f 1k=%.4f 4k=%.4f\n",
+                        name[k], g[k][0], g[k][3], g[k][5]);
+            AF_SceneDestroy(s);
+        }
+        double worst = 0.0;
+        for (int b = 0; b < kBands; ++b)
+            worst = std::max(worst, std::fabs(20.0 * std::log10(std::max(g[2][b], 1e-6f)
+                                                              / std::max(g[1][b], 1e-6f))));
+        std::printf("        → 手置き vs 自動 の差 最大 %.2f dB\n", worst);
+        check("[C1] 自動生成が手置きと同じ働きをする（6dB 以内）", worst <= 6.0);
+        // フレネルは帯域で差が付くのが要点。平坦なら積分が走っていない。
+        const double tilt = 20.0 * std::log10(std::max(g[2][5], 1e-6f)
+                                            / std::max(g[2][0], 1e-6f));
+        std::printf("        → 自動生成での帯域傾き 4k/125 = %+.2f dB"
+                    "（フレネル帯域積分が走っている証拠）\n", tilt);
+        check("[C1] 自動生成でも帯域に差が出る（フレネルが走っている）",
+              std::fabs(tilt) > 0.5);
+    }
+
+    // ── ④ 支配の境目に崖が出ていないか ──
+    //   却下済み案の再発ポイント。「線分が矩形を通るか」の二値で切り替えると
+    //   実測 8.8dB の崖が出た。portalGovern は距離から作った連続量なので出ないはず。
+    //   リスナーを戸口の正面から横へ歩かせ、支配 1→0 を跨いで隣接差を見る。
+    {
+        const float step = 0.1f;
+        double worst = 0.0; double worstAt = 0.0;
+        float prev[kBands] = {}; bool have = false;
+        std::printf("        支配の境目を歩く（戸口の正面 x=0 → 横 x=3.0）:\n          ");
+        for (int i = 0; i <= 30; ++i) {
+            const float x = i * step;
+            AF_SceneHandle s = build(false);
+            AF_SceneSetAutoPortals(s, 1);
+            AF_SceneSetListener(s, V(x, 1.5f, -2.0f));
+            AF_SceneSetSource(s, 1, V(0, 1.5f, 2.0f));
+            for (int k = 0; k < 5; ++k) AF_SceneUpdate(s, 1.0f/60.0f);
+            float g[kBands] = {};
+            const int idx = AF_SceneSourceIndex(s, 1);
+            if (idx >= 0) AF_SceneGetSourceOcclusion(s, idx, g);
+            if (i % 5 == 0) std::printf("x=%.1f:%.4f ", x, g[0]);
+            if (have) {
+                const double d = std::fabs(20.0 * std::log10(std::max(g[0], 1e-6f)
+                                                           / std::max(prev[0], 1e-6f)));
+                if (d > worst) { worst = d; worstAt = x; }
+            }
+            for (int b = 0; b < kBands; ++b) prev[b] = g[b];
+            have = true;
+            AF_SceneDestroy(s);
+        }
+        std::printf("\n        → 0.1m 刻みの最大隣接差 %.2f dB @ x=%.1f"
+                    "（二値切り替えでは 8.8dB の崖が出ていた）\n", worst, worstAt);
+        check("[C1] 支配の境目に崖が出ない（0.1m 刻みで 3dB 以内）", worst <= 3.0);
+    }
+
+    // ── ⑤ ポータルが増えたぶんのコスト ──
+    //   自動生成すると戸口の数だけポータルが並ぶ。computeSoftOcclusion は音源ごとに
+    //   全ポータルを舐めるので、枚数が効く。
+    //   ★ただし高い portalCoupling（フレネル積分）は支配 w>0 のときしか呼ばない。
+    //     遠い口は portalGovern（内積数回）だけで落ちる。その差を数字で確かめる。
+    {
+        // 5 部屋を戸口で数珠つなぎにする（廊下沿いに 4 枚の仕切り）。
+        auto buildMany = [&]() {
+            AF_SceneHandle s = AF_SceneCreate();
+            AF_SceneSetRoomCellSize(s, 0.2f);
+            const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+            const float L2 = 25.0f, W2 = 4.0f;
+            AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(W2+t, t, L2+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(W2+t, t, L2+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(-W2-t, h*0.5f, 0), V(t, h*0.5f, L2+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V( W2+t, h*0.5f, 0), V(t, h*0.5f, L2+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, -L2-t), V(W2+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f,  L2+t), V(W2+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+            for (int k = 0; k < 4; ++k) {
+                const float z = -15.0f + k * 10.0f;
+                const float sw = (W2 - doorW * 0.5f) * 0.5f;
+                const float sc = doorW * 0.5f + sw;
+                AF_SceneAddInstanceBox(s, V(-sc, h*0.5f, z), V(sw, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+                AF_SceneAddInstanceBox(s, V( sc, h*0.5f, z), V(sw, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+                const float lh = (h - doorH) * 0.5f;
+                AF_SceneAddInstanceBox(s, V(0, doorH + lh, z), V(doorW*0.5f, lh, t),
+                                       V(1,0,0), V(0,1,0), m);
+            }
+            return s;
+        };
+        for (int k = 0; k < 2; ++k) {
+            AF_SceneHandle s = buildMany();
+            AF_SceneSetAutoPortals(s, k);
+            AF_SceneSetListener(s, V(0, 1.5f, -20.0f));
+            for (int i = 0; i < 8; ++i) AF_SceneSetSource(s, i + 1, V(1.0f, 1.5f, -18.0f + i * 5.0f));
+            for (int i = 0; i < 8; ++i) AF_SceneUpdate(s, 1.0f/60.0f);   // 暖機＋部屋の構築
+            int na = 0, nm = 0; AF_SceneGetPortalCounts(s, &na, &nm);
+            const int iters = 60;
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < iters; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+            std::printf("        5部屋・音源8本  自動生成 %s  部屋 %d / ポータル %d 枚"
+                        "  1フレーム %.2f ms\n",
+                        k ? "ON " : "OFF", AF_SceneRoomCount(s), na + nm, ms);
+            AF_SceneDestroy(s);
+        }
+    }
+
+    // ── ⑥ 手置きが自動生成で消えないか ──
+    {
+        AF_SceneHandle s = build(false);
+        AF_SceneAddPortal(s, V(0, doorH*0.5f, 0), V(1,0,0), V(0,1,0), doorW*0.5f, doorH*0.5f);
+        AF_SceneSetListener(s, V(0, 1.5f, -2.0f));
+        AF_SceneSetSource(s, 1, V(0, 1.5f, 2.0f));
+        for (int i = 0; i < 3; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+        int a0 = 0, m0 = 0; AF_SceneGetPortalCounts(s, &a0, &m0);
+        AF_SceneSetAutoPortals(s, 1);
+        for (int i = 0; i < 3; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+        int a1 = 0, m1 = 0; AF_SceneGetPortalCounts(s, &a1, &m1);
+        AF_SceneSetAutoPortals(s, 0);
+        for (int i = 0; i < 3; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+        int a2 = 0, m2 = 0; AF_SceneGetPortalCounts(s, &a2, &m2);
+        std::printf("        自動 OFF→ON→OFF  手置き %d→%d→%d / 自動 %d→%d→%d\n",
+                    m0, m1, m2, a0, a1, a2);
+        check("[C1] 自動生成を入り切りしても手置きが残る", m0 == 1 && m1 == 1 && m2 == 1);
+        check("[C1] 自動ぶんだけが入れ替わる", a0 == 0 && a1 >= 1 && a2 == 0);
+        AF_SceneDestroy(s);
+    }
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -5036,6 +5286,7 @@ int main() {
     diagnoseRoomDetection();
     testOutdoorIsNotARoom();
     testRoomGridDegradeDetect();
+    testAutoPortals();
     testManySources();
     diagnosePortalScopeGlobal();
     diagnosePerSourceEchogram();

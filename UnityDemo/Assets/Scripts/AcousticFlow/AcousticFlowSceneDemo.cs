@@ -237,6 +237,26 @@ namespace AcousticFlow
                  + "曲がり角・柱・腰高の仕切りでは分かれない（くびれていないため）。")]
         [Range(0f, 2f)] public float roomSeedRadius = 0.6f;
 
+        [Tooltip("【C1】部屋グラフの開口からポータルを自動生成する。\n\n"
+                 + "ポータルは §4.3 のフレネル帯域積分の**積分範囲**で、"
+                 + "これが無いと戸口はただの幾何の隙間として一般の回折で処理される\n"
+                 + "＝『扉がどれだけ開いているかを音色で伝える』が丸ごと動かない。\n"
+                 + "置き忘れても静かに劣化するだけなので、自動で生やす。\n\n"
+                 + "手置きの AcousticPortal は消えない（そちらが優先されるわけではなく、"
+                 + "両方が候補になる）。枠の内側ぴったりに置きたい所だけ手で置けばよい。\n\n"
+                 + "実測: 自動生成と手置き（実寸）の差は 0.01dB。")]
+        public bool autoPortals = true;
+        [Tooltip("これ未満の断面積(m2)の開口はポータルにしない。\n"
+                 + "格子の量子化ノイズ（セル 1〜2 個の隙間）でありもしない戸口が並ぶのを防ぐ。")]
+        [Range(0f, 4f)] public float autoPortalMinArea = 0.25f;
+        [Tooltip("ポータルの支配が及ぶ距離(m)。矩形と経路の距離がこれを超えたら、"
+                 + "回折は一般の稜線探索に完全に戻る。あいだは滑らかに混ざる。\n\n"
+                 + "★以前は『シーンに 1 枚でもポータルがあれば回折はポータルが全部決める』"
+                 + "だった。自動生成すると全シーンがその状態になり、部屋の中央の柱の"
+                 + "回り込みまでポータルが答えてしまう（実測 -3.3dB）。\n"
+                 + "実測: 戸口の正面から横へ 0.1m 刻みで歩いて最大隣接差 1.77dB（崖なし）。")]
+        [Range(0.2f, 4f)] public float portalGovernRange = 1.0f;
+
         [Header("早期反射 (A: 仮想エミッタ)")]
         [Tooltip("ON: 各音源の主要な初期反射を像源として抽出し、像源位置に『普通の3Dボイス』を立てて"
                  + "音源と同じ音をタップゲインで鳴らす。Wwise コアの3D定位のみ使用（プラグイン不要）。"
@@ -1383,11 +1403,18 @@ namespace AcousticFlow
             // 部屋の検出設定。中で値の変化を見ているので、毎フレーム押しても作り直しは起きない。
             _scene.SetRoomCellSize(roomCellSize);
             _scene.SetRoomSeedRadius(roomSeedRadius);
+            // 【C1】開口からポータルを自動生成する。中で値の変化を見ている。
+            _scene.SetAutoPortalMinArea(autoPortalMinArea);
+            _scene.SetPortalGovernRange(portalGovernRange);
+            _scene.SetAutoPortals(autoPortals);
             _scene.Update(Time.deltaTime);
             // 格子が上限に当たって粗くなっていたら警告する（中で 1 度だけ出す）。
             //   広い地面を 1 枚置くだけで roomCellSize が黙って無視されるので、
             //   気づけないと「部屋が割れていない」ことに最後まで気づかない。
             _scene.CheckRoomGridDegraded();
+            // 部屋が 2 つ以上あるのにポータルが 0 枚なら警告する（中で 1 度だけ）。
+            //   フレネル帯域積分が一度も走らない状態＝主題が動いていない状態。
+            _scene.CheckPortalsPresent();
 
             // 3-b) 音源ごとの帯域別生存と到来方向を受け取る。
             for (int i = 0; i < _sources.Length; i++)

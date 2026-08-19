@@ -377,6 +377,22 @@ namespace AcousticFlow
         // ボクセル一辺(m)。既定 0.25。細かいほど狭い戸口を見分けられるがコストが増える。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneSetRoomCellSize(IntPtr scene, float meters);
+        // 【C1】部屋グラフの開口からポータルを自動生成する。手置きは消えない。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetAutoPortals(IntPtr scene, int enable);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetAutoPortalMinArea(IntPtr scene, float m2);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneGetPortalCounts(IntPtr scene, out int auto_, out int manual);
+        // 自動生成された矩形を読み出す（ギズモで確かめる用）。並びは [手置き..., 自動...]。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneGetPortal(IntPtr scene, int id, out AFVector3 center,
+                                                    out AFVector3 axisU, out AFVector3 axisV,
+                                                    out float halfU, out float halfV);
+        // ポータルの支配が及ぶ距離(m)。これを超えたら回折は一般の稜線探索へ完全に戻る。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetPortalGovernRange(IntPtr scene, float meters);
+
         // 格子が上限に当たって粗くなっていないか。戻り値 1 で降格あり。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneRoomGridDegraded(IntPtr scene, out float requested,
@@ -428,7 +444,7 @@ namespace AcousticFlow
         //   DLL だけ古いまま C# を更新すると、AF_VoiceTap の長さが食い違って
         //   マーシャラが別の刻み幅で書き込む（44→48 バイトになった）。例外も出ずに
         //   タップの中身が化けるので、原因に辿り着けない。ここで止める。
-        public const int ExpectedAbiVersion = 2;
+        public const int ExpectedAbiVersion = 3;
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_AbiVersion();
 

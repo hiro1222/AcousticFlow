@@ -63,8 +63,9 @@ typedef struct AF_VoiceConfig {
  * 例外も出ずにタップの中身が化けるので、原因に辿り着けない。
  *   1 : hrtfWeight 追加 / AF_VoiceSetDiffractionDirection 追加（B1）
  *   2 : AF_SceneRoomGridDegraded 追加（格子の降格をホストが検知できるように）
+ *   3 : ポータルの自動生成（AF_SceneSetAutoPortals ほか）／AF_SceneGetPortal 追加（C1）
  */
-#define AF_ABI_VERSION 2
+#define AF_ABI_VERSION 3
 ACOUSTIC_API int AF_AbiVersion(void);
 
 typedef struct AF_VoiceTap {

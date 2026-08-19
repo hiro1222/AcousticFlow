@@ -613,6 +613,49 @@ void AF_SceneUpdatePortal(AF_SceneHandle scene, int id, AF_Vector3 center,
     if (s) s->updatePortal(id, toVec3(center), toVec3(axisU), toVec3(axisV), halfU, halfV);
 }
 
+// ★ホストは毎フレーム押してくる。値が変わったときだけ作り直すこと
+//   （rebuildAutoPortals は部屋グラフ全体の開口を舐めるので、毎フレームは無駄）。
+void AF_SceneSetAutoPortals(AF_SceneHandle scene, int enable) {
+    Scene* s = asScene(scene);
+    if (!s || s->autoPortals() == (enable != 0)) return;
+    s->setAutoPortals(enable != 0);
+    s->rebuildAutoPortals();          // 切り替えた瞬間に反映する（次の update を待たない）
+}
+
+void AF_SceneSetAutoPortalMinArea(AF_SceneHandle scene, float m2) {
+    Scene* s = asScene(scene);
+    if (!s || s->autoPortalMinArea() == m2) return;
+    s->setAutoPortalMinArea(m2);
+    s->rebuildAutoPortals();
+}
+
+int AF_SceneGetPortalCounts(AF_SceneHandle scene, int* outAuto, int* outManual) {
+    Scene* s = asScene(scene);
+    if (!s) return 0;
+    if (outAuto)   *outAuto   = s->autoPortalCount();
+    if (outManual) *outManual = s->manualPortalCount();
+    return s->portalCount();
+}
+
+int AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* outCenter,
+                      AF_Vector3* outAxisU, AF_Vector3* outAxisV,
+                      float* outHalfU, float* outHalfV) {
+    Scene* s = asScene(scene);
+    if (!s || id < 0 || id >= s->portalCount()) return 0;
+    const auto& p = s->portal(id);
+    if (outCenter) *outCenter = fromVec3(p.center);
+    if (outAxisU)  *outAxisU  = fromVec3(p.axisU);
+    if (outAxisV)  *outAxisV  = fromVec3(p.axisV);
+    if (outHalfU)  *outHalfU  = p.halfU;
+    if (outHalfV)  *outHalfV  = p.halfV;
+    return 1;
+}
+
+void AF_SceneSetPortalGovernRange(AF_SceneHandle scene, float meters) {
+    Scene* s = asScene(scene);
+    if (s) s->setPortalGovernRange(meters);
+}
+
 int AF_SceneMeasurePortal(AF_SceneHandle scene, int id,
                           AF_Vector3 listener, AF_Vector3 source,
                           float* outFrac6, AF_Vector3* outPoint) {

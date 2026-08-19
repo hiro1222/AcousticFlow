@@ -595,6 +595,76 @@ namespace AcousticFlow
             if (_handle != IntPtr.Zero) Native.AF_SceneSetRoomCellSize(_handle, meters);
         }
 
+        // 【C1】部屋グラフの開口からポータルを自動生成する。手置きは消えない。
+        public void SetAutoPortals(bool on)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneSetAutoPortals(_handle, on ? 1 : 0); }
+            catch (System.Exception) { }   // 古い DLL。ABI 照合の側で警告が出る
+        }
+        public void SetAutoPortalMinArea(float m2)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneSetAutoPortalMinArea(_handle, m2); }
+            catch (System.Exception) { }
+        }
+        public void SetPortalGovernRange(float meters)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneSetPortalGovernRange(_handle, meters); }
+            catch (System.Exception) { }
+        }
+        public int GetPortalCounts(out int autoCount, out int manualCount)
+        {
+            autoCount = 0; manualCount = 0;
+            if (_handle == IntPtr.Zero) return 0;
+            try { return Native.AF_SceneGetPortalCounts(_handle, out autoCount, out manualCount); }
+            catch (System.Exception) { return 0; }
+        }
+
+        // ポータル 1 枚の矩形を読み出す。自動生成が戸口を正しく見つけたかは
+        // **見れば分かる**ようにしておきたい（音で気づくのは難しい）。
+        public bool GetPortal(int id, out Vector3 center, out Vector3 axisU, out Vector3 axisV,
+                              out float halfU, out float halfV)
+        {
+            center = Vector3.zero; axisU = Vector3.right; axisV = Vector3.up;
+            halfU = 0f; halfV = 0f;
+            if (_handle == IntPtr.Zero) return false;
+            try
+            {
+                AFVector3 c, u, v;
+                if (Native.AF_SceneGetPortal(_handle, id, out c, out u, out v,
+                                             out halfU, out halfV) == 0) return false;
+                center = c.ToVector3(); axisU = u.ToVector3(); axisV = v.ToVector3();
+                return true;
+            }
+            catch (System.Exception) { return false; }
+        }
+
+        // 部屋が 2 つ以上あるのにポータルが 1 枚も無い状態を **1 度だけ** 警告する。
+        //
+        //   ★これが C1 のいちばんの動機。ポータルが無いと §4.3 のフレネル帯域積分が
+        //     一度も走らず、戸口はただの幾何の隙間として一般の回折で処理される。
+        //     「扉がどれだけ開いているかを音色で伝える」というこのエンジンの主題が
+        //     丸ごと動いていないのに、**静かに劣化するだけで気づく手段が無い**。
+        //     神殿・洞窟を作ったときに実際に起きた。
+        private bool _portalWarned;
+        public void CheckPortalsPresent()
+        {
+            if (_handle == IntPtr.Zero || _portalWarned) return;
+            int rooms = RoomCount;
+            if (rooms < 2) return;                      // 1 部屋なら開口はそもそも無い
+            int nAuto, nMan;
+            int total = GetPortalCounts(out nAuto, out nMan);
+            if (total > 0) return;
+            _portalWarned = true;
+            UnityEngine.Debug.LogWarning(
+                $"[AcousticScene] 部屋が {rooms} 個あるのにポータルが 1 枚もありません。\n"
+                + "  戸口はただの幾何の隙間として扱われ、フレネル帯域積分"
+                + "（＝扉の開き具合を音色で伝える処理）が走りません。\n"
+                + "  autoPortals を ON にするか、AcousticPortal を戸口に置いてください。");
+        }
+
         // 格子が上限に当たって粗くなっていたら **1 度だけ** 警告する。
         //
         //   ★格子は登録された全ボックスの AABB 全体を覆う。総ボクセル数が上限（400万）を

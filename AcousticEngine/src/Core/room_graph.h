@@ -219,6 +219,14 @@ struct Aperture {
     float area = 0.0f;              // 断面積(m2)
     Vec3  center{0, 0, 0};          // 断面の重心
     Vec3  normal{0, 0, 0};          // 面の向き（A→B が正）。面積で重み付けした平均
+    // ── 外接矩形 ──
+    //   ポータル（フレネル帯域積分の積分範囲）をここから自動で作るために持つ。
+    //   法線のいちばん強い軸を面の向きとみなし、残り 2 軸で開口ボクセルの
+    //   外接箱を取る。中心もこの箱の中心（重心ではない）── 積分範囲としては
+    //   「開口全体を覆う矩形」が要るので、L 字の口でも取りこぼさないほうを採る。
+    Vec3  axisU{1, 0, 0}, axisV{0, 1, 0};   // 矩形の 2 軸（world 軸のどれか）
+    float halfU = 0.0f, halfV = 0.0f;       // 半幅(m)。セル 1 個ぶんの厚みを含む
+    Vec3  rectCenter{0, 0, 0};              // 矩形の中心
 };
 
 struct Result {
@@ -850,6 +858,8 @@ private:
             seen[static_cast<std::size_t>(f0)] = 1;
             double area = 0.0, cx = 0.0, cy = 0.0, cz = 0.0;
             double nvx = 0.0, nvy = 0.0, nvz = 0.0;
+            // 外接箱（格子座標）。ポータルの矩形をここから作る。
+            float bmin[3] = { 1e30f, 1e30f, 1e30f }, bmax[3] = { -1e30f, -1e30f, -1e30f };
             while (!stack.empty()) {
                 const int f = stack.back(); stack.pop_back();
                 const int i = faceIdx_[f];
@@ -861,6 +871,11 @@ private:
                 const float ay = (a == 1) ? 0.5f : 0.0f;
                 const float az = (a == 2) ? 0.5f : 0.0f;
                 cx += x + 0.5 + ax; cy += y + 0.5 + ay; cz += z + 0.5 + az;
+                const float fp[3] = { x + 0.5f + ax, y + 0.5f + ay, z + 0.5f + az };
+                for (int k = 0; k < 3; ++k) {
+                    bmin[k] = std::min(bmin[k], fp[k]);
+                    bmax[k] = std::max(bmax[k], fp[k]);
+                }
                 // 法線は A→B 向き。手前が A ならその軸の正、逆なら負。
                 const float s = (R[i] == pa) ? 1.0f : -1.0f;
                 if (a == 0) nvx += s; else if (a == 1) nvy += s; else nvz += s;
@@ -892,6 +907,32 @@ private:
                           static_cast<float>(nvz));
             const float nl = length(nv);
             ap.normal = (nl > 1e-6f) ? nv * (1.0f / nl) : Vec3(0, 1, 0);
+
+            // ── 外接矩形 ──
+            //   法線がいちばん強い軸を「面の向き」とみなし、残り 2 軸で矩形を張る。
+            //   半幅にセル半分ずつ足すのは、bmin/bmax が face の**中心**だから
+            //   （ボクセル 1 枚ぶんの口だと箱の厚みが 0 になってしまう）。
+            const float an[3] = { std::fabs(ap.normal.x), std::fabs(ap.normal.y),
+                                  std::fabs(ap.normal.z) };
+            int domA = 0;
+            if (an[1] > an[domA]) domA = 1;
+            if (an[2] > an[domA]) domA = 2;
+            const int uA = (domA + 1) % 3, vA = (domA + 2) % 3;
+            auto axisVec = [](int a) {
+                return (a == 0) ? Vec3(1, 0, 0) : (a == 1) ? Vec3(0, 1, 0) : Vec3(0, 0, 1);
+            };
+            auto atIdx = [](const Vec3& v, int a) { return (a == 0) ? v.x : (a == 1) ? v.y : v.z; };
+            ap.axisU = axisVec(uA);
+            ap.axisV = axisVec(vA);
+            ap.halfU = (bmax[uA] - bmin[uA]) * 0.5f * g.cell + g.cell * 0.5f;
+            ap.halfV = (bmax[vA] - bmin[vA]) * 0.5f * g.cell + g.cell * 0.5f;
+            float rc[3];
+            for (int k = 0; k < 3; ++k)
+                rc[k] = atIdx(g.origin, k) + (bmin[k] + bmax[k]) * 0.5f * g.cell;
+            // 面に垂直な向きだけは重心を使う（矩形の「厚み」方向には広がりが無いので、
+            // 箱の中心だと斜めの口でずれる）。
+            rc[domA] = atIdx(ap.center, domA);
+            ap.rectCenter = Vec3(rc[0], rc[1], rc[2]);
             res_.apertures.push_back(ap);
         }
         // 大きい順。残響の結合では効く口から順に見たい。
