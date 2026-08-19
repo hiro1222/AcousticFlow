@@ -3611,6 +3611,99 @@ void diagnosePortalLeftRightSymmetry() {
     std::printf("      ※鏡像は鏡像でなければならない。0dB でないぶんは不具合。\n");
 }
 
+// 【判断材料】ポータルの矩形が実寸より狭いと、扉の開き具合カーブの**形**が変わるのか、
+//   それとも量（スケール）だけが変わるのか。
+//
+//   決めごと #3「実測は参照であって目標ではない ── 形は物理から採り、絶対値は演出で決める」
+//   に照らすと、**形が変わるなら直すべき / 量だけなら演出の範囲**。ここを数字で分ける。
+//   自動生成の矩形は voxel 化のせいで実寸より最大 1 セル狭くなる（実測 0.750/0.900 = 17%）。
+void diagnosePortalWidthVsDoorCurve() {
+    std::printf("\n[判断] 矩形の幅が扉の開き具合カーブの「形」を変えるか\n");
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f;
+    const float hw = 6.0f, hd = 8.0f;
+
+    // 矩形の幅だけを変える。戸口の実寸は 1.2m のまま動かさない。
+    struct W { const char* name; float widthScale; };
+    const W widths[] = { {"実寸 1.20m    ", 1.00f},
+                         {"17%狭い 1.00m ", 0.83f},
+                         {"33%狭い 0.80m ", 0.67f} };
+    const int nW = 3;
+    const int nA = 19;                                   // 0..90° を 5° 刻み
+    float f[nW][nA] = {};
+
+    for (int w = 0; w < nW; ++w) {
+        for (int a = 0; a < nA; ++a) {
+            const float deg = a * 5.0f;
+            AF_SceneHandle s = AF_SceneCreate();
+            const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+            AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                                   V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                                   V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                                   V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            const float th = deg * 3.14159265f / 180.0f;
+            const float c = std::cos(th), sn = std::sin(th);
+            AF_SceneAddInstanceBox(s, V(-0.6f + c * doorW * 0.5f, doorH * 0.5f, sn * doorW * 0.5f),
+                                   V(doorW * 0.5f, doorH * 0.5f, 0.03f),
+                                   V(c, 0, sn), V(0, 1, 0), mat);
+            const int pid = AF_SceneAddPortal(s, V(0, doorH*0.5f, 0), V(1,0,0), V(0,1,0),
+                                              doorW * 0.5f * widths[w].widthScale, doorH * 0.5f);
+            const AF_Vector3 L = V(0, 1.6f, -4), S = V(-2.0f, 1.6f, 3.5f);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            for (int i = 0; i < 3; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+            float fr[kBands] = {}; AF_Vector3 pp{};
+            AF_SceneMeasurePortal(s, pid, L, S, fr, &pp);
+            f[w][a] = fr[0];                             // 125Hz の開口率
+            AF_SceneDestroy(s);
+        }
+    }
+
+    std::printf("        開き角 ");
+    for (int w = 0; w < nW; ++w) std::printf(" %s", widths[w].name);
+    std::printf("\n");
+    for (int a = 0; a < nA; a += 2) {
+        std::printf("         %4.0f° ", a * 5.0f);
+        for (int w = 0; w < nW; ++w) {
+            const float full = std::max(f[w][nA-1], 1e-6f);
+            std::printf("  %.4f (正規化 %.3f)", f[w][a], f[w][a] / full);
+        }
+        std::printf("\n");
+    }
+    // 形が同じなら「各々の全開値で正規化したカーブ」が重なる。ずれるなら形が変わっている。
+    std::printf("        正規化カーブの実寸からのずれ:\n");
+    for (int w = 1; w < nW; ++w) {
+        double worst = 0.0; float atDeg = 0.0f;
+        for (int a = 0; a < nA; ++a) {
+            const double r0 = f[0][a] / std::max(f[0][nA-1], 1e-6f);
+            const double rw = f[w][a] / std::max(f[w][nA-1], 1e-6f);
+            if (std::fabs(rw - r0) > worst) { worst = std::fabs(rw - r0); atDeg = a * 5.0f; }
+        }
+        std::printf("          %s  最大 %.3f @ %.0f°\n", widths[w].name, worst, atDeg);
+    }
+    // 「どの角度で半分開いたと聞こえるか」＝カーブの位置。ここがずれると扉の手応えが変わる。
+    for (int w = 0; w < nW; ++w) {
+        float half = -1.0f;
+        for (int a = 1; a < nA; ++a) {
+            const float r0 = f[w][a-1] / std::max(f[w][nA-1], 1e-6f);
+            const float r1 = f[w][a]   / std::max(f[w][nA-1], 1e-6f);
+            if (r0 < 0.5f && r1 >= 0.5f) {
+                half = (a - 1) * 5.0f + 5.0f * (0.5f - r0) / std::max(r1 - r0, 1e-6f);
+                break;
+            }
+        }
+        std::printf("        %s  半分開いたと聞こえる角度 %.1f°  / 全開の開口率 %.4f\n",
+                    widths[w].name, half, f[w][nA-1]);
+    }
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -5385,6 +5478,7 @@ int main() {
     testRoomGridDegradeDetect();
     testAutoPortals();
     diagnosePortalLeftRightSymmetry();
+    diagnosePortalWidthVsDoorCurve();
     testManySources();
     diagnosePortalScopeGlobal();
     diagnosePerSourceEchogram();
