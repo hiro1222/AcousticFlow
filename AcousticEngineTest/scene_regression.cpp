@@ -4583,6 +4583,42 @@ void diagnoseSlitPortalShadow() {
     }
     std::printf("      ※「2m 比」が幅の効き。125Hz(λ=2.7m) に対し 3cm はほぼ通さないはずなので、\n"
                 "        物理では -30dB 台が期待値。枚数 -1 は開口積分が走っていない（前川へ落ちた）。\n");
+
+    // 頭打ちの正体を見る。span=2 で 0.1m と 0.03m が同値になるので、
+    // **隙間以外の候補**が幅に依らない下駄を履かせている疑い。候補ごとに中身を出す。
+    std::printf("        頭打ちの正体（span=2・候補ごとの内訳。隙間は x∈[0,gap]）:\n");
+    for (float gap : {0.10f, 0.03f}) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneSetEdgePortals(s, 1);
+        AF_SceneSetEdgePortalSpan(s, 2.0f);
+        AF_SceneAddInstanceBox(s, V(-hw * 0.5f, h * 0.5f, 0), V(hw * 0.5f, h * 0.5f, t),
+                               V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(gap + (hw - gap) * 0.5f, h * 0.5f, 0),
+                               V((hw - gap) * 0.5f, h * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, 6), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, 6), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h * 0.5f, 0), V(t, h * 0.5f, 6), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(hw, h * 0.5f, 0), V(t, h * 0.5f, 6), V(1,0,0), V(0,1,0), mat);
+        const AF_Vector3 L = V(-0.1f, 1.6f, -3.0f), S = V(-0.1f, 1.6f, 3.0f);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+        AF_Vector3 dp[8]; float dg[8]; float db[8*6];
+        const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+        std::printf("          隙間 %.2fm  回折音源 %d 本:\n", gap, nd);
+        for (int i = 0; i < nd; ++i)
+            std::printf("            [%d] 位置(%+6.2f,%+5.2f,%+6.2f)  125Hz %.5f  4k %.5f\n",
+                        i, dp[i].x, dp[i].y, dp[i].z, db[i*6+0], db[i*6+5]);
+        AF_Vector3 cp[32]; float cd[32];
+        const int nc = AF_SceneDiffractionCandidates(s, L, S, cp, cd, 32);
+        std::printf("            候補 %d 個:", nc);
+        for (int i = 0; i < nc && i < 6; ++i)
+            std::printf("  (%+.2f,%+.2f,%+.2f)δ%.2f", cp[i].x, cp[i].y, cp[i].z, cd[i]);
+        std::printf("\n");
+        AF_SceneDestroy(s);
+    }
+    std::printf("      ※隙間(x=0〜gap)から離れた位置の候補が下駄の正体。\n");
 }
 
 void testOutdoorIsNotARoom() {
