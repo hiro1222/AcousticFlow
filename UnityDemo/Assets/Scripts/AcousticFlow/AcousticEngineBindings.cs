@@ -432,6 +432,10 @@ namespace AcousticFlow
             public float panL, panR;
             public float gSpec, gDiff;
             public float hrtfWeight;
+            // 到来方向（リスナー座標系）。反射タップの軽量な両耳化（ITD＋帯域別 ILD）に使う。
+            //   acoustic_voice.h の AF_VoiceTap と**並びを合わせること**（ヘッダの指示）。
+            //   ABI 5 で追加。VoiceConvolver.cs が既に書き込んでいる。
+            public float dirX, dirY, dirZ;
         }
 
         [StructLayout(LayoutKind.Sequential)]
