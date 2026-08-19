@@ -4161,6 +4161,59 @@ void testLCorridorScene() {
     check("[く字] 角へ寄るほど音源方向へ近づく", angNear < angFar);
     std::printf("      ※音源は +X の彼方だが壁の向こう。到来方向が音源方向と大きく違い、\n"
                 "        角へ近づくほどそちらへ寄るのが「音の方へ進むと角に着く」。\n");
+
+    // ③ 【定位が聞こえるか】方向が正しくても、残響に埋もれれば耳には届かない。
+    //   後期残響は HRTF を通らず L/R バランスだけなので、残響優位の場所では
+    //   方向の手がかりが薄まる。臨界距離と残響/直接比を出して、そこを数字にする。
+    {
+        // 壁の吸音を変えて 2 通り。既定のコンクリは吸わないので残響が支配する。
+        const float aHard[6] = {0.02f, 0.02f, 0.03f, 0.04f, 0.05f, 0.07f};   // コンクリ相当
+        const float aSoft[6] = {0.25f, 0.30f, 0.35f, 0.40f, 0.45f, 0.50f};   // よく吸う内装
+        for (int k = 0; k < 2; ++k) {
+            const float* ab = (k == 0) ? aHard : aSoft;
+            AF_SceneHandle s = AF_SceneCreate();
+            AF_SceneSetRoomCellSize(s, 0.25f);
+            const int mm = AF_SceneAddMaterial(s, nullptr, ab, nullptr, 6);
+            auto bx = [&](float cx, float cy, float cz, float sx, float sy, float sz) {
+                AF_SceneAddInstanceBox(s, V(cx, cy, cz), V(sx*0.5f, sy*0.5f, sz*0.5f),
+                                       V(1,0,0), V(0,1,0), mm);
+            };
+            bx(-w - t*0.5f, h*0.5f, (aEnd + w)*0.5f, t, h, w - aEnd + t);
+            bx( w + t*0.5f, h*0.5f, (aEnd - w)*0.5f, t, h, -w - aEnd);
+            bx((bEnd - w)*0.5f, h*0.5f,  w + t*0.5f, bEnd + w + t, h, t);
+            bx((bEnd + w)*0.5f, h*0.5f, -w - t*0.5f, bEnd - w, h, t);
+            bx(0.0f, h*0.5f, aEnd - t*0.5f, 2*w + 2*t, h, t);
+            bx(bEnd + t*0.5f, h*0.5f, 0.0f, t, h, 2*w + 2*t);
+            for (int q = 0; q < 2; ++q) {
+                const float ft = 0.3f;
+                const float y = (q == 0) ? -ft*0.5f : h + ft*0.5f;
+                bx(0.0f, y, (aEnd + w)*0.5f, 2*w + 2*t, ft, w - aEnd + t);
+                bx((bEnd - w)*0.5f, y, 0.0f, bEnd + w + t, ft, 2*w + 2*t);
+            }
+            const AF_Vector3 L = V(0, 1.6f, aEnd + 2.0f);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            for (int i = 0; i < 8; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+            const float vol = AF_SceneRoomVolumeAt(s, L, 2.0f);
+            float rt[kBands] = {};
+            AF_SceneRt60At(s, L, 2.0f, rt, kBands);
+            const float dx = S.x - L.x, dz = S.z - L.z;
+            const float r = std::sqrt(dx*dx + dz*dz);
+            std::printf("        【定位が耳に届くか】%s  実効V %.0f m3 / 距離 %.1fm\n",
+                        (k == 0) ? "硬い壁(コンクリ α0.02)" : "吸う壁(α0.25〜0.50) ", vol, r);
+            std::printf("          帯域   RT60(s)  臨界距離rc(m)   残響/直接 t    wet\n");
+            for (int b = 0; b < kBands; ++b) {
+                const float rc = (rt[b] > 1e-3f) ? 0.057f * std::sqrt(vol / rt[b]) : 0.0f;
+                const float tt = (rc > 1e-3f) ? (r / rc) * (r / rc) : 0.0f;
+                std::printf("          %5d   %6.2f   %8.2f   %12.0f    %.4f\n",
+                            (int)(125 << b), rt[b], rc, tt, tt / (1.0f + tt));
+            }
+            AF_SceneDestroy(s);
+        }
+        std::printf("      ※wet が 1 に近いほど、聞こえている音のほとんどが後期残響。\n"
+                    "        後期残響は HRTF を通らず L/R バランスだけなので、そこでは\n"
+                    "        回折が運ぶ方向が薄まる ── 「回折の定位が分かりにくい」の正体。\n");
+    }
 }
 
 void testOutdoorIsNotARoom() {
