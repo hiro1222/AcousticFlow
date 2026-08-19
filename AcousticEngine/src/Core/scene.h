@@ -1455,7 +1455,8 @@ public:
         };
         for (const Instance& inst : instances_) {
             if (!inst.active || beyondPortal(inst.obb)) continue;
-            if (!entersAperture(inst.obb)) continue;
+            // bit8 で切れる（計測用）。どのゲートが扉を塞いでいるかの切り分けに使う。
+            if (!(diffGateMask_ & 8) && !entersAperture(inst.obb)) continue;
             if (inst.geomId >= 0 && inst.geomId < static_cast<int>(meshes_.size())
                 && meshes_[static_cast<std::size_t>(inst.geomId)].used) {
                 const MeshGeometry& g = meshes_[static_cast<std::size_t>(inst.geomId)];

@@ -4625,6 +4625,111 @@ void diagnoseSlitPortalShadow() {
     std::printf("      ※隙間(x=0〜gap)から離れた位置の候補が下駄の正体。\n");
 }
 
+// 【看板の検査】扉の開き具合が音になっているか。
+//
+//   ★これまで扉のカーブは printf の診断でしか見ておらず、**検査が無かった**。
+//     そのためセッション中に黙って変わっていた（10°の開口率 0.0207 → 0.0000）。
+//     扉の開き具合はこの作品の看板なので、ここが動いたら落ちるようにする。
+//   ★書くのは「いまの値」ではなく「あるべき挙動」:
+//       ・閉じていれば鳴らない
+//       ・少し開けたら少し聞こえる（0 ではない）← 「気配」がここに乗る
+//       ・開けるほど増える（単調）
+//       ・全開なら十分開く
+//     いまの実装がこれを満たさないなら、それは実装の側の問題。
+void testDoorOpennessCurve() {
+    std::printf("\n[看板] 扉の開き具合が音になっているか\n");
+    const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f;
+    const float hw = 6.0f, hd = 8.0f;
+    const float angles[] = {0.0f, 10.0f, 20.0f, 45.0f, 70.0f, 90.0f};
+    float op[6] = {};
+    std::printf("        開き角   開口率(125Hz)\n");
+    for (int a = 0; a < 6; ++a) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                               V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                               V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        const float th = angles[a] * 3.14159265f / 180.0f;
+        const float c = std::cos(th), sn = std::sin(th);
+        AF_SceneAddInstanceBox(s, V(-0.6f + c*doorW*0.5f, doorH*0.5f, sn*doorW*0.5f),
+                               V(doorW*0.5f, doorH*0.5f, 0.03f), V(c,0,sn), V(0,1,0), mat);
+        const int pid = AF_SceneAddPortal(s, V(0, doorH*0.5f, 0), V(1,0,0), V(0,1,0),
+                                          doorW*0.5f, doorH*0.5f);
+        const AF_Vector3 L = V(0, 1.6f, -4), S = V(-2.0f, 1.6f, 3.5f);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+        float f[kBands] = {}; AF_Vector3 pp{};
+        AF_SceneMeasurePortal(s, pid, L, S, f, &pp);
+        op[a] = f[0];
+        std::printf("         %4.0f°   %.4f\n", angles[a], op[a]);
+        AF_SceneDestroy(s);
+    }
+    check("[看板] 閉じていれば鳴らない（<0.02）", op[0] < 0.02f);
+    // ★「少し開けたら少し聞こえる」が看板そのもの。0 だと気配が伝わらない。
+    char b[96];
+    std::snprintf(b, sizeof(b), "(10° %.4f / 20° %.4f)", op[1], op[2]);
+    check("[看板] 10° で開口率が 0 でない（少し開けたら少し聞こえる）", op[1] > 0.002f, b);
+    check("[看板] 20° で 10° より開く", op[2] > op[1], b);
+    bool mono = true;
+    for (int a = 1; a < 6; ++a) if (op[a] < op[a-1] - 1e-4f) mono = false;
+    check("[看板] 開けるほど増える（単調）", mono);
+    std::snprintf(b, sizeof(b), "(90° %.4f)", op[5]);
+    check("[看板] 全開で十分開く（>0.5）", op[5] > 0.5f, b);
+
+    // 原因の切り分け: どのゲートが低角側を塞いでいるか。
+    //   bit1 pointInsideOther / bit2 penNearWeight / bit4 crossesCore / bit8 entersAperture
+    std::printf("        ゲートを切ったときの 10°/20° の開口率:\n");
+    for (int mask : {0, 1, 2, 4, 8, 15}) {
+        float o[2] = {0, 0};
+        for (int a = 0; a < 2; ++a) {
+            const float deg = (a == 0) ? 10.0f : 20.0f;
+            AF_SceneHandle s = AF_SceneCreate();
+            const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+            AF_SceneSetDiffractionGateMask(s, mask);
+            AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, h*0.5f, 0),
+                                   V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, h*0.5f, 0),
+                                   V((hw - 0.6f) * 0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, (doorH + h) * 0.5f, 0),
+                                   V(0.6f, (h - doorH) * 0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, -t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(hw, t, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(-hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V( hw, h*0.5f, 0), V(t, h*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd), V(hw, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+            const float th2 = deg * 3.14159265f / 180.0f;
+            const float c2 = std::cos(th2), s2 = std::sin(th2);
+            AF_SceneAddInstanceBox(s, V(-0.6f + c2*doorW*0.5f, doorH*0.5f, s2*doorW*0.5f),
+                                   V(doorW*0.5f, doorH*0.5f, 0.03f), V(c2,0,s2), V(0,1,0), mat);
+            const int pid2 = AF_SceneAddPortal(s, V(0, doorH*0.5f, 0), V(1,0,0), V(0,1,0),
+                                               doorW*0.5f, doorH*0.5f);
+            const AF_Vector3 L2 = V(0, 1.6f, -4), S2 = V(-2.0f, 1.6f, 3.5f);
+            AF_SceneSetListener(s, L2);
+            AF_SceneSetSource(s, 1, S2);
+            for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+            float f2[kBands] = {}; AF_Vector3 pp2{};
+            AF_SceneMeasurePortal(s, pid2, L2, S2, f2, &pp2);
+            o[a] = f2[0];
+            AF_SceneDestroy(s);
+        }
+        const char* nm = (mask == 0) ? "全部有効      " : (mask == 1) ? "pointInsideOther"
+                       : (mask == 2) ? "penNearWeight " : (mask == 4) ? "crossesCore   "
+                       : (mask == 8) ? "entersAperture" : "全部切る      ";
+        std::printf("          %s  10°=%.4f  20°=%.4f\n", nm, o[0], o[1]);
+    }
+}
+
 void testOutdoorIsNotARoom() {
     std::printf("\n[部屋] 屋外が部屋として検出されないか\n");
     const int m0 = 0;
@@ -6403,6 +6508,7 @@ int main() {
         diagnoseEdgePortalCalibration();
     }
     g_edgeSpan = 1.0f;
+    testDoorOpennessCurve();
     diagnoseApertureContrastChoice();
     diagnoseSlitPortalShadow();
     diagnoseOpenApertureFraction();
