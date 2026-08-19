@@ -1613,27 +1613,46 @@ public:
             //       範囲 r1×2    0.5m  -3.5 / 0.1m  -6.9 / 0.03m  -6.9 ← 頭打ちして効かない
             //     低域に合わせれば高域が緩み、高域に合わせれば低域が切れる、という
             //     板挟みの正体がこれだった。
-            float limU = pt.halfU, limV = pt.halfV;
-            if (pt.fresnelSized) {
-                const float lim = edgePortalSpan_ * r1;
-                limU = std::min(limU, lim);
-                limV = std::min(limV, lim);
-            }
+            //   ★★ 範囲を狭めるのは fresnelSized のときだけ ★★
+            //     ここを「核の中心 cu/cv のまわり ±lim」で書いたとき、fresnelSized で
+            //     なくても cu/cv を中心にしてしまい、**手置きポータルの積分範囲まで
+            //     変わった**。cu は直線と面の交点を矩形へ丸めた値なので、斜めから
+            //     見ると矩形の端に寄る。すると範囲が矩形の半分になり、扉が開く側が
+            //     丸ごと外れる。実測: 扉 10° の開口率が 0.0362 → 0.0000（20° も 0）。
+            //     出荷中の扉が黙って死んでいた（検査が無かったので 2 日気づかなかった）。
+            //   → 戸口のときは**矩形そのもの**を範囲にする（従来どおり）。
             double numer = 0.0, denom = 0.0;
-            for (int j = 0; j < kRows; ++j) {
-                const float y = -pt.halfV + rowH * (j + 0.5f);
-                if (std::fabs(y - cv) > limV) continue;       // この帯域のゾーンの外
-                denom += integ(std::max(-pt.halfU, cu - limU),
-                               std::min( pt.halfU, cu + limU), y);   // 素通しのとき
-                for (int i = begin_[j]; i < begin_[j + 1]; ++i) {
-                    const float lo = std::max(openRow[static_cast<std::size_t>(i)].lo,
-                                              cu - limU);
-                    const float hi = std::min(openRow[static_cast<std::size_t>(i)].hi,
-                                              cu + limU);
-                    numer += integ(lo, hi, y);
+            if (!pt.fresnelSized) {
+                for (int j = 0; j < kRows; ++j) {
+                    const float y = -pt.halfV + rowH * (j + 0.5f);
+                    denom += integ(-pt.halfU, pt.halfU, y);      // 矩形全体＝素通しのとき
+                    for (int i = begin_[j]; i < begin_[j + 1]; ++i)
+                        numer += integ(openRow[static_cast<std::size_t>(i)].lo,
+                                       openRow[static_cast<std::size_t>(i)].hi, y);
+                }
+            } else {
+                // 稜線ポータル: 矩形は積分範囲なので、帯域ごとのゾーンで切る。
+                const float lim = edgePortalSpan_ * r1;
+                const float limU = std::min(pt.halfU, lim);
+                const float limV = std::min(pt.halfV, lim);
+                for (int j = 0; j < kRows; ++j) {
+                    const float y = -pt.halfV + rowH * (j + 0.5f);
+                    if (std::fabs(y - cv) > limV) continue;       // この帯域のゾーンの外
+                    denom += integ(std::max(-pt.halfU, cu - limU),
+                                   std::min( pt.halfU, cu + limU), y);
+                    for (int i = begin_[j]; i < begin_[j + 1]; ++i) {
+                        const float lo = std::max(openRow[static_cast<std::size_t>(i)].lo,
+                                                  cu - limU);
+                        const float hi = std::min(openRow[static_cast<std::size_t>(i)].hi,
+                                                  cu + limU);
+                        numer += integ(lo, hi, y);
+                    }
                 }
             }
-            if (b == 0) { dbgNumer_ = numer; dbgDenom_ = denom; dbgLimU_ = limU; }
+            if (b == 0) {
+                dbgNumer_ = numer; dbgDenom_ = denom;
+                dbgLimU_ = pt.fresnelSized ? std::min(pt.halfU, edgePortalSpan_ * r1) : pt.halfU;
+            }
             outFrac6[b] = (denom > 1e-12)
                         ? static_cast<float>(std::min(1.0, numer / denom)) : 1.0f;
         }
