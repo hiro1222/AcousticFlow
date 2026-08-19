@@ -731,7 +731,14 @@ public:
                 //   （実測: 閉扉で δ が 0.05m ＝ 往復 2cm ぶんしか無かった）。
                 //   衝立の影境界では膨らませた点は空中なので、この判定に掛からない
                 //   （連続性 0.033 を壊さない）。
-                if (!(diffGateMask_ & 1) && pointInsideOther(p, exceptInst, margin)) return false;
+                // ★二値の「別の実体の中か」は死角を作る（角では膨らませが 2 方向へ効くため）。
+                //   ここは「完全に落ちる深さか」だけを見て、途中は下の edgeW で連続に効かせる。
+                // ★既定は従来どおり二値。連続版は insideOtherContinuous_ で切り替える（下の解説）。
+                if (!(diffGateMask_ & 1)) {
+                    if (insideOtherContinuous_) {
+                        if (insideOtherWeight(p, exceptInst, insideOtherScale_) <= 0.0f) return false;
+                    } else if (pointInsideOther(p, exceptInst, margin)) return false;
+                }
                 // ★試して駄目だったもの: 「手前側の対になる縁が塞がれているなら奥へは
                 //   届いていない」（中心面で鏡映した点の可視性で判定）。
                 //   実測では幻が消えず、扉 10° の開き始めが 0 になる副作用だけ出た。
@@ -862,9 +869,12 @@ public:
             //     実測で 経路長の最大隣接差 2.65m → 2.44m しか改善せず、
             //     1フレーム 7.0ms → 8.1ms（+15%）。可視判定はレイを何本も撃つので高い。
             //     主因は「見え始め」ではなく掠め判定の閾値そのものだった。
-            const float edgeW = requireBothEnds
+            float edgeW = requireBothEnds
                 ? std::min(penNearWeight(from, bp, bp), penNearWeight(bp, to, bp))
                 : penNearWeight(from, bp, bp);
+            // 別の実体への食い込みも**連続**に効かせる（二値だと候補が点滅する）。
+            if (!(diffGateMask_ & 1) && insideOtherContinuous_)
+                edgeW *= insideOtherWeight(bp, exceptInst, insideOtherScale_);
             if (edgeW <= 0.0f) return false;
             float bd = length(bp - from) + length(to - bp) - direct;
             if (bd < 0.0f) bd = 0.0f;
@@ -2298,6 +2308,57 @@ public:
     //   tol は稜線を膨らませた量。膨らませたぶんだけ箱も太らせて判定しないと、
     //   扉の自由端と戸口の枠がぴったり接している状態で、候補点が扉の**数 mm 外**に
     //   落ちて判定をすり抜ける（実測: 閉扉で 6mm 外に落ちて幻の経路が残った）。
+    // 別の実体へどれだけ食い込んでいるか(m)。外なら 0。
+    //
+    //   ★pointInsideOther（二値）が回折候補の**死角**を作っていた。
+    //     稜線は面から margin だけ外へ膨らませてあるが、角では 2 方向へ同時に押されるので、
+    //     膨らませた点が隣り合う壁の中へ入ることがある。三分探索が稜線上のどこに P を
+    //     置くかはリスナー位置で変わるので、入る位置と入らない位置が交互に現れ、
+    //     候補が点滅した（実測: く字の廊下で幅 13cm の死角が 22/51 点、切り替わり 11 回）。
+    //     深さを測って連続な重みにすれば、生まれる瞬間の重みが 0 なので跳ばない
+    //     （隣の edgeNear が同じ理由で smoothstep 化されているのと同じ処置）。
+    ///   戻り値は**符号付き**: 正 = 中へ食い込んだ深さ / 負 = 外側までの距離。
+    ///   ★二値の頃は tol(=margin) を足して「2cm 以内なら中」としていた。これが
+    ///     狭い隙間の番人になっている ── 隙間が膨らませ幅より狭ければ、膨らませた点は
+    ///     必ず向かい側の面の近くに来るので、そこで落として「3cm の隙間は通らない」を
+    ///     成立させていた。外しただけだと 3cm の隙間が 2m と同じくらい漏れる（実測）。
+    ///     なので**外側も含めて連続**にする。
+    float insideOtherSigned(const Vec3& P, int selfInst) const {
+        float best = -1e30f;   // いちばん「中寄り」の値
+        const int n = static_cast<int>(instances_.size());
+        for (int i = 0; i < n; ++i) {
+            if (i == selfInst) continue;
+            const Instance& inst = instances_[static_cast<std::size_t>(i)];
+            if (!inst.active || inst.geomId >= 0) continue;
+            const Obb& o = inst.obb;
+            const Vec3 l = obbToLocalPoint(P, o);
+            const float ex = std::fabs(l.x) - o.halfExtents.x;
+            const float ey = std::fabs(l.y) - o.halfExtents.y;
+            const float ez = std::fabs(l.z) - o.halfExtents.z;
+            float d;
+            if (ex <= 0.0f && ey <= 0.0f && ez <= 0.0f) {
+                d = -std::max(ex, std::max(ey, ez));           // 中: 面までの最短＝深さ(正)
+            } else {
+                const float ox = std::max(ex, 0.0f), oy = std::max(ey, 0.0f),
+                            oz = std::max(ez, 0.0f);
+                d = -std::sqrt(ox * ox + oy * oy + oz * oz);   // 外: 距離(負)
+            }
+            if (d > best) best = d;
+        }
+        return (best > -1e29f) ? best : -1e30f;
+    }
+    /// 符号付き距離 → 重み(1..0)。
+    ///   d >= 0（中）        → 0。実体の中の回折点＝幻
+    ///   d <= -scale（十分外）→ 1
+    ///   あいだは smoothstep。**ここが連続なので候補が点滅しない。**
+    float insideOtherWeight(const Vec3& P, int selfInst, float scale) const {
+        const float d = insideOtherSigned(P, selfInst);
+        if (d >= 0.0f) return 0.0f;
+        if (scale <= 1e-6f || d <= -scale) return 1.0f;
+        const float x = -d / scale;                 // 0(面上) .. 1(scale だけ外)
+        return x * x * (3.0f - 2.0f * x);
+    }
+
     bool pointInsideOther(const Vec3& P, int selfInst, float tol) const {
         const int n = static_cast<int>(instances_.size());
         for (int i = 0; i < n; ++i) {
@@ -4928,6 +4989,20 @@ private:
     //   bit0 pointInsideOther / bit1 penNearWeight / bit2 crossesCore
     //   ★どのゲートが死角を作っているかを切り分けるためだけのもの。本番では 0。
     int   diffGateMask_ = 0;
+    // 回折点が別の実体へ食い込むのを許す深さ(m)。これを超えたら「実体の中の回折点」＝幻。
+    //   稜線の膨らませ margin(2cm) の 2 倍を既定にしてある（角では 2 方向ぶん押されるため）。
+    // 【未採用】回折点が別の実体に近いかを**連続**に効かせる版。既定 OFF。
+    //   二値の pointInsideOther が回折候補の死角を作っている（実測: く字の廊下で
+    //   死角 22/51 点・切り替わり 11 回 → 連続版で 8 点・1 回に解消）。
+    //   ★しかし連続版にすると「3cm の隙間は 2m の隙間よりずっと通らない」が壊れる
+    //     （2m 0.558 に対し 3cm が 0.451。合格には 0.14 以下が要る）。しかも smoothstep の
+    //     幅を 0.02/0.04/0.08 と振っても 3cm 側の値が 1 も動かない ── 二値の tol は
+    //     距離ランプとは**構造的に別のこと**をしている。
+    //   → 狭い隙間を塞ぐことと、角で死角を作らないことが、1 点回折の模型では両立しない。
+    //     記録にある「幻の経路は 1 点で回折する模型では原理的に分離できない」と同じ壁。
+    //     稜線からポータル（フレネル積分）を生成する方向で解くべき問題。
+    bool  insideOtherContinuous_ = false;
+    float insideOtherScale_ = 0.08f;
     float portalGovernRange_ = 1.0f;       // ポータルの支配が及ぶ距離(m)
     bool  autoPortals_ = false;            // 開口からポータルを自動生成するか
     float autoPortalMinArea_ = 0.25f;      // これ未満の口はポータルにしない(m2)
