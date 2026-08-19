@@ -87,5 +87,87 @@ namespace AcousticFlow
                 default: return DefaultWall();
             }
         }
+
+        // ── 任意の材質を作る ──
+        //
+        // ★インスペクタに透過の生値（コンクリで 1e-5 級）を並べても人は扱えないので、
+        //   外向きの単位は**透過損失 TL[dB]** と**吸音率 α**にする。material.cpp の
+        //   コメントと同じ単位なので、文献値をそのまま入れられる。
+        //     transmission(エネルギー) = 10^(-TL/10)
+        //
+        // ★α の上限を 0.99 に切ってある。エンジンは reflection = 1 - α - τ で反射を出すので、
+        //   α + τ が 1 を超えると反射が負になる（エンジン側でも clamp しているが、
+        //   ここで切っておかないと「入れた値と鳴る値が違う」ことに気づけない）。
+
+        /// 透過損失(dB) → 透過率(エネルギー比)。
+        public static float TlDbToEnergy(float tlDb)
+        {
+            if (tlDb >= 200f) return 0f;                  // 実質の完全不透過
+            return UnityEngine.Mathf.Pow(10f, -tlDb / 10f);
+        }
+
+        /// 透過率(エネルギー比) → 透過損失(dB)。表示用。
+        public static float EnergyToTlDb(float energy)
+        {
+            if (energy <= 1e-20f) return 200f;
+            return -10f * UnityEngine.Mathf.Log10(energy);
+        }
+
+        /// 6 帯域を直に指定して作る。alphaBands / tlDbBands / scatterBands は各 6 要素。
+        /// null を渡した配列は Default の値を使う。
+        public static AcousticMaterial FromBands(float[] alphaBands, float[] tlDbBands,
+                                                 float[] scatterBands)
+        {
+            var baseMat = DefaultWall();
+            int n = AcousticEngine.NumBands;
+            var tr = new float[n];
+            var ab = new float[n];
+            var sc = new float[n];
+            for (int b = 0; b < n; b++)
+            {
+                tr[b] = (tlDbBands != null && tlDbBands.Length > b)
+                      ? TlDbToEnergy(tlDbBands[b]) : baseMat.transmission[b];
+                ab[b] = (alphaBands != null && alphaBands.Length > b)
+                      ? UnityEngine.Mathf.Clamp(alphaBands[b], 0f, 0.99f) : baseMat.absorption[b];
+                sc[b] = (scatterBands != null && scatterBands.Length > b)
+                      ? UnityEngine.Mathf.Clamp01(scatterBands[b]) : baseMat.scattering[b];
+            }
+            return new AcousticMaterial(tr, ab, sc);
+        }
+
+        /// プリセットの**形は残したまま**、量だけ動かす。
+        ///   absorptionScale : 吸音率を何倍にするか（1 でそのまま）
+        ///   tlOffsetDb      : 透過損失を何 dB 足すか（+ で遮る、− で漏れる）
+        /// 決めごと #3「形は物理から採り、絶対値は演出で決める」に沿った入口。
+        /// 形そのものを変えたいとき（雪のように高域だけ極端に吸うなど）は FromBands を使う。
+        public static AcousticMaterial Adjusted(AcousticMaterialPreset preset,
+                                                float absorptionScale, float tlOffsetDb)
+        {
+            var m = FromPreset(preset);
+            int n = AcousticEngine.NumBands;
+            var tr = new float[n];
+            var ab = new float[n];
+            var sc = new float[n];
+            for (int b = 0; b < n; b++)
+            {
+                tr[b] = TlDbToEnergy(EnergyToTlDb(m.transmission[b]) + tlOffsetDb);
+                ab[b] = UnityEngine.Mathf.Clamp(m.absorption[b] * absorptionScale, 0f, 0.99f);
+                sc[b] = m.scattering[b];
+            }
+            return new AcousticMaterial(tr, ab, sc);
+        }
+
+        /// 中身で決まるキー。materialId のキャッシュに使う。
+        ///   ★プリセットの enum をキーにしてはいけない。任意材質を入れると
+        ///     「別の材質なのに同じ ID」に潰れる（同じ壁として鳴る）。
+        public string ContentKey()
+        {
+            var sb = new System.Text.StringBuilder(96);
+            int n = AcousticEngine.NumBands;
+            for (int b = 0; b < n; b++) sb.Append(transmission[b].ToString("G6")).Append(',');
+            for (int b = 0; b < n; b++) sb.Append(absorption[b].ToString("G6")).Append(',');
+            for (int b = 0; b < n; b++) sb.Append(scattering[b].ToString("G6")).Append(',');
+            return sb.ToString();
+        }
     }
 }

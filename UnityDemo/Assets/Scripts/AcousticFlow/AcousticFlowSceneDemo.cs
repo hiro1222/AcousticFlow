@@ -367,9 +367,10 @@ namespace AcousticFlow
 
         private AcousticScene _scene;
         private int _materialId;
-        // プリセット→materialId。同じ材質の壁が何枚あってもテーブルは1つで済ませる。
-        private readonly System.Collections.Generic.Dictionary<int, int> _materialIdByPreset
-            = new System.Collections.Generic.Dictionary<int, int>();
+        // 材質の中身→materialId。同じ値の壁が何枚あってもテーブルは1つで済ませる。
+        //   ★キーをプリセットの enum にしてはいけない（任意材質が同じ ID に潰れる）。
+        private readonly System.Collections.Generic.Dictionary<string, int> _materialIdByContent
+            = new System.Collections.Generic.Dictionary<string, int>();
         // occluder は箱かメッシュ。geomId < 0 が箱で、その場合 local* は使わない。
         //   メッシュはローカルAABBが単位箱になるよう正規化されて登録されるので、
         //   ホスト側は「そのローカルAABB＋Transform」から毎フレーム OBB を組み直す。
@@ -858,10 +859,16 @@ namespace AcousticFlow
             if (surf == null) surf = o.col.GetComponentInParent<AcousticSurface>();
             if (surf == null) return _materialId;
 
-            int key = (int)surf.material;
-            if (_materialIdByPreset.TryGetValue(key, out int id)) return id;
-            id = _scene.AddMaterial(surf.Resolve());
-            _materialIdByPreset[key] = id;
+            // ★キーは**中身**にする。以前はプリセットの enum をキーにしていたので、
+            //   任意材質（AcousticSurfaceMode.Adjusted / Custom）を入れると
+            //   「形の出どころが同じプリセット」というだけで別の材質が同じ ID に潰れ、
+            //   最初に登録した方の音で全部鳴っていた。
+            //   中身をキーにすれば、同じ値の壁は今までどおり 1 つを共有する。
+            var mat = surf.Resolve();
+            string key = mat.ContentKey();
+            if (_materialIdByContent.TryGetValue(key, out int id)) return id;
+            id = _scene.AddMaterial(mat);
+            _materialIdByContent[key] = id;
             return id;
         }
 
@@ -870,7 +877,7 @@ namespace AcousticFlow
             _meshGeomCache.Clear();
             _meshLocalCenter.Clear();
             _meshLocalHalf.Clear();
-            _materialIdByPreset.Clear();
+            _materialIdByContent.Clear();
 
             for (int i = 0; i < _occluders.Count; i++)
             {
