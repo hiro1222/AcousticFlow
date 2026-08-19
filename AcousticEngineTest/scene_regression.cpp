@@ -4389,6 +4389,33 @@ void diagnoseCorridorTapDropout() {
         std::printf("  死角 %2d 点 / 切り替わり %d 回\n", dead, flips);
     }
     std::printf("      ※'#'=候補あり / '.'=死角。死角が消えたゲートが犯人。\n");
+
+    // 【(B)】稜線からポータルを生成する版。回折の**量**が矩形の中の影で決まるので、
+    //   候補の有無ではなく実際の帯域ゲインで見る（本数が同じでも中身が変わる）。
+    std::printf("        (B) 稜線ポータル ON/OFF での回折ゲイン（125Hz / 傾き4k-125）:\n");
+    for (int mode = 0; mode < 2; ++mode) {
+        std::printf("          %s ", mode ? "ON （稜線→矩形→フレネル）" : "OFF（前川＋開口積分）  ");
+        double worstTilt = 0.0; float prevTilt = 0.0f; bool have = false;
+        for (float z = -6.0f; z <= -1.0f; z += 0.1f) {
+            AF_SceneHandle s = build();
+            AF_SceneSetEdgePortals(s, mode);
+            const AF_Vector3 L = V(0, 1.6f, z);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
+            AF_Vector3 dp[8]; float dg[8]; float db[8*6];
+            const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+            float lo = 0.0f, hi = 0.0f;
+            for (int i = 0; i < nd; ++i) { lo += db[i*6+0]; hi += db[i*6+5]; }
+            const float tilt = (lo > 1e-6f)
+                ? 20.0f * std::log10(std::max(hi, 1e-6f) / lo) : 0.0f;
+            if (have && lo > 1e-6f) worstTilt = std::max(worstTilt, (double)std::fabs(tilt - prevTilt));
+            if (lo > 1e-6f) { prevTilt = tilt; have = true; }
+            std::printf("%c", (nd == 0) ? '.' : '#');
+            AF_SceneDestroy(s);
+        }
+        std::printf("  傾きの最大隣接差 %.2f dB\n", worstTilt);
+    }
 }
 
 void testOutdoorIsNotARoom() {

@@ -734,7 +734,10 @@ public:
                 // ★二値の「別の実体の中か」は死角を作る（角では膨らませが 2 方向へ効くため）。
                 //   ここは「完全に落ちる深さか」だけを見て、途中は下の edgeW で連続に効かせる。
                 // ★既定は従来どおり二値。連続版は insideOtherContinuous_ で切り替える（下の解説）。
-                if (!(diffGateMask_ & 1)) {
+                // ★(B) が有効なら、この二値ゲートは要らない。矩形の中で壁が影として落ちるので、
+                //   幻の経路は「全部塞がれている」＝ゲイン 0 として積分側が決める。
+                //   ゲートの役目（狭い隙間を塞ぐ・実体の中の回折点を消す）を積分が引き取る。
+                if (!(diffGateMask_ & 1) && !edgePortals_) {
                     if (insideOtherContinuous_) {
                         if (insideOtherWeight(p, exceptInst, insideOtherScale_) <= 0.0f) return false;
                     } else if (pointInsideOther(p, exceptInst, margin)) return false;
@@ -1231,6 +1234,49 @@ public:
     void setDiffractionGateMask(int m) { diffGateMask_ = m; }
     void setPortalGovernRange(float m) { portalGovernRange_ = std::max(0.05f, m); }
     float portalGovernRange() const { return portalGovernRange_; }
+
+    // ── (B) 稜線からポータルを生成する ──
+    //
+    //   稜線点 P を中心に、稜線方向 u と、それに直交する v で矩形を張り、
+    //   既存の portalOpenBands（フレネル帯域積分）へ流す。
+    //   ★どちらが開いている側かを決めない。**両側へ張る**ので、壁の側は壁自身が
+    //     影として落ちる。「面のうちどこまでを積分するか」に答えを出す必要が消える
+    //     （4 通り試して全部失敗した、あの問い）。
+    //   ★寸法はフレネル半径 r1 = √(λd₁d₂/(d₁+d₂)) から採る。数ゾーンを超えると
+    //     寄与は振動して消えるので、そこまで張れば物理は捉えられる。
+    //     いちばん波長の長い 125Hz で決めれば全帯域を覆える。
+    bool edgePortalBands(const Vec3& P, const Vec3& edgeDir,
+                         const Vec3& listener, const Vec3& source,
+                         float* outFrac6, Vec3* outPoint) const {
+        const Vec3 toL = listener - P, toS = source - P;
+        const float d1 = std::max(length(toL), 1e-3f), d2 = std::max(length(toS), 1e-3f);
+        Vec3 u = edgeDir;
+        if (length(u) < 1e-4f) return false;
+        u = normalized(u);
+        // 面の向き: 入射と出射の二等分（回折面）。稜線に直交させる。
+        Vec3 n = normalized(toS) - normalized(toL);
+        if (length(n) < 1e-4f) n = source - listener;
+        n = n - u * dot(n, u);
+        if (length(n) < 1e-4f) return false;
+        n = normalized(n);
+        const Vec3 v = cross(n, u);
+        if (length(v) < 1e-4f) return false;
+        const float lambda = 343.0f / 125.0f;                 // いちばん長い波長で決める
+        const float r1 = std::sqrt(lambda * d1 * d2 / (d1 + d2));
+        const float half = std::max(edgePortalSpan_ * r1, 0.5f);
+        Portal pt;
+        pt.center = P;
+        pt.axisU = u;
+        pt.axisV = normalized(v);
+        pt.halfU = half;
+        pt.halfV = half;
+        return portalOpenBands(pt, listener, source, outFrac6, outPoint);
+    }
+    /// (B) を使うか。既定 OFF（従来の前川＋開口積分）。
+    void setEdgePortals(bool on) { edgePortals_ = on; }
+    bool edgePortals() const { return edgePortals_; }
+    /// 矩形の半幅をフレネル半径の何倍にするか。
+    void setEdgePortalSpan(float k) { edgePortalSpan_ = std::max(0.25f, k); }
 
     // ── 部屋グラフの開口からポータルを自動生成する ──
     //
@@ -3009,8 +3055,39 @@ public:
             //   （実測 3m）、窓ごと飛んで値が乱高下する。窓は測定の基準ではなく
             //   積分の範囲なので、**連続に動く点**（直線と平面の交点）に据える。
             float fres[kNumBands];
-            const bool haveFres = useFresnelAperture_
-                                && apertureFresnelBands(listener, source, fres);
+            bool haveFres = useFresnelAperture_
+                          && apertureFresnelBands(listener, source, fres);
+            // ── (B) 稜線からポータルを生成してフレネル積分する ──
+            //
+            //   ★ここまでの経緯: 回折候補が幅 13cm の死角で点滅していた（実測: く字の廊下で
+            //     51 点中 22 点が死角・切り替わり 11 回）。犯人は pointInsideOther（二値）で、
+            //     連続化すると死角は消えるが「3cm の隙間が漏れない」が壊れた。しかも
+            //     smoothstep の幅を振っても 3cm 側が 1 も動かない ── 二値の tol は
+            //     「隙間の幅そのものを測る」役割を兼ねていて、距離ランプでは代替できない。
+            //     **狭い隙間を塞ぐことと、角で死角を作らないことが、1 点回折では両立しない。**
+            //
+            //   → 1 点で表すのをやめる。稜線を縁とする**矩形**を張り、既存のフレネル帯域積分
+            //     （ポータルと同じもの）に流す。ナイフエッジ回折の厳密解はもともと
+            //     「稜線の向こうの開いた面にフレネル核を掛けた積分」で、前川の式はその
+            //     近似なので、これは技ではなく元の形に戻す動き。
+            //   ・隙間の幅 … 矩形の中で壁が影として落ちるので、測る必要がない
+            //   ・角の死角 … 探索も可視判定も無いので発生しない
+            //   ・答えが 1 つになる（決めごと #1）。ポータルと同じ経路を通る
+            //
+            //   矩形は**稜線点を中心に両側へ**張る。どちらが開いている側かを決めなくてよい
+            //   （壁の側は壁自身が影として落ちる）。寸法はフレネル半径から採る。
+            // ★メッシュは従来経路のまま。矩形への影は OBB を前提に落としているので、
+            //   境界箱と実形状がずれるメッシュでは量が合わない（実測: 同形の箱の 4.75 倍）。
+            //   ここは後から直す（実形状で影を落とすようにする）。
+            const bool selfMesh = (cl[bi].inst >= 0 && cl[bi].inst < instanceCount()
+                                   && instances_[(std::size_t)cl[bi].inst].geomId >= 0);
+            if (edgePortals_ && !selfMesh && cl[bi].npts > 0) {
+                float ef[kNumBands]; Vec3 ep(0, 0, 0);
+                if (edgePortalBands(centroid, cl[bi].edges[0], listener, source, ef, &ep)) {
+                    for (int b = 0; b < kNumBands; ++b) fres[b] = ef[b];
+                    haveFres = true;
+                }
+            }
             float openGainHere = 1.0f;
             float slitHere = 0.0f;                 // 診断用。フレネル使用時は測らない
 
@@ -5003,6 +5080,9 @@ private:
     //     稜線からポータル（フレネル積分）を生成する方向で解くべき問題。
     bool  insideOtherContinuous_ = false;
     float insideOtherScale_ = 0.08f;
+    // (B) 稜線からポータルを生成してフレネル積分する。既定 OFF（従来経路）。
+    bool  edgePortals_ = false;
+    float edgePortalSpan_ = 1.0f;          // 矩形の半幅 = これ × フレネル半径
     float portalGovernRange_ = 1.0f;       // ポータルの支配が及ぶ距離(m)
     bool  autoPortals_ = false;            // 開口からポータルを自動生成するか
     float autoPortalMinArea_ = 0.25f;      // これ未満の口はポータルにしない(m2)

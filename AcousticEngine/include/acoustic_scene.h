@@ -332,6 +332,10 @@ ACOUSTIC_API int  AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* ou
 /* 【計測用】回折の可視判定のゲートを個別に切る。0 = 全部有効（本番）。
  * bit0 pointInsideOther / bit1 penNearWeight / bit2 crossesCore
  * どのゲートが死角を作っているかを切り分けるためだけの口。 */
+/* 【(B)】稜線からポータルを生成してフレネル積分する。既定 0（従来の前川＋開口積分）。 */
+ACOUSTIC_API void AF_SceneSetEdgePortals(AF_SceneHandle scene, int enable);
+ACOUSTIC_API void AF_SceneSetEdgePortalSpan(AF_SceneHandle scene, float k);
+
 ACOUSTIC_API void AF_SceneSetDiffractionGateMask(AF_SceneHandle scene, int mask);
 
 ACOUSTIC_API void AF_SceneSetPortalGovernRange(AF_SceneHandle scene, float meters);

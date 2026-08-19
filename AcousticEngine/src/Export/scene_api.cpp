@@ -652,6 +652,20 @@ int AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* outCenter,
 }
 
 /* 【計測用】回折の可視判定のゲートを個別に切る。0 = 全部有効（本番）。 */
+/* 【(B)】稜線からポータルを生成してフレネル積分する。既定 0（従来の前川＋開口積分）。
+ * 1 点で回折を表すのをやめる ── 隙間の幅も角の死角も、矩形の中で影が落ちることで
+ * 自動的に解ける。ナイフエッジ回折の厳密解はもともとこの形の積分。 */
+void AF_SceneSetEdgePortals(AF_SceneHandle scene, int enable) {
+    Scene* s = asScene(scene);
+    if (s) s->setEdgePortals(enable != 0);
+}
+
+/* 矩形の半幅をフレネル半径の何倍にするか（既定 1.0）。 */
+void AF_SceneSetEdgePortalSpan(AF_SceneHandle scene, float k) {
+    Scene* s = asScene(scene);
+    if (s) s->setEdgePortalSpan(k);
+}
+
 void AF_SceneSetDiffractionGateMask(AF_SceneHandle scene, int mask) {
     Scene* s = asScene(scene);
     if (s) s->setDiffractionGateMask(mask);
