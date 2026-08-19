@@ -64,6 +64,24 @@ AF_SceneHandle AF_SceneCreate(void) { return new (std::nothrow) Scene(); }
 
 void AF_SceneDestroy(AF_SceneHandle scene) { delete asScene(scene); }
 
+int AF_MaterialPresetBands(int preset, float* outTransmission,
+                           float* outAbsorption, float* outScattering) {
+    AcousticMaterial m;
+    switch (preset) {
+        case 1:  m = AcousticMaterial::concrete();    break;
+        case 2:  m = AcousticMaterial::glass();       break;
+        case 3:  m = AcousticMaterial::opaque();      break;
+        case 4:  m = AcousticMaterial::woodDoor();    break;
+        default: m = AcousticMaterial::defaultWall(); break;
+    }
+    for (int b = 0; b < kNumBands; ++b) {
+        if (outTransmission) outTransmission[b] = m.transmission[b];
+        if (outAbsorption)   outAbsorption[b]   = m.absorption[b];
+        if (outScattering)   outScattering[b]   = m.scattering[b];
+    }
+    return kNumBands;
+}
+
 int AF_SceneAddMaterial(AF_SceneHandle scene,
                         const float* transmission, const float* absorption,
                         const float* scattering, int numBands) {

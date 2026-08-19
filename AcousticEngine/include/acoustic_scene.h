@@ -31,6 +31,18 @@ ACOUSTIC_API void AF_SceneDestroy(AF_SceneHandle scene);
 
 /* ===== 材質テーブル ===== */
 
+/* 【材質プリセットの唯一の出どころ】preset 番号の 6 帯域値を書く。書けた帯域数を返す。
+ *   preset: 0=Default / 1=Concrete / 2=Glass / 3=Opaque / 4=WoodDoor
+ *   各 out は 6 要素以上、または null（要らないものは null でよい）。
+ *
+ * ★ホスト側がプリセット値を自前で持つと必ずずれる。実際に C++ と C# で
+ *   Default と Concrete の透過が 6〜8dB 食い違っていた（C++ 側だけ意図的に上げて、
+ *   C# が置き去りになった）。回帰テストが守る遮音量と出荷する音が違う状態で、
+ *   決めごと #1「同じ問いに 2 つの答えを持たせない」そのもの。
+ *   ホストはこの関数から引くこと。 */
+ACOUSTIC_API int AF_MaterialPresetBands(int preset, float* outTransmission,
+                                        float* outAbsorption, float* outScattering);
+
 /* 材質をテーブルに追加し materialId を返す。
  *   transmission/absorption/scattering : 各帯域(0..1)配列。null なら既定壁の該当値。
  *   numBands : 配列要素数。内部帯域数(6)未満なら不足分は既定壁で補う。<=0 は全て既定。

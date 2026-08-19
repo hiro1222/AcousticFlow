@@ -76,7 +76,42 @@ namespace AcousticFlow
             new[] { 0.10f, 0.10f, 0.15f, 0.20f, 0.30f, 0.40f },
             new[] { 0.10f, 0.15f, 0.20f, 0.30f, 0.40f, 0.50f });
 
+        // ★プリセットは**エンジンから引く**。下の C# 側の表は、DLL が古い/読めないときの
+        //   保険であって正ではない。
+        //
+        //   ここを自前の表にしていたせいで、C++ と C# で Default と Concrete の透過が
+        //   6〜8dB 食い違っていた。C++ 側は「壁が漏らしすぎると扉から漏れる音が壁の漏れに
+        //   埋もれてどこから聞こえるか分からなくなる」という理由で意図的に上げてあったが、
+        //   C# が置き去りになっていた。Unity で鳴っていたのは C# の値なので、
+        //   **回帰テストが守る遮音量と出荷する音が違う**状態だった
+        //   （決めごと #1「同じ問いに 2 つの答えを持たせない」そのもの）。
+        private static bool _presetWarned;
         public static AcousticMaterial FromPreset(AcousticMaterialPreset preset)
+        {
+            int n = AcousticEngine.NumBands;
+            var tr = new float[n];
+            var ab = new float[n];
+            var sc = new float[n];
+            try
+            {
+                if (Native.AF_MaterialPresetBands((int)preset, tr, ab, sc) >= n)
+                    return new AcousticMaterial(tr, ab, sc);
+            }
+            catch (System.Exception) { /* 古い DLL＝エントリポイント無し。下へ落ちる */ }
+
+            if (!_presetWarned)
+            {
+                _presetWarned = true;
+                UnityEngine.Debug.LogWarning(
+                    "[AcousticMaterial] エンジンからプリセットを引けませんでした。"
+                    + "C# 側の保険の表を使います（エンジンとずれている可能性があります）。"
+                    + "DLL が古くないか確認してください。");
+            }
+            return FromPresetFallback(preset);
+        }
+
+        // 保険。エンジンが引けないときだけ使う。**ここを正としない。**
+        private static AcousticMaterial FromPresetFallback(AcousticMaterialPreset preset)
         {
             switch (preset)
             {

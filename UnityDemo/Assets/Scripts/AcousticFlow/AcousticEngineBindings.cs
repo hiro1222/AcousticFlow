@@ -158,6 +158,14 @@ namespace AcousticFlow
         // インスタンス方式(geomId+OBB transform+matId)の幾何/音響クエリ。
         // 旧 AddBox/IsOccluded/ComputeOcclusion 系を置き換える。ハンドルは別系統(AF_Scene*)。
 
+        // 材質プリセットの唯一の出どころ。ホストが自前で値を持つと必ずずれる
+        // （実際 Default と Concrete の透過が C++ と 6〜8dB 食い違っていた）。
+        //   preset: 0=Default / 1=Concrete / 2=Glass / 3=Opaque / 4=WoodDoor
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_MaterialPresetBands(int preset,
+            [Out] float[] outTransmission, [Out] float[] outAbsorption,
+            [Out] float[] outScattering);
+
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern IntPtr AF_SceneCreate();
 
