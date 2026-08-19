@@ -3353,15 +3353,36 @@ public:
         const int N = numSamples < 1 ? 1 : numSamples;
         float transAccum[kNumBands] = {0, 0, 0, 0, 0, 0};
         int occCount = 0;
-        uint32_t rng = static_cast<uint32_t>(dist * 1000.0f) * 2654435761u + 98765u;
-        for (int i = 0; i < N; ++i) {
-            const float rr = sourceRadius * std::sqrt(hashRand01(rng));
-            const float aa = 2.0f * kPiF * hashRand01(rng);
-            const Vec3 p = source + u * (rr * std::cos(aa)) + v * (rr * std::sin(aa));
-            float g[kNumBands];
-            computeTransmission(listener, p, g);
-            for (int b = 0; b < kNumBands; ++b) transAccum[b] += g[b];
-            if (g[0] < 1.0f) ++occCount;  // このサンプルは壁を通った
+        // ★標本は**4 回対称**に置く。乱数で撒くと、左右対称なシーンの鏡像の位置で
+        //   別の点を踏むので、同じ音になるべき所で差が出る（実測 0.28dB）。
+        //
+        //   なぜ 4 回対称かの理屈: 世界を x=0 で鏡映すると dir も鏡映される。
+        //   u = cross(dir, t) は t が固定なので u' = ±M·u、v = cross(dir,u) は
+        //   外積が 2 回入って v' = ∓M·v になる（det(M) = -1 のため符号が 1 つ落ちる）。
+        //   つまり鏡像側の標本は、元の標本の θ → −θ（または π−θ）に対応する。
+        //   点の集合がその 2 つの反転で閉じていれば、集合として鏡像になる。
+        //   → 第 1 象限に置いた点を 4 象限へ折り返す。
+        //
+        //   ついでに決定的になる（乱数だとフレームごとにパターンが変わってちらつく。
+        //   同じ理由で開口の標本にはフィボナッチ円盤を使っている）。
+        const int nQ = (N + 3) / 4;                       // 第 1 象限ぶん
+        const float kGolden = 2.39996323f;                // 黄金角（半径方向に均す）
+        for (int q = 0; q < nQ; ++q) {
+            const float rr = sourceRadius
+                           * std::sqrt((static_cast<float>(q) + 0.5f) / static_cast<float>(nQ));
+            // 第 1 象限 (0, π/2) に収める。折り返して 4 象限を埋める。
+            const float a0 = std::fmod(kGolden * static_cast<float>(q), kPiF * 0.5f);
+            const float cs = std::cos(a0), sn = std::sin(a0);
+            const float sx[4] = { +1.0f, -1.0f, -1.0f, +1.0f };
+            const float sy[4] = { +1.0f, +1.0f, -1.0f, -1.0f };
+            for (int k = 0; k < 4; ++k) {
+                if (q * 4 + k >= N) break;
+                const Vec3 p = source + u * (rr * cs * sx[k]) + v * (rr * sn * sy[k]);
+                float g[kNumBands];
+                computeTransmission(listener, p, g);
+                for (int b = 0; b < kNumBands; ++b) transAccum[b] += g[b];
+                if (g[0] < 1.0f) ++occCount;  // このサンプルは壁を通った
+            }
         }
         const float inv = 1.0f / static_cast<float>(N);
         const float occFrac = static_cast<float>(occCount) * inv;

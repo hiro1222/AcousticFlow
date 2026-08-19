@@ -3570,8 +3570,10 @@ void diagnosePortalLeftRightSymmetry() {
             AF_SceneDestroy(s);
         }
         double worst = 0.0; float worstX = 0.0f;
+        double worstDir = 0.0;
         for (float x : xs) {
             float g[2][kBands] = {};
+            float dir[2][3] = {};
             for (int k = 0; k < 2; ++k) {
                 const float sx = (k == 0) ? -x : x;
                 AF_SceneHandle s = build(c.cell, c.autoP);
@@ -3579,19 +3581,32 @@ void diagnosePortalLeftRightSymmetry() {
                 AF_SceneSetSource(s, 1, V(0, 1.5f, 2.5f));   // 音源は開口の正面
                 for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
                 const int idx = AF_SceneSourceIndex(s, 1);
-                if (idx >= 0) AF_SceneGetSourceOcclusion(s, idx, g[k]);
+                if (idx >= 0) {
+                    AF_SceneGetSourceOcclusion(s, idx, g[k]);
+                    AF_SceneGetSourceArrivalDir(s, idx, dir[k]);
+                }
                 AF_SceneDestroy(s);
             }
             double d = 0.0;
             for (int b = 0; b < kBands; ++b)
                 d = std::max(d, std::fabs(20.0 * std::log10(std::max(g[1][b], 1e-6f)
                                                           / std::max(g[0][b], 1e-6f))));
-            std::printf("          x=%+.1f 対 %+.1f   左 125=%.4f 4k=%.4f / "
-                        "右 125=%.4f 4k=%.4f  → 差 %.2f dB\n",
-                        -x, x, g[0][0], g[0][5], g[1][0], g[1][5], d);
+            // 到来方向は鏡像なら x が反転して y,z は同じになるはず。
+            //   ★ここがこのエンジンの主張そのもの ── 開口が方向を決める。
+            //     方向がずれていたら「音の方へ進むと穴に着く」が成立しない。
+            const double dx = std::fabs((double)dir[0][0] + dir[1][0]);   // 反転して足すと 0
+            const double dy = std::fabs((double)dir[0][1] - dir[1][1]);
+            const double dz = std::fabs((double)dir[0][2] - dir[1][2]);
+            const double dd = std::max(dx, std::max(dy, dz));
+            worstDir = std::max(worstDir, dd);
+            std::printf("          x=%+.1f 対 %+.1f  ゲイン差 %.2f dB / "
+                        "到来方向 左(%+.3f,%+.3f,%+.3f) 右(%+.3f,%+.3f,%+.3f) 鏡像ずれ %.4f\n",
+                        -x, x, d, dir[0][0], dir[0][1], dir[0][2],
+                        dir[1][0], dir[1][1], dir[1][2], dd);
             if (d > worst) { worst = d; worstX = x; }
         }
-        std::printf("      → 鏡像どうしの差 最大 %.2f dB @ x=±%.1f\n", worst, worstX);
+        std::printf("      → 鏡像どうしの差 ゲイン 最大 %.2f dB @ x=±%.1f / "
+                    "到来方向 最大 %.4f\n", worst, worstX, worstDir);
     }
     std::printf("      ※鏡像は鏡像でなければならない。0dB でないぶんは不具合。\n");
 }
