@@ -1170,6 +1170,9 @@ public:
         float halfU = 0.6f;
         float halfV = 1.2f;
         bool active = true;
+        // 矩形が「実在する穴」ではなく「積分範囲」であるという印。
+        //   稜線から作った一時ポータルだけが立てる。帯域ごとに r1 で範囲を切る。
+        bool fresnelSized = false;
     };
 
     int addPortal(const Vec3& center, const Vec3& axisU, const Vec3& axisV,
@@ -1270,6 +1273,7 @@ public:
         pt.axisV = normalized(v);
         pt.halfU = half;
         pt.halfV = half;
+        pt.fresnelSized = true;   // 矩形は積分範囲。帯域ごとに r1 で切る
         return portalOpenBands(pt, listener, source, outFrac6, outPoint);
     }
     /// (B) を使うか。既定 OFF（従来の前川＋開口積分）。
@@ -1543,13 +1547,40 @@ public:
                 for (int c = 0; c < kCols; ++c) acc += kern(lo + st * (c + 0.5f), pv);
                 return acc * st;
             };
+            // ── 積分範囲を帯域ごとに切る（稜線ポータルのときだけ）──
+            //
+            //   ★戸口のポータルと稜線のポータルは、矩形の**意味が違う**:
+            //     戸口 … 矩形は**実在する穴**（枠の内側）。大きさが周波数で変わっては困る
+            //     稜線 … 矩形は**積分範囲**。本当の開口は無限の半空間で、それを矩形で
+            //             正規化している以上、範囲はそのゾーンの広がり＝帯域ごとの r1 に
+            //             比例していないと辻褄が合わない
+            //   混ぜてはいけない 2 つなので、fresnelSized の印がある矩形にだけ掛ける。
+            //
+            //   ★これが無いと、矩形は 125Hz の r1 で作られるので 4kHz には √32 ≒ 5.7 倍
+            //     大きすぎる。実測（隙間の幅を振ったときの効き。2m を 0dB として）:
+            //       範囲 r1×0.5  0.5m -19.9 / 0.1m -43.3 / 0.03m -132  ← 物理どおり
+            //       範囲 r1×2    0.5m  -3.5 / 0.1m  -6.9 / 0.03m  -6.9 ← 頭打ちして効かない
+            //     低域に合わせれば高域が緩み、高域に合わせれば低域が切れる、という
+            //     板挟みの正体がこれだった。
+            float limU = pt.halfU, limV = pt.halfV;
+            if (pt.fresnelSized) {
+                const float lim = edgePortalSpan_ * r1;
+                limU = std::min(limU, lim);
+                limV = std::min(limV, lim);
+            }
             double numer = 0.0, denom = 0.0;
             for (int j = 0; j < kRows; ++j) {
                 const float y = -pt.halfV + rowH * (j + 0.5f);
-                denom += integ(-pt.halfU, pt.halfU, y);      // 矩形全体＝素通しのとき
-                for (int i = begin_[j]; i < begin_[j + 1]; ++i)
-                    numer += integ(openRow[static_cast<std::size_t>(i)].lo,
-                                   openRow[static_cast<std::size_t>(i)].hi, y);
+                if (std::fabs(y - cv) > limV) continue;       // この帯域のゾーンの外
+                denom += integ(std::max(-pt.halfU, cu - limU),
+                               std::min( pt.halfU, cu + limU), y);   // 素通しのとき
+                for (int i = begin_[j]; i < begin_[j + 1]; ++i) {
+                    const float lo = std::max(openRow[static_cast<std::size_t>(i)].lo,
+                                              cu - limU);
+                    const float hi = std::min(openRow[static_cast<std::size_t>(i)].hi,
+                                              cu + limU);
+                    numer += integ(lo, hi, y);
+                }
             }
             outFrac6[b] = (denom > 1e-12)
                         ? static_cast<float>(std::min(1.0, numer / denom)) : 1.0f;
