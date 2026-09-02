@@ -51,6 +51,13 @@ namespace AcousticFlow
         public KeyCode closeKey = KeyCode.Alpha6;
         [Tooltip("開閉の速さ(度/秒)。")]
         public float speedDegPerSec = 45f;
+        [Header("ドラッグ操作")]
+        [Tooltip("左クリックしながらマウスを上下に動かすと開閉する（上へ動かすと開く）。\n"
+                 + "扉を狙っている必要はない。右ドラッグ（視点）とは別のボタンなので同時に使える。\n"
+                 + "★DoorSweepLab が流している間は enableKeys ごと止まるので、ここも効かない（角度の書き手は 1 つ）。")]
+        public bool enableDrag = true;
+        [Tooltip("マウスの上下 1 単位あたりの角度(度)。大きいほど少しの動きで開く。")]
+        public float dragDegPerUnit = 15f;
         [Tooltip("自動で往復させる（デモ動画の収録用）。")]
         public bool autoSwing = false;
         [Range(0f, 120f)] public float autoMaxDeg = 90f;
@@ -71,6 +78,10 @@ namespace AcousticFlow
                 {
                     if (Input.GetKey(openKey)) angleDeg += speedDegPerSec * Time.deltaTime;
                     if (Input.GetKey(closeKey)) angleDeg -= speedDegPerSec * Time.deltaTime;
+                    // 左ドラッグの上下で開閉。速さはマウスの動きそのものなので、
+                    // ゆっくり開けるのも一気に開けるのも手で決められる（聴き比べ用）。
+                    if (enableDrag && Input.GetMouseButton(0))
+                        angleDeg += Input.GetAxis("Mouse Y") * dragDegPerUnit;
                     angleDeg = Mathf.Clamp(angleDeg, 0f, 120f);
                 }
             }
