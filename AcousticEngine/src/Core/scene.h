@@ -33,6 +33,22 @@
 #include "Core/room_graph.h"
 #include "Core/utd.h"
 #include "Core/vec3.h"
+#include "Core/worker_pool.h"
+#include "Debug/capture.h"      // 入力と音響の出力を常時録る器（docs/SOUND_DEBUG_TOOL.md）
+
+#include <memory>
+
+// 積算先のポインタに付ける。**性能のためではなく、性能の劣化を防ぐため**に要る。
+//   レイのループを「積む先をポインタで受ける」形に変えたとき、直列の平均が
+//   7.97 → 11.43ms と **43% 悪化**した。積む先が seg[] などの局所配列と
+//   別物だとコンパイラが証明できず、ストアのたびに読み直していたため。
+//   ここは呼び出し側が必ず**専用の箱**を渡す（スレッドごと／直列の本体）ので、
+//   重ならないことを約束できる。
+#if defined(_MSC_VER)
+#  define AF_RESTRICT __restrict
+#else
+#  define AF_RESTRICT __restrict__
+#endif
 
 namespace acoustic {
 
@@ -247,9 +263,31 @@ public:
             || dot(o.axisY, obb.axisY) < 0.9999f) {
             // ★動いた瞬間に静的な塗り分けから外れるので、**元居た場所**を塗り直さないと
             //   実体が残る。移動先も「そこには何も無い」を確定させるために渡す。
-            roomBuilder_.touch(rooms::obbBounds(o));
-            roomBuilder_.touch(rooms::obbBounds(obb));
-            in.moved = true;
+            //
+            // ★★ 汚すのは「静的 → 動く」に変わる**最初の一度だけ**でよい ★★
+            //   roomGraph() は `if (in.moved) continue;` で動く実体を入力から外している。
+            //   つまり 2 回目以降にどれだけ動かしても、部屋グラフの入力は変わらない ──
+            //   にもかかわらず毎フレーム touch して作り直していた。**結果が同じ再構築**を
+            //   毎フレーム払っていたことになる。
+            //   実測（Test_Full 規模・扉が毎フレーム動く）: 扉を動かす代金 2.845 ms、
+            //   1 フレーム平均の 26%。部屋グラフの差分更新 2.4 ms とほぼ一致する。
+            if (!in.moved) {
+                roomBuilder_.touch(rooms::obbBounds(o));
+                roomBuilder_.touch(rooms::obbBounds(obb));
+                in.moved = true;
+            }
+            // ★キャプチャは**実際に動いたときだけ**録る。ホストが毎フレーム同じ値を
+            //   押してくるので、呼ばれた回数で録ると全実体が毎フレーム乗って爆発する。
+            //   ここは既に「値が変わった」が確定している枝なので、そのまま使える。
+            if (capture_.active()) {
+                dbg::CapMoved m;
+                m.instance = instanceId;
+                m.cx = obb.center.x;      m.cy = obb.center.y;      m.cz = obb.center.z;
+                m.hx = obb.halfExtents.x; m.hy = obb.halfExtents.y; m.hz = obb.halfExtents.z;
+                m.rx = obb.axisX.x;       m.ry = obb.axisX.y;       m.rz = obb.axisX.z;
+                m.ux = obb.axisY.x;       m.uy = obb.axisY.y;       m.uz = obb.axisY.z;
+                capture_.noteMoved(m);
+            }
         }
         in.obb = obb;
         bvhDirty_ = true;
@@ -516,8 +554,86 @@ public:
         }
     }
 
-    // ── B: キューブマップ エッジカタログ（Phase 4-B, [[dynamic-ray-architecture]] 項1） ──
-    // 回折に効くシルエット稜線。UTD のウェッジ幾何込み。
+    // 【調整支援】この直線の透過損失を**誰が担っているか**を、大きい順に返す。
+    //
+    // ★なぜ要るか
+    //   「この地点でこう聞こえてほしい」に合わせる道具を作るとき、いちばん困るのは
+    //   **どの材質を触れば効くのか分からない**こと。壁か、扉か、床か。
+    //   総量だけ見ても分からないので、担い手を engine が名指しする。
+    //   ⚠ これは診断であって、音の経路を増やす物ではない。鳴るのは合成後の 1 つのまま
+    //     （決めごと #1）。ここで分けて返すのは「どこを触れば動くか」を知るためだけ。
+    //
+    //   outLossDb は帯域平均の透過損失(dB, 正の値)。大きいほどよく遮っている＝担い手。
+    //   戻り値は書けた数。
+    int transmissionCarriers(const Vec3& from, const Vec3& to,
+                             int* outInst, int* outMat, float* outLossDb,
+                             int maxCount) const {
+        using namespace scene_detail;
+        if (!outInst || !outMat || !outLossDb || maxCount <= 0) return 0;
+        ensureBvh();
+        if (bvhNodes_.empty()) return 0;
+        int n = 0;
+        int stack[64];
+        int sp = 0;
+        stack[sp++] = 0;
+        while (sp > 0) {
+            const BvhNode& node = bvhNodes_[stack[--sp]];
+            if (!segmentIntersectsAabb(from, to, node.bounds)) continue;
+            if (node.count > 0) {
+                for (int k = 0; k < node.count; ++k) {
+                    const int i = bvhOrder_[node.leftFirst + k];
+                    const Instance& inst = instances_[i];
+                    if (!instanceOccludes(inst, from, to)) continue;
+                    const AcousticMaterial& m = materialOf(inst.materialId);
+                    // 帯域平均の透過損失。エネルギー比の平均を dB に直す。
+                    float sum = 0.0f;
+                    for (int b = 0; b < kNumBands; ++b) sum += m.transmission[b];
+                    const float avg = std::max(sum / kNumBands, 1e-9f);
+                    const float lossDb = -10.0f * std::log10(avg);
+                    if (n < maxCount) {
+                        outInst[n] = i; outMat[n] = inst.materialId; outLossDb[n] = lossDb;
+                        ++n;
+                    } else {
+                        // 埋まっていたら、いちばん小さい担い手と入れ替える。
+                        int worst = 0;
+                        for (int q = 1; q < n; ++q) if (outLossDb[q] < outLossDb[worst]) worst = q;
+                        if (lossDb > outLossDb[worst]) {
+                            outInst[worst] = i; outMat[worst] = inst.materialId;
+                            outLossDb[worst] = lossDb;
+                        }
+                    }
+                }
+            } else if (sp + 2 <= 64) {
+                stack[sp++] = node.leftFirst;
+                stack[sp++] = node.leftFirst + 1;
+            }
+        }
+        // 大きい順（＝担い手の順）に並べる。件数が少ないので単純な選択ソートで足りる。
+        for (int a = 0; a < n; ++a) {
+            int best = a;
+            for (int b2 = a + 1; b2 < n; ++b2) if (outLossDb[b2] > outLossDb[best]) best = b2;
+            if (best != a) {
+                std::swap(outInst[a], outInst[best]);
+                std::swap(outMat[a], outMat[best]);
+                std::swap(outLossDb[a], outLossDb[best]);
+            }
+        }
+        return n;
+    }
+
+    // 回折に効く稜線。UTD のウェッジ幾何込み。
+    //
+    // ★2026-08-23、これを作っていた「エッジカタログ」（リスナー中心にキューブマップを撒いて
+    //   シルエット稜線を拾う仕組み）を**削除した**。理由:
+    //   候補列挙は元から**全インスタンスの箱 12 稜線を回している**ので、カタログが出すのは
+    //   その部分集合を 0.15m 外へずらしたほぼ重複だった。切って測ったら
+    //   **266 検査 + 全診断で音響値の差分が 0 行**、く字の空振りも同じ 5 箇所。
+    //   費用だけ（平均 7.66 → 7.38ms）掛かっていた。
+    //   ⚠ しかもメッシュに対しては `instances_[i].obb`（境界ボックス）の稜線を渡していて、
+    //     箱ループが意図的に避けている「遮蔽は実形状・回折は境界ボックス」の食い違いを
+    //     作りうる状態だった。
+    //   ★「カタログが点滅の源」という見立ては**外れ**。切っても空振りは 1 箇所も減らない。
+    //     空振りは稜線の集合ではなく**候補の可視判定・選択**の側にある。
     struct DiffEdge {
         Vec3 p0, p1;      // 稜線の端点（ワールド）
         Vec3 edgeDir;     // 単位エッジ方向
@@ -525,6 +641,7 @@ public:
         float n;          // ウェッジ指数（箱=1.5）
         int instance;     // この稜線が属するインスタンス（遮蔽判定の自己除外用。-1=不明）
     };
+
 
     // リスナー中心にキューブマップ(6面×res²)でレイを撒き、隣接セルの深度不連続を
     // シルエット稜線として拾ってカタログ化する。1回撒けば全音源で共有できる（リスナー係留）。
@@ -569,6 +686,7 @@ public:
     int edgeCatalogCount() const { return static_cast<int>(edgeCatalog_.size()); }
     void clearEdgeCatalog() const { edgeCatalog_.clear(); }
 
+
     // 【回折の候補列挙（共有）】遮蔽時、回り込み候補エッジを列挙し、各エッジで「掠める点 P
     // （from→P→to が最短になる点＝三分探索）」と余剰経路 δ を、両区間見通せるものだけ
     //   fn(P, delta, edgeDir, refT) で渡す。エッジカタログがあればそれを、無ければ箱稜線を使う
@@ -604,6 +722,7 @@ public:
         // 当の箱の裏に再突入して自分で自分を遮る＝候補消滅・中央死角、を防ぐ）。
         auto tryEdge = [&](const Vec3& A, const Vec3& B, const Vec3& edgeDir, const Vec3& refT,
                            int exceptInst) -> bool {
+            ++dbgEdgeTried_;   // 【診断】稜線として検討した本数（可視判定より前）
             auto Pf = [&](float t) { return A + (B - A) * t; };
             auto g  = [&](float t) { const Vec3 p = Pf(t); return length(p - from) + length(to - p); };
             float lo = 0.0f, hi = 1.0f;
@@ -1105,8 +1224,18 @@ public:
         };
         float narrowest = kMaxSpan * 2.0f;
         Vec3 w = cross(edgeDir, travelDir);
-        if (length(w) > 1e-4f) narrowest = std::min(narrowest, span(normalized(w)));
-        if (length(edgeDir) > 1e-4f) narrowest = std::min(narrowest, span(normalized(edgeDir)));
+        // ★以前はここで dbgSpanPerp_ / dbgSpanEdge_（メンバ）へ書いてから読み返していた。
+        //   名前は「診断」なのに**計算の作業変数として使っていた**。音源ごとの並列化で
+        //   別スレッドが同じメンバを踏み合い、診断ではなく**値そのものが壊れる**。
+        //   → 計算はローカルで完結させ、メンバへは控えるだけにする。
+        const float spanPerp = (length(w) > 1e-4f) ? span(normalized(w)) : -1.0f;
+        const float spanEdge = (length(edgeDir) > 1e-4f) ? span(normalized(edgeDir)) : -1.0f;
+        if (spanPerp >= 0.0f) narrowest = std::min(narrowest, spanPerp);
+        if (spanEdge >= 0.0f) narrowest = std::min(narrowest, spanEdge);
+        // 【診断】どちらの軸が最小を出しているかを控える（読み返さない）。
+        //   実測で「隙間 2m でも 0.1m でも常に 3.000m」＝部屋の高さが返っていた。
+        dbgSpanPerp_ = spanPerp;
+        dbgSpanEdge_ = spanEdge;
         return narrowest;
     }
 
@@ -1299,6 +1428,21 @@ public:
     //   ★小さすぎる口は作らない。格子の量子化ノイズ（セル 1〜2 個の隙間）まで
     //     ポータルにすると、ありもしない戸口が並ぶ。
     void setAutoPortals(bool on) { autoPortals_ = on; }
+
+    // 音源ごとの段を何コアで回すか。1 以下＝直列（既定）。
+    //   ★並列にしても**結果はビット一致**。割るのは「音源ごとに自分の枠にしか書かない」
+    //     段だけなので、各音源の計算順も丸めも変わらない。
+    //   ⚠ 診断カウンタは thread_local。並列で走らせると、呼び出し元スレッドが担当した
+    //     音源のぶんしか読めない。診断を採るときは 1 に戻すこと。
+    //   ⚠ ホストは**シーンを破棄する前に**再生を止めること。破棄で join する。
+    void setWorkerThreads(int n) {
+        const int want = (n < 1) ? 1 : n;
+        if (want == workerThreads_) return;
+        workerThreads_ = want;
+        pool_.reset();                                  // 先に前のを畳んでから作る
+        if (want > 1) pool_.reset(new WorkerPool(want));
+    }
+    int workerThreads() const { return workerThreads_; }
     bool autoPortals() const { return autoPortals_; }
     void setAutoPortalMinArea(float m2) { autoPortalMinArea_ = std::max(0.0f, m2); }
     float autoPortalMinArea() const { return autoPortalMinArea_; }
@@ -1316,10 +1460,37 @@ public:
             autoPortalCount_ = 0;
         }
         if (!autoPortals_) return;
+        // ★手置きが既に覆っている開口には自動を作らない。
+        //   作ると**同じ戸口に矩形が 2〜3 枚**でき、同じ開口へ答えが複数できる（決めごと #1）。
+        //   しかも自動ぶんはボクセルの部屋グラフ由来なので、扉が回ると矩形の位置・大きさ・
+        //   向きごと作り直され、そのたびに開口率が飛ぶ。
+        //   実測（扉 1°掃引・手置き 1 枚の戸口）:
+        //     手置き P0      0.4319→0.5103  影 1 枚のまま  ── 完全に滑らか
+        //     自動  P1      0.4093→0.7360  影 3 枚→2 枚   ── 58°で跳ぶ
+        //     自動  P2      1.0000→0.5036  影 0 枚→2 枚   ── 55°で湧いて 58°で跳ぶ
+        //   合計が 57°→58° で 0.2016→0.4056（1 度で倍）。耳でも段差として聞こえた。
+        //   ここで自動を止めると、鳴るのは手置きの 1 枚だけになり滑らかに戻る。
+        //   （手置きが無い場所の開口は従来どおり自動が担当する）
+        const std::size_t manualN = portals_.size();   // この時点で残っているのは手置きだけ
+        auto coveredByManual = [&](const rooms::Aperture& ap) {
+            const Vec3 na = normalized(cross(ap.axisU, ap.axisV));
+            for (std::size_t i = 0; i < manualN; ++i) {
+                const Portal& m = portals_[i];
+                if (!m.active) continue;
+                const Vec3 nm = normalized(cross(m.axisU, m.axisV));
+                if (std::fabs(dot(nm, na)) < 0.7f) continue;      // 面の向きが違えば別の口
+                const Vec3 d = ap.rectCenter - m.center;
+                if (std::fabs(dot(d, nm)) > autoPortalDedupDist_) continue;   // 面から離れている
+                if (std::fabs(dot(d, m.axisU)) <= m.halfU + autoPortalDedupDist_ &&
+                    std::fabs(dot(d, m.axisV)) <= m.halfV + autoPortalDedupDist_) return true;
+            }
+            return false;
+        };
         const rooms::Result& rr = roomGraph();
         for (const rooms::Aperture& ap : rr.apertures) {
             if (ap.area < autoPortalMinArea_) continue;
             if (ap.halfU <= 1e-3f || ap.halfV <= 1e-3f) continue;
+            if (coveredByManual(ap)) continue;
             Portal p;
             p.center = ap.rectCenter;
             p.axisU = ap.axisU;
@@ -1373,6 +1544,7 @@ public:
         static thread_local std::vector<Poly> polys;
         polys.clear();
         const float planeD = dot(n, pt.center - listener);
+        const Vec3 planeN = n;   // 下の遮蔽物ループでは n が別の物に隠れるので控えておく
         auto project = [&](const Vec3& q, float& ou, float& ov) -> bool {
             const Vec3 dq = q - listener;
             const float dd = dot(n, dq);
@@ -1883,6 +2055,17 @@ public:
 
         for (int b = 0; b < kNumBands; ++b) outFrac[b] = 1.0f;
 
+        // 有界な（＝窓の中で閉じた）開口を 1 つでも見つけたか。1 つも無ければ
+        // この経路は角・衝立の類なので、f ではなく前川に任せる（設計 §5-13）。
+        bool anyBounded = false;
+        // 【診断】どの段で落ちるか。f が効かない経路の切り分け用。
+        dbgFresPlanes_ = nPlanes;   // 見つけた面の数（0 なら平面探索で落ちている）
+        dbgFresDropped_ = 0;
+        dbgFresBounded_ = 0;        // うち有界と判定できた数
+        // 窓の縁のうち、これを超える割合が開いていたら「閉じていない」と見なす。
+        // 戸口は枠が四方を囲むのでほぼ 0、部屋の角は半分前後になる。
+        constexpr double kBoundedPerimMax = 0.45;
+
         for (int pl = 0; pl < nPlanes; ++pl) {
         const Obb& planeObb = instances_[static_cast<std::size_t>(planeInst[pl])].obb;
 
@@ -1986,6 +2169,10 @@ public:
             for (int i = 0; i < out.n; ++i) { out.u[i] = px[st[i]]; out.v[i] = py[st[i]]; }
         };
 
+        // ★ここには「面より奥の物を除外する」判定が**無い**（ポータル側の beyondPortal 相当）。
+        //   上の「頂点が 1 つでも後ろなら箱ごと捨てる」が偶然その役目を兼ねている。
+        //   近平面クリップを入れるならこの除外も明示的に足す必要がある（試して確認済み。
+        //   足すと 4 件の失敗が 2 件まで減ったが、それでも過剰遮蔽が残った）。
         for (const Instance& inst : instances_) {
             if (!inst.active || static_cast<int>(polys.size()) >= kMaxPoly) continue;
             if (inst.geomId >= 0 && inst.geomId < static_cast<int>(meshes_.size())
@@ -2010,21 +2197,91 @@ public:
                 }
             } else {
                 // 箱：8頂点を投影して凸包を取る（＝箱の影の輪郭）。
+                //
+                // ★★ ここは 3 度作り直した。2 つの失敗を残しておく（2026-08-23 解決）★★
+                //
+                // 【失敗1】「1 頂点でもリスナーの後ろにあれば箱ごと無視」
+                //   床・天井・長い壁はリスナーを跨ぐので**必ず後ろの頂点を持ち**、丸ごと落ちた。
+                //   実測（壁 2 枚に隙間を空けた形状・遮蔽物 6 個）: **4 個が落ちていた**。
+                //   残るのは仕切りの左右 2 枚だけで、積分窓の上下と外側が開きっぱなし
+                //   （縁 u=0.75 / v=1.00）。f の有界判定が「半空間」と誤判定して f から外れ、
+                //   **隙間幅がまったく効かない**（2m でも 0.1m でも同じ音）。
+                //
+                // 【失敗2】近平面だけでクリップ（リスナーの手前で切る）
+                //   隙間幅は効くようになったが、副作用が大きすぎた。実測:
+                //     く字の角の回折      0.103〜0.131 → **0.000（全滅）**
+                //     2 次回折（食い違い） 0.486 → **0.000**
+                //     仕切りの掃引         0.090〜0.233 → 0.001〜0.078（7 箇所でゼロ）
+                //   ★原因は**奥側**だった。床は積分面の向こう側まで続いている。中心投影は
+                //     その無限の床をそのまま落とすので、影が窓の下半分（目線より下）を覆う。
+                //     だが目線から窓の下部へ引いた線は床に当たらない。
+                //     **当たらない物が塞いでいる**ことになっていた。
+                //
+                // 【いま】リスナーと**積分面**のあいだの帯 s∈(0,1] に切ってから投影する。
+                //   積分面を塞げるのは、その面より手前にある物だけ。奥は塞げない。
+                //   実測: 隙間幅 2.00/1.00/0.50/0.25/0.10/0.03m →
+                //         0.180/0.143/0.097/0.057/0.024/0.000（単調）
+                //         く字の角の回折 0.212（生きている）／落とした遮蔽物 0 個／縁 u=0.00 v=0.00
                 const Obb& ob = inst.obb;
-                float px[8], py[8];
-                bool ok = true;
-                for (int i = 0; i < 8 && ok; ++i) {
+                Vec3 vtx[8];
+                float sN[8];      // 積分面までを 1 とした奥行き（0=リスナー / 1=積分面）
+                for (int i = 0; i < 8; ++i) {
                     const float sx = (i & 1) ? 1.0f : -1.0f;
                     const float sy = (i & 2) ? 1.0f : -1.0f;
                     const float sz = (i & 4) ? 1.0f : -1.0f;
-                    const Vec3 q = ob.center + ob.axisX * (ob.halfExtents.x * sx)
-                                             + ob.axisY * (ob.halfExtents.y * sy)
-                                             + ob.axisZ * (ob.halfExtents.z * sz);
-                    ok = project(q, px[i], py[i]);
+                    vtx[i] = ob.center + ob.axisX * (ob.halfExtents.x * sx)
+                                       + ob.axisY * (ob.halfExtents.y * sy)
+                                       + ob.axisZ * (ob.halfExtents.z * sz);
+                    sN[i] = (std::fabs(planeD) > 1e-6f)
+                          ? dot(nrm, vtx[i] - listener) / planeD : 0.0f;
                 }
-                if (!ok) continue;
+                // ★★ 遮蔽物を「リスナーと積分面のあいだ」に切ってから投影する ★★
+                //
+                //   以前は「1 頂点でもリスナーの後ろにあれば箱ごと無視」していた。床・天井・
+                //   長い壁はリスナーを跨ぐので必ず落ち、**扉が閉じていても開口率 1.000**
+                //   ＝ 隙間幅がまったく効かなかった（0°〜10° で全部 1.000 と実測）。
+                //
+                //   近平面だけで切る手も試したが、今度は逆に効きすぎて角の回折が全滅した
+                //   （0.103〜0.131 → 0.000）。原因は**奥側**だった:
+                //   床は積分面の**向こう側まで続いている**。中心投影は無限の床をそのまま
+                //   落とすので、影が窓の下半分（リスナーの目線より下）を全部覆う。
+                //   だが目線から窓の下部へ引いた線は床に当たらない。**当たらない物が
+                //   塞いでいる**ことになっていた。
+                //
+                //   正しくは、積分面を塞げるのは**その面より手前にある物だけ**。
+                //   だから s∈(0,1] の帯（リスナー〜積分面）に切ってから投影する。
+                //   ★箱を帯で切った凸多面体の頂点は「帯の中の元の頂点」と「辺と面の交点」
+                //     だけなので、**12 本の辺を切って端点を集めれば**凸包として過不足ない。
+                static const int kEdge[12][2] = {{0,1},{2,3},{4,5},{6,7},
+                                                 {0,2},{1,3},{4,6},{5,7},
+                                                 {0,4},{1,5},{2,6},{3,7}};
+                constexpr float kSLo = 1e-3f;   // リスナーに張り付いた点で t が爆発しない程度
+                float px[24], py[24];
+                int m = 0;
+                for (int e = 0; e < 12 && m + 2 <= 24; ++e) {
+                    const int a = kEdge[e][0], b = kEdge[e][1];
+                    float t0 = 0.0f, t1 = 1.0f;   // 辺 a→b のパラメータ範囲
+                    const float da = sN[a], db = sN[b];
+                    // s >= kSLo と s <= 1 の 2 枚で辺を切る。
+                    for (int side = 0; side < 2; ++side) {
+                        // side 0: s >= kSLo（値 = s - kSLo）／ side 1: s <= 1（値 = 1 - s）
+                        const float fa = (side == 0) ? (da - kSLo) : (1.0f - da);
+                        const float fb = (side == 0) ? (db - kSLo) : (1.0f - db);
+                        if (fa < 0.0f && fb < 0.0f) { t0 = 1.0f; t1 = 0.0f; break; }
+                        if (fa < 0.0f) t0 = std::max(t0, fa / (fa - fb));
+                        else if (fb < 0.0f) t1 = std::min(t1, fa / (fa - fb));
+                    }
+                    if (t0 > t1) continue;   // この辺は帯の外
+                    for (int k = 0; k < 2; ++k) {
+                        const float t = (k == 0) ? t0 : t1;
+                        const Vec3 q = vtx[a] + (vtx[b] - vtx[a]) * t;
+                        float ou, ov;
+                        if (project(q, ou, ov)) { px[m] = ou; py[m] = ov; ++m; }
+                    }
+                }
+                if (m < 3) { ++dbgFresDropped_; continue; }
                 Poly pg; pg.n = 0;
-                hullInto(px, py, 8, pg);
+                hullInto(px, py, m, pg);
                 if (pg.n >= 3) polys.push_back(pg);
             }
         }
@@ -2119,9 +2376,71 @@ public:
         }
         openBegin[kRows] = static_cast<int>(openRow.size());
         if (area <= 1e-9) {                 // どこも開いていない
+            // ★ここを「開口が窓の外へ出たのかもしれない」と疑って、回折点が窓の外なら
+            //   前川へ落とす、という手当てを試した。**外れ**。横へ外れた点でも f は
+            //   0.0008 など**小さいが 0 ではない**ので、この分岐に入っていなかった。
+            //   （f が前川より一貫して小さいのが実態で、それは有限の開口が半無限
+            //     スクリーンより通さないという意味で向きとしては正しい）
             for (int b = 0; b < kNumBands; ++b) outFrac[b] = 0.0f;
+            anyBounded = true;              // 「完全に塞がれている」も有界な答え
             continue;
         }
+
+        // ── A2) この開口は**有界**か（＝窓の中で閉じているか）──
+        //
+        //   ★f は「開口面のうち塞がっていない割合」を測る量なので、**閉じた開口**にしか
+        //     意味がない。戸口は板に空いた穴で、四方を枠が囲む。ところが**部屋の角**は
+        //     半平面で、片側が開いたままなので、割合という概念が成立しない。
+        //   ★それでもこの関数は角でも「断面が取れた」と答えてしまう。すると呼び出し側は
+        //     f の枝に入り、角の音量を f が決めることになる。実測（く字廊下の角へ近づく）:
+        //       f が持つ    0.179 → 0.116  ← **近づくほど小さくなる**（向きが逆）
+        //       前川が持つ  0.103 → 0.314  ← 正しい向き。3 倍に増える
+        //     角の向きを運ぶ唯一の成分が、角に近づくほど消えていた。
+        //   → 開いた領域が**窓の縁に接している**なら、範囲を広げればまだ広がる＝半空間。
+        //     その面は f の担当外にして、前川へ渡す（設計 §5-13）。
+        //   ★形状で決まる性質なので、リスナーが動いても切り替わらない
+        //     （扉は常に閉じた穴、角は常に半平面）。
+        //   ★近づいて窓が開口より小さくなった場合は「全部開いている＝縁に接する」と出るが、
+        //     そこでは δ≈0 なので前川も 1 に近く、両者が一致する。段差にならない。
+        {
+            //   ★判定は**軸ごと**にする。「窓の縁のどこかに接していたら半空間」では駄目。
+            //     壁 2 枚に挟まれた隙間は u 方向には閉じているが、床から天井まで抜けて
+            //     いれば v 方向は開いている ── それを「半空間」と誤判定して f から外し、
+            //     隙間幅がまったく効かなくなっていた（実測: 隙間 2m でも 0.1m でも同じ音）。
+            //     戸口も上下が床・天井に達していることがあり、同じ罠を踏む。
+            //   → **どちらか一方の軸でも閉じていれば、有界な開口として f が担当する。**
+            //     角（半平面）は u・v どちらへも開いているので、いままでどおり前川へ渡る。
+            double uOpen = 0.0, uPerim = 0.0;   // u 方向（行の左右の端）
+            double vOpen = 0.0, vPerim = 0.0;   // v 方向（上下の端の行）
+            for (int j = 0; j < kRows; ++j) {
+                bool touchLo = false, touchHi = false;
+                double rowOpen = 0.0;
+                for (int i = openBegin[j]; i < openBegin[j + 1]; ++i) {
+                    const Span& sp = openRow[static_cast<std::size_t>(i)];
+                    rowOpen += sp.hi - sp.lo;
+                    if (sp.lo <= -R + 1e-4f) touchLo = true;
+                    if (sp.hi >=  R - 1e-4f) touchHi = true;
+                }
+                uPerim += 2.0 * rowH;
+                if (touchLo) uOpen += rowH;
+                if (touchHi) uOpen += rowH;
+                if (j == 0 || j == kRows - 1) { vOpen += rowOpen; vPerim += 2.0 * R; }
+            }
+            const double uFrac = (uPerim > 1e-9) ? uOpen / uPerim : 0.0;
+            const double vFrac = (vPerim > 1e-9) ? vOpen / vPerim : 0.0;
+            // 両方の軸が開いている＝どちらへも広がれる＝半空間。前川に任せる。
+            dbgUFrac_ = static_cast<float>(uFrac);
+            dbgVFrac_ = static_cast<float>(vFrac);
+
+            // ★「直線そのものが面で塞がれているなら半空間ではない」という規則を試したが**却下**。
+            //   閉扉の崖は 0.8m で直った（-17.4 → -36.2dB）が、**影境界に別の崖ができた**
+            //   （隣接差 0.264 > 0.2）。崖を移しただけで、同じ失敗型のまま。
+            //   窓が部屋より大きいこと（縁が天井・床の外へはみ出す）が元なので、
+            //   判定の側をいじっても解けない。設計 §5-12「窓の大きさ／開口率の分母」の再検討が要る。
+            if (uFrac > kBoundedPerimMax && vFrac > kBoundedPerimMax) continue;
+        }
+        anyBounded = true;
+        ++dbgFresBounded_;
 
         // ── B) 開いている領域の面積重心。連続に動く点。──
         const float ku = static_cast<float>(cu / area);
@@ -2170,7 +2489,8 @@ public:
             outFrac[b] = std::min(outFrac[b], here);
         }
         }   // 面のループ
-        return true;
+        // 有界な開口が 1 つも無かった＝この経路に f は使えない。呼び出し側は前川に落ちる。
+        return anyBounded;
     }
 
     // 【開口のエネルギー】遮蔽物の面に開いている**面積**(m²)と、その実効幅(m)を返す。
@@ -2425,6 +2745,29 @@ public:
     ///   ON: 開口タップは前川の δ 減衰を払わず、f をそのまま持つ。壁の透過は (1−f) で減る。
     ///   OFF: 従来（前川 × 開口率）。
     void setApertureIsTransmission(int on) { apertureIsTransmission_ = (on != 0); }
+    /// 診断用。開口率の二重掛けを一時的に戻す（変更前後を同じ物差しで測る）。
+    void setKeepDoubleOpen(int on) { dbgKeepDoubleOpen_ = (on != 0); }
+    /// 「回折点が他の実体の中」の判定を連続にする（二値の棄却をやめる）。
+    ///   二値だと、箱を重ねて組んだ角で回折点が隣の箱へ出入りするたびに経路が消える。
+    ///   実測（く字廊下・0.1m 刻みで 71 点）: 塞がれているのに経路 0 本が 10 箇所。
+    ///   scale は重みが 1→0 へ落ちる深さ(m)。**歩幅より広く**すること。
+    ///   狭いと 1 歩で 1→0 を通過して跳ぶ（8cm のとき 1 歩で 31.4dB）。
+    void setInsideOtherContinuous(int on, float scale) {
+        insideOtherContinuous_ = (on != 0);
+        if (scale > 1e-3f) insideOtherScale_ = scale;
+    }
+    /// 【診断】直近の回折探索の段ごとの本数。生の候補 / 重み0で棄却 / クラスタ数。
+    void diffractionSearchCounts(int* raw, int* cut, int* clusters) const {
+        if (raw) *raw = dbgCandRaw_;
+        if (cut) *cut = dbgCandCut_;
+        if (clusters) *clusters = dbgClusters_;
+        // raw に検討本数も返せるよう、cut の上位に載せる（診断専用の詰め方）。
+        if (cut) *cut = dbgCandCut_ + dbgEdgeTried_ * 1000;
+    }
+    /// 回折の減衰を前川だけに任せる（フレネル積分 f を重ねて掛けない）。
+    ///   前川は f の近似なので、両方掛けるのは同じ物理の二重計上。
+    void setDiffractionSingleModel(int on) { diffractionSingleModel_ = (on != 0); }
+    int diffractionSingleModel() const { return diffractionSingleModel_ ? 1 : 0; }
     int apertureIsTransmission() const { return apertureIsTransmission_ ? 1 : 0; }
 
     /// 開口率の**幅**を開く指数。形は変えずコントラストだけを上げる。1.0=素通し。
@@ -2797,6 +3140,12 @@ public:
         float slitWidth = 0.0f;   // 実測の隙間幅(m)。診断用（ゲインは openGain に入っている）
         // 隙間の幅による帯域ごとの通りやすさ。開くほど低い帯域が入ってくる。
         float openBand[kNumBands] = {1, 1, 1, 1, 1, 1};
+        // openBand が Fresnel 積分 f そのものか（true）、隙間幅から作った音色か（false）。
+        //   true のときだけ openGain と openBand は**同じ量**になる（openGain は openBand を
+        //   低域加重で畳んだ値）。その場合に両方掛けると開口率が二乗になる。
+        //   false（扉）のときは別物なので割ってはいけない ── 割ると開き具合のカーブが
+        //   消えて 10°も 90°も 1.0000 になる（実測で確認済み）。
+        bool openBandIsFresnel = false;
         // 開口の**広がり**を表す実在の点（ホイヘンス）。開口を点1つで鳴らすと戸口が
         // ピンポイントに聞こえる ── 現実の開口は面全体が二次音源として光る。
         // spread[0] は aperture と同じ。以降は開口の端の方へ散らした点。
@@ -2897,14 +3246,18 @@ public:
 
         auto gather = [&](bool bothEnds) {
             ncl = 0;
+            // 【診断】どの段で候補が消えるかを数える。経路が 0 本になる穴の切り分け用。
+            //   gather は 2 回呼ばれることがあるので、最後の呼び出しの値が残る。
+            dbgCandRaw_ = 0; dbgCandCut_ = 0; dbgEdgeTried_ = 0;
             globalMinDelta = -1.0f;
             const Vec3 travelDir = normalized(source - listener);
             forEachDiffractionCandidate(listener, source,
                 [&](const Vec3& P, float d, const Vec3& edgeDir, const Vec3& refT,
                     const Vec3& eA, const Vec3& eB, float edgeW, int inst) {
+                    ++dbgCandRaw_;
                     if (globalMinDelta < 0.0f || d < globalMinDelta) globalMinDelta = d;
                     const float w = maekawa::apertureWeight(occ ? d : -d);
-                    if (w < 1e-6f) return;
+                    if (w < 1e-6f) { ++dbgCandCut_; return; }
                     const float sw = slitWidthAt(P, edgeDir, travelDir);
                     const Vec3 dir = normalized(P - listener);
                     int best = -1; float bestDot = cosThresh;
@@ -2986,6 +3339,7 @@ public:
             secondOrder = true;
         }
 
+        dbgClusters_ = ncl;
         if (ncl == 0) return 0;   // 回折の相手が無い。呼び出し側で「遮蔽なら0/見通しなら1.0」を決める
 
         // 見通しているときは、回折は「直接経路への補正」であって別経路ではない。
@@ -3411,8 +3765,34 @@ public:
             out[n].slitWidth = slitHere;
             // 隙間の幅による**帯域ごと**の通りやすさ。狭いほど高域だけが通る。
             //   「開くと音色が開く」はここで作られる（slitWidthBandGain のコメント参照）。
-            if (haveFres) for (int b = 0; b < kNumBands; ++b) out[n].openBand[b] = fres[b];
-            else slitWidthBandGain(slitHere, out[n].openBand);
+            // ★★ §5-13 の排他: 2 段目が成立した経路に f を掛けてはいけない ★★
+            //   f は **listener→source の直線**まわりのフレネル開口積分。
+            //   2 次回折の経路はその直線を通らない（2 回曲がって届く）。食い違いに置いた
+            //   2 つの戸口では、直線は壁を貫いていて開口がゼロなので、f ≈ 0 になる。
+            //   それをこの経路へ掛けると**音が丸ごと消える**（実測 0.486 → 0.000）。
+            //   ⚠ 積分窓が「完全に塞がっている」ことと「開口が無い」ことは別物なのに、
+            //     有界判定は両方を「有界」と答える。**次数で切るのが正しい切り口**。
+            //   → 断面が取れないので、この経路は前川が持つ（§5-13 の「排他」そのもの）。
+            //
+            //   ⚠ 「開口面積が 0 なら f を使わない」ではダメ。閉じた扉がそれに当たり、
+            //     前川へ落とすと -39dB の床が戻って材質が効かなくなる（§5-12 の罠）。
+            const bool useFres = haveFres && !have2;
+            if (useFres) {
+                for (int b = 0; b < kNumBands; ++b) out[n].openBand[b] = fres[b];
+                out[n].openBandIsFresnel = true;
+            } else if (have2) {
+                // ★2 段目は**前川が単独で持つ**。開口の項は掛けない。
+                //   ここで隙間幅へ落とすと 0 になる ── f を使う予定だったので
+                //   slitHere が測られておらず 0 のままだから（実測でそれを踏んだ）。
+                //   そもそも 2 次回折の経路に「開口の断面」は無いので、掛ける物が無いのが正しい。
+                for (int b = 0; b < kNumBands; ++b) out[n].openBand[b] = 1.0f;
+                openGainHere = 1.0f;
+                out[n].openGain = 1.0f;
+                out[n].openBandIsFresnel = false;
+            } else {
+                slitWidthBandGain(slitHere, out[n].openBand);
+                out[n].openBandIsFresnel = false;
+            }
             if (btmDone && !have2) {
                 // ★BTM は「前川の δ 減衰 × 開口率」を**まとめて置き換える**。
                 //   両方掛けると二重になる（そこが今までの詰まりだった）。
@@ -3421,7 +3801,7 @@ public:
                     out[n].openBand[b] = 1.0f;
                 }
                 out[n].openGain = 1.0f;
-            } else if (haveFres && apertureIsTransmission_) {
+            } else if (useFres && apertureIsTransmission_) {
                 // ★開口を通る分は**前川の δ 減衰を払わない**。
                 //   f（フレネル/影の積分）はキルヒホッフ側の量で、遠回りの効果は
                 //   その中の重みに既に入っている。ここへ前川を掛けると二重になる
@@ -3477,6 +3857,24 @@ public:
         };
         // 重みは頭打ちしない前川値（定位をぼやけさせないため。findDiffractionPaths と同じ理由）。
         const float directDist = std::max(length(source - listener), 1e-4f);
+
+        // ★総量に 1.0 の頭打ちを掛ける係数を先に出す。
+        //   経路ごとの thru は「その開口をどれだけ通るか」の絶対量なので、
+        //   別々の開口なら足してよい（扉が 2 枚開けば大きくなる）。
+        //   ところが**同じ遮蔽物の左右の稜線**は 1 つの回折場を 2 本に分けたものなので、
+        //   それぞれが満額を持つと二重になる。実測（柱の陰・x=-1.90）:
+        //     配分比あり 0.88071 / 配分比なし **1.76143** ← 直接音より大きい＝非物理
+        //   かといって配分比（w/sum）で割ると、**経路が 1 本生まれ消えするだけで
+        //   残り全部の音量が動く**（扉 57°→58° で 2.1 倍。耳で段差として聞こえた）。
+        //   → 足したうえで 1.0 で頭打ちにする。scale は total の連続関数なので飛ばない。
+        float totalThru = 0.0f;
+        for (int i = 0; i < np; ++i) {
+            const float t = paths[i].openBandIsFresnel
+                ? bbGain(paths[i].gain) / std::max(paths[i].openGain, 1e-6f)
+                : bbGain(paths[i].gain);
+            totalThru += t;
+        }
+        const float overflowScale = (totalThru > 1.0f) ? (1.0f / totalThru) : 1.0f;
         float sum = 0.0f;
         for (int i = 0; i < np; ++i) sum += maekawa::apertureWeight(paths[i].pathLength - directDist);
         int n = 0;
@@ -3493,8 +3891,33 @@ public:
             //   ★低域加重で 1 スカラに畳んで掛ける（帯域別に掛けない）。
             //     帯域別に掛けるのは LPF であり、こもりは透過が担当という役割分担を壊す。
             //     回折が運ぶのは「開口への定位」と「回り込むぶんの距離」の 2 つだけ。
-            const float thru = bbGain(paths[i].gain);
-            const float g = ((sum > 1e-6f) ? w / sum : 0.0f) * thru;
+            //   ★開口率を openGain で割って外す。gain[] には既に openGain が掛けてあり、
+            //     この下で openBand[b] を掛けるので、外さないと**開口率が二度掛かる**。
+            //     openGain は openBand を低域加重で畳んだ値そのもの（実測 0.2316 に対し
+            //     openBand の低域加重平均 0.2318）。同じ量を直列に掛けていた。
+            //     く字廊下の角で回折が前川より 22〜24dB 低かったのはこれが原因。
+            //     ここを外すと thru は「前川の δ 減衰だけ」になり、開口率は openBand が
+            //     帯域ごとに一度だけ担う ── 上のコメントの役割分担どおりになる。
+            //   ★ただし Fresnel を使った経路に限る。扉の openBand は隙間幅から作った
+            //     **音色**で openGain とは別物なので、割ると開き具合のカーブが消える。
+            const float thru = (paths[i].openBandIsFresnel && !dbgKeepDoubleOpen_)
+                ? bbGain(paths[i].gain) / std::max(paths[i].openGain, 1e-6f)
+                : bbGain(paths[i].gain);
+            //   ★前川とフレネル積分 f は**同じ物理の二つのモデル**（前川は f の近似）。
+            //     Fresnel 経路で両方掛けると、openGain×openBand と同じ二重計上になる。
+            //     diffractionSingleModel_ が ON なら前川だけに任せ、f は掛けない
+            //     ── 設計の「回折が運ぶのは定位と回り込む距離の 2 つだけ」に戻る。
+            //     扉の openBand は隙間幅から作った音色（非 Fresnel）なので影響しない。
+            const bool dropF = diffractionSingleModel_ && paths[i].openBandIsFresnel;
+            //   ★配分比 w/sum を掛けない。thru は既に**絶対量**（その開口をどれだけ通るか）
+            //     なので、そこへ「他の経路が何本あるか」で決まる係数を掛けると、
+            //     **経路が 1 本生まれ消えするだけで残り全部の音量が動く**。
+            //     実測（扉 1°掃引・57°→58° で幻の自動ポータルが 1 枚消えた）:
+            //       57°  P0 の取り分 0.2256/0.4632 = 0.487 → ×0.31642 = 0.154
+            //       58°  P0 の取り分 1.000            → ×0.32535 = 0.325   ← 2.1倍
+            //     開口が 2 つあれば音は増える ── 割るのではなく足すのが正しい。
+            //     w は経路の**選別**にだけ使う（弱い経路を捨てる）。
+            const float g = ((sum > 1e-6f && w <= 0.0f) ? 0.0f : thru) * overflowScale;
 
             // ★開口を**面**として鳴らす（ホイヘンス）。
             //   点1つだと戸口がピンポイントに聞こえて「直線的」になる。開口の広がりに
@@ -3517,11 +3940,69 @@ public:
                 outGain[n] = g * inv;
                 if (outBand)
                     for (int b = 0; b < kNumBands; ++b)
-                        outBand[n * kNumBands + b] = g * inv * paths[i].openBand[b];
+                        outBand[n * kNumBands + b] =
+                            g * inv * (dropF ? 1.0f : paths[i].openBand[b]);
                 ++n;
             }
         }
         return n;
+    }
+
+    // 【診断】最強の回折経路の内訳を取り出す。
+    //   回折の音量が想定より低いとき、どの係数が効いているかを当てずに見るための口。
+    //   out[0]=δ / out[1]=openGain / out[2]=slitWidth / out[3]=thru(低域加重の広帯域)
+    //   out[4..9]=gain[6]（前川×openGain 済み）/ out[10..15]=openBand[6] / out[16]=nSpread
+    //   which < 0 なら最強の 1 本。0 以上ならその番号の経路（順番は鳴らす順と同じ）。
+    //   [17]=pathLength [18]=openBandIsFresnel [19]=配分の重み apertureWeight(pathLength-直線)
+    int debugDiffractionPath(const Vec3& listener, const Vec3& source, float* out17,
+                             int which = -1) const {
+        if (!out17) return 0;
+        for (int i = 0; i < 28; ++i) out17[i] = 0.0f;
+        if (!isOccluded(listener, source)) return 0;
+        constexpr int kMaxOut = 24;
+        DiffractionPath paths[kMaxOut];
+        const int np = findDiffractionPaths(listener, source, paths, kMaxOut);
+        if (np <= 0) return 0;
+        const float w[kNumBands] = {3.0f, 2.5f, 2.0f, 1.3f, 1.0f, 0.8f};
+        int best = 0;
+        float bestV = -1.0f;
+        for (int i = 0; i < np; ++i) {
+            float gs = 0.0f, ws = 0.0f;
+            for (int b = 0; b < kNumBands; ++b) { gs += w[b] * paths[i].gain[b]; ws += w[b]; }
+            const float v = (ws > 0.0f) ? gs / ws : 0.0f;
+            if (v > bestV) { bestV = v; best = i; }
+        }
+        if (which >= 0) {
+            if (which >= np) return np;
+            best = which;
+            float gs = 0.0f, ws = 0.0f;
+            for (int b = 0; b < kNumBands; ++b) { gs += w[b] * paths[best].gain[b]; ws += w[b]; }
+            bestV = (ws > 0.0f) ? gs / ws : 0.0f;
+        }
+        const DiffractionPath& p = paths[best];
+        const float directDist = std::max(length(source - listener), 1e-4f);
+        out17[17] = p.pathLength;
+        out17[18] = p.openBandIsFresnel ? 1.0f : 0.0f;
+        out17[19] = maekawa::apertureWeight(p.pathLength - directDist);
+        out17[0] = p.delta;
+        out17[1] = p.openGain;
+        out17[2] = p.slitWidth;
+        out17[3] = bestV;
+        for (int b = 0; b < kNumBands; ++b) {
+            out17[4 + b] = p.gain[b];
+            out17[10 + b] = p.openBand[b];
+        }
+        out17[16] = static_cast<float>(p.nSpread);
+        // slitWidthAt の 2 軸（どちらが最小を出したか）
+        out17[20] = dbgSpanPerp_;
+        out17[21] = dbgSpanEdge_;
+        // フレネル開口の段: 見つけた面の数 / 有界と判定できた数
+        out17[22] = static_cast<float>(dbgFresPlanes_);
+        out17[23] = static_cast<float>(dbgFresBounded_);
+        out17[24] = dbgUFrac_;
+        out17[25] = dbgVFrac_;
+        out17[26] = static_cast<float>(dbgFresDropped_);
+        return np;
     }
 
     /// 開口を何点に散らすか（1=点のまま／2〜3=面として鳴らす）。既定 1。
@@ -3656,8 +4137,11 @@ public:
     // ※ 影境界の厳密な連続化は Phase 4（UTD 遷移関数）で。ここはその手前の緩和。
     //   outDetourDelta : null でなければ 回折の迂回余剰長 δ(m) を書く（非遮蔽=0 / 完全遮蔽=大）。
     //                    ステアの直接項を「実効経路=直接距離+δ」で重み付けするのに使う。
+    // skipDiffraction=true で「簡易の段」＝ 透過（音量と帯域カーブ）だけを返す。
+    //   回り込みを一切解かないので、費用のほぼ全部が消える。
     void computeDirectSoft(const Vec3& listener, const Vec3& source, float outGain[kNumBands],
-                           int numSamples, float sourceRadius, float* outDetourDelta) const {
+                           int numSamples, float sourceRadius, float* outDetourDelta,
+                           bool skipDiffraction = false) const {
         using namespace scene_detail;
         Vec3 dir = source - listener;
         const float dist = length(dir);
@@ -3713,6 +4197,16 @@ public:
         //     ここを通る。computeDiffraction を直しただけでは音に効かない。
         const bool centerOcc = isOccluded(listener, source);
         float dif[kNumBands];
+        // ★簡易の段はここで打ち切る。**回り込みを一切解かない。**
+        //   上の透過サンプリングで「音量」と「帯域カーブ」は既に出ているので、
+        //   遮蔽の量とこもりは残る。落ちるのは「壁を回り込んで届くぶん」だけ。
+        //   実測で費用のほぼ全部がこの下（候補探索・ポータル支配・前川の合成）にある。
+        //   ⚠ 段は音源ごとに固定なので、同じ音源が場面で別の答えを持つことはない（決めごと #1）。
+        if (skipDiffraction) {
+            for (int b = 0; b < kNumBands; ++b) outGain[b] = clamp01(transAccum[b] * inv);
+            if (outDetourDelta) *outDetourDelta = 0.0f;
+            return;
+        }
         // ★ポータルがこの経路を支配しているなら、回り込み量は**ポータルが唯一の答え**。
         //   旧経路（前川ベース）を併用すると、閉じた部屋で経路が無いのに
         //   回折が −39dB の床を作り、そこから上は材質が効かなくなる
@@ -4048,9 +4542,26 @@ public:
         // 1) 直接（音源ごと）＝ソフト遮蔽。定位を担う「第一波面」の到来方向を作る：
         //    見通せる → 音源方向 / 遮蔽 → 回り込む角（回折の掠める点）方向。反射は方向に効かせない
         //    （反射は現実でも先行音効果でほぼ定位せず、幅・広がりに化けるため。docs/EARLY_REFLECTIONS.md）。
-        for (int j = 0; j < count; ++j) {
+        //   ★ここは音源ごとに total[j] / refDist[j] / dirAccum[j] という**自分の枠**にしか
+        //     書かない。共有への書き込みがゼロなので、音源で割っても各音源の計算順も
+        //     丸めも変わらない ＝ **結果はビット一致**のまま複数コアへ割れる。
+        //     遮蔽された音源だけ diffractionComposite が走って 8 倍高いので、
+        //     ここを割るのが per-source の床にいちばん効く。
+        //   ⚠ 下の 2) はレイを全音源で共有して reflected[j] へ足し込むので、**割れない**。
+        forEachSource(count, [&](int j) {
+            // ★バーチャル: 何も解かない。自由音場（素通り）を書いて、方向は音源の向き。
+            //   ホストは再生位置だけ進める。可聴限界より下でしか選ばれないので、
+            //   ここで素通りを書いても聞こえ方に出ない。
+            if (tierIs_(j, TierVirtual)) {
+                for (int b = 0; b < kNumBands; ++b) total[j * kNumBands + b] = 1.0f;
+                refDist[j] = std::max(length(sources[j] - listener), 1e-3f);
+                dirAccum[j] = normalized(sources[j] - listener) * directWeight;
+                return;
+            }
             float detourDelta = 0.0f;
-            computeDirectSoft(listener, sources[j], &total[j * kNumBands], 8, 0.4f, &detourDelta);
+            const bool simple = tierIs_(j, TierSimple);
+            computeDirectSoft(listener, sources[j], &total[j * kNumBands], 8, 0.4f, &detourDelta,
+                              simple);
             refDist[j] = std::max(length(sources[j] - listener), 1e-3f);
             float directMean = 0.0f;
             for (int b = 0; b < kNumBands; ++b) directMean += total[j * kNumBands + b];
@@ -4060,6 +4571,15 @@ public:
             //（滑らかに切替わり、複数開口があれば両側から）。実効経路が長いほど定位を弱める。
             Vec3 firstDir = normalized(sources[j] - listener);
             float firstW = directMean;  // 見通せる＝そのまま強い定位
+            // ★簡易: ここで打ち切る。computeDirectSoft が既に**音量と帯域カーブ**を出して
+            //   いるので、遮蔽の「量」と「こもり」は出る。出ないのは**どこから聞こえるか**
+            //   ── 回り込みの方向。音源の方向のまま鳴る。
+            //   実測でここが費用の主（遮蔽 6.0ms/本 vs 見通せる 1.0ms/本）。
+            //   「其処に何か在る」だけ伝わればよい音源はこれで足りる。
+            if (simple) {
+                dirAccum[j] = firstDir * (firstW * directWeight);
+                return;
+            }
             if (isOccluded(listener, sources[j])) {
                 // ★★ 未完成: 壁を抜けてくる音を「面が再放射する」形にしたい ★★
                 //   音源方向のまま鳴らすと壁の中から聞こえ、歩いても
@@ -4088,14 +4608,17 @@ public:
                 }
             }
             dirAccum[j] = firstDir * (firstW * directWeight);
-        }
+        });
 
         // 2) 反射（リスナーレイは1回だけ＝音源数非依存）。到来方向は初期レイ方向 d0。
         if (numRays > 0 && maxBounces > 0 && instanceCount() > 0) {
             float maxRef = 1e-3f;
             for (int j = 0; j < count; ++j) maxRef = std::max(maxRef, refDist[j]);
             const float maxDist = maxRef * 8.0f + 50.0f;
-            for (int i = 0; i < numRays; ++i) {
+            // レイ [lo,hi) を acc（count*kNumBands）へ積む。積む先を引数にしたので、
+            // 直列でもスレッドごとの箱へでも同じ本体が使える。
+            auto runRayRange = [&](float* AF_RESTRICT acc, int lo, int hi) {
+            for (int i = lo; i < hi; ++i) {
                 Vec3 o = listener;
                 Vec3 d = fibonacciSphereDir(i, numRays);
                 uint32_t rng = static_cast<uint32_t>(i) * 2654435761u + 12345u;
@@ -4114,6 +4637,7 @@ public:
                     for (int b = 0; b < kNumBands; ++b)
                         refl[b] = clamp01(1.0f - mat.absorption[b] - mat.transmission[b]);
                     for (int j = 0; j < count; ++j) {  // ここだけ音源数ぶん
+                        if (tierIs_(j, TierVirtual)) continue;   // 解かない段は飛ばす
                         float seg[kNumBands];
                         computeTransmission(q, sources[j], seg);
                         const float pathLen = totalLen + length(sources[j] - q);
@@ -4123,11 +4647,39 @@ public:
                         // 反射エネルギーは帯域生存(音量・広がり)には効くが、方向(dirAccum)には
                         // 効かせない（反射は定位を持たせない＝拡散扱い）。
                         for (int b = 0; b < kNumBands; ++b)
-                            reflected[j * kNumBands + b] += carry[b] * refl[b] * seg[b] * atten;
+                            acc[j * kNumBands + b] += carry[b] * refl[b] * seg[b] * atten;
                     }
                     for (int b = 0; b < kNumBands; ++b) carry[b] *= refl[b];  // 継続レイの減衰
                     d = scatteredDir(d, hit.normal, scatteringMean(mat), rng);
                     o = q;
+                }
+            }
+            };  // runRayRange
+
+            // ★★ ここも複数コアで割る ★★
+            //   エコグラムと同じ形。レイを全音源で共有して reflected[] へ足し込むので、
+            //   塊ごとに別の箱へ積んで、**塊の番号順に**足す（実行のたびに揺れない）。
+            //   ⚠ 直列とはビット一致しない（足す順が変わるため）。許容差で押さえる。
+            {
+                const int chunks = (pool_ && pool_->size() > 1) ? pool_->size() : 1;
+                const int useChunks = std::max(1, std::min(chunks, numRays / 32));
+                if (useChunks <= 1) {
+                    runRayRange(reflected.data(), 0, numRays);
+                } else {
+                    ensureBvh();   // 遅延構築をスレッドの中で競合させない
+                    const size_t plane = static_cast<size_t>(count) * kNumBands;
+                    std::vector<float> scratch(plane * static_cast<size_t>(useChunks), 0.0f);
+                    const int per = (numRays + useChunks - 1) / useChunks;
+                    pool_->parallelFor(useChunks, [&](int c) {
+                        const int lo = c * per;
+                        const int hi = std::min((c + 1) * per, numRays);
+                        if (lo < hi) runRayRange(scratch.data() + plane * static_cast<size_t>(c),
+                                                 lo, hi);
+                    });
+                    for (int c = 0; c < useChunks; ++c) {
+                        const float* src = scratch.data() + plane * static_cast<size_t>(c);
+                        for (size_t k = 0; k < plane; ++k) reflected[k] += src[k];
+                    }
                 }
             }
             const float inv = 1.0f / static_cast<float>(numRays);
@@ -4196,12 +4748,23 @@ public:
     //     尾に本来存在しない 1/t² の減衰が乗る。拡散音場のエネルギー密度は空間的にほぼ一様で、
     //     時間減衰は吸音だけが担うのが正しい。広い部屋の中央ほど経路が長いので、
     //     総経路長で掛けるとそこの反響だけが痩せる。
+    // ★rayBegin / rayCount でレイを**分割して積める**（-1 で全部）。
+    //   レイは fibonacciSphereDir(i, numRays) の決定的な分布で、正規化も 1/numRays 固定。
+    //   なので [0,numRays) を何回かに分けて積んでも、**結果は一字一句同じ**になる。
+    //   これで 1 フレームの山を崩す（実測: 走るフレームで約 15ms かかっていた）。
+    //   clearFirst=false のときは outBins を消さずに足し込む（続きを積む用）。
     void computeEchogramBands(const Vec3& listener, const Vec3* sources, int count,
                               float* outBins, int numBins, float binSeconds, float speedOfSound,
-                              int numRays, int maxBounces, float distanceRef) const {
+                              int numRays, int maxBounces, float distanceRef,
+                              int rayBegin = -1, int rayCount = -1, bool clearFirst = true,
+                              bool useTiers = false) const {
         using namespace scene_detail;
         if (!outBins || numBins <= 0 || !sources || count <= 0) return;
-        for (size_t k = 0; k < static_cast<size_t>(numBins) * kNumBands * count; ++k) outBins[k] = 0.0f;
+        if (clearFirst)
+            for (size_t k = 0; k < static_cast<size_t>(numBins) * kNumBands * count; ++k)
+                outBins[k] = 0.0f;
+        const int rayLo = (rayBegin < 0) ? 0 : std::min(rayBegin, numRays);
+        const int rayHi = (rayCount < 0) ? numRays : std::min(numRays, rayLo + rayCount);
 
         const float kEps = 1e-3f;
         const float invC = (speedOfSound > 1e-3f) ? 1.0f / speedOfSound : 0.0f;
@@ -4221,19 +4784,28 @@ public:
         //     レイ追跡はリスナーから 1 回で共有なので、分けても**計算は増えない**
         //     （音源ごとの computeTransmission は元から呼んでいる）。増えるのはメモリだけ。
         const size_t srcStride = static_cast<size_t>(numBins) * kNumBands;
-        auto addBin = [&](int j, float dist, const float* energy6, float scale) {
+        // ★積む先をポインタで受ける。複数コアで回すとき、スレッドごとに別の箱へ積むため
+        //   （同じビンへ同時に足すと壊れる）。直列のときは outBins をそのまま渡す。
+        auto addBinTo = [&](float* AF_RESTRICT bins, int j, float dist, const float* energy6, float scale) {
             const int k = static_cast<int>(dist * invC * invBin);
             if (k < 0 || k >= numBins) return;
-            float* dst = outBins + static_cast<size_t>(j) * srcStride
-                                 + static_cast<size_t>(k) * kNumBands;
+            float* dst = bins + static_cast<size_t>(j) * srcStride
+                              + static_cast<size_t>(k) * kNumBands;
             for (int b = 0; b < kNumBands; ++b) {
                 const float e = energy6[b] * scale;
                 if (e > 0.0f) dst[b] += e;
             }
         };
+        auto addBin = [&](int j, float dist, const float* energy6, float scale) {
+            addBinTo(outBins, j, dist, energy6, scale);
+        };
 
         // 直接音（直線の透過）。音源→リスナーの広がり損失を掛ける。
-        for (int j = 0; j < count; ++j) {
+        //   ★レイのループの**外**にあるので、分割して積むときは 1 周に 1 回だけ足す。
+        //     ここを素通しにすると、見通せる音源だけ直接音が分割数ぶん重なる
+        //     （実測: 4 分割で総和が 141.72 → 159.72、遮られた音源は変わらず ＝ 直接音の 3 回ぶん）。
+        for (int j = 0; (rayLo == 0) && j < count; ++j) {
+            if (useTiers && tierIs_(j, TierVirtual)) continue;
             float g[kNumBands];
             computeTransmission(listener, sources[j], g);
             const float d = length(sources[j] - listener);
@@ -4251,7 +4823,10 @@ public:
             const float kDiffuseCoupling = 6.2831853f;
             const float inv = kDiffuseCoupling / static_cast<float>(numRays);
 
-            for (int i = 0; i < numRays; ++i) {
+            // レイ [lo,hi) を bins へ積む。積む先を引数にしたので、直列でも
+            // スレッドごとの箱へでも同じ本体が使える。
+            auto runRayRange = [&](float* AF_RESTRICT bins, int lo, int hi) {
+            for (int i = lo; i < hi; ++i) {
                 Vec3 o = listener;
                 Vec3 d = fibonacciSphereDir(i, numRays);
                 uint32_t rng = static_cast<uint32_t>(i) * 2654435761u + 12345u;
@@ -4272,6 +4847,10 @@ public:
                         refl[b] = clamp01(1.0f - mat.absorption[b] - mat.transmission[b]);
 
                     for (int j = 0; j < count; ++j) {
+                        // ★バーチャルはここでも飛ばす。バウンスごと・音源ごとに
+                        //   computeTransmission が走るので、**音源数に比例する費用の本体**。
+                        //   段分けがいちばん効くのはここ。
+                        if (useTiers && tierIs_(j, TierVirtual)) continue;
                         float seg[kNumBands];
                         computeTransmission(q, sources[j], seg);
                         const float srcLeg = length(sources[j] - q);   // 音源→反射点
@@ -4279,11 +4858,57 @@ public:
                         float e[kNumBands];
                         for (int b = 0; b < kNumBands; ++b) e[b] = carry[b] * refl[b] * seg[b];
                         // 広がり損失は「音源→反射点」の区間にだけ掛ける（総経路長ではない）。
-                        addBin(j, pathLen, e, inv * spreadEnergy(srcLeg));
+                        addBinTo(bins, j, pathLen, e, inv * spreadEnergy(srcLeg));
                     }
                     for (int b = 0; b < kNumBands; ++b) carry[b] *= refl[b];
                     d = scatteredDir(d, hit.normal, scatteringMean(mat), rng);
                     o = q;
+                }
+            }
+            };  // runRayRange
+
+            // ★★ ここを複数コアで割る ★★
+            //   レイは全音源で共有していて、同じビンへ足し込む。だからスレッドごとに
+            //   **別の箱**を持たせて、最後に決まった順で足す。
+            //
+            //   ⚠ 音源ごとの段（forEachSource）と違い、**直列とビット一致しない。**
+            //     浮動小数の足す順が変わるため。ただし塊の割り方を固定してあるので、
+            //     どのスレッドがどの塊を取っても**同じ答え**になる（実行のたびに揺れない）。
+            //     塊の番号で箱を選んでいるので、仕事の取り合いが起きても順は変わらない。
+            //
+            //   ⚠ 検査ハーネスは既定の直列で回す。「変えたつもりが無い変更」を
+            //     厳密差分で判定できる状態を手放さないため。並列と直列が合うことは
+            //     許容差で別に押さえる（分割畳み込みと同じ作り）。
+            const int rays = rayHi - rayLo;
+            const int chunks = (pool_ && pool_->size() > 1) ? pool_->size() : 1;
+            // 塊が細かすぎると同期の代金に負ける。1 塊 32 レイは確保する。
+            //   ★ここで「足りなければ直列」にすると崖ができる。実測: フレーム分割で
+            //     1 回 128 レイのところへ 8 コアを指定すると 8×32=256 に届かず直列へ落ち、
+            //     4 コア 4.82ms に対して 8 コア 8.31ms と**逆に遅くなった**。
+            //     コア数ではなく「レイ数が許す塊数」で頭打ちにする。
+            const int maxByRays = rays / 32;
+            const int useChunks = std::max(1, std::min(chunks, maxByRays));
+            if (useChunks <= 1) {
+                runRayRange(outBins, rayLo, rayHi);
+            } else {
+                ensureBvh();     // ★遅延構築をここで済ませる。スレッドの中で競合させない
+                const size_t plane = static_cast<size_t>(numBins) * kNumBands
+                                   * static_cast<size_t>(count);
+                if (rayScratch_.size() != plane * static_cast<size_t>(useChunks))
+                    rayScratch_.assign(plane * static_cast<size_t>(useChunks), 0.0f);
+                else
+                    std::fill(rayScratch_.begin(), rayScratch_.end(), 0.0f);
+                const int per = (rays + useChunks - 1) / useChunks;
+                pool_->parallelFor(useChunks, [&](int c) {
+                    const int lo = rayLo + c * per;
+                    const int hi = std::min(rayLo + (c + 1) * per, rayHi);
+                    if (lo < hi) runRayRange(rayScratch_.data() + plane * static_cast<size_t>(c),
+                                             lo, hi);
+                });
+                // 塊の番号順に足す＝実行のたびに同じ答え。
+                for (int c = 0; c < useChunks; ++c) {
+                    const float* src = rayScratch_.data() + plane * static_cast<size_t>(c);
+                    for (size_t k = 0; k < plane; ++k) outBins[k] += src[k];
                 }
             }
         }
@@ -4326,9 +4951,38 @@ public:
                 remaining -= hit.t;
                 if (remaining <= kEps) break;
                 const AcousticMaterial& mat = materialOf(hit.materialId);
+                // ★★ 反射点から**音源が見えるか**を掛ける ★★
+                //   これが無いと、測っているのは「その向きへレイを飛ばすとエネルギーが
+                //   どれだけ生き残るか」でしかない。閉じた部屋で材質が同じなら、どの向きへ
+                //   飛ばしても同じ答えになる ── 実測: 6 軸すべて 0.250、最大差 **0.1dB**。
+                //   角の向こうの廊下（音は角の口からしか来ない）でも平坦だった。
+                //   結果、Unity の enableDirectionalTail は入れても何も起きなかった。
+                //   早期反射側は最初からこれを掛けている（computeEarlyReflections の seg）。
+                //   ここも同じ形にする ＝「音源から出た音がどの向きから届くか」を測る。
+                const Vec3 q = hit.point + hit.normal * 0.02f;
+                float seg[kNumBands] = {1, 1, 1, 1, 1, 1};
+                if (!sources_.empty()) {
+                    // 複数音源はいちばんよく届くものを採る（尾は音源ごとに持っているので、
+                    // ここで混ぜると音源ごとの差が消える）。
+                    float best[kNumBands] = {0, 0, 0, 0, 0, 0};
+                    float bestSum = -1.0f;
+                    for (const SourceEntry& se : sources_) {
+                        if (!se.active) continue;
+                        float t[kNumBands];
+                        computeTransmission(q, se.pos, t);
+                        float sum = 0.0f;
+                        for (int b = 0; b < kNumBands; ++b) sum += t[b];
+                        if (sum > bestSum) {
+                            bestSum = sum;
+                            for (int b = 0; b < kNumBands; ++b) best[b] = t[b];
+                        }
+                    }
+                    if (bestSum >= 0.0f)
+                        for (int b = 0; b < kNumBands; ++b) seg[b] = best[b];
+                }
                 for (int b = 0; b < kNumBands; ++b) {
                     carry[b] *= clamp01(1.0f - mat.absorption[b] - mat.transmission[b]);
-                    dst[b] += carry[b];
+                    dst[b] += carry[b] * seg[b];
                 }
                 d = scatteredDir(d, hit.normal, scatteringMean(mat), rng);
                 o = hit.point + hit.normal * 0.02f;
@@ -4407,6 +5061,105 @@ public:
         return n;
     }
 
+    // ★★ 早期反射：レイをリスナーから 1 回だけ撃って全音源で共有する ★★
+    //
+    //   computeEarlyReflections は**音源ごとに 512 本ずつ**撃っていた。だがレイの経路
+    //   （原点・方向・当たり・バウンス・carry）は**全音源で同一**で、音源ごとに違うのは
+    //   各ヒットでの評価（透過・経路長）だけ。エコグラムはとっくに共有しているのに、
+    //   こちらだけ共有していなかった（実測 8.2%／簡易の段を作ったとき費用の主だった）。
+    //
+    //   ⚠ maxDist だけ音源に依存する（refDist×8+50）。共有するには**いちばん遠い音源**に
+    //     合わせる。レイは少し長く飛ぶが、音源数ぶん撃つより桁違いに安い。
+    //     エコグラムが既に同じ手当てをしている。
+    //
+    //   outCount[j] にタップ数、outImagePos/outGain は [音源][タップ] の並び。
+    void computeEarlyReflectionsMulti(const Vec3& listener, const Vec3* sources, int count,
+                                      Vec3* outImagePos, float* outGain, int* outCount,
+                                      int maxTaps, int numRays, int maxBounces) const {
+        using namespace scene_detail;
+        if (!sources || count <= 0 || !outImagePos || !outGain || !outCount) return;
+        for (int j = 0; j < count; ++j) outCount[j] = 0;
+        if (maxTaps <= 0 || instanceCount() == 0 || numRays <= 0 || maxBounces <= 0) return;
+
+        struct Tap { Vec3 dir; float len; float g[kNumBands]; float e; };
+        static thread_local std::vector<std::vector<Tap>> taps;
+        taps.resize(static_cast<std::size_t>(count));
+        for (int j = 0; j < count; ++j) taps[static_cast<std::size_t>(j)].clear();
+
+        const float kEps = 1e-3f;
+        // 共有するので、いちばん遠い音源に合わせて飛ばす。
+        float maxRef = 1e-3f;
+        for (int j = 0; j < count; ++j)
+            maxRef = std::max(maxRef, std::max(length(sources[j] - listener), 1e-3f));
+        const float maxDist = maxRef * 8.0f + 50.0f;
+
+        ensureBvh();   // スレッドを起こす前に遅延構築を済ませる（並列化したときの競合を防ぐ）
+        for (int i = 0; i < numRays; ++i) {
+            Vec3 o = listener;
+            Vec3 d = fibonacciSphereDir(i, numRays);
+            const Vec3 d0 = d;                  // リスナーに届く方向（第1レグ）
+            uint32_t rng = static_cast<uint32_t>(i) * 2654435761u + 12345u;
+            float carry[kNumBands] = {1, 1, 1, 1, 1, 1};
+            float totalLen = 0.0f;
+            float remaining = maxDist;
+            for (int bounce = 0; bounce < maxBounces; ++bounce) {
+                const SceneHit hit = raycastClosest(o, d, remaining);
+                if (!hit.hit) break;
+                totalLen += hit.t;
+                remaining -= hit.t;
+                if (remaining <= kEps) break;
+                const AcousticMaterial& mat = materialOf(hit.materialId);
+                const Vec3 q = hit.point + hit.normal * 0.02f;
+                float refl[kNumBands];
+                for (int b = 0; b < kNumBands; ++b)
+                    refl[b] = clamp01(1.0f - mat.absorption[b] - mat.transmission[b]);
+                // ここだけ音源数ぶん。バーチャルの段は解かない。
+                for (int j = 0; j < count; ++j) {
+                    if (tierIs_(j, TierVirtual)) continue;
+                    float seg[kNumBands];
+                    computeTransmission(q, sources[j], seg);
+                    Tap t;
+                    t.dir = d0;
+                    t.len = totalLen + length(sources[j] - q);
+                    float e = 0.0f;
+                    for (int b = 0; b < kNumBands; ++b) {
+                        t.g[b] = carry[b] * refl[b] * seg[b];
+                        e += t.g[b];
+                    }
+                    t.e = e / kNumBands;
+                    if (t.e > 1e-4f) taps[static_cast<std::size_t>(j)].push_back(t);
+                }
+                for (int b = 0; b < kNumBands; ++b) carry[b] *= refl[b];
+                d = scatteredDir(d, hit.normal, scatteringMean(mat), rng);
+                o = q;
+            }
+        }
+
+        // 音源ごとに、エネルギー降順で方向の近いものをまとめて上位を採る（元の実装と同じ規則）。
+        for (int j = 0; j < count; ++j) {
+            std::vector<Tap>& tv = taps[static_cast<std::size_t>(j)];
+            std::sort(tv.begin(), tv.end(), [](const Tap& a, const Tap& b) { return a.e > b.e; });
+            Vec3 pickedDir[64];
+            int n = 0;
+            Vec3* pos = outImagePos + static_cast<std::size_t>(j) * maxTaps;
+            float* gain = outGain + static_cast<std::size_t>(j) * maxTaps * kNumBands;
+            for (const Tap& t : tv) {
+                if (n >= maxTaps || n >= 64) break;
+                bool dup = false;
+                for (int k = 0; k < n; ++k)
+                    if (dot(t.dir, pickedDir[k]) > 0.9f) { dup = true; break; }
+                if (dup) continue;
+                pickedDir[n] = t.dir;
+                pos[n] = listener + t.dir * t.len;
+                // 内部はエネルギー、タップのゲインは振幅で返す（material.h の単位規約）。
+                for (int b = 0; b < kNumBands; ++b)
+                    gain[n * kNumBands + b] = std::sqrt(t.g[b]);
+                ++n;
+            }
+            outCount[j] = n;
+        }
+    }
+
     // 【可視化】origin から dir 方向へ鏡面反射で maxBounces 回まで追い、通過点を outPoints に書く。
     //   outPoints[0]=origin、以降=反射点、最後=終端（開放空間での到達点 or 最終反射点）。
     //   返り値=書き込んだ点数。反響経路(reflection path)を Unity で線描画するための土台。
@@ -4443,10 +5196,24 @@ public:
     // ここで保持するようにしておくと、後段の af_Update（1発で全音源を回す）と
     // ワーカースレッド化（入力をスナップショットして投げる）が素直に乗る。
     // 段1では保持するだけで、既存クエリは引数版のまま＝挙動は一切変わらない。
+    // 音源の段。**音源ごとに固定**する（オーサリング）。
+    //   距離で自動に切り替えると、歩くだけで段が変わって切り替わりが聞こえる
+    //   ＝ 同じ音源が場面によって別の仕組みで鳴る（決めごと #1）。
+    //   固定なら、2 つの模型が同居しても同じ音源が混ざることはない。
+    enum SourceTier : unsigned char {
+        TierExact   = 0,   // 回折の合成まで解く。体験の芯（扉の奥の音・探しているベル）
+        TierSimple  = 1,   // 遮蔽の音量と帯域カーブだけ。「其処に何か在る」が伝わればよいもの
+        TierVirtual = 2,   // 解かない。ホストは再生位置だけ進める
+    };
+
     struct SourceEntry {
         unsigned long long id = 0;
         Vec3 pos{};
         bool active = true;
+        SourceTier tier = TierExact;   // 既定は厳密（既存のホストの音を変えない）
+        // 自由音場で聞こえなくなる距離(m)。0 以下＝自動でバーチャルへ落とさない。
+        float audibleRadius = 0.0f;
+        bool  autoVirtual = false;     // ヒステリシスの状態（いま自動で落ちているか）
     };
 
     void setListener(const Vec3& pos) { listenerPos_ = pos; }
@@ -4461,6 +5228,28 @@ public:
         e.id = id;
         e.pos = pos;
         sources_.push_back(e);
+    }
+
+    // 段を決める。音源ごとに固定する前提（毎フレーム同じ値を押してよい）。
+    void setSourceTier(unsigned long long id, int tier) {
+        const SourceTier t = (tier <= 0) ? TierExact
+                           : (tier == 1) ? TierSimple : TierVirtual;
+        for (auto& s : sources_) if (s.id == id) { s.tier = t; return; }
+    }
+
+    // 自由音場で聞こえなくなる距離(m)。0 以下で自動バーチャルを使わない。
+    //
+    // ★ここが「距離だけで落とすと壊れる」ところ ──
+    //   板の案には「自由音場で聞こえないなら遮蔽込みでも絶対に聞こえない」とあったが、
+    //   **遮蔽については正しく、残響については逆**。残響は音を足す。
+    //   臨界距離 rc より遠いところでは直接音より残響のほうが大きく、しかも残響は
+    //   距離でほとんど減らない。だから自由音場の直接音だけで判定すると、
+    //   **響く部屋では聞こえている音を切る**（大聖堂の奥の鐘が距離だけを見て黙る）。
+    //   響く場所ほど間違えるので、いちばん聞かせたい場面で壊れる外れ方になる。
+    //
+    //   → 判定は effectiveTier_() 側で rc と比べて決める。ここは自由音場の半径だけを持つ。
+    void setSourceAudibleRadius(unsigned long long id, float metres) {
+        for (auto& s : sources_) if (s.id == id) { s.audibleRadius = metres; return; }
     }
 
     void removeSource(unsigned long long id) {
@@ -4523,11 +5312,11 @@ public:
         int reflectionBounces = 3;
         float directWeight = 1.0f;
         bool useReflections = true;
-
-        // エッジカタログ
         bool useEdgeCatalog = true;
         int edgeCatalogRes = 16;
         float edgeCatalogMaxDist = 40.0f;
+
+        // エッジカタログ
 
         // 役割2: エコグラム
         bool enableReverb = true;
@@ -4556,17 +5345,46 @@ public:
 
     // 毎フレーム 1 発。内部レートに従って各役割を実行し、結果を results_ に置く。
     void update(float /*dt*/) {
+        // 診断カウンタを戻す。
+        //   thread_local にした結果、シーンをまたいで**前のシーンの値が残る**ようになった
+        //   （メンバだった頃はシーンごとに -1 から始まっていた）。実際、隙間幅を一度も
+        //   測らないシーンで前のシーンの値が出た。ここで戻せば直列時の意味は元どおり。
+        resetThreadDiagnostics_();
+
+        // ★段の位相は update に**入る前**の値を録る。押し直す側はこれを戻してから
+        //   同じフレームを回すので、位相が揃う（戻さないと尾が永久にずれる）。
+        if (capture_.active()) debugGetStagePhase(capturePhase_);
+
         // 部屋グラフが作り直されたなら、自動生成ポータルも作り直す。
         //   roomGraph() は中で dirty を見ているので毎フレーム呼んでも構築は走らない。
         if (autoPortals_ && roomBuilder_.dirty()) { roomGraph(); rebuildAutoPortals(); }
 
         const int n = sourceCount();
         results_.resize(n, cfg_);
-        if (n == 0) return;
+        // ★音源が 0 でも録る。リスナーは動いているし、扉も動く。
+        //   「無音の区間だけ記録が抜ける」と、あとでフレーム番号が合わなくなる。
+        if (n == 0) { captureFrame_(0); return; }
 
         // 音源位置を配列へ（既存の multi 系 API がポインタ配列を取るため）。
         srcScratch_.resize(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) srcScratch_[static_cast<size_t>(i)] = sources_[static_cast<size_t>(i)].pos;
+
+        // 段を解決する（固定の段＋自動バーチャル）。以後の各段はこれを見て仕事を飛ばす。
+        resolveTiers_(n);
+        // 尾の共有（部屋ごとの代表）。★毎フレーム解く ── ホストが
+        //   AF_SceneGetTailShapeIndex をいつ引いても答えられるようにするため。
+        //   計算はエコグラムの周回の頭で固定した顔ぶれを使う（runEchogram 参照）。
+        resolveTailGroups_(n);
+
+        // ★★ 遅延構築をここで済ませる。スレッドを起こす前に、必ず ★★
+        //   BVH は raycast の中から ensureBvh() で作られる（遅延）。音源ごとの段を
+        //   複数コアで回すと、**複数スレッドが同時に作り直して競合する**。
+        //   扉が毎フレーム動くシーンでは bvhDirty_ が毎フレーム立つので確実に踏む
+        //   （実測: 回帰テストが診断の途中で落ちた）。
+        //   ⚠ 静止したシーンでは滅多に出ないので、**検査で見つからない**類の壊れ方をする。
+        //     レイの段（エコグラム・反射）では既に個別に呼んでいたが、
+        //     音源ごとの段（遮蔽・回折）で呼び忘れていた。ここで一括して潰す。
+        ensureBvh();
 
         // a) エッジカタログ（リスナー中心・全音源共有）。回折が使う。
         if (cfg_.useEdgeCatalog) {
@@ -4600,16 +5418,63 @@ public:
             }
         }
 
-        // e) 役割2: エコグラム（全音源まとめて・最低レート）。
+        // e) 役割2: エコグラム（全音源まとめて）。
+        //   ★以前は role2EveryN フレームに 1 回、512 本まとめて撃っていた。
+        //     平均 3.87ms だが**走るフレームだけで約 15ms** かかり、最悪フレーム 22.8ms の
+        //     正体になっていた（切ると最悪が 9.8ms まで落ちることで確認）。
+        //   → **毎フレーム 1/N ずつ**撃つ。N = role2EveryN なので 1 周の周期は従来と同じ。
+        //     レイの分布は決定的で正規化も固定なので、**結果は一字一句同じ**。
         if (cfg_.enableReverb) {
-            if (--role2Countdown_ <= 0) {
-                role2Countdown_ = (cfg_.role2EveryN > 0) ? cfg_.role2EveryN : 1;
-                runEchogram(n);
-            }
+            echoSlices_ = (cfg_.role2EveryN > 0) ? cfg_.role2EveryN : 1;
+            runEchogram(n);
         }
 
         // 初回で全段を走らせ終えたら、以後の位相をずらす。
         if (!staggered_) { staggered_ = true; phaseStages_(); }
+
+        // ★キャプチャは**全段が終わったあと**。出力を録るので、途中で録ると
+        //   「今フレーム更新されなかった段」が前フレームの値のまま混ざる…のは正しいが、
+        //   段の位相ずらしの結果そのものを見たいので、必ず最後に 1 回だけ。
+        captureFrame_(n);
+    }
+
+    // 1 フレームぶんを器へ落とす。★読むのは全部**公開の getter 経由**にしてある。
+    //   内部配列を直接舐めると、段の並びを変えるたびにここが壊れる。
+    void captureFrame_(int n) {
+        if (!capture_.active() || capture_.ready()) return;
+        dbg::CapGlobal* g = capture_.beginFrame(listenerPos_.x, listenerPos_.y, listenerPos_.z,
+                                                captureAudioSample_.load(std::memory_order_relaxed));
+        if (!g) return;
+        for (int i = 0; i < 8; ++i)
+            g->phase[i] = static_cast<std::uint8_t>(capturePhase_[i] < 0 ? 0
+                          : (capturePhase_[i] > 255 ? 255 : capturePhase_[i]));
+        const int cap = capture_.config().maxSources;
+        const int m = (n < cap) ? n : cap;
+        for (int i = 0; i < m; ++i) {
+            dbg::CapSource* s = capture_.sourceSlot(i);
+            if (!s) break;
+            *s = dbg::CapSource{};
+            s->id = sources_[static_cast<size_t>(i)].id;
+            const Vec3& p = sources_[static_cast<size_t>(i)].pos;
+            s->sx = p.x; s->sy = p.y; s->sz = p.z;
+            getSourceOcclusion(i, s->band);
+            float d[3] = {0, 0, 0};
+            getSourceArrivalDir(i, d);
+            s->dx = d[0]; s->dy = d[1]; s->dz = d[2];
+            s->occ = getSourceOcclusionScalar(i);
+            s->tier = static_cast<std::uint8_t>(effectiveTier(i));
+            // 本数は型紙3（経路が消えない）が見る量。位置までは録らない（容量）。
+            Vec3 pos8[8]; float g8[8], gb48[48];
+            s->earlyTaps = static_cast<std::uint16_t>(getEarlyReflections(i, pos8, gb48, 8));
+            s->diffSrcs  = static_cast<std::uint16_t>(getDiffractionSources(i, pos8, g8, 8));
+            // 尾の量はエコグラムの総和。型紙A（比が保たれる）が直接音と突き合わせる。
+            float bins[64 * kNumBands];
+            const int nb = getEchogramBands(i, bins, 64);
+            float tot = 0.0f;
+            for (int k = 0; k < nb * kNumBands; ++k) tot += bins[k];
+            s->tailLevel = tot;
+        }
+        capture_.endFrame(m);
     }
 
     // 【段の位相をずらす】周期は変えず、走る**フレームをずらす**だけ。
@@ -4687,7 +5552,14 @@ public:
     //     吸う部屋の音源が同じ尾になっていた（実測: 減衰の形が 500ms で 9.0dB 違うのに
     //     1 本へ潰れ、両方置くとどちらでもない中間になった）。
     //     レイ追跡はリスナーから 1 回で共有なので、分けても計算は増えない。
-    //   index に -1 を渡すと全音源の和（従来の値）。部屋全体の響きを見る用。
+    //   ★同じ部屋の音源は**代表 1 本を共有する**（tailShapeIndex）。尾は部屋の形にしか
+    //     依存しないので、音源ごとに計算していたぶんは丸ごと無駄だった
+    //     （実測 16 本で 16.798 ms のうち 14.3 ms がそれ）。
+    //     どの index で引いても、その音源の部屋の尾が返る ── 呼び手は変えなくてよい。
+    //   index に -1 を渡すと全音源の和（従来どおり）。部屋全体の響きを見る用。
+    //   ⚠ 代表を共有しても**人数ぶん足す**。ここを「代表の和」にすると、
+    //     ホストが RT60/wet を出すのに使っている量が音源数ぶん小さくなり、
+    //     出荷の残響レベルが変わってしまう。**意味は変えない。**
     int getEchogramBands(int index, float* outBins, int numBins) const {
         if (!outBins || numBins <= 0 || results_.echogramBins <= 0) return 0;
         const int n = std::min(numBins, results_.echogramBins);
@@ -4695,12 +5567,17 @@ public:
         if (index < 0) {
             for (int i = 0; i < n * kNumBands; ++i) outBins[i] = 0.0f;
             for (int j = 0; j < results_.count; ++j) {
-                const float* src = results_.echogram.data() + static_cast<size_t>(j) * stride;
+                // 自分の部屋の代表を足す（人数ぶん足るので従来と同じ意味になる）。
+                const int r = tailShapeIndex(j);
+                const int k = (r >= 0 && r < results_.count) ? r : j;
+                const float* src = results_.echogram.data() + static_cast<size_t>(k) * stride;
                 for (int i = 0; i < n * kNumBands; ++i) outBins[i] += src[i];
             }
             return n;
         }
         if (!validResult(index)) return 0;
+        const int rep = tailShapeIndex(index);             // 部屋の代表へ引き直す
+        if (rep >= 0 && rep < results_.count) index = rep;
         const float* src = results_.echogram.data() + static_cast<size_t>(index) * stride;
         for (int i = 0; i < n * kNumBands; ++i) outBins[i] = src[i];
         return n;
@@ -4786,27 +5663,62 @@ private:
         }
     }
 
+    // ★音源ごとにレイを撃ち、自分の枠にしか書かない。ビット一致のまま割れる。
+    // ★★ レイをリスナーから 1 回だけ撃って全音源で共有する ★★
+    //   以前は音源ごとに 512 本ずつ撃っていた。レイの経路は全音源で同一なので、
+    //   まるごと無駄だった（エコグラムはとっくに共有していたのに、こちらだけ残っていた）。
+    //   ⚠ 簡易・バーチャルの段は早期反射を持たない。共有版の中で飛ばしている
+    //     （簡易は「遮蔽の音量と帯域カーブだけ」の段で、反射はそのどちらでもない）。
     void runEarlyReflections(int n) {
         const int cap = results_.earlyCap;
+        // 厳密の段だけを詰めて渡す。簡易・バーチャルはここで 0 にしておく。
+        earlyIdx_.clear();
         for (int i = 0; i < n; ++i) {
-            const size_t base = static_cast<size_t>(i) * cap;
-            const int got = computeEarlyReflections(
-                listenerPos_, srcScratch_[static_cast<size_t>(i)],
-                &results_.earlyPos[base], &results_.earlyGain[base * kNumBands],
-                cap, cfg_.earlyRays, cfg_.earlyBounces);
+            if (tierIs_(i, TierExact)) earlyIdx_.push_back(i);
+            else results_.earlyCount[static_cast<size_t>(i)] = 0;
+        }
+        const int m = static_cast<int>(earlyIdx_.size());
+        if (m <= 0) return;
+        earlySrc_.resize(static_cast<size_t>(m));
+        earlyPosBuf_.assign(static_cast<size_t>(m) * cap, Vec3(0, 0, 0));
+        earlyGainBuf_.assign(static_cast<size_t>(m) * cap * kNumBands, 0.0f);
+        earlyCntBuf_.assign(static_cast<size_t>(m), 0);
+        for (int k = 0; k < m; ++k)
+            earlySrc_[static_cast<size_t>(k)] = srcScratch_[static_cast<size_t>(earlyIdx_[k])];
+
+        computeEarlyReflectionsMulti(listenerPos_, earlySrc_.data(), m,
+                                     earlyPosBuf_.data(), earlyGainBuf_.data(),
+                                     earlyCntBuf_.data(), cap,
+                                     cfg_.earlyRays, cfg_.earlyBounces);
+
+        for (int k = 0; k < m; ++k) {
+            const int i = earlyIdx_[k];
+            const size_t dst = static_cast<size_t>(i) * cap;
+            const size_t src = static_cast<size_t>(k) * cap;
+            const int got = earlyCntBuf_[static_cast<size_t>(k)];
+            for (int t = 0; t < got; ++t) {
+                results_.earlyPos[dst + t] = earlyPosBuf_[src + t];
+                for (int b = 0; b < kNumBands; ++b)
+                    results_.earlyGain[(dst + t) * kNumBands + b] =
+                        earlyGainBuf_[(src + t) * kNumBands + b];
+            }
             results_.earlyCount[static_cast<size_t>(i)] = got;
         }
     }
 
+    // ★これも音源ごとに自分の枠にしか書かない。ビット一致のまま割れる。
     void runDiffractionSources(int n) {
         const int cap = results_.diffCap;
-        for (int i = 0; i < n; ++i) {
+        forEachSource(n, [&](int i) {
+            // 二次音源は「回折がどこから来るか」を鳴らす仕掛け。簡易とバーチャルには要らない
+            //   （簡易は回り込みの方向を持たないと決めた段なので、ここだけ持つと辻褄が合わない）。
+            if (!tierIs_(i, TierExact)) { results_.diffCount[static_cast<size_t>(i)] = 0; return; }
             const size_t base = static_cast<size_t>(i) * cap;
             const int got = computeDiffractionSources(
                 listenerPos_, srcScratch_[static_cast<size_t>(i)],
                 &results_.diffPos[base], &results_.diffGain[base], cap);
             results_.diffCount[static_cast<size_t>(i)] = got;
-        }
+        });
     }
 
     // ポータルを**仮のリスナー**にして、奥側で聞こえているものをエコグラムへ足す。
@@ -4930,35 +5842,151 @@ private:
         }
     }
 
+    // ★★ レイを数フレームに分けて積む（山を崩す）★★
+    //   以前は 512 本を 4 フレームに 1 回まとめて撃っていた。平均では 3.87ms だが、
+    //   **走るフレームだけで約 15ms** かかり、そこが最悪フレーム 22.8ms の正体だった
+    //   （エコグラムを切ると最悪が 9.8ms まで落ちることで確認）。
+    //   レイの分布は決定的（fibonacciSphereDir）で正規化も 1/numRays 固定なので、
+    //   [0,512) を 4 回に分けて積んでも**結果は一字一句同じ**。総量も変わらない。
+    //   ★積んでいる途中の中間結果を出さないよう、別バッファに貯めて、
+    //     1 周そろった時点で results_ へ差し替える。
+    //   ★初回だけは分割しない。1 周そろうまで結果を出さない仕組みなので、分割したままだと
+    //     最初の数フレームがエコグラム無しで鳴ってしまう。起動時の山は予算の外なので一括で撃つ。
+    //   ★瞬間移動したら積みかけを捨てて一括で撃ち直す。
+    //     分割は「1 周のあいだリスナーがほぼ同じ場所にいる」ことに乗っている。歩きなら
+    //     4 フレームで 9cm しか動かないので問題ないが、シーン切替やリスポーンで飛ぶと
+    //     尾が 2 部屋ぶん混ざったまま数フレーム鳴る。飛んだフレームは絵も切り替わるので、
+    //     そこで一括に戻すのがいちばん安い（山が出ても見えない）。
+    // 【尾は部屋で共有する】同じ部屋にいる音源は同じ代表のエコグラムを使う。
+    //
+    // ★なぜ: 尾（後期残響）は**部屋の形にしか依存しない**。それを音源ごとに計算していた。
+    //   実測（尾を焼く前の下調べ）: 音源 1 本 2.492 ms（レイ側の固定費）に対し
+    //   16 本で 16.798 ms。**差の 14.3 ms は音源数で伸びるぶん**で、
+    //   出荷経路が読むのは部屋の代表 1 本だけなので、そのぶんは丸ごと無駄だった。
+    //
+    // ★代表の選び方は「同じ部屋のいちばん若い index」で決め打ち。
+    //   位置で選ぶと音源が動くたび代表が入れ替わり、尾の形が乗り換わって**段差**になる
+    //   （連続量に二値の判定を置く型。このプロジェクトの第一制約に反する）。
+    //   部屋が取れない（屋外＝-1）音源は自分自身を代表にする。
+    //
+    // ⚠ この規則は元は C# 側（AcousticFlowSceneDemo）にあった。同じ規則が 2 箇所にあると
+    //   片方だけ変えたときに「エンジンが計算した代表」と「ホストが読む代表」がずれる。
+    //   → エンジンに寄せて、ホストは AF_SceneGetTailShapeIndex で引く（決めごと #1）。
+    void resolveTailGroups_(int n) {
+        tailRep_.resize(static_cast<size_t>(n));
+        tailRoom_.resize(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            tailRoom_[static_cast<size_t>(i)] = roomAt(sources_[static_cast<size_t>(i)].pos);
+            tailRep_[static_cast<size_t>(i)] = i;
+        }
+        for (int i = 0; i < n; ++i) {
+            const int room = tailRoom_[static_cast<size_t>(i)];
+            if (room < 0) continue;                       // 屋外は共有しない
+            for (int j = 0; j < i; ++j)
+                if (tailRoom_[static_cast<size_t>(j)] == room) {
+                    tailRep_[static_cast<size_t>(i)] = tailRep_[static_cast<size_t>(j)];
+                    break;
+                }
+        }
+    }
+
+public:
+    /// この音源の尾を担っている代表音源の index（同じ部屋の最も若いもの）。範囲外は -1。
+    /// ★ホストはこれで尾の形を引く。ホスト側で同じ規則を持たないこと。
+    int tailShapeIndex(int index) const {
+        if (index < 0 || index >= static_cast<int>(tailRep_.size())) return -1;
+        return tailRep_[static_cast<size_t>(index)];
+    }
+private:
+
     void runEchogram(int n) {
         if (results_.echogramBins <= 0) return;
-        computeEchogramBands(listenerPos_, srcScratch_.data(), n,
-                             results_.echogram.data(), results_.echogramBins,
+        {
+            const Vec3 d = listenerPos_ - echoRoundOrigin_;
+            const float kTeleport = 2.0f;   // 1 フレームで 2m ＝ 120m/s。歩きでも車でも出ない
+            if (echoRaySlice_ != 0 && length(d) > kTeleport) {
+                echoRaySlice_ = 0;
+                echoPrimed_ = false;
+            }
+        }
+        // ★代表の顔ぶれは**周回の頭で固定する**。途中で変えると、溜まりかけの
+        //   エコグラムと配列の並びが食い違って別人の尾が混ざる
+        //   （周回の基準点 echoRoundOrigin_ を頭で固定しているのと同じ理由）。
+        // ⚠★ `echoRepIdx_.empty()` を必ず見ること。
+        //   周回の途中（echoRaySlice_ != 0）から始まる入り方がある ──
+        //   入力リプレイは段の位相を戻してから回すので、**slice 0 を踏まずに始まる**。
+        //   最初これを `echoRaySlice_ == 0` だけにしていて、代表の顔ぶれが一度も
+        //   作られず m=0 のまま毎回帰り、**尾が丸ごと無音になった**
+        //   （リプレイの検査が「相対差ちょうど 1.000」＝片方ゼロで捕まえた）。
+        if (echoRaySlice_ == 0 || echoRepIdx_.empty()) {
+            echoRoundOrigin_ = listenerPos_;
+            echoRepIdx_.clear();
+            echoRepPos_.clear();
+            for (int i = 0; i < n; ++i)
+                if (tailRep_[static_cast<size_t>(i)] == i) {
+                    echoRepIdx_.push_back(i);
+                    echoRepPos_.push_back(sources_[static_cast<size_t>(i)].pos);
+                }
+        }
+        const int m = static_cast<int>(echoRepIdx_.size());
+        if (m <= 0) return;
+        const int total = std::max(1, cfg_.echogramRays);
+        const int slices = echoPrimed_ ? std::max(1, echoSlices_) : 1;
+        const int chunk = (total + slices - 1) / slices;
+        const int begin = echoRaySlice_ * chunk;
+        const bool first = (echoRaySlice_ == 0);
+        const bool last  = (begin + chunk >= total);
+
+        // ★積む箱は**代表の数**ぶんだけ。ここが 16 本 → 部屋数に減るのが効きどころ。
+        const std::size_t need = static_cast<std::size_t>(results_.echogramBins) * kNumBands
+                               * static_cast<std::size_t>(m);
+        if (echoAccum_.size() != need) { echoAccum_.assign(need, 0.0f); }
+        computeEchogramBands(listenerPos_, echoRepPos_.data(), m,
+                             echoAccum_.data(), results_.echogramBins,
                              cfg_.echogramBinSeconds, cfg_.speedOfSound,
-                             cfg_.echogramRays, cfg_.echogramBounces, cfg_.distanceRef);
-        // 閉じた開口の向こうの響きを足す。レイ数は落としてよい ──
+                             cfg_.echogramRays, cfg_.echogramBounces, cfg_.distanceRef,
+                             begin, chunk, first, /*useTiers=*/true);
+        echoRaySlice_ = last ? 0 : (echoRaySlice_ + 1);
+        if (!last) return;      // まだ 1 周していない。前回の結果を保ったまま帰る
+        echoPrimed_ = true;
+        // 代表ぶんを詰めた箱のまま、開口の向こうの響きを足す。
+        //   閉じた開口の向こうの響き。レイ数は落としてよい ──
         //   要るのは尾の包絡であって細かい構造ではないので（本体の 1/4）。
         for (const Portal& pt : portals_) {
             if (!pt.active) continue;
-            addPortalEchogram(pt, srcScratch_.data(), n,
-                              results_.echogram.data(), results_.echogramBins,
+            addPortalEchogram(pt, echoRepPos_.data(), m,
+                              echoAccum_.data(), results_.echogramBins,
                               cfg_.echogramBinSeconds, cfg_.speedOfSound,
                               std::max(cfg_.echogramRays / 4, 32), cfg_.echogramBounces,
                               cfg_.distanceRef);
+        }
+        // 代表の枠へ配る。同じ部屋の音源は getEchogramBands で代表へ引き直される。
+        const std::size_t stride = static_cast<std::size_t>(results_.echogramBins) * kNumBands;
+        for (int j = 0; j < m; ++j) {
+            const int dst = echoRepIdx_[static_cast<std::size_t>(j)];
+            if (dst < 0 || dst >= results_.count) continue;
+            std::copy(echoAccum_.begin() + static_cast<long>(static_cast<std::size_t>(j) * stride),
+                      echoAccum_.begin() + static_cast<long>((static_cast<std::size_t>(j) + 1) * stride),
+                      results_.echogram.begin() + static_cast<long>(static_cast<std::size_t>(dst) * stride));
         }
     }
 
     UpdateConfig cfg_;
     Results results_;
     std::vector<Vec3> srcScratch_;
+    // 尾の共有（部屋ごと）。tailRep_[i] = 代表の index／tailRoom_[i] = 部屋 id（-1=屋外）
+    std::vector<int> tailRep_, tailRoom_;
+    // 周回の頭で固定する代表の顔ぶれ（元 index と位置）。
+    std::vector<int> echoRepIdx_;
+    std::vector<Vec3> echoRepPos_;
     // ★初回は全段を走らせる。ホストが 1 フレーム目に空の結果を掴まないための契約
     //   （「初回updateでエコグラムが埋まる」は回帰テストで縛ってある）。
     //   そのうえで 2 回目以降の位相をずらす → phaseStages_()
+    int catalogCountdown_ = 1;
     int role1Countdown_ = 1;
     int role2Countdown_ = 1;
     int earlyCountdown_ = 1;
     int diffSrcCountdown_ = 1;
-    int catalogCountdown_ = 1;
     bool staggered_ = false;
 
     bool validInstance(int id) const { return id >= 0 && id < instanceCount(); }
@@ -4970,6 +5998,11 @@ private:
     }
 
     // materialId から材質を取る。テーブル空/範囲外なら既定壁を返す（安全側）。
+public:
+    // 材質の現在値を読む。調整の道具が「いま幾つか」を出すのに要る
+    //   （値が見えないと追い込めない）。読むだけなので公開してよい。
+    const AcousticMaterial& materialAt(int id) const { return materialOf(id); }
+private:
     const AcousticMaterial& materialOf(int id) const {
         if (id >= 0 && id < materialCount()) return materials_[id];
         static const AcousticMaterial fallback = AcousticMaterial::defaultWall();
@@ -5046,6 +6079,7 @@ private:
         buildNode(left, start, mid - start);
         buildNode(left + 1, mid, start + count - mid);
     }
+
 
     // ── エッジカタログ補助 ──
     // キューブマップのテクセル方向（面f=0..5:+X,-X,+Y,-Y,+Z,-Z、u,v∈[-1,1]）。
@@ -5146,7 +6180,49 @@ private:
         return y / std::max(x, 1e-4f);
     }
 
-    bool  apertureIsTransmission_ = false; // 開口を透過の一部として扱う（既定 OFF）
+    // ★既定はホスト（Unity）と一致させること。ずれていると
+    //   「回帰テストが守る音」と「出荷する音」が別物になる（決めごと #1・設計 §5-13）。
+    //   実際、以下 3 つがずれていて、同じ角の回折が 19.7dB 違っていた。
+    bool  apertureIsTransmission_ = true;  // 開口を透過の一部として扱う（Unity と一致）
+    // 診断用。true にすると開口率の二重掛けを戻す（変更前後を同じ物差しで測るため）。
+    bool  dbgKeepDoubleOpen_ = false;
+    // 【診断】回折の候補探索が、どの段で候補を失っているか。
+    //
+    // ★これらは **static thread_local** にしてある。理由は 2 つ:
+    //   1. 音源ごとのループを並列化したとき、メンバのままだと**データ競合**になる。
+    //      診断であっても競合は未定義動作なので、値が化けるだけでは済まない。
+    //   2. スレッドごとに持てば競合が消え、**直列で走らせる検査ハーネスでは
+    //      これまでどおり正しい値が読める**（呼び出し元スレッド＝計算したスレッド）。
+    //   ⚠ 代償: シーンごとではなく**スレッドごと**になる。シーンを 2 つ同時に回して
+    //      両方の診断を読む、はできない。検査は 1 シーンずつなので実害なし。
+    //   ⚠ 並列で走らせると、読めるのは呼び出し元スレッドが担当した音源のぶんだけになる。
+    //      診断を採るときは worker を 1 にすること。
+    //
+    // ★もう一つの罠（実際に踏んでいた）: dbgSpanPerp_/dbgSpanEdge_ は「診断」の名前で
+    //   **計算の作業変数として読み返されていた**（slitWidthAt）。並列化すると診断ではなく
+    //   値そのものが壊れる。ローカルに直してある。**名前が診断でも、読み返していないかを
+    //   必ず確かめること。**
+    static inline thread_local int dbgCandRaw_ = 0;      // forEachDiffractionCandidate が返した生の候補数
+    static inline thread_local int dbgCandCut_ = 0;      // 前川の重みが 0 で捨てた数
+    static inline thread_local int dbgClusters_ = 0;     // 方向クラスタにまとまった数（0 なら経路なし）
+    static inline thread_local int dbgEdgeTried_ = 0;    // 稜線として検討した本数（可視判定より前）
+    // slitWidthAt が測った 2 軸の差し渡し（診断用）。-1 は測っていない。
+    static inline thread_local float dbgSpanPerp_ = -1.0f;   // 稜線に垂直な軸
+    static inline thread_local float dbgSpanEdge_ = -1.0f;   // 稜線に沿った軸
+    static inline thread_local int dbgFresPlanes_ = 0;    // apertureFresnelBands が見つけた面の数
+    static inline thread_local int dbgFresBounded_ = 0;   // うち有界と判定できた数
+    static inline thread_local float dbgUFrac_ = -1.0f;   // 有界判定: u 方向の縁が開いている割合
+    static inline thread_local float dbgVFrac_ = -1.0f;   // 同 v 方向
+    static inline thread_local int dbgFresDropped_ = 0;   // 頂点が後ろにあって丸ごと捨てた遮蔽物の数
+    // エコグラムをレイで分割して積むための状態。
+    //   echoSlices_ を大きくするほど 1 フレームの山が低くなる（結果は変わらない）。
+    int echoSlices_ = 4;
+    int echoRaySlice_ = 0;
+    bool echoPrimed_ = false;   // 一度でも 1 周そろったか（初回だけ一括で撃つため）
+    Vec3 echoRoundOrigin_{0, 0, 0};  // その周を撃ち始めたときのリスナー位置（瞬間移動の検出用）
+    std::vector<float> echoAccum_;
+    // 回折の減衰を前川だけに任せるか（既定 OFF。既存の鳴りを勝手に変えないため）。
+    bool  diffractionSingleModel_ = false;
     // ★既定は**ホスト(Unity)が実際に押している値**に揃える。
     //   以前は 1.0（素通し）で、Unity は 4.0 を毎フレーム押していた。
     //   つまり回帰テストが**出荷しない設定**を守っていて、実機の挙動を誰も検査して
@@ -5157,6 +6233,9 @@ private:
     //     p=1.5  20°で 0.0146（閉じかけでも漏れる）
     //     p=2.0  20°で 0.0036 / 45°で 0.0648 / 90°で 0.8136  ← 採用
     //     p=3〜4 45°で -40dB 以下（半開きが無音）
+    // ★Unity は 4.0 を押している（未解消の食い違い）。4.0 だと 10° の扉が
+    //   完全に無音（実測 0.0000／90° は 0.9573）で、看板チェックが落ちる。
+    //   出荷値をどちらにするかはユーザーの判断待ち。ここは 1.0 のままにしてある。
     float apertureContrast_ = 1.0f;        // 開口率→音量の傾き（1=恒等）
     // 開口の音色の広がり（1=素通し）。既定は素通し ── 物理から出る形をそのまま出す。
     //   誇張は作品側の判断なので、エンジンの既定では掛けない（決めごと #3）。
@@ -5192,12 +6271,208 @@ private:
     //     1 倍 9.32dB（-20〜-29dB） / **2 倍 2.87dB（+2.2〜+5.0dB）** / 4 倍 2.71dB / 8 倍 3.19dB
     //   2 倍で形が合い、残りはほぼ一定のオフセット＝決めごと #3 の範囲。
     float edgePortalSpan_ = 2.0f;
-    mutable double dbgNumer_ = 0.0, dbgDenom_ = 0.0;   // 計測用: 125Hz の分子・分母
-    mutable float  dbgLimU_ = 0.0f;                    // 計測用: 125Hz の積分範囲
-    mutable int dbgPortalPolys_ = -1;      // 計測用: 直近の portalOpenBands で矩形に写った枚数
+    // ── 複数コア ─────────────────────────────────────────────────────
+    //   ★既定は直列（pool_ が null）。ホストが明示的に増やしたときだけスレッドを起こす。
+    //     検査ハーネスを直列に保てば、「変えたつもりが無い変更」を厳密差分で判定でき続ける。
+    //   ★プールはシーンが持ち、シーンの破棄で join される。
+    //     静的デストラクタで join すると DLL アンロード中のローダロックで固まるため。
+    mutable std::unique_ptr<WorkerPool> pool_;
+    int workerThreads_ = 1;
+    // レイを塊で割るときの、塊ごとの積算バッファ（[塊][音源][ビン][帯域]）。
+    //   同じビンへ同時に足せないので、塊ごとに別の箱へ積んで最後に足す。
+    mutable std::vector<float> rayScratch_;
+    // 今フレーム実際に使う段（音源ごと）。固定の段＋自動バーチャルの結果。
+    std::vector<unsigned char> tierScratch_;
+    // 早期反射を共有で撃つための作業領域（厳密の段だけを詰めて渡す）。
+    std::vector<int> earlyIdx_;
+    std::vector<Vec3> earlySrc_;
+    std::vector<Vec3> earlyPosBuf_;
+    std::vector<float> earlyGainBuf_;
+    std::vector<int> earlyCntBuf_;
+
+    // ── 段の解決 ───────────────────────────────────────────────────
+    // 音源ごとの固定の段に、自動バーチャルの判定を重ねて「今フレーム実際に使う段」を作る。
+    //
+    // ★自動バーチャルは**距離だけでは決められない。**
+    //   自由音場なら「遠い＝小さい」でよいが、部屋の中では臨界距離
+    //   `rc = 0.057√(V/RT60)` より遠いところで**残響が直接音を上回り、しかも距離で
+    //   ほとんど減らない**。だから距離だけで落とすと、響く部屋で聞こえている音を切る。
+    //
+    //   判定はこうする:
+    //     rc <= 聞こえる半径  … その部屋の残響は可聴限界より上まで届いている
+    //                           ＝ 距離では落とせない（残響が担っている）
+    //     rc >  聞こえる半径  … 残響は可聴限界より下。自由音場の判定で安全
+    //   ★「響く部屋では自動バーチャルを使わない」という形になる。安全側に倒れる。
+    //
+    // ★ヒステリシスは半径 2 つ。境目で行き来すると入り直しのたびに費用を払い、
+    //   復帰時に段が埋まるまでの数フレームが露出する（平滑 0.35 秒が支配的）。
+    void resolveTiers_(int n) {
+        tierScratch_.resize(static_cast<size_t>(n));
+        // 部屋の臨界距離。リスナーの居る所で採る（耳のある側）。
+        float rc = 1e9f;   // 部屋が無い（屋外）＝残響が担わない＝自由音場の判定でよい
+        {
+            const float vol = roomVolumeAt(listenerPos_, 2.0f);
+            float rt[kNumBands] = {};
+            rt60At(listenerPos_, 2.0f, rt, kNumBands);
+            // 中域(500Hz/1k)で代表させる。可聴限界を決めるのはだいたいここ。
+            const float rtMid = 0.5f * (rt[2] + rt[3]);
+            if (vol > 1.0f && rtMid > 1e-3f)
+                rc = 0.057f * std::sqrt(vol / rtMid);
+        }
+        for (int i = 0; i < n; ++i) {
+            SourceEntry& s = sources_[static_cast<size_t>(i)];
+            SourceTier t = s.tier;
+            if (t != TierVirtual && s.audibleRadius > 0.0f) {
+                if (rc <= s.audibleRadius) {
+                    s.autoVirtual = false;      // 残響が担っている。落とさない
+                } else {
+                    const float d = length(s.pos - listenerPos_);
+                    const float rIn  = s.audibleRadius;          // ここより内で解き始める
+                    const float rOut = s.audibleRadius * 1.25f;  // ここより外で解くのをやめる
+                    if (s.autoVirtual) { if (d < rIn)  s.autoVirtual = false; }
+                    else               { if (d > rOut) s.autoVirtual = true;  }
+                }
+                if (s.autoVirtual) t = TierVirtual;
+            } else if (t == TierVirtual) {
+                s.autoVirtual = false;
+            }
+            tierScratch_[static_cast<size_t>(i)] = static_cast<unsigned char>(t);
+        }
+    }
+public:
+    // いま実際に使われている段（自動バーチャルの結果込み）。範囲外は -1。
+    int effectiveTier(int index) const {
+        if (index < 0 || index >= static_cast<int>(tierScratch_.size())) return -1;
+        return static_cast<int>(tierScratch_[static_cast<size_t>(index)]);
+    }
+
+    // ── キャプチャ（サウンドデバッグツール）─────────────────────────
+    //   常時録っておいて、「変だ」と思ったところで mark() を押す。前 preroll と
+    //   後 postroll が揃ったら ready になり、write() で 1 ファイルに落とせる。
+    // ★段の間引きの位相。リプレイで尾を再現するために要る（詳細は capture.h の phase[]）。
+    //   [0]catalog [1]diffSrc [2]early [3]echoRaySlice [4]staggered [5]echoPrimed
+    void debugGetStagePhase(int out[8]) const {
+        if (!out) return;
+        out[0] = catalogCountdown_;
+        out[1] = diffSrcCountdown_;
+        out[2] = earlyCountdown_;
+        out[3] = echoRaySlice_;
+        out[4] = staggered_ ? 1 : 0;
+        out[5] = echoPrimed_ ? 1 : 0;
+        out[6] = 0; out[7] = 0;
+    }
+    void debugSetStagePhase(const int in[8]) {
+        if (!in) return;
+        catalogCountdown_ = in[0] > 0 ? in[0] : 1;
+        diffSrcCountdown_ = in[1] > 0 ? in[1] : 1;
+        earlyCountdown_   = in[2] > 0 ? in[2] : 1;
+        echoRaySlice_     = in[3] >= 0 ? in[3] : 0;
+        staggered_        = in[4] != 0;
+        echoPrimed_       = in[5] != 0;
+        // 周回の基準点も今のリスナーへ合わせる（瞬間移動ガードが誤爆しないように）。
+        echoRoundOrigin_  = listenerPos_;
+    }
+
+    void captureBegin(const dbg::CaptureConfig& c) {
+        capture_.begin(c);
+        // ★静的な形をここで 1 回だけ写す。生成した回帰テストが自己完結するために要る
+        //   （形が入っていないと「呼び手が同じ場面を作れ」になり、検査として使えない）。
+        std::vector<dbg::CapBox> boxes;
+        int meshes = 0;
+        boxes.reserve(instances_.size());
+        for (size_t i = 0; i < instances_.size(); ++i) {
+            const Instance& in = instances_[i];
+            if (in.geomId >= 0) { ++meshes; continue; }   // メッシュは入れない（容量）
+            dbg::CapBox b;
+            b.instance = static_cast<int>(i);
+            b.material = in.materialId;
+            b.cx = in.obb.center.x;      b.cy = in.obb.center.y;      b.cz = in.obb.center.z;
+            b.hx = in.obb.halfExtents.x; b.hy = in.obb.halfExtents.y; b.hz = in.obb.halfExtents.z;
+            b.rx = in.obb.axisX.x;       b.ry = in.obb.axisX.y;       b.rz = in.obb.axisX.z;
+            b.ux = in.obb.axisY.x;       b.uy = in.obb.axisY.y;       b.uz = in.obb.axisY.z;
+            boxes.push_back(b);
+        }
+        // ★材質も録る。これが無いと、吐いた回帰テストが**別の音を測る**
+        //   （最初これを忘れていて、生成物は全部の箱に既定材質を使っていた）。
+        std::vector<dbg::CapMaterial> mats;
+        mats.reserve(static_cast<size_t>(materialCount()));
+        for (int i = 0; i < materialCount(); ++i) {
+            const AcousticMaterial& src = materialAt(i);
+            dbg::CapMaterial m;
+            for (int b = 0; b < kNumBands && b < dbg::kCapBands; ++b) {
+                m.transmission[b] = src.transmission[b];
+                m.absorption[b]   = src.absorption[b];
+                m.scattering[b]   = src.scattering[b];
+            }
+            mats.push_back(m);
+        }
+        capture_.setGeometry(boxes, meshes, mats);
+    }
+    void captureEnd() { capture_.end(); }
+    void captureMark() { capture_.mark(); }
+    bool captureActive() const { return capture_.active(); }
+    bool captureReady()  const { return capture_.ready(); }
+    int  captureFramesHeld() const { return capture_.framesHeld(); }
+
+    // オーディオスレッドから。ロックも確保もしない。
+    void capturePushAudio(const float* interleavedStereo, int frames) {
+        capture_.pushAudio(interleavedStereo, frames);
+        captureAudioSample_.fetch_add(static_cast<unsigned long long>(frames),
+                                      std::memory_order_relaxed);
+    }
+
+    bool captureWrite(const char* path, const char* sceneName, unsigned int dllHash) const {
+        // ★段の間引き設定はヘッダに焼く。フレーム単位で再生するときに、
+        //   これが違うと**段の位相がずれて値が変わる**（§2.2）。
+        char rates[256];
+        std::snprintf(rates, sizeof(rates),
+                      "rates role1EveryN %d role2EveryN %d earlyEveryN %d "
+                      "diffSrcEveryN %d catalogEveryN %d",
+                      cfg_.role1EveryN, cfg_.role2EveryN, cfg_.earlyEveryN,
+                      cfg_.diffSrcEveryN, cfg_.catalogEveryN);
+        return capture_.write(path, sceneName, dllHash, workerThreads_, rates);
+    }
+private:
+    mutable dbg::Capture capture_;
+    std::atomic<unsigned long long> captureAudioSample_{0};
+    int capturePhase_[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    bool tierIs_(int i, SourceTier t) const {
+        return i >= 0 && i < static_cast<int>(tierScratch_.size())
+               && tierScratch_[static_cast<size_t>(i)] == static_cast<unsigned char>(t);
+    }
+
+    // 音源ごとのループ。pool_ が無ければただの for。
+    //   ここへ渡す仕事は「音源 i の枠にしか書かない」ものに限ること。
+    //   共有の箱へ足し込むもの（反射の reflected[] やエコグラムのビン）は**渡してはいけない**。
+    template <class F>
+    void forEachSource(int n, F&& fn) const {
+        if (!pool_ || pool_->size() <= 1) {
+            for (int i = 0; i < n; ++i) fn(i);
+            return;
+        }
+        pool_->parallelFor(n, std::function<void(int)>(std::forward<F>(fn)));
+    }
+
+    // 診断カウンタを初期値へ戻す。update() の頭で呼ぶ（宣言時の初期値と同じにすること）。
+    static void resetThreadDiagnostics_() {
+        dbgCandRaw_ = 0; dbgCandCut_ = 0; dbgClusters_ = 0; dbgEdgeTried_ = 0;
+        dbgSpanPerp_ = -1.0f; dbgSpanEdge_ = -1.0f;
+        dbgFresPlanes_ = 0; dbgFresBounded_ = 0;
+        dbgUFrac_ = -1.0f; dbgVFrac_ = -1.0f; dbgFresDropped_ = 0;
+        dbgNumer_ = 0.0; dbgDenom_ = 0.0; dbgLimU_ = 0.0f; dbgPortalPolys_ = -1;
+    }
+
+    // ここも同じ理由で thread_local（上の注意書きを参照）。
+    static inline thread_local double dbgNumer_ = 0.0, dbgDenom_ = 0.0;  // 計測用: 125Hz の分子・分母
+    static inline thread_local float  dbgLimU_ = 0.0f;                   // 計測用: 125Hz の積分範囲
+    static inline thread_local int dbgPortalPolys_ = -1;   // 計測用: 直近の portalOpenBands で矩形に写った枚数
     float portalGovernRange_ = 1.0f;       // ポータルの支配が及ぶ距離(m)
-    bool  autoPortals_ = false;            // 開口からポータルを自動生成するか
+    bool  autoPortals_ = true;             // 開口からポータルを自動生成するか（Unity と一致）
     float autoPortalMinArea_ = 0.25f;      // これ未満の口はポータルにしない(m2)
+    // 手置きポータルがこの距離まで覆っていれば、その開口に自動は作らない(m)。
+    //   ボクセル由来の開口中心は数センチ揺れるので、余裕を持たせて出入りさせない。
+    float autoPortalDedupDist_ = 0.5f;
     int   autoPortalCount_ = 0;            // portals_ の末尾のうち自動生成ぶん
     std::vector<Portal> portals_;          // ホストが置く開口の矩形（トポロジはホストの担当）
     bool  useBtm_ = false;                 // BTM 経路（既定 OFF）
@@ -5224,12 +6499,14 @@ private:
     mutable std::vector<int> bvhOrder_;        // アクティブなインスタンス index の並び
     mutable bool bvhDirty_ = true;             // インスタンス変更で立つ再構築フラグ
     // 部屋・開口の検出。幾何が変わった領域だけ塗り直す（毎フレームではない）。
+    mutable std::vector<DiffEdge> edgeCatalog_;  // キューブマップ由来のシルエット稜線
     mutable rooms::Builder roomBuilder_;
     // 回折の帯域依存を捨てるか（既定 ON。こもりは透過が担当する方針）。
     bool diffractionFlat_ = true;
-    mutable std::vector<DiffEdge> edgeCatalog_;  // キューブマップ由来のシルエット稜線
 };
 
 }  // namespace acoustic
 
 #endif  // ACOUSTICFLOW_CORE_SCENE_H
+
+// 再ビルド確認用の空行

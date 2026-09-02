@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -90,12 +91,107 @@ bool readWav(const char* path, std::vector<float>& out, int& sampleRate) {
 
 float toDb(double v) { return 20.0f * std::log10(static_cast<float>(std::max(v, 1e-12))); }
 
+// 左右をそのまま読む（定位の確認用。モノラル化してしまうと両耳差が消える）。
+bool readWavStereo(const char* path, std::vector<float>& l, std::vector<float>& r, int& sampleRate) {
+    std::FILE* f = std::fopen(path, "rb");
+    if (!f) return false;
+    char riff[12];
+    if (std::fread(riff, 1, 12, f) != 12 ||
+        std::memcmp(riff, "RIFF", 4) != 0 || std::memcmp(riff + 8, "WAVE", 4) != 0) {
+        std::fclose(f); return false;
+    }
+    int channels = 0, bits = 0;
+    sampleRate = 0;
+    while (true) {
+        char id[4];
+        std::uint32_t size = 0;
+        if (std::fread(id, 1, 4, f) != 4) break;
+        if (std::fread(&size, 4, 1, f) != 1) break;
+        if (std::memcmp(id, "fmt ", 4) == 0) {
+            std::vector<unsigned char> fmt(size);
+            if (std::fread(fmt.data(), 1, size, f) != size) break;
+            channels = *reinterpret_cast<std::uint16_t*>(&fmt[2]);
+            sampleRate = *reinterpret_cast<std::uint32_t*>(&fmt[4]);
+            bits = *reinterpret_cast<std::uint16_t*>(&fmt[14]);
+        } else if (std::memcmp(id, "data", 4) == 0) {
+            if (channels != 2 || bits != 16) { std::fclose(f); return false; }
+            const std::size_t frames = size / 4u;
+            l.resize(frames); r.resize(frames);
+            std::int16_t buf[2];
+            for (std::size_t i = 0; i < frames; ++i) {
+                if (std::fread(buf, 2, 2, f) != 2) { l.resize(i); r.resize(i); break; }
+                l[i] = buf[0] / 32768.0f;
+                r[i] = buf[1] / 32768.0f;
+            }
+            std::fclose(f);
+            return !l.empty();
+        } else {
+            std::fseek(f, static_cast<long>(size + (size & 1)), SEEK_CUR);
+        }
+    }
+    std::fclose(f);
+    return false;
+}
+
+// 窓ごとに ILD（左右の音量差）と ITD（相互相関のずれ）を出す。
+// 定位が入っているなら、歩くにつれてこの二つが連続的に動くはず。
+int analyzeLr(const char* path, float winMs) {
+    std::vector<float> l, r;
+    int sr = 0;
+    if (!readWavStereo(path, l, r, sr)) {
+        std::printf("[FAIL] ステレオ 16bit PCM の WAV のみ対応: %s\n", path);
+        return 1;
+    }
+    const int n = static_cast<int>(l.size());
+    const int win = std::max(1, static_cast<int>(sr * winMs * 0.001f));
+    const int maxLag = static_cast<int>(sr * 0.0012f);  // ±1.2 ms＝人の頭の幅ぶん
+    std::printf("=== 両耳差の解析 ===\n");
+    std::printf("  %s\n", path);
+    std::printf("  %d Hz / %.2f 秒 / 窓 %.0f ms\n\n", sr, static_cast<float>(n) / sr, winMs);
+    std::printf("  時刻     全体     ILD      ITD    定位の向き\n");
+    std::printf("   (s)     (dB)     (dB)     (us)\n");
+    double ildAbsSum = 0.0, itdAbsSum = 0.0;
+    int rows = 0;
+    for (int s = 0; s + win <= n; s += win) {
+        double el = 0.0, er = 0.0;
+        for (int i = 0; i < win; ++i) { el += l[s + i] * l[s + i]; er += r[s + i] * r[s + i]; }
+        const double rmsL = std::sqrt(el / win), rmsR = std::sqrt(er / win);
+        const double all = std::sqrt((el + er) / (2.0 * win));
+        if (all < 1e-5) continue;  // 無音の窓は飛ばす
+        const float ild = toDb(rmsR) - toDb(rmsL);   // ＋なら右が大きい
+        // 相互相関で左右のずれを探す。＋なら右が先（右から来ている）。
+        int bestLag = 0; double best = -1e30;
+        for (int lag = -maxLag; lag <= maxLag; ++lag) {
+            double acc = 0.0;
+            for (int i = maxLag; i < win - maxLag; ++i) acc += l[s + i] * r[s + i + lag];
+            if (acc > best) { best = acc; bestLag = lag; }
+        }
+        const float itdUs = bestLag * 1e6f / sr;
+        const char* side = (ild > 1.0f) ? "右" : (ild < -1.0f) ? "左" : "正面";
+        std::printf("  %5.2f   %6.1f   %+6.1f   %+7.0f    %s\n",
+                    static_cast<float>(s) / sr, toDb(all), ild, itdUs, side);
+        ildAbsSum += std::fabs(ild); itdAbsSum += std::fabs(itdUs); ++rows;
+    }
+    if (rows > 0) {
+        std::printf("\n  平均 |ILD| = %.2f dB / 平均 |ITD| = %.0f us（%d 窓）\n",
+                    ildAbsSum / rows, itdAbsSum / rows, rows);
+        std::printf("  ※ 定位が入っていれば |ILD| が数 dB、|ITD| が数百 us 出る。\n");
+        std::printf("     どちらもほぼ 0 なら、その音は左右同じ＝頭の中で鳴っている。\n");
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::printf("使い方: AfAnalyzeWav <入力.wav> [窓ms]\n");
+        std::printf("        AfAnalyzeWav lr <入力.wav> [窓ms]   左右差（定位）を見る\n");
         return 1;
+    }
+    if (std::string(argv[1]) == "lr") {
+        if (argc < 3) { std::printf("使い方: AfAnalyzeWav lr <入力.wav> [窓ms]\n"); return 1; }
+        return analyzeLr(argv[2], (argc > 3) ? static_cast<float>(std::atof(argv[3])) : 250.0f);
     }
     const float winMs = (argc > 2) ? static_cast<float>(std::atof(argv[2])) : 100.0f;
 

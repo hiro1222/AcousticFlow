@@ -380,6 +380,201 @@ namespace AcousticFlow
         // 【C1】部屋グラフの開口からポータルを自動生成する。手置きは消えない。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneSetAutoPortals(IntPtr scene, int enable);
+        // 音源ごとの段（遮蔽・回折／早期反射／回折二次音源）を何コアで回すか。1 以下＝直列。
+        //   並列にしても**結果はビット一致**（回帰テストで 616 個の値を厳密比較して確認）。
+        //   ⚠ スレッドはシーンが持ち AF_SceneDestroy で join される。
+        //      OnDisable → Dispose の経路を切らないこと。切るとドメインリロードで固まる。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetWorkerThreads(IntPtr scene, int threads);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneGetWorkerThreads(IntPtr scene);
+
+        // 音源の段。0=厳密 / 1=簡易 / 2=バーチャル。**音源ごとに固定**する。
+        //   ⚠ 距離で自動に切り替えないこと（歩くだけで段が変わり、切り替わりが聞こえる）。
+        //   ★2D の音（UI・音楽・ナレーション）に段はない。音源として登録しないこと。
+        // 【調整支援】この直線の透過損失を誰が担っているか（大きい順）。
+        //   ⚠ 透過だけ。回り込み（回折）が担っている帯域では材質を触っても動かない。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneTransmissionCarriers(
+            IntPtr scene, AFVector3 listener, AFVector3 source,
+            int[] outInstance, int[] outMaterial, float[] outLossDb, int maxCount);
+        // 材質の現在値を読む（道具が「いま幾つか」を出すのに要る）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneGetMaterial(IntPtr scene, int materialId,
+                                                     float[] outTransmission, float[] outAbsorption,
+                                                     float[] outScattering, int count);
+        // 材質を書き換える。**その材質を使っている実体が一斉に変わる。**
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneSetMaterial(IntPtr scene, int materialId,
+                                                     float[] transmission, float[] absorption,
+                                                     float[] scattering, int numBands);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetSourceTier(IntPtr scene, ulong id, int tier);
+        // 自由音場で聞こえなくなる距離(m)。0 以下＝自動バーチャルを使わない。
+        //   ⚠ 響く部屋（臨界距離 <= この半径）ではエンジン側が自動バーチャルを止める。
+        //     残響は距離でほとんど減らないので、距離だけで切ると聞こえている音を黙らせる。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetSourceAudibleRadius(IntPtr scene, ulong id, float metres);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneGetSourceTierEffective(IntPtr scene, int index);
+        // この音源の尾を担っている代表音源の index（同じ部屋のいちばん若いもの）。
+        //   ★規則はエンジン側に 1 つだけ。ホストで同じ規則を持たないこと。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneGetTailShapeIndex(IntPtr scene, int index);
+
+        // ── キャプチャ（サウンドデバッグツール。docs/SOUND_DEBUG_TOOL.md）──
+        //   常時録っておいて「いま変だった」を押すと、押した時点の前 preroll と
+        //   後 postroll が 1 ファイル（.afcap）に落ちる。破れの判定は録音後（走査）で行う。
+        //   ★録るのは結果ではなく**入力**なので、押し直せばそれが再現になる。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneCaptureBegin(IntPtr scene, int prerollFrames,
+                                                       int postrollFrames, int maxSources,
+                                                       int sampleRate, int recordPcm);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneCaptureEnd(IntPtr scene);
+        // いまカタログに載っている稜線の本数（計器表示用）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneEdgeCatalogCount(IntPtr scene);
+
+        // ── 録った .afcap を開いて調べる ──
+        //   ★走査（型紙を当てる）は**DLL の中**で回す。回帰テストが呼ぶのと同じ関数で
+        //     なければ「Unity では印が出るのに検査は通る」が起きる。C# へ写経すると必ずずれる。
+        [StructLayout(LayoutKind.Sequential)]
+        public struct AF_CaptureInfo
+        {
+            public int frames;
+            public int sampleRate;
+            public int maxSources;
+            public int preroll;
+            public int postroll;
+            public int workerThreads;
+            public int markedFrame;
+            public uint dllHash;
+            public int boxCount;
+            public int meshCount;      // >0 なら C++ の検査には吐けない場面
+            public int materialCount;
+            public int pcmFrames;
+            public int sourceCount;
+        }
+
+        // ⚠ 文字列は byte[] で受けて **UTF-8 として自分で読む**こと。
+        //   ByValTStr にすると既定の Ansi マーシャリング（このマシンでは CP932）で
+        //   復号され、C++ が UTF-8 で書いた「型紙1 跳ばない」が化ける。
+        //   → 化けても例外は出ないので、**画面が読めなくなるまで気づけない**類の壊れ方。
+        //   読み出しは Native.MarkText() を使う。
+        [StructLayout(LayoutKind.Sequential)]
+        public struct AF_CaptureMark
+        {
+            public ulong sourceId;
+            public int frame;
+            public float seconds;
+            public float amount;
+            public int reserved;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 40)] public byte[] templateName;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 24)] public byte[] what;
+        }
+
+        /// 固定長 byte 配列から UTF-8 文字列を取り出す（NUL で切る）。
+        public static string Utf8(byte[] raw)
+        {
+            if (raw == null) return "";
+            int n = 0;
+            while (n < raw.Length && raw[n] != 0) ++n;
+            return n > 0 ? System.Text.Encoding.UTF8.GetString(raw, 0, n) : "";
+        }
+
+        [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
+        public static extern IntPtr AF_CaptureOpen(string path);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_CaptureClose(IntPtr cap);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_CaptureGetInfo(IntPtr cap, out AF_CaptureInfo info);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_CaptureGetSceneName(IntPtr cap, byte[] buf, int bufSize);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_CaptureGetSourceIds(IntPtr cap, ulong[] outIds, int maxOut);
+        // ⚠★ [In, Out] が要る。
+        //   AF_CaptureMark は byte[] を持つので **blittable ではない**。blittable でない
+        //   構造体の配列は既定で **In だけ**マーシャリングされ、ネイティブ側の書き込みが
+        //   managed へ戻ってこない（例外も出ず、全フィールドが 0／文字列が空になる）。
+        //   実際にこれで自己診断が「印 1 件・型紙名『』」で落ちた。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_CaptureScan(IntPtr cap,
+                                                [In, Out] AF_CaptureMark[] outMarks, int maxOut);
+
+        // 連続した同じ印をまとめたもの。★まとめ方は AfCapScan（CLI）と同じ関数。
+        //   実機のキャプチャは印 382 件 → まとめると 5 か所。生のままでは読めない。
+        [StructLayout(LayoutKind.Sequential)]
+        public struct AF_CaptureRun
+        {
+            public ulong sourceId;
+            public int firstFrame;
+            public int lastFrame;
+            public int count;          // 続いたフレーム数
+            public int reserved;
+            public float firstSeconds;
+            public float lastSeconds;
+            public float worst;        // 続いたあいだの最大の破れ量
+            public float reserved2;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 40)] public byte[] templateName;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 24)] public byte[] what;
+        }
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_CaptureScanRuns(IntPtr cap,
+                                                    [In, Out] AF_CaptureRun[] outRuns, int maxOut);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_CaptureGetPcm(IntPtr cap, float[] outInterleaved, int maxFrames);
+        // ⚠ 必ず 0 から順に呼ぶこと。飛ばすと尾が再現しない（段の位相を 0 で戻すため）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_CaptureApplyFrame(IntPtr scene, IntPtr cap, int frameIndex);
+        [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
+        public static extern int AF_CaptureEmitCase(IntPtr cap, int markIndex, string testName,
+                                                    byte[] buf, int bufSize);
+        // 段の間引きの位相（8要素）。★入力リプレイで**尾を再現する**ために要る。
+        //   戻さないとエコグラムのレイを撃つフレームが録音時とずれ、扉が動き続けるかぎり
+        //   永久に一致しない（実測 91 フレーム全部不一致 → 位相を戻すと 6 フレームで収束）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneDebugGetStagePhase(IntPtr scene, int[] out8);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneDebugSetStagePhase(IntPtr scene, int[] in8);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneCaptureMark(IntPtr scene);
+        // 0=止まっている 1=録っている 2=前後が揃った（保存できる）
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneCaptureStatus(IntPtr scene, out int framesHeld);
+        // ⚠ オーディオスレッドから呼ぶこと（OnAudioFilterRead）。内部でロックも確保もしない。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneCapturePushAudio(IntPtr scene, float[] interleavedStereo,
+                                                           int frames);
+        [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
+        public static extern int AF_SceneCaptureWrite(IntPtr scene, string path,
+                                                      string sceneName, uint dllHash);
+
+        // ── 尾の共有バス（段階②）──
+        //   後期残響の畳み込みを音源で共有する。畳み込みは線形なので、同じ IR なら
+        //   「レベルを掛けてから足して 1 回畳む」で厳密に等しい。
+        //   実測: 音源 8 本で 1 ブロック 2.345 → 0.404 ms（5.81 倍）。出力の差 -123.7dB 下。
+        //   ⚠ 同じ IR の音源だけを同じバスへ（＝部屋ごとに 1 本）。
+        //   ⚠ 代表を 1 本差すこと。0 本だと IR が入らず尾が丸ごと鳴らない。
+        //   ⚠ Render は AudioListener 側で 1 回（全音源のミックス後に走るので順序が保証される）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern IntPtr AF_TailBusCreate(int sampleRate, float tailSeconds,
+                                                     int firstBlock, int capBlock, int maxFrames);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_TailBusDestroy(IntPtr bus);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_TailBusSetCrossfadeMs(IntPtr bus, float ms);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_TailBusRender(IntPtr bus, int frames,
+                                                   float[] outL, float[] outR);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern float AF_TailBusRms(IntPtr bus);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_TailBusHasIr(IntPtr bus);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetTailBus(IntPtr voice, IntPtr bus, int isOwner);
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneSetAutoPortalMinArea(IntPtr scene, float m2);
         [DllImport(Dll, CallingConvention = Cc)]
@@ -553,13 +748,6 @@ namespace AcousticFlow
             IntPtr scene, AFVector3 origin, AFVector3 dir, float maxDist, int maxBounces,
             [In, Out] AFVector3[] outPoints, int maxPoints);
 
-        // B: キューブマップ エッジカタログ構築（リスナー中心・全音源共有）。
-        [DllImport(Dll, CallingConvention = Cc)]
-        public static extern void AF_SceneBuildEdgeCatalog(IntPtr scene, AFVector3 listener, int res, float maxDist);
-        [DllImport(Dll, CallingConvention = Cc)]
-        public static extern int AF_SceneEdgeCatalogCount(IntPtr scene);
-        [DllImport(Dll, CallingConvention = Cc)]
-        public static extern void AF_SceneClearEdgeCatalog(IntPtr scene);
 
         // 可視化：遮蔽時の回折候補の迂回点 P と余剰δを outPoints/outDeltas に書き、個数を返す。
         [DllImport(Dll, CallingConvention = Cc)]

@@ -6,9 +6,13 @@
 #include "acoustic_scene.h"
 
 #include <algorithm>
+#include <cstring>
 #include <new>
+#include <string>
 #include <vector>
 
+#include "Debug/capture_emit.h"   // 破れ → C++ の回帰テスト
+#include "Debug/capture_scan.h"   // 録った .afcap に型紙を当てる（回帰テストと同じ関数）
 #include "Core/aabb.h"
 #include "Core/material.h"
 #include "Core/scene.h"
@@ -88,6 +92,22 @@ int AF_SceneAddMaterial(AF_SceneHandle scene,
     Scene* s = asScene(scene);
     if (!s) return -1;
     return s->addMaterial(makeMaterial(transmission, absorption, scattering, numBands));
+}
+
+int AF_SceneGetMaterial(AF_SceneHandle scene, int materialId,
+                        float* outTransmission, float* outAbsorption,
+                        float* outScattering, int count) {
+    Scene* s = asScene(scene);
+    if (!s || count <= 0) return 0;
+    if (materialId < 0 || materialId >= s->materialCount()) return 0;
+    const AcousticMaterial& m = s->materialAt(materialId);
+    const int n = (count < kNumBands) ? count : kNumBands;
+    for (int b = 0; b < n; ++b) {
+        if (outTransmission) outTransmission[b] = m.transmission[b];
+        if (outAbsorption) outAbsorption[b] = m.absorption[b];
+        if (outScattering) outScattering[b] = m.scattering[b];
+    }
+    return n;
 }
 
 int AF_SceneSetMaterial(AF_SceneHandle scene, int materialId,
@@ -622,6 +642,106 @@ void AF_SceneSetAutoPortals(AF_SceneHandle scene, int enable) {
     s->rebuildAutoPortals();          // 切り替えた瞬間に反映する（次の update を待たない）
 }
 
+// ★ホストは毎フレーム押してくる。値が変わったときだけプールを作り直すこと
+//   （毎フレーム作り直したらスレッドの起こし直しで元も子もない）。setWorkerThreads が中で見ている。
+void AF_SceneSetWorkerThreads(AF_SceneHandle scene, int threads) {
+    Scene* s = asScene(scene);
+    if (!s) return;
+    s->setWorkerThreads(threads);
+}
+
+int AF_SceneGetWorkerThreads(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    return s ? s->workerThreads() : 0;
+}
+
+int AF_SceneTransmissionCarriers(AF_SceneHandle scene,
+                                 AF_Vector3 listener, AF_Vector3 source,
+                                 int* outInstance, int* outMaterial,
+                                 float* outLossDb, int maxCount) {
+    Scene* s = asScene(scene);
+    if (!s) return 0;
+    return s->transmissionCarriers(toVec3(listener), toVec3(source),
+                                   outInstance, outMaterial, outLossDb, maxCount);
+}
+
+void AF_SceneSetSourceTier(AF_SceneHandle scene, unsigned long long id, int tier) {
+    Scene* s = asScene(scene);
+    if (!s) return;
+    s->setSourceTier(id, tier);
+}
+
+void AF_SceneSetSourceAudibleRadius(AF_SceneHandle scene, unsigned long long id, float metres) {
+    Scene* s = asScene(scene);
+    if (!s) return;
+    s->setSourceAudibleRadius(id, metres);
+}
+
+int AF_SceneGetSourceTierEffective(AF_SceneHandle scene, int index) {
+    Scene* s = asScene(scene);
+    return s ? s->effectiveTier(index) : -1;
+}
+
+/* ── キャプチャ（サウンドデバッグツール。docs/SOUND_DEBUG_TOOL.md）───────── */
+
+void AF_SceneCaptureBegin(AF_SceneHandle scene, int prerollFrames, int postrollFrames,
+                          int maxSources, int sampleRate, int recordPcm) {
+    Scene* s = asScene(scene);
+    if (!s) return;
+    acoustic::dbg::CaptureConfig c;
+    if (prerollFrames  > 0) c.prerollFrames  = prerollFrames;
+    if (postrollFrames >= 0) c.postrollFrames = postrollFrames;
+    if (maxSources > 0) c.maxSources = maxSources;
+    if (sampleRate > 0) c.sampleRate = sampleRate;
+    c.recordPcm = (recordPcm != 0);
+    s->captureBegin(c);
+}
+
+int AF_SceneGetTailShapeIndex(AF_SceneHandle scene, int index) {
+    Scene* s = asScene(scene);
+    return s ? s->tailShapeIndex(index) : -1;
+}
+
+void AF_SceneDebugGetStagePhase(AF_SceneHandle scene, int* out8) {
+    Scene* s = asScene(scene);
+    if (s && out8) s->debugGetStagePhase(out8);
+}
+
+void AF_SceneDebugSetStagePhase(AF_SceneHandle scene, const int* in8) {
+    Scene* s = asScene(scene);
+    if (s && in8) s->debugSetStagePhase(in8);
+}
+
+void AF_SceneCaptureEnd(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    if (s) s->captureEnd();
+}
+
+void AF_SceneCaptureMark(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    if (s) s->captureMark();
+}
+
+int AF_SceneCaptureStatus(AF_SceneHandle scene, int* outFramesHeld) {
+    Scene* s = asScene(scene);
+    if (!s) return 0;
+    if (outFramesHeld) *outFramesHeld = s->captureFramesHeld();
+    /* 0=止まっている 1=録っている 2=前後が揃った（保存できる） */
+    return !s->captureActive() ? 0 : (s->captureReady() ? 2 : 1);
+}
+
+void AF_SceneCapturePushAudio(AF_SceneHandle scene, const float* interleavedStereo, int frames) {
+    Scene* s = asScene(scene);
+    if (s) s->capturePushAudio(interleavedStereo, frames);
+}
+
+int AF_SceneCaptureWrite(AF_SceneHandle scene, const char* path,
+                         const char* sceneName, unsigned int dllHash) {
+    Scene* s = asScene(scene);
+    if (!s || !path) return 0;
+    return s->captureWrite(path, sceneName, dllHash) ? 1 : 0;
+}
+
 void AF_SceneSetAutoPortalMinArea(AF_SceneHandle scene, float m2) {
     Scene* s = asScene(scene);
     if (!s || s->autoPortalMinArea() == m2) return;
@@ -662,6 +782,33 @@ void AF_SceneDebugPortalIntegral(AF_SceneHandle scene, double* numer, double* de
     if (numer) *numer = s->dbgNumer();
     if (denom) *denom = s->dbgDenom();
     if (limU)  *limU  = s->dbgLimU();
+}
+
+void AF_SceneSetDiffractionSingleModel(AF_SceneHandle scene, int on) {
+    Scene* s = asScene(scene);
+    if (s) s->setDiffractionSingleModel(on);
+}
+
+void AF_SceneDebugDiffractionCounts(AF_SceneHandle scene, int* raw, int* cut, int* clusters) {
+    Scene* s = asScene(scene);
+    if (s) s->diffractionSearchCounts(raw, cut, clusters);
+}
+
+void AF_SceneSetInsideOtherContinuous(AF_SceneHandle scene, int on, float scale) {
+    Scene* s = asScene(scene);
+    if (s) s->setInsideOtherContinuous(on, scale);
+}
+
+void AF_SceneSetKeepDoubleOpen(AF_SceneHandle scene, int on) {
+    Scene* s = asScene(scene);
+    if (s) s->setKeepDoubleOpen(on);
+}
+
+int AF_SceneDebugDiffractionPath(AF_SceneHandle scene, AF_Vector3 listener, AF_Vector3 source,
+                                 float* out17, int which) {
+    Scene* s = asScene(scene);
+    if (!s) return 0;
+    return s->debugDiffractionPath(toVec3(listener), toVec3(source), out17, which);
 }
 
 int AF_SceneDebugPortalPolys(AF_SceneHandle scene) {
@@ -890,4 +1037,177 @@ int AF_SceneMeasureApertureFresnel(AF_SceneHandle scene, AF_Vector3 listener,
     const bool ok = s->apertureFresnelBands(L, S, f);
     for (int b = 0; b < kNumBands; ++b) outFrac6[b] = f[b];
     return ok ? 1 : 0;
+}
+
+/* ============================================================================
+ * 録った .afcap を開いて調べる（ホスト側の道具用）
+ *
+ * ★走査は**この DLL の中**で回す。回帰テストが呼ぶのと同じ関数でなければ
+ *   「道具は見つけたのに検査は通る」が起きるため。C# へ写経すると必ずずれる。
+ * ========================================================================== */
+
+namespace {
+
+struct CaptureBundle {
+    acoustic::dbg::CaptureFile file;
+    std::vector<af::scan::Mark> marks;
+    bool scanned = false;
+    std::vector<unsigned long long> ids;
+};
+
+CaptureBundle* asCapture(AF_CaptureHandle h) { return static_cast<CaptureBundle*>(h); }
+
+void copyStr(char* dst, int cap, const char* src) {
+    if (!dst || cap <= 0) return;
+    int i = 0;
+    for (; src && src[i] && i < cap - 1; ++i) dst[i] = src[i];
+    dst[i] = '\0';
+}
+
+}  // namespace
+
+AF_CaptureHandle AF_CaptureOpen(const char* path) {
+    if (!path) return nullptr;
+    CaptureBundle* b = new (std::nothrow) CaptureBundle();
+    if (!b) return nullptr;
+    if (!acoustic::dbg::readCapture(path, b->file)) { delete b; return nullptr; }
+    for (const auto& row : b->file.sources)
+        for (const auto& s : row) {
+            bool seen = false;
+            for (auto id : b->ids) if (id == s.id) { seen = true; break; }
+            if (!seen) b->ids.push_back(s.id);
+        }
+    return b;
+}
+
+void AF_CaptureClose(AF_CaptureHandle cap) { delete asCapture(cap); }
+
+int AF_CaptureGetInfo(AF_CaptureHandle cap, AF_CaptureInfo* out) {
+    CaptureBundle* b = asCapture(cap);
+    if (!b || !out) return 0;
+    out->frames         = b->file.frames;
+    out->sampleRate     = b->file.sampleRate;
+    out->maxSources     = b->file.maxSources;
+    out->preroll        = b->file.preroll;
+    out->postroll       = b->file.postroll;
+    out->workerThreads  = b->file.workerThreads;
+    out->markedFrame    = static_cast<int>(b->file.markedFrame);
+    out->dllHash        = b->file.dllHash;
+    out->boxCount       = static_cast<int>(b->file.boxes.size());
+    out->meshCount      = b->file.meshCount;
+    out->materialCount  = static_cast<int>(b->file.materials.size());
+    out->pcmFrames      = static_cast<int>(b->file.pcm.size() / 2);
+    out->sourceCount    = static_cast<int>(b->ids.size());
+    return 1;
+}
+
+int AF_CaptureGetSceneName(AF_CaptureHandle cap, char* buf, int bufSize) {
+    CaptureBundle* b = asCapture(cap);
+    if (!b || !buf || bufSize <= 0) return 0;
+    copyStr(buf, bufSize, b->file.scene.c_str());
+    return static_cast<int>(std::strlen(buf));
+}
+
+int AF_CaptureGetSourceIds(AF_CaptureHandle cap, unsigned long long* out, int maxOut) {
+    CaptureBundle* b = asCapture(cap);
+    if (!b || !out || maxOut <= 0) return 0;
+    const int n = std::min<int>(maxOut, static_cast<int>(b->ids.size()));
+    for (int i = 0; i < n; ++i) out[i] = b->ids[static_cast<size_t>(i)];
+    return n;
+}
+
+int AF_CaptureScan(AF_CaptureHandle cap, AF_CaptureMark* out, int maxOut) {
+    CaptureBundle* b = asCapture(cap);
+    if (!b) return 0;
+    if (!b->scanned) { b->marks = af::scan::scan(b->file); b->scanned = true; }
+    const int total = static_cast<int>(b->marks.size());
+    if (!out || maxOut <= 0) return total;
+    const int n = std::min(maxOut, total);
+    for (int i = 0; i < n; ++i) {
+        const af::scan::Mark& m = b->marks[static_cast<size_t>(i)];
+        out[i].sourceId = m.sourceId;
+        out[i].frame    = m.frame;
+        out[i].seconds  = m.seconds;
+        out[i].amount   = m.amount;
+        out[i].reserved = 0;
+        copyStr(out[i].templateName, static_cast<int>(sizeof(out[i].templateName)),
+                m.templateName);
+        copyStr(out[i].what, static_cast<int>(sizeof(out[i].what)), m.what);
+    }
+    return total;
+}
+
+int AF_CaptureScanRuns(AF_CaptureHandle cap, AF_CaptureRun* out, int maxOut) {
+    CaptureBundle* b = asCapture(cap);
+    if (!b) return 0;
+    if (!b->scanned) { b->marks = af::scan::scan(b->file); b->scanned = true; }
+    /* ★まとめ方は AfCapScan と同じ関数（af::scan::groupRuns）。
+     *   画面とコマンドラインで数が違うと、どちらを信じるか分からなくなる。 */
+    const std::vector<af::scan::MarkRun> runs = af::scan::groupRuns(b->marks);
+    const int total = static_cast<int>(runs.size());
+    if (!out || maxOut <= 0) return total;
+    const int n = std::min(maxOut, total);
+    for (int i = 0; i < n; ++i) {
+        const af::scan::MarkRun& r = runs[static_cast<size_t>(i)];
+        out[i].sourceId     = r.first.sourceId;
+        out[i].firstFrame   = r.first.frame;
+        out[i].lastFrame    = r.lastFrame;
+        out[i].count        = r.count;
+        out[i].reserved     = 0;
+        out[i].firstSeconds = r.first.seconds;
+        out[i].lastSeconds  = r.lastSeconds;
+        out[i].worst        = r.worst;
+        out[i].reserved2    = 0.0f;
+        copyStr(out[i].templateName, static_cast<int>(sizeof(out[i].templateName)),
+                r.first.templateName);
+        copyStr(out[i].what, static_cast<int>(sizeof(out[i].what)), r.first.what);
+    }
+    return total;
+}
+
+int AF_CaptureGetPcm(AF_CaptureHandle cap, float* outInterleaved, int maxFrames) {
+    CaptureBundle* b = asCapture(cap);
+    if (!b || !outInterleaved || maxFrames <= 0) return 0;
+    const int have = static_cast<int>(b->file.pcm.size() / 2);
+    const int n = std::min(maxFrames, have);
+    for (int i = 0; i < n * 2; ++i)
+        outInterleaved[i] = static_cast<float>(b->file.pcm[static_cast<size_t>(i)]) / 32768.0f;
+    return n;
+}
+
+int AF_CaptureApplyFrame(AF_SceneHandle scene, AF_CaptureHandle cap, int frameIndex) {
+    Scene* s = asScene(scene);
+    CaptureBundle* b = asCapture(cap);
+    if (!s || !b || frameIndex < 0 || frameIndex >= b->file.frames) return 0;
+    const size_t k = static_cast<size_t>(frameIndex);
+    /* 押す順は録音時と同じでなければならない: 動いた実体 → リスナー → 音源。 */
+    for (const auto& m : b->file.moved[k]) {
+        const AF_Vector3 c{m.cx, m.cy, m.cz}, he{m.hx, m.hy, m.hz};
+        const AF_Vector3 r{m.rx, m.ry, m.rz}, u{m.ux, m.uy, m.uz};
+        s->updateInstanceTransform(m.instance, makeObb(c, he, r, u));
+    }
+    const auto& g = b->file.global[k];
+    s->setListener(Vec3{g.lx, g.ly, g.lz});
+    for (const auto& src : b->file.sources[k]) s->setSource(src.id, Vec3{src.sx, src.sy, src.sz});
+    /* ★段の位相は**リスナーを押したあと**に戻す（周回の基準点を合わせるため）。
+     *   戻さないと尾が永久にずれる（docs/SOUND_DEBUG_TOOL.md §3.1）。 */
+    if (frameIndex == 0) {
+        int ph[8];
+        for (int i = 0; i < 8; ++i) ph[i] = g.phase[i];
+        s->debugSetStagePhase(ph);
+    }
+    return 1;
+}
+
+int AF_CaptureEmitCase(AF_CaptureHandle cap, int markIndex, const char* testName,
+                       char* buf, int bufSize) {
+    CaptureBundle* b = asCapture(cap);
+    if (!b || !buf || bufSize <= 0) return 0;
+    if (!b->scanned) { b->marks = af::scan::scan(b->file); b->scanned = true; }
+    if (markIndex < 0 || markIndex >= static_cast<int>(b->marks.size())) return 0;
+    const std::string src = af::emit::emitCase(
+        b->file, b->marks[static_cast<size_t>(markIndex)],
+        (testName && *testName) ? testName : "testGenerated_FromCapture");
+    copyStr(buf, bufSize, src.c_str());
+    return static_cast<int>(src.size());
 }

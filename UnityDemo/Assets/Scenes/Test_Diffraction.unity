@@ -773,7 +773,7 @@ MonoBehaviour:
   diffractionDistanceOnly: 1
   diffractionDistanceRef: 0
   diffractionDistancePower: 1
-  enableDirectionalTail: 0
+  enableDirectionalTail: 1
   probeRays: 64
   probeBounces: 10
   probeUpdateEveryFrames: 8
@@ -796,7 +796,7 @@ MonoBehaviour:
   diffractionPosSmoothTime: 0.1
   liveMaterialUpdate: 0
   apertureIsTransmission: 1
-  apertureContrast: 4
+  apertureContrast: 1
   useBtmDiffraction: 0
   useCppDsp: 1
   showReflectionPaths: 0

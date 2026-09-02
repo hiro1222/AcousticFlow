@@ -11,6 +11,7 @@
 
 #include <algorithm>
 
+#include "../AcousticEngine/src/Debug/detectors.h"          // 破れの型紙。走査（デバッグツール）と検査で同じ式を使う
 #include "../AcousticEngine/src/Dsp/fft.h"
 #include "../AcousticEngine/src/Dsp/partitioned_convolver.h"
 #include "../AcousticEngine/src/Dsp/nonuniform_convolver.h"
@@ -776,12 +777,17 @@ void testEarlyReflectConv() {
         std::vector<float> in(static_cast<std::size_t>(m)), ol(static_cast<std::size_t>(m), 0.0f),
                            orr(static_cast<std::size_t>(m), 0.0f), dd(static_cast<std::size_t>(m), 0.0f);
         for (int i = 0; i < m; ++i) in[static_cast<std::size_t>(i)] = rng.next();
-        c3.processAdd(in.data(), 0, m, false, ol.data(), orr.data(), 0, 1.0f, dd.data());
+        // 拡散送りは**左右別**になった（散乱にも方向を持たせるため）。
+        // パワーを見るときは両方を足すこと。片方だけだとパンのぶん足りなくなる。
+        std::vector<float> dr(static_cast<std::size_t>(m), 0.0f);
+        c3.processAdd(in.data(), 0, m, false, ol.data(), orr.data(), 0, 1.0f, dd.data(),
+                      nullptr, nullptr, dr.data());
         double pIn = 0.0, pSpec = 0.0, pDiff = 0.0;
         for (int i = m / 2; i < m; ++i) {
             pIn += in[static_cast<std::size_t>(i)] * in[static_cast<std::size_t>(i)];
             pSpec += ol[static_cast<std::size_t>(i)] * ol[static_cast<std::size_t>(i)];
-            pDiff += dd[static_cast<std::size_t>(i)] * dd[static_cast<std::size_t>(i)];
+            pDiff += dd[static_cast<std::size_t>(i)] * dd[static_cast<std::size_t>(i)]
+                   + dr[static_cast<std::size_t>(i)] * dr[static_cast<std::size_t>(i)];
         }
         char b2[96];
         std::snprintf(b2, sizeof(b2), "(入 %.1f / 鏡面+拡散 %.1f)", pIn, pSpec + pDiff);
@@ -1677,15 +1683,15 @@ void testDiffractionHrtf() {
         af::dsp::EarlyReflectConv::Tap t[2];
         for (int b = 0; b < 6; ++b) { t[0].g[b] = 1.0f; t[1].g[b] = 0.5f; }
         t[1].delaySamples = 100;
-        float l, r, d, dir, hm;
+        float l, r, dL, dR, dir, hm;
         conv.setTaps(t, 2);
         conv.beginBlock();
-        conv.processSample(1.0f, true, l, r, d, dir, hm);
+        conv.processSample(1.0f, true, l, r, dL, dR, dir, hm);
         check("[B1] 回折タップが無ければバスは立たない", !conv.hasHrtfBus());
         t[1].hrtfWeight = 1.0f;
         conv.setTaps(t, 2);
         conv.beginBlock();
-        conv.processSample(1.0f, true, l, r, d, dir, hm);
+        conv.processSample(1.0f, true, l, r, dL, dR, dir, hm);
         check("[B1] 回折タップを載せるとバスが立つ", conv.hasHrtfBus());
     }
 
@@ -1925,6 +1931,213 @@ void testTailCalibration() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// 【尾・段階②】VoiceRenderer に共有バスを差したとき、音が同じで費用が減るか
+//
+//   段階①（尾の**形**を部屋ごとに共有）は済んでいた。ここは段階②＝**畳み込みそのもの**を
+//   1 回にまとめる話。畳み込み器レベルの等価は testSharedTailBusEquivalence で
+//   -119.6dB まで確認済みなので、ここで見るのは**配線が正しいか**。
+//
+//   ★見たいのは 3 つ:
+//     ① バスあり／なしで出力が一致する（音源ごとのレベルが保たれている）
+//     ② 音源数が増えても畳み込みは 1 回のまま＝費用が音源数に比例しない
+//     ③ 代表を 1 本も差さないと尾が鳴らない（配線ミスが黙って通らないこと）
+// ─────────────────────────────────────────────────────────────────────
+void testVoiceTailBus() {
+    std::printf("\n[尾・段階②] 共有バスを VoiceRenderer に差す\n");
+    const int sr = 48000;
+    const int nSrc = 8;
+    const int n = 8192;
+
+    af::dsp::VoiceRenderer::Config cfg;
+    cfg.sampleRate = sr;
+    cfg.maxFrames = 512;
+    cfg.tailSeconds = 0.25f;
+    cfg.tapCrossfadeMs = 1.0f;
+
+    // 同じ部屋＝同じエコグラム。音源ごとに直接音のゲインだけ変える（＝尾の量が変わる）。
+    const int bins = 50;
+    std::vector<float> echo(static_cast<std::size_t>(bins) * 6, 0.0f);
+    for (int k = 0; k < bins; ++k)
+        for (int b = 0; b < 6; ++b)
+            echo[static_cast<std::size_t>(k) * 6 + b] = std::pow(0.9f, static_cast<float>(k));
+
+    Rng rng;
+    std::vector<std::vector<float>> in(static_cast<std::size_t>(nSrc));
+    for (int s = 0; s < nSrc; ++s) {
+        in[static_cast<std::size_t>(s)].resize(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i)
+            in[static_cast<std::size_t>(s)][static_cast<std::size_t>(i)] = rng.next() * 0.3f;
+    }
+    auto directGainOf = [](int s) { return 0.4f + 0.08f * static_cast<float>(s); };
+
+    // 出力を貯める箱。
+    auto runAll = [&](bool useBus, std::vector<float>& sumL, std::vector<float>& sumR,
+                      double* outMs, int* outPartitions) {
+        sumL.assign(static_cast<std::size_t>(n), 0.0f);
+        sumR.assign(static_cast<std::size_t>(n), 0.0f);
+        std::vector<af::dsp::VoiceRenderer*> voices;
+        // 尾の長さはバスも音源も同じにする（比較の前提）。
+        const int tailSamples = static_cast<int>(cfg.tailSeconds * static_cast<float>(sr));
+        af::dsp::TailBus bus(tailSamples, cfg.tailFirstBlock, cfg.tailCapBlock,
+                             cfg.maxFrames, sr);
+        for (int s = 0; s < nSrc; ++s) {
+            auto* v = new af::dsp::VoiceRenderer(cfg);
+            // ★等倍にしない。**音源ごとに違う値**にする。
+            //   最初この検査は setOutputGain(1.0f) で回していて、そのせいで
+            //   「バスへ回すと outputGain の掛け忘れで尾だけ大きくなる」を見逃した。
+            //   実機で「聞こえ方が壊れる」と報告されて分かった。等倍だと掛け忘れが
+            //   1.0 倍になって**見えない**。検査は倍率の間違いを見つけられる形にすること。
+            v->setOutputGain(0.35f + 0.05f * static_cast<float>(s));
+            v->setHrtfEnabled(false);
+            af::dsp::EarlyReflectConv::Tap tap;
+            for (int b = 0; b < 6; ++b) tap.g[b] = 1.0f;
+            tap.delaySamples = 0;
+            v->setTaps(&tap, 1);
+            if (useBus) v->setTailBus(&bus, /*isOwner=*/s == 0);   // 代表は 1 本だけ
+            v->rebuildTail(echo.data(), bins, 5.0f, 20.0f, 5.0f, 0.0f, 0.0f, 1.0f,
+                           directGainOf(s), 0.5f);
+            voices.push_back(v);
+        }
+        std::vector<float> ol(static_cast<std::size_t>(cfg.maxFrames), 0.0f);
+        std::vector<float> orr(static_cast<std::size_t>(cfg.maxFrames), 0.0f);
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int off = 0; off + cfg.maxFrames <= n; off += cfg.maxFrames) {
+            for (int s = 0; s < nSrc; ++s) {
+                std::fill(ol.begin(), ol.end(), 0.0f);
+                std::fill(orr.begin(), orr.end(), 0.0f);
+                af::dsp::VoiceRenderer::Metering mm{};
+                voices[static_cast<std::size_t>(s)]->render(
+                    in[static_cast<std::size_t>(s)].data() + off, cfg.maxFrames,
+                    ol.data(), orr.data(), &mm);
+                for (int i = 0; i < cfg.maxFrames; ++i) {
+                    sumL[static_cast<std::size_t>(off + i)] += ol[static_cast<std::size_t>(i)];
+                    sumR[static_cast<std::size_t>(off + i)] += orr[static_cast<std::size_t>(i)];
+                }
+            }
+            if (useBus) {
+                // ★リスナー側で 1 回だけ。Unity では AudioListener のフィルタがここに当たる
+                //   （全音源のミックス後に走るので、遅延を足さずに順序が保証される）。
+                std::fill(ol.begin(), ol.end(), 0.0f);
+                std::fill(orr.begin(), orr.end(), 0.0f);
+                bus.render(cfg.maxFrames, ol.data(), orr.data());
+                for (int i = 0; i < cfg.maxFrames; ++i) {
+                    sumL[static_cast<std::size_t>(off + i)] += ol[static_cast<std::size_t>(i)];
+                    sumR[static_cast<std::size_t>(off + i)] += orr[static_cast<std::size_t>(i)];
+                }
+            }
+        }
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        if (outMs) *outMs = std::chrono::duration<double, std::milli>(t1 - t0).count()
+                            / (n / cfg.maxFrames);
+        if (outPartitions) *outPartitions = useBus ? bus.partitions()
+                                                   : voices[0]->tailPartitions() * nSrc;
+        for (auto* v : voices) delete v;
+    };
+
+    std::vector<float> aL, aR, bL, bR;
+    double msPer = 0.0, msBus = 0.0;
+    int partPer = 0, partBus = 0;
+    runAll(false, aL, aR, &msPer, &partPer);
+    runAll(true,  bL, bR, &msBus, &partBus);
+
+    double sa = 0.0, sb = 0.0, worst = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sa += aL[static_cast<std::size_t>(i)] * aL[static_cast<std::size_t>(i)];
+        sb += bL[static_cast<std::size_t>(i)] * bL[static_cast<std::size_t>(i)];
+        worst = std::max(worst, std::fabs(static_cast<double>(aL[static_cast<std::size_t>(i)])
+                                        - static_cast<double>(bL[static_cast<std::size_t>(i)])));
+        worst = std::max(worst, std::fabs(static_cast<double>(aR[static_cast<std::size_t>(i)])
+                                        - static_cast<double>(bR[static_cast<std::size_t>(i)])));
+    }
+    const double rmsA = std::sqrt(sa / n), rmsB = std::sqrt(sb / n);
+    const double rel = (rmsA > 1e-12) ? worst / rmsA : 0.0;
+    std::printf("        音源 %d 本 / 個別 RMS %.6f / バス RMS %.6f\n", nSrc, rmsA, rmsB);
+    std::printf("        最大の差 %.3e（RMS 比 %.2e ＝ %.1f dB 下）\n",
+                worst, rel, 20.0 * std::log10(std::max(rel, 1e-12)));
+    char note[128];
+    std::snprintf(note, sizeof(note), "(RMS 比 %.1f dB 下)", 20.0 * std::log10(std::max(rel, 1e-12)));
+    check("[尾②] バスに差しても出力が変わらない（-100dB 以下）", rel < 1e-5, note);
+
+    // ── 型紙 A（比が保たれる）を共有の式で（detectors.h）──
+    //   ★元になったバグ: バスへ回すと **尾だけ 8.3 倍**（outputGain の掛け忘れ）。
+    //     跳びでも幻でもなく「**一定して**間違っている」ので他の型紙では捕まらない。
+    //   ⚠ サンプル単位の比はゼロ交差で暴れる。**ブロックごとの RMS の比**で見る。
+    {
+        std::vector<float> rmsPer, rmsBus, atBlock;
+        for (int off = 0; off + cfg.maxFrames <= n; off += cfg.maxFrames) {
+            double pa = 0.0, pb = 0.0;
+            for (int i = 0; i < cfg.maxFrames; ++i) {
+                const double x = aL[static_cast<std::size_t>(off + i)];
+                const double y = bL[static_cast<std::size_t>(off + i)];
+                pa += x * x; pb += y * y;
+            }
+            rmsPer.push_back(static_cast<float>(std::sqrt(pa / cfg.maxFrames)));
+            rmsBus.push_back(static_cast<float>(std::sqrt(pb / cfg.maxFrames)));
+            atBlock.push_back(static_cast<float>(off) / static_cast<float>(sr));
+        }
+        af::detect::Break br[8];
+        const int nr = af::detect::ratioInRange(rmsBus.data(), rmsPer.data(), atBlock.data(),
+                                                static_cast<int>(rmsBus.size()),
+                                                0.99f, 1.01f, "bus/individual", br, 8);
+        af::detect::report("型紙A 比が保たれる", br, nr, " 倍");
+        std::snprintf(note, sizeof(note), "(%zu ブロック中 外れ %d 個)", rmsBus.size(), nr);
+        check("[尾②] 型紙A バスと個別の比が 1.00 のまま（倍率の掛け忘れを捕まえる）",
+              nr == 0, note);
+    }
+
+    std::snprintf(note, sizeof(note), "(個別 %.3f ms → バス %.3f ms / %.2f 倍)",
+                  msPer, msBus, (msBus > 0) ? msPer / msBus : 0.0);
+    std::printf("        1 ブロックの費用: 個別 %.3f ms → バス %.3f ms（%.2f 倍）\n",
+                msPer, msBus, (msBus > 0) ? msPer / msBus : 0.0);
+    check("[尾②] 音源 8 本でバスのほうが安い", msBus < msPer * 0.8, note);
+
+    std::snprintf(note, sizeof(note), "(個別 合計 %d 分割 → バス %d 分割)", partPer, partBus);
+    check("[尾②] 畳み込みの分割が音源数ぶん減る", partBus * 2 <= partPer, note);
+
+    // ④ 尾 IR の**組み直し**の費用。制御スレッド側。
+    //   共有バスにすると畳み込みは 1 回になるが、IR を組む方は各音源が呼び続ける。
+    //   同じ部屋なら同じエコグラムを渡すので**まったく同じ IR を人数ぶん作って捨てている**。
+    //   ここが効くなら、代表以外は組むのを飛ばせる。
+    {
+        const int tailSamples = static_cast<int>(cfg.tailSeconds * static_cast<float>(sr));
+        af::dsp::TailBus bus(tailSamples, cfg.tailFirstBlock, cfg.tailCapBlock, cfg.maxFrames, sr);
+        af::dsp::VoiceRenderer owner(cfg), guest(cfg);
+        owner.setTailBus(&bus, true);
+        guest.setTailBus(&bus, false);
+        auto timeRebuild = [&](af::dsp::VoiceRenderer& v, int iters) {
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            for (int k = 0; k < iters; ++k)
+                v.rebuildTail(echo.data(), bins, 5.0f, 20.0f, 5.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.5f);
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            return std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+        };
+        timeRebuild(owner, 5);                      // 暖機
+        const double msOwner = timeRebuild(owner, 60);
+        const double msGuest = timeRebuild(guest, 60);
+        std::printf("        尾IRの組み直し: 代表 %.3f ms / 代表でない %.3f ms\n", msOwner, msGuest);
+        std::printf("        → 同じ部屋なら同じ IR なので、代表でない側は組まない。\n"
+                    "          直す前は 1 本 0.521ms・8 本で 1 回の組み直しに 3.645ms 無駄だった。\n");
+        char n2[128];
+        std::snprintf(n2, sizeof(n2), "(代表 %.3f ms / 代表でない %.3f ms)", msOwner, msGuest);
+        check("[尾②] 代表でない音源は尾IRを組まない", msGuest < msOwner * 0.2, n2);
+    }
+
+    // ③ 代表を 1 本も差さないと尾が鳴らない ── 配線ミスが黙って通らないこと。
+    {
+        const int tailSamples = static_cast<int>(cfg.tailSeconds * static_cast<float>(sr));
+        af::dsp::TailBus bus(tailSamples, cfg.tailFirstBlock, cfg.tailCapBlock,
+                             cfg.maxFrames, sr);
+        af::dsp::VoiceRenderer v(cfg);
+        v.setHrtfEnabled(false);
+        v.setTailBus(&bus, /*isOwner=*/false);          // 代表にしない
+        v.rebuildTail(echo.data(), bins, 5.0f, 20.0f, 5.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.5f);
+        std::snprintf(note, sizeof(note), "(IR あり=%d)", bus.hasIr() ? 1 : 0);
+        check("[尾②] 代表を差さないとバスに IR が入らない（黙って鳴らない状態を検出できる）",
+              !bus.hasIr(), note);
+    }
+}
+
 void testVoiceRenderer() {
     std::printf("\n[信号フロー] 部品の配線と段別の内訳\n");
 
@@ -2059,6 +2272,7 @@ int main() {
     testDiffractionHrtf();
     testTapEarCues();
     testTailCalibration();
+    testVoiceTailBus();
     testVoiceRenderer();
 
     std::printf("\n----\n");

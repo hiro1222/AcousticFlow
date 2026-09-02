@@ -13,14 +13,31 @@
  *   テストが信用されなくなる。一方で関係が壊れるのは物理として明確な回帰なので、
  *   検出したいのはそちら。乱数を使う推定量（レイトレース）とも相性が良い。
  */
+// ★windows.h はここで、しかも std のヘッダより先に取り込む。
+//   NOMINMAX が無いと min/max がマクロになって std::max(...) が全滅する（実際にやった）。
+//   用途は「配布先の DLL が古い」警告を赤字で出すための ANSI 有効化だけ。
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  define NOMINMAX
+#  include <windows.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 #include "acoustic_scene.h"
+// ★破れの型紙。**デバッグツールの走査と、この検査が同じ式を使う**ためのヘッダ。
+//   別々の式にすると「道具は見つけたのに検査は通る」が起きる（docs/SOUND_DEBUG_TOOL.md）。
+#include "../AcousticEngine/src/Debug/detectors.h"
+#include "../AcousticEngine/src/Debug/capture_scan.h"       // 録った .afcap に型紙を当てる（走査）
+#include "capture_replay.h"     // 録った入力を押し直して解き直す
+#include "../AcousticEngine/src/Debug/capture_emit.h"       // 破れ → 回帰テストの生成
 #include "acoustic_voice.h"
 
 namespace {
@@ -29,6 +46,119 @@ AF_Vector3 V(float x, float y, float z) { return AF_Vector3{ x, y, z }; }
 
 int g_failures = 0;
 int g_checks = 0;
+
+// ─────────────────────────────────────────────────────────────────────
+// Unity 側の DLL が、いま試験しているビルドと同じものかを見る。
+//
+// ★なぜ要るか（2026-08-22 に実際に起きた事故）
+//   DLL を Unity へ配るのは CMake に入っておらず、手作業だった。1 日ぶん抜けていて、
+//   **エディタでは前日のエンジンが動いていた**。こちらがテストで出していた数字と、
+//   本人がエディタで聞いていた音が別物だったことになる。
+//   「実装したのに音が変わらない」を何時間も追うことになる事故なので、気づける形にする。
+//
+//   ビルド後の自動コピーは採らなかった。Unity が開いていると DLL を掴むので、
+//   ビルドが止まるか、黙って飛ばして「コピーされていないのに気づかない」を作る。
+//   **ビルドは絶対に止めず、数字を読む直前に必ず目に入る**ほうを採った。
+//
+//   検査ではない（g_checks に数えない）。環境の話であってエンジンの性質ではないので、
+//   ここで FAIL を増やすと「テストが落ちた」の意味が濁る。
+// ─────────────────────────────────────────────────────────────────────
+// ANSI の色が使えるなら使う。使えない端末では制御文字を出さない（文字化けさせない）。
+bool ansiColorAvailable() {
+#if defined(_WIN32)
+    static const bool ok = [] {
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD mode = 0;
+        if (h == INVALID_HANDLE_VALUE || !GetConsoleMode(h, &mode)) return false;
+        return SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+    }();
+    return ok;
+#else
+    return true;
+#endif
+}
+
+// 中身が同じか。大きさが違えば即座に違う。同じなら全部読んで比べる（430KB 程度）。
+enum class DllCmp { Same, Differ, Missing };
+DllCmp compareFiles(const char* a, const char* b) {
+    std::FILE* fa = std::fopen(a, "rb");
+    std::FILE* fb = std::fopen(b, "rb");
+    if (!fa || !fb) {
+        if (fa) std::fclose(fa);
+        if (fb) std::fclose(fb);
+        return DllCmp::Missing;
+    }
+    std::fseek(fa, 0, SEEK_END); const long na = std::ftell(fa); std::rewind(fa);
+    std::fseek(fb, 0, SEEK_END); const long nb = std::ftell(fb); std::rewind(fb);
+    DllCmp r = DllCmp::Same;
+    if (na != nb) {
+        r = DllCmp::Differ;
+    } else {
+        char ba[16384], bb[16384];
+        for (;;) {
+            const size_t ra = std::fread(ba, 1, sizeof(ba), fa);
+            const size_t rb = std::fread(bb, 1, sizeof(bb), fb);
+            if (ra != rb || std::memcmp(ba, bb, ra) != 0) { r = DllCmp::Differ; break; }
+            if (ra == 0) break;
+        }
+    }
+    std::fclose(fa);
+    std::fclose(fb);
+    return r;
+}
+
+// 出荷先ごとの状態。main の冒頭と末尾の 2 回出す（末尾がいちばん読まれるので）。
+struct DllSite { const char* name; const char* path; DllCmp state; };
+DllSite g_dllSites[] = {
+#if defined(AF_BUILT_DLL_PATH) && defined(AF_UNITY_DLL_PATH)
+    { "UnityDemo", AF_UNITY_DLL_PATH, DllCmp::Same },
+#endif
+#if defined(AF_BUILT_DLL_PATH) && defined(AF_DIST_DLL_PATH)
+    { "DistDemo",  AF_DIST_DLL_PATH,  DllCmp::Same },
+#endif
+};
+const int g_dllSiteCount = static_cast<int>(sizeof(g_dllSites) / sizeof(g_dllSites[0]));
+
+void scanDllFreshness() {
+#if defined(AF_BUILT_DLL_PATH)
+    for (int i = 0; i < g_dllSiteCount; ++i)
+        g_dllSites[i].state = compareFiles(AF_BUILT_DLL_PATH, g_dllSites[i].path);
+#endif
+}
+
+// stale が 1 つでもあれば true。
+bool reportDllFreshness() {
+    int stale = 0;
+    for (int i = 0; i < g_dllSiteCount; ++i)
+        if (g_dllSites[i].state != DllCmp::Same) ++stale;
+    if (stale == 0) return false;
+
+    const char* R = ansiColorAvailable() ? "\033[1;31m" : "";
+    const char* Z = ansiColorAvailable() ? "\033[0m"    : "";
+    std::printf("\n%s"
+        "########################################################################\n"
+        "##  ⚠ 配布先の DLL が、いま試験したビルドと違います                   ##\n"
+        "########################################################################%s\n",
+        R, Z);
+    for (int i = 0; i < g_dllSiteCount; ++i) {
+        const char* s = (g_dllSites[i].state == DllCmp::Missing) ? "見つからない"
+                      : (g_dllSites[i].state == DllCmp::Differ)  ? "★古い（中身が違う）"
+                                                                 : "一致";
+        std::printf("%s  %-10s %-22s %s%s\n", R, g_dllSites[i].name, s,
+                    g_dllSites[i].path, Z);
+    }
+    std::printf("%s"
+        "  → ここに出ている数字は、Unity で聞こえる音の数字では**ありません**。\n"
+        "  → Unity を閉じてから配ってください（開いていると DLL を掴んで上書きできません）:\n"
+        "%s\n", R, Z);
+#if defined(AF_BUILT_DLL_PATH)
+    for (int i = 0; i < g_dllSiteCount; ++i)
+        if (g_dllSites[i].state != DllCmp::Same)
+            std::printf("       cp \"%s\" \"%s\"\n", AF_BUILT_DLL_PATH, g_dllSites[i].path);
+#endif
+    std::printf("\n");
+    return true;
+}
 
 void check(const char* label, bool ok, const char* detail = "") {
     ++g_checks;
@@ -312,10 +442,11 @@ void testBatchUpdate() {
     // 毎フレーム全部走るように間隔を 1 にする（レート分岐は別で確認）。
     AF_UpdateConfig cfg = {};
     cfg.role1EveryN = 1; cfg.role2EveryN = 1; cfg.earlyEveryN = 1;
-    cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 1;
+    cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 3;
     cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
     cfg.directWeight = 1.0f; cfg.useReflections = 1;
     cfg.useEdgeCatalog = 1; cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+
     cfg.enableReverb = 1; cfg.echogramBins = 100; cfg.echogramBinSeconds = 0.01f;
     cfg.echogramRays = 512; cfg.echogramBounces = 24; cfg.speedOfSound = 343.0f;
     cfg.distanceRef = 0.0f;
@@ -390,15 +521,23 @@ void testBatchUpdate() {
     const int gotBins = AF_SceneGetEchogramBands(s, -1, batchEcho.data(), kBins);
     check("エコグラムのビン数が一致", gotBins == kBins);
 
+    // ★比べるのは**代表 1 本**。以前は -1（全音源の和）と「2 音源をまとめた従来クエリ」を
+    //   突き合わせていたが、尾を部屋で共有するようにしたので、和の中身は
+    //   「代表を人数ぶん足したもの」になった（意味＝全音源の和 は変えていない）。
+    //   等価性の検査として意味があるのは「代表の位置で直接計算したものと一致するか」。
+    const int repIdx = AF_SceneGetTailShapeIndex(s, 0);
+    AF_Vector3 repSrc[1] = { srcs[(repIdx >= 0 && repIdx < 2) ? repIdx : 0] };
     std::vector<float> refEcho(kBins * kBands, 0.0f);
-    AF_SceneComputeEchogramBands(s, L, srcs, 2, refEcho.data(), kBins, 0.01f, 343.0f, 512, 24, 0.0f);
+    AF_SceneComputeEchogramBands(s, L, repSrc, 1, refEcho.data(), kBins, 0.01f, 343.0f, 512, 24, 0.0f);
+    std::vector<float> repEcho(kBins * kBands, 0.0f);
+    AF_SceneGetEchogramBands(s, 0, repEcho.data(), kBins);
     float maxDiff = 0.0f, refTotal = 0.0f;
     for (int i = 0; i < kBins * kBands; ++i) {
-        maxDiff = std::max(maxDiff, std::fabs(batchEcho[i] - refEcho[i]));
+        maxDiff = std::max(maxDiff, std::fabs(repEcho[i] - refEcho[i]));
         refTotal += refEcho[i];
     }
-    std::snprintf(buf, sizeof(buf), "(maxDiff=%.6g, total=%.4g)", maxDiff, refTotal);
-    check("エコグラムが従来クエリと一致", maxDiff < 1e-3f, buf);
+    std::snprintf(buf, sizeof(buf), "(代表 %d / maxDiff=%.6g, total=%.4g)", repIdx, maxDiff, refTotal);
+    check("エコグラム（代表）が従来クエリと一致", maxDiff < 1e-3f, buf);
 
     // --- 範囲外 index は何も壊さない ---
     float guard[kBands] = { -1, -1, -1, -1, -1, -1 };
@@ -420,10 +559,11 @@ void testUpdateRates() {
 
     AF_UpdateConfig cfg = {};
     cfg.role1EveryN = 1; cfg.role2EveryN = 4; cfg.earlyEveryN = 1;
-    cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 1;
+    cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 3;
     cfg.reflectionRays = 64; cfg.reflectionBounces = 2;
     cfg.directWeight = 1.0f; cfg.useReflections = 1;
-    cfg.useEdgeCatalog = 0;
+    cfg.useEdgeCatalog = 1; cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+
     cfg.enableReverb = 1; cfg.echogramBins = 50; cfg.echogramBinSeconds = 0.01f;
     cfg.echogramRays = 128; cfg.echogramBounces = 8; cfg.speedOfSound = 343.0f;
     cfg.enableEarlyReflections = 1; cfg.earlyTaps = 2; cfg.earlyRays = 64; cfg.earlyBounces = 2;
@@ -1119,6 +1259,18 @@ void testSecondOrderDiffraction() {
         std::printf("        [%d] 方向(%6.2f,%6.2f,%6.2f)  重み %.3f\n",
                     i, pos[i].x, pos[i].y, pos[i].z, gain[i]);
 
+    // ★f（フレネル開口）が掛かっているかを出す。§5-13 の排他が効いているかの判定用。
+    //   2 次回折には**開口の断面が取れない**ので、f ではなく前川が持つのが設計。
+    //   f が掛かっていると 0 になる（開口が無いので開口率が 0 に落ちる）。
+    {
+        float d17[32] = {};
+        AF_SceneDebugDiffractionPath(s, L, S, d17, 0);
+        std::printf("      f の状態: 使用 %s / 面 %.0f 枚 有界 %.0f 枚 / 縁 u=%.2f v=%.2f"
+                    " / 後ろで捨てた %.0f 個\n",
+                    d17[18] > 0.5f ? "★している" : "していない（前川）",
+                    d17[22], d17[23], d17[24], d17[25], d17[26]);
+    }
+
     check("2次回折で音が届く(ゲイン>0)", g[0] > 0.001f);
     check("二次音源が出る", n > 0);
 
@@ -1152,9 +1304,20 @@ void testSecondOrderDiffraction() {
 //     AF_SceneUpdate → 音源ごとに 遮蔽 + 回折タップ取得
 //   扉は毎フレーム動かす（updateInstance が BVH を作り直すので、その分も込みで測る）。
 void diagnoseFrameCost() {
-    std::printf("\n[診断] 1フレームの音響計算にかかる時間（Test_Full と同じ規模）\n");
+    // ★ワーカー数を環境変数で振れるようにしてある（AF_WORKERS=4 など）。
+    //   既定は 1（＝エンジンの既定）のまま。ここを既定で増やすと、
+    //   厳密差分で回帰を判定できなくなるため（worker_pool.h の設計どおり）。
+    //   ただし **ホスト側の既定は 4**（AcousticFlowSceneDemo.workerThreads）なので、
+    //   実機に対応する数字が欲しいときは AF_WORKERS=4 で回すこと。
+    int workers = 1;
+    if (const char* w = std::getenv("AF_WORKERS")) {
+        const int v = std::atoi(w);
+        if (v >= 1 && v <= 64) workers = v;
+    }
+    std::printf("\n[診断] 1フレームの音響計算にかかる時間（Test_Full と同じ規模 / ワーカー %d）\n", workers);
 
     AF_SceneHandle s = AF_SceneCreate();
+    AF_SceneSetWorkerThreads(s, workers);
     const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
     const float t = 0.15f, h = 4.0f, doorW = 1.2f, doorH = 2.4f;
     const float hw = 6.0f, hd = 8.0f;
@@ -1190,6 +1353,7 @@ void diagnoseFrameCost() {
     base.reflectionRays = 256; base.reflectionBounces = 3;
     base.directWeight = 1.0f;  base.useReflections = 1;
     base.useEdgeCatalog = 1;   base.edgeCatalogRes = 16; base.edgeCatalogMaxDist = 40.0f;
+
     base.enableReverb = 1;     base.echogramBins = 100;  base.echogramBinSeconds = 0.01f;
     base.echogramRays = 512;   base.echogramBounces = 24;
     base.speedOfSound = 343.0f; base.distanceRef = 1.5f;
@@ -1241,6 +1405,7 @@ void diagnoseFrameCost() {
         {"早期反射",         [](AF_UpdateConfig& c){ c.enableEarlyReflections = 0; }},
         {"回折二次音源",     [](AF_UpdateConfig& c){ c.enableDiffractionSources = 0; }},
         {"エッジカタログ",   [](AF_UpdateConfig& c){ c.useEdgeCatalog = 0; }},
+        {"エッジカタログ",   [](AF_UpdateConfig& c){ }},
         {"反射込み遮蔽",     [](AF_UpdateConfig& c){ c.useReflections = 0; }},
     };
     for (const Ablate& a : abl) {
@@ -1250,10 +1415,85 @@ void diagnoseFrameCost() {
                     a.name, ms, all - ms, (all - ms) / all * 100.0, lastMax);
     }
 
+    // ★コア数を振る。ホストの HUD に出る「音響 ms」がそのまま何倍になるかを見る。
+    //   ここは Test_Full と同じ規模なので、ゲーム側の体感に一番近い数字になる。
+    {
+        std::printf("\n        コア数を振ったときの 1 フレーム（★ホストの音響 ms に直結）\n");
+        std::printf("          %8s %10s %10s %10s\n", "コア", "平均 ms", "最悪 ms", "1コア比");
+        double base1 = 0.0;
+        for (int th : {1, 2, 4, 8}) {
+            AF_SceneSetWorkerThreads(s, th);
+            runFrames(base, true, 30);                 // 暖機
+            const double ms = runFrames(base, true, 150);
+            if (th == 1) base1 = ms;
+            std::printf("          %8d %10.3f %10.3f %9.2fx\n",
+                        th, ms, lastMax, (ms > 0) ? base1 / ms : 0.0);
+        }
+        AF_SceneSetWorkerThreads(s, 1);                // 以降の診断は直列で採る
+        runFrames(base, true, 30);
+    }
+
+    // ★部屋分割・自動ポータルの取り分。
+    //   GPU へ回せるか（連絡板 2026-08-22）を判断するために要る数字。
+    //   ボクセルの距離変換・連結・塗り戻しは GPU 向きの形をしているが、
+    //   **定常フレームで何 ms 占めているか**を先に知らないと、回しても無駄になる。
+    //   ⚠ 自動ポータルを切ると音も変わる（ポータルの寄与が消える）ので、
+    //     これは「取り分の上限」であって純粋なボクセル処理の代金ではない。
+    {
+        AF_SceneSetAutoPortals(s, 0);
+        const double noRooms = runFrames(base, true, 200);
+        AF_SceneSetAutoPortals(s, 1);
+        runFrames(base, true, 30);   // 戻して暖機
+        std::printf("        %-16s を切ると 平均 %7.3f ms（取り分の上限 %6.3f / %4.1f%%）\n",
+                    "部屋分割・自動ポータル", noRooms, all - noRooms,
+                    (all - noRooms) / all * 100.0);
+    }
+
     // 扉を止める＝BVH が汚れない。差が「動かすこと自体」の代金。
     const double still = runFrames(base, false, 200);
     std::printf("        扉を止めると %7.3f ms  （動かす代金 %6.3f ms / %4.1f%%）\n",
                 still, all - still, (all - still) / all * 100.0);
+
+    // ─────────────────────────────────────────────────────────────
+    // ★間引きの効き方を段ごとに測る
+    //
+    //   ゲームレーンからの問い（連絡板 2026-08-22）:
+    //     「diffractionUpdateEveryFrames を 4 → 8 にしても 80ms から動かない。
+    //       間隔が 4 以上でクランプされているのか、別に律速があるのか」
+    //
+    //   間隔を 1,2,4,8,16 と振って、**まだ効くのか飽和するのか**を段ごとに出す。
+    //   飽和していれば「その段はもう費用の主ではない」＝別の段が床を作っている。
+    //   コードにクランプは無い（cfg_.*EveryN は <=0 のときだけ 1 に直すだけ）ので、
+    //   飽和するとすればそれは律速が別にあることを意味する。
+    // ─────────────────────────────────────────────────────────────
+    std::printf("\n        間引きを振ったときの平均 ms（★まだ効くのか / 飽和したのか）\n");
+    std::printf("          %-14s %8s %8s %8s %8s %8s   %s\n",
+                "段", "N=1", "N=2", "N=4", "N=8", "N=16", "1→16 で減る量");
+    struct Knob { const char* name; int AF_UpdateConfig::* field; };
+    const Knob knobs[] = {
+        {"遮蔽・回折",   &AF_UpdateConfig::role1EveryN},
+        {"回折二次音源", &AF_UpdateConfig::diffSrcEveryN},
+        {"早期反射",     &AF_UpdateConfig::earlyEveryN},
+        {"エッジカタログ", &AF_UpdateConfig::catalogEveryN},
+        {"残響エコグラム", &AF_UpdateConfig::role2EveryN},
+    };
+    for (const Knob& k : knobs) {
+        double v[5];
+        const int ns[5] = {1, 2, 4, 8, 16};
+        for (int i = 0; i < 5; ++i) {
+            AF_UpdateConfig c = base;
+            c.*(k.field) = ns[i];
+            v[i] = runFrames(c, true, 150);
+        }
+        std::printf("          %-14s %8.3f %8.3f %8.3f %8.3f %8.3f   %6.3f ms (%4.1f%%)\n",
+                    k.name, v[0], v[1], v[2], v[3], v[4],
+                    v[0] - v[4], (v[0] - v[4]) / v[0] * 100.0);
+    }
+    std::printf("        → 8→16 でほぼ動かない段は、その段が費用の主ではない。\n"
+                "          既定で毎フレーム走るのは**遮蔽・回折(role1EveryN=1)**だけで、\n"
+                "          これが per-source の床を作る（音源ごとに computeDirectSoft ＋\n"
+                "          遮蔽なら diffractionComposite が走る）。回折二次音源の間引きは\n"
+                "          「二次音源の置き直し」を間引くだけで、回折そのものは間引かない。\n");
 
     AF_SceneDestroy(s);
 }
@@ -1362,11 +1602,11 @@ void diagnoseWallDoorBoundary() {
         for (int mode = 0; mode < 2; ++mode) {
             AF_UpdateConfig c{};
             c.role1EveryN = 1; c.role2EveryN = 4; c.earlyEveryN = 3;
-            c.diffSrcEveryN = 2; c.catalogEveryN = 3;
+            c.diffSrcEveryN = 2;
             c.reflectionRays = 256; c.reflectionBounces = 3;
             c.directWeight = 1.0f;
             c.useReflections = (mode == 0) ? 1 : 0;     // 反射込み / 直接+回折のみ
-            c.useEdgeCatalog = 1; c.edgeCatalogRes = 16; c.edgeCatalogMaxDist = 40.0f;
+
             c.enableReverb = 0; c.echogramBins = 100; c.echogramBinSeconds = 0.01f;
             c.echogramRays = 512; c.echogramBounces = 24;
             c.speedOfSound = 343.0f; c.distanceRef = 1.5f;
@@ -2125,6 +2365,37 @@ void diagnoseUnityGapScene() {
     std::printf("      %s\n", withPortal ? "【ポータルを置いた（Test_Full と同じ経路）】"
                             : asPortal   ? "【開口をポータルとして評価（開口率最大）】"
                                          : "【稜線探索（回折シーンと同じ経路）】");
+    // ★実機で「2 つの位置で 13dB 変わる」と報告されたので、成分ごとに追う。
+    //   HUD では早期反射と散乱が**丸ごと消えて**いた。減衰ではなく消滅なら別の話。
+    {
+        std::printf("      ── 成分の内訳（早期反射が消える所を探す）──\n");
+        std::printf("      x     透過     回折     反射本数  反射(広帯域)  部屋 実効体積\n");
+        for (float x = -5.0f; x <= 5.01f; x += 1.0f) {
+            const AF_Vector3 L = V(x, 1.6f, -2.0f);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            for (int k = 0; k < 3; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+            float tr[kBands] = {}; float of = 0.0f;
+            AF_SceneComputeSoftOcclusion(s, L, S, tr, kBands, &of);
+            float trb = 0.0f;
+            for (int b = 0; b < kBands; ++b) trb += tr[b] / kBands;
+            AF_Vector3 dp[8]; float dg[8], db[48];
+            const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+            float dif = 0.0f;
+            for (int i = 0; i < nd; ++i)
+                for (int b = 0; b < kBands; ++b) dif += db[i * kBands + b] / kBands;
+            const int idx = AF_SceneSourceIndex(s, 1);
+            AF_Vector3 ep[16]; float eg[16 * kBands];
+            const int ne = (idx >= 0) ? AF_SceneGetEarlyReflections(s, idx, ep, eg, 16) : 0;
+            float ref = 0.0f;
+            for (int i = 0; i < ne; ++i)
+                for (int b = 0; b < kBands; ++b) ref += eg[i * kBands + b] / kBands;
+            std::printf("   %5.1f  %7.4f  %7.4f   %2d本      %8.4f     %7.1f m3%s\n",
+                        x, trb, dif, ne, ref,
+                        AF_SceneRoomVolumeAt(s, L, 1.0f),
+                        (ne == 0) ? "   ★反射が消えている" : "");
+        }
+    }
     std::printf("      listener.x  経路本数  回折125Hz  二次音源  到来方向(正規化)   経路長\n");
     int fired = 0, total = 0;
     float prevG = -1.0f, maxJump = 0.0f, jAt = 0.0f;
@@ -3498,6 +3769,9 @@ void testAutoPortals() {
         AF_SceneAddPortal(s, V(0, doorH*0.5f, 0), V(1,0,0), V(0,1,0), doorW*0.5f, doorH*0.5f);
         AF_SceneSetListener(s, V(0, 1.5f, -2.0f));
         AF_SceneSetSource(s, 1, V(0, 1.5f, 2.0f));
+        // 前提を明示する。既定に頼ると、既定が変わった瞬間にこのテストが嘘をつく
+        //   （実際、自動生成の既定を Unity に合わせた途端に落ちた）。
+        AF_SceneSetAutoPortals(s, 0);
         for (int i = 0; i < 3; ++i) AF_SceneUpdate(s, 1.0f/60.0f);
         int a0 = 0, m0 = 0; AF_SceneGetPortalCounts(s, &a0, &m0);
         AF_SceneSetAutoPortals(s, 1);
@@ -3509,7 +3783,11 @@ void testAutoPortals() {
         std::printf("        自動 OFF→ON→OFF  手置き %d→%d→%d / 自動 %d→%d→%d\n",
                     m0, m1, m2, a0, a1, a2);
         check("[C1] 自動生成を入り切りしても手置きが残る", m0 == 1 && m1 == 1 && m2 == 1);
-        check("[C1] 自動ぶんだけが入れ替わる", a0 == 0 && a1 >= 1 && a2 == 0);
+        // ★このシーンの開口は手置きポータルが覆っているので、自動は作られないのが正しい。
+        //   作ると同じ戸口に矩形が 2〜3 枚でき、扉を回すとボクセル由来の矩形が
+        //   位置・大きさ・向きごと作り直されて開口率が飛ぶ（実測 57°→58° で 1 度で倍）。
+        //   自動生成そのものが効くことは「5部屋・音源8本」の計測が見ている。
+        check("[C1] 手置きが覆う開口には自動を作らない", a0 == 0 && a1 == 0 && a2 == 0);
         AF_SceneDestroy(s);
     }
 }
@@ -4825,24 +5103,42 @@ void testManySources() {
     std::printf("   相異なる値 %d/%d（最小 %.3f 最大 %.3f）\n", distinct, N, lo, hi);
     check("[多音源] 遮られた音源と見通せる音源が分かれる", distinct >= 3 && hi > lo * 1.5f);
 
-    // ③ エコグラムが音源ごとに別物であること（今日入れた変更の実地確認）
+    // ③ エコグラムは**部屋ごと**であること
+    //
+    // ★2026-08-24 に契約を変えた。以前は「音源ごとに別物」を縛っていたが、
+    //   尾（後期残響）は**部屋の形にしか依存しない**ので、同じ部屋の音源は共有する。
+    //   出荷経路（VoiceConvolver）は元から代表 1 本しか読んでおらず
+    //   （形は代表・量は自分。実測 形は同室 1.3dB 以内／隣室 2.6〜3.9dB ずれ）、
+    //   音源ごとに計算していたぶんは**丸ごと無駄**だった
+    //   （実測: 音源 16 本で 16.798 ms、うち 14.3 ms が音源数で伸びるぶん）。
+    //
+    //   → 縛るのは「同じ部屋なら一致し、代表が引ける」。
+    //     部屋をまたいで違うことは [残響] 小部屋 vs 大部屋 が別に縛っている。
     std::vector<float> e(100 * kBands);
     double total[N] = {};
-    int echoDistinct = 0;
+    int sameRoomMismatch = 0, badRep = 0;
     for (int i = 0; i < N; ++i) {
         const int bins = AF_SceneGetEchogramBands(s, idx[i], e.data(), 100);
         double sum = 0.0;
         for (int k = 0; k < bins * kBands; ++k) sum += e[static_cast<std::size_t>(k)];
         total[i] = sum;
-        bool uniq = true;
+        const int rep = AF_SceneGetTailShapeIndex(s, idx[i]);
+        if (rep < 0) { ++badRep; continue; }
+        // 代表が同じなら、返ってくる尾も同じでなければならない。
         for (int j = 0; j < i; ++j)
-            if (std::fabs(total[i] - total[j]) < 1e-9) { uniq = false; break; }
-        if (uniq) ++echoDistinct;
+            if (AF_SceneGetTailShapeIndex(s, idx[j]) == rep
+                && std::fabs(total[i] - total[j]) > 1e-9) ++sameRoomMismatch;
     }
     std::printf("      エコグラム総和 音源ごと:");
     for (int i = 0; i < N; ++i) std::printf(" %.2f", total[i]);
-    std::printf("   相異なる値 %d/%d\n", echoDistinct, N);
-    check("[多音源] エコグラムが音源ごとに異なる", echoDistinct >= N - 1);
+    std::printf("\n      代表:");
+    for (int i = 0; i < N; ++i) std::printf(" %d", AF_SceneGetTailShapeIndex(s, idx[i]));
+    std::printf("\n");
+    char shareNote[96];
+    std::snprintf(shareNote, sizeof(shareNote), "(同室で食い違い %d / 代表が引けない %d)",
+                  sameRoomMismatch, badRep);
+    check("[多音源] 同じ部屋の音源は同じ尾を共有する",
+          sameRoomMismatch == 0 && badRep == 0, shareNote);
 
     // ④ 全音源の和(-1) が個別の和と一致すること
     double sumAll = 0.0;
@@ -5093,6 +5389,7 @@ void diagnoseShadowCliff() {
     double ref = 0.0;
     double prevDb = 0.0, worst = 0.0; float worstAt = 0.0f; bool first = true;
     double worstD = 0.0, prevD = 0.0;
+    double prevTilt = 0.0, worstTilt = 0.0; float worstTiltAt = 0.0f;
     for (float x = -2.0f; x <= 0.001f; x += 0.1f) {
         const AF_Vector3 L = V(x, 1.6f, -3.5f);
         AF_SceneSetListener(s, L);
@@ -5118,18 +5415,43 @@ void diagnoseShadowCliff() {
         if (first) ref = total;
         const double db = 20.0 * std::log10(std::max(total, 1e-9) / std::max(ref, 1e-9));
 
+        // 【B7】帯域ごとに D と F を足して、**傾き（4k/125）**が 1 歩で何 dB 動くか。
+        //   ゲーム側の起票どおりの測り方。合計レベルの連続性しか見ていなかったので、
+        //   「レベルは連続なのに音色が跳ぶ」が検査を素通りしていた。
+        AF_Vector3 dp2[8]; float dg2[8], db2[48];
+        const int nd2 = AF_SceneComputeDiffractionSourceBands(s, L, S, dp2, dg2, db2, 8);
+        float tot6[kBands] = {};
+        for (int b = 0; b < kBands; ++b) {
+            float f = 0.0f;
+            for (int i = 0; i < nd2; ++i) f += db2[i * kBands + b];
+            f *= occFrac;
+            tot6[b] = std::sqrt(soft[b] * soft[b] + f * f);
+        }
+        const double tilt = 20.0 * std::log10(std::max<double>(tot6[kBands - 1], 1e-9)
+                                            / std::max<double>(tot6[0], 1e-9));
         if (!first) {
             const double step = std::fabs(db - prevDb);
             if (step > worst) { worst = step; worstAt = x; }
             worstD = std::max(worstD, std::fabs(20.0 * std::log10(std::max(sm, 1e-9))
                                               - 20.0 * std::log10(std::max(prevD, 1e-9))));
+            const double ts = std::fabs(tilt - prevTilt);
+            if (ts > worstTilt) { worstTilt = ts; worstTiltAt = x; }
         }
-        first = false; prevDb = db; prevD = sm;
-        std::printf("        %5.2f   %5.2f   %7.5f   %7.5f      %7.5f  %7.1f   %6.3f\n",
-                    x, occFrac, sm, fpart, total, db, om);
+        first = false; prevDb = db; prevD = sm; prevTilt = tilt;
+        std::printf("        %5.2f   %5.2f   %7.5f   %7.5f      %7.5f  %7.1f   %6.3f   %+7.1f",
+                    x, occFrac, sm, fpart, total, db, om, tilt);
+        if (x < -1.95f || (x > -1.75f && x < -1.65f)) {
+            std::printf("  │ D:");
+            for (int b = 0; b < kBands; ++b) std::printf("%7.4f", soft[b]);
+            std::printf("  F本%d", nd2);
+        }
+        std::printf("\n");
     }
     std::printf("      0.1m あたりの最大変化: D⊕F の合計 %.1f dB / D タップ単体 %.1f dB"
                 "（x=%.2f 付近）\n", worst, worstD, worstAt);
+    std::printf("      【B7】D⊕F の**傾き**(4k/125) の 0.1m あたり最大変化: %.1f dB（x=%.2f）\n",
+                worstTilt, worstTiltAt);
+    std::printf("      ※ 合計レベルが連続でも、傾きが跳べば「音色が変わった」と聞こえる。\n");
     std::printf("      → D 単体は必ず崖になる（標本が二値）。F が occFrac で立ち上がって"
                 "補うので、合計が連続なら設計どおり。\n");
     AF_SceneDestroy(s);
@@ -5448,6 +5770,1222 @@ void diagnoseSecondOrderQuality() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// 【診断・見立て外れの記録】BVH の作り直しは床ではなかった
+//
+//   連絡板 2026-08-22 でゲームレーンが「音源 1 本 10.6ms・間引きで消えない床がある」
+//   と報告してきた。床の候補として **BVH の全再構築** を疑った。
+//   実装は確かに refit ではなく全再構築で（インスタンスが 1 つでも動くと bvhDirty_ が
+//   立ち、次のレイで buildBvh が全ノードを捨てて再分割する）、動く物が 1 つでもあれば
+//   毎フレーム払う ＝ 音源数と無関係な床に見える、という筋だった。
+//
+//   ★測ったら外れていた。作り直しの代金は**測定ノイズ以下**（符号が負に出る）。
+//     理由は単純で、作り直しは遅延実行（ensureBvh はレイを撃つときに呼ばれる）なので、
+//     1 フレームぶんの費用が **音源あたり 256レイ × 3バウンス ≒ 768 回の走査**に
+//     ならされる。1025 形でも作り直しは 2.4ms 未満で、走査の総額に埋もれる。
+//     → **refit 化は無駄。優先度から落としてよい。**
+//
+//   代わりに見えたのは「形の数に対する伸び」のほう（17形 1.6ms → 1025形 128.8ms）。
+//   ⚠ ただしこの試験は形を増やすと**密度も上がる**（同じ間隔で並べるので迷路が濃くなる）
+//     ので、この数字は BVH の良し悪しを切り分けたものでは**ない**。
+//     切り分けるには密度を保ったまま形を増やす（＝場を広げる）必要がある。
+// ─────────────────────────────────────────────────────────────────────
+void diagnoseBvhRebuildCost() {
+    std::printf("\n[診断] BVH の作り直しは床か（→ 外れ。ノイズ以下）\n");
+    std::printf("        1 つでも動くと全再構築だが、遅延実行なので 768 回の走査にならされる。\n");
+    std::printf("        %8s %12s %12s %12s %10s\n",
+                "形の数", "静止 ms", "1つ動かす ms", "作り直し ms", "1形あたり us");
+
+    for (int nBox : {16, 64, 256, 1024}) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        // 格子状に箱を並べる。1 点に寄せると BVH の分割が縮退して測り物にならない。
+        const int side = static_cast<int>(std::ceil(std::cbrt(static_cast<double>(nBox))));
+        for (int i = 0; i < nBox; ++i) {
+            const int ix = i % side, iy = (i / side) % side, iz = i / (side * side);
+            AF_SceneAddInstanceBox(s, V(ix * 2.0f - side, iy * 2.0f, iz * 2.0f - side),
+                                   V(0.5f, 0.5f, 0.5f), V(1,0,0), V(0,1,0), m);
+        }
+        const unsigned long long movedId =
+            AF_SceneAddInstanceBox(s, V(0, 1.0f, 0), V(0.5f, 1.0f, 0.05f),
+                                   V(1,0,0), V(0,1,0), m);
+        AF_SceneSetListener(s, V(0, 1.6f, -3.0f));
+        AF_SceneSetSource(s, 1, V(0, 1.6f, 3.0f));
+
+        // レイを撃つ段だけ残す。BVH の代金を他の段で薄めないため。
+        AF_UpdateConfig c{};
+        c.role1EveryN = 1; c.role2EveryN = 1; c.earlyEveryN = 1;
+        c.diffSrcEveryN = 1;
+        c.reflectionRays = 256; c.reflectionBounces = 3;
+        c.directWeight = 1.0f; c.useReflections = 1;
+ c.enableReverb = 0;
+        c.enableEarlyReflections = 0; c.enableDiffractionSources = 0;
+        c.speedOfSound = 343.0f; c.distanceRef = 1.5f;
+        AF_SceneSetUpdateConfig(s, &c);
+
+        using clk = std::chrono::high_resolution_clock;
+        auto run = [&](bool move, int frames) {
+            double acc = 0.0;
+            for (int f = 0; f < frames; ++f) {
+                const auto t0 = clk::now();
+                if (move) {
+                    const float th = (f % 90) * 3.14159265f / 180.0f;
+                    AF_SceneUpdateInstance(s, movedId, V(0, 1.0f, 0), V(0.5f, 1.0f, 0.05f),
+                                           V(std::cos(th), 0, std::sin(th)), V(0, 1, 0));
+                }
+                AF_SceneUpdate(s, 1.0f / 60.0f);
+                acc += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+            }
+            return acc / frames;
+        };
+        run(true, 20);                       // 暖機
+        const double moving  = run(true, 120);
+        const double stillMs = run(false, 120);
+        const double rebuild = moving - stillMs;
+        std::printf("        %8d %12.3f %12.3f %12.3f %10.2f\n",
+                    nBox + 1, stillMs, moving, rebuild, rebuild * 1000.0 / (nBox + 1));
+        AF_SceneDestroy(s);
+    }
+    std::printf("        → 「作り直し ms」が 0 前後（負にも振れる）＝**代金は測れない**。\n"
+                "          遅延実行で 768 回の走査にならされるため。refit 化は無駄。\n"
+                "        ⚠ 「静止 ms」の伸びは形の数だけでなく**密度**も上がっているので、\n"
+                "          BVH の良し悪しを切り分けた数字ではない。読み違えないこと。\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 【複数コア】並列で回しても結果がビット一致すること
+//
+//   割るのは「音源ごとに自分の枠にしか書かない」段だけ:
+//     遮蔽・回折(role1 の前半) / 早期反射 / 回折二次音源
+//   共有の箱へ足し込む段（反射の reflected[] やエコグラムのビン）は割っていない。
+//   だから各音源の計算順も丸めも変わらず、**厳密に一致するはず**。
+//
+//   ★ここは「だいたい合っている」では意味がない。**1 ビットでも違えば、割ってはいけない
+//     ものを割っている**ということなので、許容差ではなく厳密比較にする。
+//     （速い経路と参照経路を許容差で縛るのは分割畳み込みのような**別物**の場合。
+//       ここは同じ計算を場所を変えてやるだけなので、一致しないほうがおかしい。）
+// ─────────────────────────────────────────────────────────────────────
+void testWorkerThreads() {
+    std::printf("\n[複数コア] 直列と並列がビット一致するか\n");
+
+    // 遮蔽された音源を多めに置く（diffractionComposite が走る＝いちばん重い経路）。
+    auto build = [](int threads) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        const float h = 4.0f, t = 0.3f, hw = 9.0f, hd = 9.0f;
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        // 衝立を 2 枚。半分の音源を影に入れる。
+        AF_SceneAddInstanceBox(s, V(-4.0f, h*0.5f, 0), V(2.5f, h*0.5f, 0.3f), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( 4.0f, h*0.5f, 1.0f), V(2.5f, h*0.5f, 0.3f), V(1,0,0), V(0,1,0), m);
+        AF_SceneSetListener(s, V(0, 1.6f, -6.0f));
+        for (int i = 0; i < 12; ++i) {
+            const float x = -7.0f + i * 1.3f;
+            AF_SceneSetSource(s, static_cast<unsigned long long>(200 + i), V(x, 1.6f, 4.0f));
+        }
+        AF_SceneSetWorkerThreads(s, threads);
+        for (int k = 0; k < 6; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        return s;
+    };
+
+    // ★2 種類に分けて集める。並列化のしかたが違うので、要求できる強さが違う。
+    //
+    //   exact  … 早期反射・回折二次音源。**音源ごとに自分の枠にしか書かない**段なので、
+    //            各音源の計算順も丸めも変わらない ＝ **ビット一致を要求できる**。
+    //   approx … 生存6帯域・到来方向・遮蔽スカラ。この中には
+    //            occlusionReflectedMulti の**反射の足し込み**が入っている。
+    //            レイを全音源で共有して同じ箱へ足すので、塊で割ると足す順が変わる。
+    //            ＝ ビット一致は要求できない。**許容差で押さえる**。
+    auto collectExact = [](AF_SceneHandle s, std::vector<float>& out) {
+        out.clear();
+        for (int i = 0; i < 12; ++i) {
+            const int idx = AF_SceneSourceIndex(s, static_cast<unsigned long long>(200 + i));
+            AF_Vector3 ep[8]; float eg[8 * kBands];
+            const int ne = AF_SceneGetEarlyReflections(s, idx, ep, eg, 8);
+            out.push_back(static_cast<float>(ne));
+            for (int k = 0; k < ne; ++k) {
+                out.push_back(ep[k].x); out.push_back(ep[k].y); out.push_back(ep[k].z);
+                for (int b2 = 0; b2 < kBands; ++b2) out.push_back(eg[k * kBands + b2]);
+            }
+            AF_Vector3 dp[8]; float dg[8];
+            const int nd = AF_SceneGetDiffractionSources(s, idx, dp, dg, 8);
+            out.push_back(static_cast<float>(nd));
+            for (int k = 0; k < nd; ++k) {
+                out.push_back(dp[k].x); out.push_back(dp[k].y); out.push_back(dp[k].z);
+                out.push_back(dg[k]);
+            }
+        }
+    };
+    auto collectApprox = [](AF_SceneHandle s, std::vector<float>& out) {
+        out.clear();
+        for (int i = 0; i < 12; ++i) {
+            const int idx = AF_SceneSourceIndex(s, static_cast<unsigned long long>(200 + i));
+            float b[kBands] = {};
+            AF_SceneGetSourceOcclusion(s, idx, b);
+            for (int k = 0; k < kBands; ++k) out.push_back(b[k]);
+            float d[3] = {};
+            AF_SceneGetSourceArrivalDir(s, idx, d);
+            out.push_back(d[0]); out.push_back(d[1]); out.push_back(d[2]);
+            out.push_back(AF_SceneGetSourceOcclusionScalar(s, idx));
+        }
+    };
+    auto collect = collectExact;
+
+    std::vector<float> serial, par2, par4;
+    AF_SceneHandle s1 = build(1); collect(s1, serial);
+    const int got1 = AF_SceneGetWorkerThreads(s1);
+    AF_SceneDestroy(s1);                       // ★ここで join される
+    AF_SceneHandle s2 = build(2); collect(s2, par2);
+    const int got2 = AF_SceneGetWorkerThreads(s2);
+    AF_SceneDestroy(s2);
+    AF_SceneHandle s4 = build(4); collect(s4, par4);
+    const int got4 = AF_SceneGetWorkerThreads(s4);
+    AF_SceneDestroy(s4);
+
+    char note[160];
+    std::snprintf(note, sizeof(note), "(設定 1/2/4 → 実際 %d/%d/%d)", got1, got2, got4);
+    check("[複数コア] スレッド数が設定どおり入る", got1 == 1 && got2 == 2 && got4 == 4, note);
+
+    auto exactSame = [&](const std::vector<float>& a, const std::vector<float>& b,
+                         const char* label) {
+        if (a.size() != b.size()) {
+            std::snprintf(note, sizeof(note), "(要素数が違う %zu vs %zu)", a.size(), b.size());
+            check(label, false, note);
+            return;
+        }
+        // ★型紙 B（設定不変）を共有の式で（detectors.h）。
+        //   「速くするだけの設定」は音を変えてはいけない。型紙 5（同じ設定で 2 回）とは別物。
+        //   ★今日いちばん使った型紙。並列／共有バス／エコグラム分割の 3 つを全部これで見た。
+        af::detect::Break br[8];
+        const int nv = af::detect::invariantUnderSetting(a.data(), b.data(), (int)a.size(),
+                                                         /*exact=*/true, 0.0f, br, 8);
+        std::snprintf(note, sizeof(note), "(%zu 個中 違い %d 個%s)", a.size(), nv,
+                      nv ? "" : " ＝ 完全一致");
+        check(label, nv == 0, note);
+        if (nv) std::printf("        ★最初の食い違い: [%d] %.9g vs %.9g\n",
+                            br[0].index, a[(size_t)br[0].index], b[(size_t)br[0].index]);
+    };
+    std::printf("        音源 12 本（半分は衝立の影）\n");
+    std::printf("        ① 音源ごとの段（早期反射・回折二次音源）／比べる値 %zu 個\n", serial.size());
+    exactSame(serial, par2, "[複数コア] 2 コアの音源ごとの段がビット一致");
+    exactSame(serial, par4, "[複数コア] 4 コアの音源ごとの段がビット一致");
+
+    // ② 反射の足し込みが入る量は許容差で。丸めの差だけのはず。
+    {
+        std::vector<float> aS, aP;
+        { AF_SceneHandle s = build(1); collectApprox(s, aS); AF_SceneDestroy(s); }
+        { AF_SceneHandle s = build(4); collectApprox(s, aP); AF_SceneDestroy(s); }
+        double worstRel = 0.0;
+        const size_t n = std::min(aS.size(), aP.size());
+        for (size_t k = 0; k < n; ++k) {
+            const double den = std::max(std::fabs((double)aS[k]), 1e-6);
+            if (std::fabs((double)aS[k]) > 1e-5)
+                worstRel = std::max(worstRel, std::fabs((double)aP[k] - (double)aS[k]) / den);
+        }
+        std::snprintf(note, sizeof(note), "(%zu 個 / 最大相対差 %.3e)", n, worstRel);
+        std::printf("        ② 反射の足し込みが入る量（生存・到来方向）は許容差で\n");
+        check("[複数コア] 生存・到来方向が直列と一致（相対差 < 1e-4）",
+              worstRel < 1e-4 && n > 0, note);
+    }
+
+    // ─── エコグラム: レイで割るので**ビット一致しない**。許容差で押さえる ───
+    //   レイは全音源で共有していて同じビンへ足し込むので、スレッドごとに別の箱へ積んで
+    //   最後に足す。浮動小数の足す順が変わるため厳密には一致しない。
+    //   ★ただし塊の割り方は固定なので、**実行のたびには揺れない**。そこは厳密に縛る。
+    //   （速い経路と参照経路を許容差で縛るのは分割畳み込みと同じ作り。dsp_regression 参照）
+    auto collectEcho = [](AF_SceneHandle s, std::vector<float>& out) {
+        out.clear();
+        std::vector<float> e(100 * kBands);
+        for (int i = 0; i < 12; ++i) {
+            const int idx = AF_SceneSourceIndex(s, static_cast<unsigned long long>(200 + i));
+            const int bins = AF_SceneGetEchogramBands(s, idx, e.data(), 100);
+            for (int k = 0; k < bins * kBands; ++k) out.push_back(e[static_cast<size_t>(k)]);
+        }
+    };
+    std::vector<float> echoSerial, echoPar4a, echoPar4b;
+    { AF_SceneHandle s = build(1); collectEcho(s, echoSerial); AF_SceneDestroy(s); }
+    { AF_SceneHandle s = build(4); collectEcho(s, echoPar4a);  AF_SceneDestroy(s); }
+    { AF_SceneHandle s = build(4); collectEcho(s, echoPar4b);  AF_SceneDestroy(s); }
+
+    // ① 実行のたびに揺れないこと（塊の割り方が固定なら厳密に一致するはず）
+    {
+        // ★型紙 5（決定的）を共有の式で。元になったバグ: 並列で BVH の遅延構築が競合した。
+        const int n = (int)std::min(echoPar4a.size(), echoPar4b.size());
+        af::detect::Break br[8];
+        const int nd2 = af::detect::deterministic(echoPar4a.data(), echoPar4b.data(), n,
+                                                  0.0f, br, 8);
+        af::detect::report("型紙5 決定的", br, nd2, "");
+        std::snprintf(note, sizeof(note), "(%d 個中 違い %d 個%s)", n, nd2,
+                      nd2 ? "" : " ＝ 実行のたびに同じ");
+        check("[複数コア] 並列のエコグラムが実行のたびに揺れない", nd2 == 0 && n > 0, note);
+    }
+    // ② 直列と許容差で一致すること（丸めの差だけのはず）
+    {
+        double worstRel = 0.0; double sumS = 0.0, sumP = 0.0;
+        const size_t n = std::min(echoSerial.size(), echoPar4a.size());
+        for (size_t k = 0; k < n; ++k) {
+            sumS += echoSerial[k]; sumP += echoPar4a[k];
+            const double den = std::max(std::fabs((double)echoSerial[k]), 1e-9);
+            const double rel = std::fabs((double)echoPar4a[k] - (double)echoSerial[k]) / den;
+            if (std::fabs((double)echoSerial[k]) > 1e-7) worstRel = std::max(worstRel, rel);
+        }
+        const double totalRel = (sumS > 1e-9) ? std::fabs(sumP - sumS) / sumS : 0.0;
+        std::snprintf(note, sizeof(note), "(最大相対差 %.3e / 総和の差 %.3e)", worstRel, totalRel);
+        check("[複数コア] 並列のエコグラムが直列と一致（相対差 < 1e-4）",
+              worstRel < 1e-4 && totalRel < 1e-6, note);
+        // ★型紙 B の**許容差版**を共有の式で（上のビット一致版と同じ関数の別モード）。
+        //   エコグラムはレイを塊で割って最後に足すので、浮動小数の足す順が変わりビット一致しない。
+        //   「速くするだけの設定が音を変えていないか」を許容差で縛るのがここ。
+        af::detect::Break br[8];
+        const int nv2 = af::detect::invariantUnderSetting(
+            echoSerial.data(), echoPar4a.data(), (int)n, /*exact=*/false, 1e-4f, br, 8);
+        af::detect::report("型紙B 設定不変(許容差)", br, nv2, " 相対");
+        std::snprintf(note, sizeof(note), "(%zu 個中 外れ %d 個)", n, nv2);
+        check("[複数コア] 型紙B 並列にしても音が変わらない", nv2 == 0, note);
+    }
+
+    // ★どれだけ速くなるか。ゲームレーンの場面（遮蔽音源が多い）に寄せて測る。
+    //   割っているのは音源ごとの段だけなので、遮蔽音源が多いほど効く。
+    std::printf("        速さ（音源 12 本・半分が影）\n");
+    std::printf("          %8s %10s %10s\n", "コア", "ms/frame", "直列比");
+    double base1 = 0.0;
+    for (int th : {1, 2, 4, 8}) {
+        AF_SceneHandle s = build(th);
+        using clk = std::chrono::high_resolution_clock;
+        for (int k = 0; k < 20; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);   // 暖機
+        const auto t0 = clk::now();
+        const int N = 120;
+        for (int k = 0; k < N; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count() / N;
+        if (th == 1) base1 = ms;
+        std::printf("          %8d %10.3f %9.2fx\n", th, ms, (ms > 0) ? base1 / ms : 0.0);
+        AF_SceneDestroy(s);
+    }
+    std::printf("        ※ 音源ごとの段（ビット一致）とレイの段（許容差）の両方を割っている。\n"
+                "          残る直列は 部屋・BVH 構築など。そこが頭打ちを作る。\n");
+
+    // ★エコグラムを切って、音源ごとの段だけを見る。
+    //   ゲームレーンの場面（遮蔽音源 10 本超・per-source が費用のほぼ全部）に近いのはこちら。
+    //   上の数字は「エコグラムが半分を占める場面での全体の伸び」で、天井ではない。
+    std::printf("        速さ（同じ場面でエコグラムを切る＝音源ごとの段だけを見る）\n");
+    std::printf("          %8s %10s %10s\n", "コア", "ms/frame", "直列比");
+    double baseNo = 0.0;
+    for (int th : {1, 2, 4, 8}) {
+        AF_SceneHandle s = build(th);
+        AF_UpdateConfig c{};
+        c.role1EveryN = 1; c.role2EveryN = 4; c.earlyEveryN = 1;
+        c.diffSrcEveryN = 1;
+        c.reflectionRays = 256; c.reflectionBounces = 3;
+        c.directWeight = 1.0f; c.useReflections = 1;
+
+        c.enableReverb = 0;                       // ← ここだけ切る
+        c.speedOfSound = 343.0f; c.distanceRef = 1.5f;
+        c.enableEarlyReflections = 1; c.earlyTaps = 4; c.earlyRays = 512; c.earlyBounces = 2;
+        c.enableDiffractionSources = 1; c.diffSources = 3;
+        AF_SceneSetUpdateConfig(s, &c);
+        using clk = std::chrono::high_resolution_clock;
+        for (int k = 0; k < 20; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        const auto t0 = clk::now();
+        const int N = 120;
+        for (int k = 0; k < N; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count() / N;
+        if (th == 1) baseNo = ms;
+        std::printf("          %8d %10.3f %9.2fx\n", th, ms, (ms > 0) ? baseNo / ms : 0.0);
+        AF_SceneDestroy(s);
+    }
+
+    // 破棄でスレッドが確実に畳まれること。畳めていなければここで固まるか落ちる。
+    //   ★Unity のドメインリロードで固まる事故は、まさにこれが畳めていないと起きる。
+    for (int k = 0; k < 8; ++k) {
+        AF_SceneHandle s = build(4);
+        AF_SceneDestroy(s);
+    }
+    check("[複数コア] 作って壊してを 8 回繰り返しても固まらない", true, "(join できている)");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 【段】音源ごとに「どこまで解くか」を固定する
+//
+//   厳密   … 回折の合成まで。体験の芯
+//   簡易   … 遮蔽の音量と帯域カーブだけ。回り込みの方向は出ない
+//   バーチャル … 解かない
+//
+//   ★見たいのは 3 つ:
+//     ① 段を下げても**遮蔽の量は残る**（簡易でも「其処に何か在る」は伝わる）
+//     ② 段を下げると**費用が下がる**
+//     ③ 自動バーチャルが**響く部屋では発動しない**（残響が担っているので切ってはいけない）
+// ─────────────────────────────────────────────────────────────────────
+void testSourceTiers() {
+    std::printf("\n[段] 音源ごとに解く深さを決める\n");
+
+    // 衝立の裏に音源。遮蔽されているので厳密と簡易で差が出る。
+    auto build = []() {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        const float h = 4.0f, t = 0.3f, hw = 9.0f, hd = 9.0f;
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(3.0f, h*0.5f, 0.3f), V(1,0,0), V(0,1,0), m);
+        AF_SceneSetListener(s, V(0, 1.6f, -5.0f));
+        AF_SceneSetSource(s, 1, V(0, 1.6f, 5.0f));   // 衝立の真後ろ
+        return s;
+    };
+
+    // ① 段ごとの結果
+    std::printf("        %-10s %10s %10s %10s %8s\n",
+                "段", "生存125Hz", "生存4kHz", "こもり倍率", "二次音源");
+    float occ0[kBands] = {}, occ1[kBands] = {}, occ2[kBands] = {};
+    int nd0 = 0, nd1 = 0, nd2 = 0;
+    const char* names[3] = {"厳密", "簡易", "バーチャル"};
+    for (int tier = 0; tier < 3; ++tier) {
+        AF_SceneHandle s = build();
+        AF_SceneSetSourceTier(s, 1, tier);
+        for (int k = 0; k < 6; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        const int idx = AF_SceneSourceIndex(s, 1);
+        float b[kBands] = {};
+        AF_SceneGetSourceOcclusion(s, idx, b);
+        AF_Vector3 dp[8]; float dg[8];
+        const int nd = AF_SceneGetDiffractionSources(s, idx, dp, dg, 8);
+        const float ratio = (b[5] > 1e-9f) ? b[0] / b[5] : 0.0f;
+        std::printf("        %-10s %10.5f %10.5f %10.2f %8d\n", names[tier], b[0], b[5], ratio, nd);
+        for (int k = 0; k < kBands; ++k)
+            (tier == 0 ? occ0 : tier == 1 ? occ1 : occ2)[k] = b[k];
+        (tier == 0 ? nd0 : tier == 1 ? nd1 : nd2) = nd;
+        AF_SceneDestroy(s);
+    }
+    char note[160];
+    // 簡易でも遮蔽は残る（音量と帯域カーブは出る）。
+    std::snprintf(note, sizeof(note), "(簡易 125Hz %.5f / 4kHz %.5f)", occ1[0], occ1[5]);
+    check("[段] 簡易でも遮蔽の量が残る（素通しにならない）", occ1[0] < 0.99f && occ1[5] < 0.99f, note);
+    // 簡易でも「低いほうが通る」形は出る。これが「其処に何か在る」を伝える最低限。
+    std::snprintf(note, sizeof(note), "(簡易 こもり倍率 %.2f)", occ1[0] / std::max(occ1[5], 1e-9f));
+    check("[段] 簡易でもこもりの向きが出る（125Hz > 4kHz）", occ1[0] > occ1[5], note);
+    // バーチャルは解かない＝素通し。
+    std::snprintf(note, sizeof(note), "(バーチャル 125Hz %.5f / 4kHz %.5f)", occ2[0], occ2[5]);
+    check("[段] バーチャルは解かない（自由音場のまま）", occ2[0] > 0.99f && occ2[5] > 0.99f, note);
+    // 二次音源は厳密だけ。
+    std::snprintf(note, sizeof(note), "(厳密 %d / 簡易 %d / バーチャル %d)", nd0, nd1, nd2);
+    check("[段] 回折二次音源は厳密だけ", nd0 > 0 && nd1 == 0 && nd2 == 0, note);
+
+    // ② 費用。音源を増やして段ごとに測る。
+    std::printf("        費用（衝立の裏に音源 12 本）\n");
+    std::printf("          %-10s %10s %10s\n", "段", "ms/frame", "厳密比");
+    double base = 0.0;
+    for (int tier = 0; tier < 3; ++tier) {
+        AF_SceneHandle s = build();
+        for (int i = 0; i < 12; ++i) {
+            AF_SceneSetSource(s, static_cast<unsigned long long>(300 + i),
+                              V(-6.0f + i * 1.1f, 1.6f, 5.0f));
+            AF_SceneSetSourceTier(s, static_cast<unsigned long long>(300 + i), tier);
+        }
+        using clk = std::chrono::high_resolution_clock;
+        for (int k = 0; k < 20; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        const auto t0 = clk::now();
+        const int N = 120;
+        for (int k = 0; k < N; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count() / N;
+        if (tier == 0) base = ms;
+        std::printf("          %-10s %10.3f %9.2fx\n", names[tier], ms, (ms > 0) ? base / ms : 0.0);
+        if (tier == 2) {
+            std::snprintf(note, sizeof(note), "(厳密 %.3f → バーチャル %.3f ms)", base, ms);
+            check("[段] バーチャルは厳密よりはっきり安い", ms < base * 0.7, note);
+        }
+        AF_SceneDestroy(s);
+    }
+
+    // ③ ★自動バーチャルが響く部屋で発動しないこと（いちばん大事）
+    //   板の案は「自由音場で聞こえないなら遮蔽込みでも聞こえない」だったが、
+    //   **残響は音を足す**ので、そのまま距離で切ると響く部屋で聞こえている音を黙らせる。
+    {
+        AF_SceneHandle s = build();          // 閉じた部屋（響く）
+        // ★半径は rc より**大きく**取る。
+        //   rc は「直接音と残響が同じ大きさになる距離」。半径 > rc なら、
+        //   残響の大きさ ＝ 直接音の rc での大きさ ＞ 可聴限界（＝半径での大きさ）。
+        //   つまり残響が可聴限界より上まで届いている ＝ 距離では切れない。
+        //   逆に半径 < rc なら残響は可聴限界より下なので、自由音場の判定で安全。
+        //   （最初この向きを取り違えて、半径 1.0m・rc 1.81m で「切るな」と書いて落とした）
+        AF_SceneSetSourceAudibleRadius(s, 1, 4.0f);   // rc(約1.8m) より大きい
+        for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        const int idx = AF_SceneSourceIndex(s, 1);
+        const int eff = AF_SceneGetSourceTierEffective(s, idx);   // 距離は 10m ある
+        float rt[kBands] = {};
+        AF_SceneRt60At(s, V(0, 1.6f, -5.0f), 2.0f, rt, kBands);
+        const float vol = AF_SceneRoomVolumeAt(s, V(0, 1.6f, -5.0f), 2.0f);
+        const float rtMid = 0.5f * (rt[2] + rt[3]);
+        const float rc = (vol > 1.0f && rtMid > 1e-3f) ? 0.057f * std::sqrt(vol / rtMid) : 1e9f;
+        std::snprintf(note, sizeof(note), "(体積 %.0fm3 / RT60中域 %.2fs / rc %.2fm / 段 %d)",
+                      vol, rtMid, rc, eff);
+        check("[段] 響く部屋では自動バーチャルへ落とさない", eff == 0, note);
+        std::printf("        → rc(%.2fm) <= 聞こえる半径(4.0m) なら残響が担っている。切らない。\n", rc);
+        AF_SceneDestroy(s);
+    }
+    // 屋外（部屋にならない＝残響が担わない）なら、距離で落とす。
+    {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -0.3f, 0), V(40, 0.3f, 40), V(1,0,0), V(0,1,0), m);
+        AF_SceneSetListener(s, V(0, 1.6f, 0));
+        AF_SceneSetSource(s, 1, V(0, 1.6f, 30.0f));
+        AF_SceneSetSourceAudibleRadius(s, 1, 5.0f);   // 30m は遠い
+        for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        const int eff = AF_SceneGetSourceTierEffective(s, AF_SceneSourceIndex(s, 1));
+        std::snprintf(note, sizeof(note), "(屋外・距離 30m / 半径 5m / 段 %d)", eff);
+        check("[段] 屋外の遠い音源は自動でバーチャルへ落ちる", eff == 2, note);
+
+        // ヒステリシス: 半径のすぐ内側へ戻せば復帰し、境目で往復しない。
+        AF_SceneSetSource(s, 1, V(0, 1.6f, 5.8f));    // 出の閾(6.25m)より内、入り(5m)より外
+        for (int k = 0; k < 2; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        const int mid = AF_SceneGetSourceTierEffective(s, AF_SceneSourceIndex(s, 1));
+        AF_SceneSetSource(s, 1, V(0, 1.6f, 4.0f));    // 入りの閾より内
+        for (int k = 0; k < 2; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        const int in = AF_SceneGetSourceTierEffective(s, AF_SceneSourceIndex(s, 1));
+        std::snprintf(note, sizeof(note), "(5.8m で %d のまま / 4.0m で %d へ復帰)", mid, in);
+        check("[段] ヒステリシス: 帯の中では段が動かず、内側で復帰する",
+              mid == 2 && in == 0, note);
+        AF_SceneDestroy(s);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 【調整支援】「この地点でこう聞こえてほしい」に合わせるための土台
+//
+//   道具の流れ:
+//     ① いま届いている音の内訳を採る（透過ぶん / 回折ぶん）
+//     ② 透過が担っているなら、**誰が担っているか**を engine に名指しさせる
+//     ③ その材質を書き換える → 音が動く
+//     ④ 届かない目標は「届かない」と分かる
+//
+//   ★ここで縛るのは②③④。①は既存の API（GetSourceOcclusion / ComputeSoftOcclusion）。
+//   ⚠ 回折が担っている帯域では材質を触っても動かない。それも検査で押さえる
+//     （効かないつまみを回し続けるのが、この手の道具のいちばんの失敗）。
+// ─────────────────────────────────────────────────────────────────────
+void testTuningSupport() {
+    std::printf("\n[調整支援] 誰が担っているかを名指しできるか\n");
+
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mWall = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);   // 既定の壁
+    // 扉だけ別の材質にする。壁より通す＝担い手になるはず。
+    const float trDoor[kBands] = {0.02f, 0.015f, 0.010f, 0.006f, 0.004f, 0.003f};
+    const float abDoor[kBands] = {0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f};
+    const int mDoor = AF_SceneAddMaterial(s, trDoor, abDoor, nullptr, kBands);
+
+    const float h = 4.0f, t = 0.3f, hw = 6.0f, hd = 6.0f;
+    AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), mWall);
+    AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), mWall);
+    // 音源とリスナーのあいだに、壁 1 枚＋扉 1 枚。扉のほうがよく通す。
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(hw+t, h*0.5f, 0.2f), V(1,0,0), V(0,1,0), mWall);
+    const unsigned long long door =
+        AF_SceneAddInstanceBox(s, V(0, 1.6f, 1.5f), V(0.5f, 1.0f, 0.05f), V(1,0,0), V(0,1,0), mDoor);
+    (void)door;
+    const AF_Vector3 L = V(0, 1.6f, -4.0f), S = V(0, 1.6f, 4.0f);
+    AF_SceneSetListener(s, L);
+    AF_SceneSetSource(s, 1, S);
+    for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+
+    // ② 担い手を名指しできるか
+    int inst[8], mat[8]; float lossDb[8];
+    const int nc = AF_SceneTransmissionCarriers(s, L, S, inst, mat, lossDb, 8);
+    std::printf("        担い手 %d 件（透過損失の大きい順）\n", nc);
+    for (int i = 0; i < nc; ++i)
+        std::printf("          [%d] 実体 %d / 材質 %d / 透過損失 %.1f dB%s\n",
+                    i, inst[i], mat[i], lossDb[i], (mat[i] == mDoor) ? "  ← 扉" : "");
+    char note[160];
+    std::snprintf(note, sizeof(note), "(%d 件 / 先頭の材質 %d)", nc, nc > 0 ? mat[0] : -1);
+    check("[調整] 経路上の遮蔽物を名指しできる", nc >= 2, note);
+    // 壁のほうが遮る＝損失が大きいので先頭に来るはず（順序が壊れていないか）。
+    bool sorted = true;
+    for (int i = 1; i < nc; ++i) if (lossDb[i] > lossDb[i - 1] + 1e-4f) sorted = false;
+    check("[調整] 透過損失の大きい順に並ぶ", sorted, "");
+
+    // ③ ★名指しの順が**効き目の順**になっているか
+    //   道具の値打ちは「どれを触れば効くか」を当てること。1 番目を触ったときのほうが
+    //   2 番目を触ったときより大きく動かなければ、名指しに意味が無い。
+    //   ⚠ ここは倍率ではなく**大小関係**で縛る（絶対値で書かない方針）。
+    float before[kBands] = {};
+    AF_SceneGetSourceOcclusion(s, AF_SceneSourceIndex(s, 1), before);
+    auto bumpAndMeasure = [&](int matId, const float* baseTr) {
+        float tr2[kBands];
+        for (int b = 0; b < kBands; ++b) tr2[b] = std::min(1.0f, baseTr[b] * 10.0f);
+        AF_SceneSetMaterial(s, matId, tr2, abDoor, nullptr, kBands);
+        for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        float g[kBands] = {};
+        AF_SceneGetSourceOcclusion(s, AF_SceneSourceIndex(s, 1), g);
+        AF_SceneSetMaterial(s, matId, baseTr, abDoor, nullptr, kBands);   // 戻す
+        for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        return g[0];
+    };
+    // 1 番目（壁）の元の透過率を engine から引く。
+    float trWall[kBands] = {};
+    AF_SceneGetMaterial(s, mat[0], trWall, nullptr, nullptr, kBands);
+    const float top = bumpAndMeasure(mat[0], trWall);
+    const float second = bumpAndMeasure(mat[1], trDoor);
+    std::printf("        125Hz %.5f を基準に、10 倍にしたときの動き\n", before[0]);
+    std::printf("          1番目(材質%d) → %.5f （%.2f 倍）\n", mat[0], top, top / before[0]);
+    std::printf("          2番目(材質%d) → %.5f （%.2f 倍）\n", mat[1], second, second / before[0]);
+    std::snprintf(note, sizeof(note), "(1番目 %.2f倍 / 2番目 %.2f倍)",
+                  top / before[0], second / before[0]);
+    check("[調整] 1番目の担い手のほうがよく効く（名指しに意味がある）", top > second, note);
+
+    // ④ 回折が担っている帯域では材質を触っても動かない ── それが見えること。
+    //   透過だけの値と合成後の値を並べれば、差が回折の取り分になる。
+    {
+        float soft[kBands] = {}; float occFrac = 0.0f;
+        AF_SceneComputeSoftOcclusion(s, L, S, soft, kBands, &occFrac);
+        float comb[kBands] = {};
+        AF_SceneGetSourceOcclusion(s, AF_SceneSourceIndex(s, 1), comb);
+        std::printf("        内訳(125Hz) 透過のみ %.5f / 合成後 %.5f  → 回折の取り分 %.5f\n",
+                    soft[0], comb[0], std::max(0.0f, comb[0] - soft[0]));
+        check("[調整] 透過ぶんと合成後を別々に採れる（回折の取り分が出せる）",
+              soft[0] >= 0.0f && comb[0] >= soft[0] - 1e-3f, "");
+    }
+    AF_SceneDestroy(s);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 【早期反射の共有】音源ごとに撃つのをやめて、リスナーから 1 回にした影響
+//
+//   レイの経路（原点・方向・当たり・バウンス）は全音源で同一なので共有できる。
+//   ⚠ ただし 1 つだけ音源に依存する量がある ── レイの飛距離 maxDist(=refDist×8+50)。
+//     共有するには**いちばん遠い音源**に合わせるので、近い音源のレイは以前より長く飛ぶ。
+//     → 遠くの弱いタップが増える可能性がある。**上位 N の選び方が変わっていないか**を見る。
+//
+//   基準は「その音源だけのシーン」。1 音源なら maxDist は元と同じなので、
+//   共有版でも個別版と同じ答えになるはず。それと群れの中での値を比べる。
+// ─────────────────────────────────────────────────────────────────────
+void testEarlySharing() {
+    std::printf("\n[早期反射・共有] 1 音源のときと群れの中で答えが変わらないか\n");
+
+    auto build = [](int nSrc) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        const float h = 4.0f, t = 0.3f, hw = 8.0f, hd = 8.0f;
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneSetListener(s, V(0, 1.6f, -6.0f));
+        // ★距離をばらけさせる。近い音源ほど「飛距離を遠い音源に合わせた」影響を受ける。
+        for (int i = 0; i < nSrc; ++i)
+            AF_SceneSetSource(s, static_cast<unsigned long long>(400 + i),
+                              V(-5.0f + i * 2.5f, 1.6f, -4.0f + i * 3.0f));
+        for (int k = 0; k < 6; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        return s;
+    };
+
+    const int kSrc = 5;
+    // 群れの中での値
+    AF_SceneHandle sAll = build(kSrc);
+    // 音源 0 番だけのシーン（＝共有しても個別版と同じになる基準）
+    AF_SceneHandle sOne = AF_SceneCreate();
+    {
+        const int m = AF_SceneAddMaterial(sOne, nullptr, nullptr, nullptr, 0);
+        const float h = 4.0f, t = 0.3f, hw = 8.0f, hd = 8.0f;
+        AF_SceneAddInstanceBox(sOne, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(sOne, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(sOne, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(sOne, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(sOne, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(sOne, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneSetListener(sOne, V(0, 1.6f, -6.0f));
+        AF_SceneSetSource(sOne, 400, V(-5.0f, 1.6f, -4.0f));
+        for (int k = 0; k < 6; ++k) AF_SceneUpdate(sOne, 1.0f / 60.0f);
+    }
+
+    AF_Vector3 pA[8], pB[8]; float gA[8 * kBands], gB[8 * kBands];
+    const int nA = AF_SceneGetEarlyReflections(sAll, AF_SceneSourceIndex(sAll, 400), pA, gA, 8);
+    const int nB = AF_SceneGetEarlyReflections(sOne, AF_SceneSourceIndex(sOne, 400), pB, gB, 8);
+    std::printf("        いちばん近い音源のタップ数: 群れの中 %d / 単独 %d\n", nA, nB);
+
+    double worst = 0.0, sumA = 0.0, sumB = 0.0;
+    const int nc = std::min(nA, nB);
+    for (int k = 0; k < nc * kBands; ++k) {
+        sumA += gA[k]; sumB += gB[k];
+        worst = std::max(worst, std::fabs((double)gA[k] - (double)gB[k]));
+    }
+    const double rel = (sumB > 1e-9) ? std::fabs(sumA - sumB) / sumB : 0.0;
+    std::printf("        エネルギー和 群れ %.4f / 単独 %.4f（相対差 %.2e）最大の差 %.3e\n",
+                sumA, sumB, rel, worst);
+    char note[160];
+    std::snprintf(note, sizeof(note), "(タップ数 %d vs %d / 総和の相対差 %.2e)", nA, nB, rel);
+    // ★飛距離を遠い音源に合わせたぶん、遠くの弱いタップが増えうる。
+    //   上位の並びが変わっていなければ、聞こえ方は変わらない。
+    check("[早期反射] 共有しても上位のタップが変わらない（相対差 < 5%）",
+          nA == nB && rel < 0.05, note);
+
+    AF_SceneDestroy(sAll);
+    AF_SceneDestroy(sOne);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 【幾何が主役か】ポータルを切っても素の回折で音が出るか
+//
+//   元の判定基準（[[portal-is-precision-not-mechanism]]）:
+//     「ポータルを全部消しても音が出るか」。出れば幾何が主役、出なければ authoring
+//
+//   2026-08-23 にこれを「**手置きを**全部消しても音が出るか」へ読み替えた。
+//   自動ポータルは部屋グラフ（ボクセル分割）から出ていて誰も注記していない ＝ 幾何そのもの、
+//   という理由。「自動ポータルを消しても動け」は「BVH を消しても動け」に近い。
+//
+//   ⚠ ただし読み替えで**安全網が 1 枚減る**。自動生成にはパラメータがあり
+//     （最小面積・格子の大きさ・重複の距離）、外すと開口が消える。つまり
+//     「網羅性の問題」は消えたのではなく、**人の注記からパラメータ調整へ移っただけ**。
+//   → だから元の基準を検査として残す。**自動ポータルも切って、素の回折だけで音が出るか。**
+//     ここが 0 になったら、聞こえる場所を決めているのが幾何ではなくなったということ。
+// ─────────────────────────────────────────────────────────────────────
+// ★測る 2 点は 1 箇所で持つ。以前は build と測定で別々に書いていて、
+//   片方だけ動かすと「見通しを測っているのに気づかない」状態になる。
+static const AF_Vector3 kGeoL = V(-5.0f, 1.6f, -2.0f);
+static const AF_Vector3 kGeoS = V( 3.0f, 1.6f,  4.0f);
+
+void testGeometryIsPrimary() {
+    std::printf("\n[幾何が主役か] ポータルを切っても素の回折で音が出るか\n");
+
+    // 壁に戸口を 1 つ空けただけの形。ポータルを置く/置かないで比べる。
+    auto build = [](int autoPortals) {
+        AF_SceneHandle s = AF_SceneCreate();
+        AF_SceneSetAutoPortals(s, autoPortals);
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        const float h = 4.0f, t = 0.3f, hw = 8.0f, hd = 8.0f;
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        // 部屋を割る仕切り。中央に**戸口の実寸**（幅 0.9m × 高さ 2.0m・まぐさ付き）を残す。
+        //   ⚠ 最初は幅 1.6m × 天井まで開けたが、**部屋が 1 個のまま**でポータルが生えず、
+        //     ON/OFF が同じ値になって「緑だが何も測っていない」検査になった。
+        //     広い開口は「くびれのある 1 部屋」と判定されるのが正しい振る舞い。
+        AF_SceneAddInstanceBox(s, V(-4.425f, h*0.5f, 0), V(3.975f, h*0.5f, 0.25f), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( 4.425f, h*0.5f, 0), V(3.975f, h*0.5f, 0.25f), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0.0f, 3.0f, 0), V(0.45f, 1.0f, 0.25f), V(1,0,0), V(0,1,0), m);  // まぐさ
+        // ★直線が**壁を貫く**位置に置くこと。戸口を素通りすると回折ではなく見通しを測る。
+        //   最初 (-3,-4)→(3,4) にしたが、z=0 での x が 0（＝開口の真ん中）で素通りだった。
+        //   いまは z=0 で x=-2.33 ＝ 仕切りの中。届くには戸口を回り込むしかない。
+        AF_SceneSetListener(s, kGeoL);
+        AF_SceneSetSource(s, 1, kGeoS);
+        for (int k = 0; k < 8; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        return s;
+    };
+
+    float gOn[kBands] = {}, gOff[kBands] = {};
+    int pOn = 0, pOff = 0, dummy = 0;
+    {
+        AF_SceneHandle s = build(1);
+        AF_SceneComputeDiffractionBands(s, kGeoL, kGeoS, gOn, kBands);
+        AF_SceneGetPortalCounts(s, &pOn, &dummy);
+        AF_SceneDestroy(s);
+    }
+    {
+        AF_SceneHandle s = build(0);
+        AF_SceneComputeDiffractionBands(s, kGeoL, kGeoS, gOff, kBands);
+        AF_SceneGetPortalCounts(s, &pOff, &dummy);
+        AF_SceneDestroy(s);
+    }
+    // ★部屋が割れていないと開口が無く、ポータルも生えない＝比較が成立しない。
+    //   「緑だが何も測っていない」を避けるため、部屋数も出す。
+    {
+        AF_SceneHandle s = build(1);
+        int nx = 0, ny = 0, nz = 0; float cell = 0.0f;
+        AF_SceneRoomGridDims(s, &nx, &ny, &nz, &cell);
+        std::printf("        部屋 %d 個 / 格子 %dx%dx%d @%.2fm\n",
+                    AF_SceneRoomCount(s), nx, ny, nz, cell);
+        AF_SceneDestroy(s);
+    }
+    std::printf("        自動ポータル ON  ポータル %d 枚   125Hz %.5f / 4kHz %.5f\n",
+                pOn, gOn[0], gOn[5]);
+    std::printf("        自動ポータル OFF ポータル %d 枚   125Hz %.5f / 4kHz %.5f\n",
+                pOff, gOff[0], gOff[5]);
+    const float ratio = (gOn[0] > 1e-9f) ? gOff[0] / gOn[0] : 0.0f;
+    std::printf("        → 素の回折だけで ON の %.2f 倍。**0 になったら幾何の経路が死んでいる。**\n",
+                ratio);
+
+    char note[160];
+    std::snprintf(note, sizeof(note), "(ポータル無しで 125Hz %.5f / ON 比 %.2f)", gOff[0], ratio);
+    // ★量ではなく「出るか」だけを縛る。ポータルは精度の上積みなので、値が違うのは正しい。
+    //   縛りたいのは「ポータルが唯一の手段になっていないこと」。
+    check("[幾何] ポータルを全部切っても素の回折で音が出る", gOff[0] > 1e-4f, note);
+    std::printf("        ※ 2026-08-23 に基準を「手置きを全部消しても」へ読み替えたが、\n"
+                "          自動生成のパラメータ次第で開口が消えうるので、元の基準も残している。\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 【閉扉】扉を閉じたまま近づくと、あるところで急に中の音が聞こえ出さないか
+//
+//   連絡板 2026-08-23（紹介資料の測定中）で報告された症状:
+//     0.6m で -13.5dB（帯域まっすぐ＝開いた経路）／0.7m で -36.5dB（透過）
+//     **10cm で 23.0 dB。**しかも音の性質が「回り込み」から「透過」へ入れ替わる。
+//
+//   ★帯域が**まっすぐ**なのが手がかり。回折も透過も周波数依存なので、平らなのは
+//     「開口が全開（f が全帯域 1.0）」と判定されているということ。
+//   閉扉なら透過しか経路が無いので、近距離側の -13.5dB は幻の経路。
+//
+//   実機で言えば「**閉じた扉に近づくと、あるところで急に中の音が聞こえ出す**」。
+//   主題が扉なので体験にまっすぐ当たる。既知の連続性の不具合（12.5/8.8/14.9/27.6dB）の
+//   中でいちばん大きい。
+// ─────────────────────────────────────────────────────────────────────
+void testClosedDoorApproach() {
+    std::printf("\n[閉扉] 閉じた扉へ近づくときに跳ばないか\n");
+    // 連絡板の形状に合わせる: 部屋 7.08 x 3.48 x 3.0 / 戸口 0.90 幅 / 壁厚 0.16 / 扉 0.08 厚
+    const float rw = 7.08f, rd = 3.48f, rh = 3.0f, wt = 0.16f, dw = 0.90f;
+    AF_SceneHandle s = AF_SceneCreate();
+    const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    const float cx = rw * 0.5f, cz = rd;            // 戸口の中心（+Z 側の壁）
+    AF_SceneAddInstanceBox(s, V(cx, -wt, rd*0.5f), V(rw*0.5f+wt, wt, rd*0.5f+wt), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(cx, rh+wt, rd*0.5f), V(rw*0.5f+wt, wt, rd*0.5f+wt), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(-wt, rh*0.5f, rd*0.5f), V(wt, rh*0.5f, rd*0.5f+wt), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(rw+wt, rh*0.5f, rd*0.5f), V(wt, rh*0.5f, rd*0.5f+wt), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(cx, rh*0.5f, -wt), V(rw*0.5f+wt, rh*0.5f, wt), V(1,0,0), V(0,1,0), m);
+    // 戸口のある壁: 左右の袖＋まぐさ
+    const float lw = (rw - dw) * 0.5f;
+    AF_SceneAddInstanceBox(s, V(lw*0.5f, rh*0.5f, cz), V(lw*0.5f, rh*0.5f, wt), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(rw - lw*0.5f, rh*0.5f, cz), V(lw*0.5f, rh*0.5f, wt), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(cx, 2.5f, cz), V(dw*0.5f, 0.5f, wt), V(1,0,0), V(0,1,0), m);
+    // 閉じた扉（戸口と面一）
+    AF_SceneAddInstanceBox(s, V(cx, 1.0f, cz), V(dw*0.5f, 1.0f, 0.04f), V(1,0,0), V(0,1,0), m);
+    // 音源は部屋の中（戸口の左・奥）
+    AF_SceneSetSource(s, 1, V(cx - 1.94f, 1.6f, cz - 1.12f));
+
+    std::printf("        距離   総量(dB)  低−高(dB)   f使用  面 有界  縁u   v   捨\n");
+    float prevDb = 0.0f, maxJump = 0.0f, jumpAt = 0.0f;
+    bool first = true;
+    // 型紙へ渡す列（道具の走査と同じ形）。
+    std::vector<float> dbSeries, atSeries, bandSeries;
+    for (float d = 0.3f; d <= 1.51f; d += 0.1f) {
+        const AF_Vector3 L = V(cx, 1.6f, cz + d);
+        AF_SceneSetListener(s, L);
+        for (int k = 0; k < 3; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        float g[kBands] = {};
+        AF_SceneGetSourceOcclusion(s, AF_SceneSourceIndex(s, 1), g);
+        float sum = 0.0f;
+        for (int b = 0; b < kBands; ++b) sum += g[b];
+        const float db = 20.0f * std::log10(std::max(sum / kBands, 1e-6f));
+        const float tilt = 20.0f * std::log10(std::max(g[0], 1e-6f) / std::max(g[5], 1e-6f));
+        float d17[32] = {};
+        AF_SceneDebugDiffractionPath(s, L, V(cx - 1.94f, 1.6f, cz - 1.12f), d17, 0);
+        std::printf("        %4.1f m %8.1f %9.1f      %s   %.0f  %.0f   %.2f %.2f  %.0f\n",
+                    d, db, tilt, d17[18] > 0.5f ? "○" : "×",
+                    d17[22], d17[23], d17[24], d17[25], d17[26]);
+        dbSeries.push_back(db); atSeries.push_back(d);
+        for (int b = 0; b < kBands; ++b) bandSeries.push_back(g[b]);
+        if (!first) {
+            const float j = std::fabs(db - prevDb);
+            if (j > maxJump) { maxJump = j; jumpAt = d; }
+        }
+        prevDb = db; first = false;
+    }
+    std::printf("        → 0.1m あたりの最大変化 %.1f dB @ %.1f m  %s\n",
+                maxJump, jumpAt, (maxJump < 6.0f) ? "" : "未達 ←");
+
+    // ★★ ここから下は**デバッグツールの走査とまったく同じ式**（detectors.h）★★
+    //   道具が録音を走査するときに呼ぶ関数を、検査からも呼ぶ。別々の式にすると
+    //   「道具は見つけたのに検査は通る」「検査は落ちるのに道具は黙る」が起きる。
+    {
+        af::detect::Break br[16];
+        const int nj = af::detect::noJump(dbSeries.data(), atSeries.data(),
+                                          (int)dbSeries.size(), 6.0f, br, 16);
+        af::detect::report("型紙1 跳ばない(6dB)", br, nj, " dB");
+        // ★型紙4: 遮蔽されているのに帯域がまっすぐ＝幻。
+        //   閉扉なので全行が遮蔽 ＝ occluded に nullptr を渡して全行を見る。
+        const int nRows = static_cast<int>(bandSeries.size()) / af::detect::kBands;
+        const int np = af::detect::noPhantom(bandSeries.data(), nullptr,
+                                             atSeries.data(), nRows, 3.0f, br, 16);
+        af::detect::report("型紙4 幻が出ない(傾き3dB)", br, np, " dB");
+        std::printf("        ※ この 2 つは道具がキャプチャを走査するときと同じ関数です。\n");
+    }
+    std::printf(
+        "        ★原因（2026-08-23 特定）: **有界判定が二値**。\n"
+        "          積分窓の縁の開き具合 uFrac が kBoundedPerimMax(0.45) を跨いだ瞬間に\n"
+        "          「有界／半空間」が切り替わり、f を使う経路と前川へ落ちる経路が入れ替わる。\n"
+        "          上の表で 縁u 0.41→0.73 と跨いだ所で 有界 1→0、f 使用 ○→× になっている。\n"
+        "        ★しかも**2 つの模型が 20dB 食い違う**ので、どこで切り替えても崖になる。\n"
+        "          閉じた扉なら透過しか経路が無いので -37dB 側が正しく、前川側の -17dB は幻。\n"
+        "          前川は「扉が閉じている」ことを知らず、隙間幅ゲートも効いていない\n"
+        "          （帯域が平ら＝slitWidthBandGain が素通し＝slitWidthAt が広い値を返している。\n"
+        "            設計 §5-11 の失敗様態 4「まぐさに乗ると戸口の高さを測る」が生きている）。\n"
+        "        → 直し方は**滑らかに混ぜる**ことではない。20dB 食い違う 2 つを混ぜても\n"
+        "          途中がどちらでもない値になるだけ。**食い違いそのものを潰す**のが筋。\n"
+        "          設計 §5-13（f と前川は排他）に触るので、判断を仰いでから着手する。\n");
+    // ★ここは check にしていない。**既知の未解決**であり、このファイルの書き方に合わせて
+    //   数字を毎回出して「未達」と示す（合否にすると赤が常態化して意味が濁る）。
+    //   直したら check へ格上げすること。
+    AF_SceneDestroy(s);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 【診断】エコグラムの費用は音源数にどう効くか（尾を焼く前の下調べ）
+//
+//   レイはリスナーから 1 回撃って共有しているが、**各ヒットで音源数ぶん**
+//   computeTransmission を回している（[音源][ビン][帯域] へ積むため）。
+//   一方で出荷経路（VoiceConvolver）が読むのは**部屋の代表 1 本ぶんだけ**
+//   （尾の形は部屋ごとに共有＝段階①）。残りは積んで捨てている可能性がある。
+//
+//   ★焼く前に、ここがどれだけ効くのかを数字にする。
+//     音源数に強く比例するなら「部屋ごとに 1 本だけ積む」で先に減らせる。
+//     比例が弱いなら、費用はレイ側なので**焼くしかない**。
+// ─────────────────────────────────────────────────────────────────────
+// ================================================ 尾を焼く前の決定的な測定
+// ★「尾はリスナーの部屋にしか依存しない」は**仮説**。焼く仕組みを作る前に測る。
+//   ここで決まるのは:
+//     ・部屋の中で尾がほとんど変わらない → **部屋ごとに 1 本**焼けばよい（24〜120KB）
+//     ・部屋の中でも変わる               → 格子で焼く必要がある（1.5〜6MB／継ぎ目の心配）
+//   ⚠ 形（減衰の傾き）と量（レベル）を**分けて**見る。
+//     出荷経路は「形は代表・量は自分」なので、焼くのは**形**。
+//     量が場所で変わるのは正常（距離減衰）で、それは焼く対象ではない。
+void diagnoseTailProbeDensity() {
+    std::printf("\n[診断] 部屋の中で尾はどれだけ変わるか（焼く密度を決める）\n");
+
+    AF_SceneHandle s = AF_SceneCreate();
+    // ⚠ 最初この検査は 2 部屋を同じ材質・戸口 2m で組んでいて、**部屋をまたぐ差が
+    //   0.09dB** しか出なかった。2 つが音響的に 1 つの空間になっていただけで、
+    //   測っていたのは「部屋の違い」ではなかった。
+    //   → 戸口を 0.9m にして、**小部屋だけよく吸う材質**にする
+    //     （per-source を入れた元のバグ「響く部屋と吸う部屋」と同じ形にそろえる）。
+    const int mLive = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);   // 既定＝響く
+    const float absorb[kBands] = { 0.60f, 0.70f, 0.80f, 0.85f, 0.85f, 0.85f };
+    const float trans[kBands]  = { 0.0008f, 0.00025f, 0.00006f, 0.000025f, 0.00001f, 0.000006f };
+    const float scat[kBands]   = { 0.30f, 0.40f, 0.50f, 0.60f, 0.70f, 0.80f };
+    const int mDead = AF_SceneAddMaterial(s, trans, absorb, scat, kBands);    // よく吸う
+    // 大部屋（x∈[-8,0]）と小部屋（x∈[1,5]）を **0.9m の戸口**でつなぐ。高さ 3m。
+    const float h = 3.0f, t = 0.15f;
+    AF_SceneAddInstanceBox(s, V(-4.0f, h*0.5f, -6), V(4.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mLive);
+    AF_SceneAddInstanceBox(s, V(-4.0f, h*0.5f,  6), V(4.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mLive);
+    AF_SceneAddInstanceBox(s, V(-8.5f, h*0.5f,  0), V(t, h*0.5f, 6), V(1,0,0), V(0,1,0), mLive);
+    // 仕切り（戸口 z∈[-0.45,0.45]）
+    AF_SceneAddInstanceBox(s, V(0.5f, h*0.5f, -3.2f), V(t, h*0.5f, 2.75f), V(1,0,0), V(0,1,0), mLive);
+    AF_SceneAddInstanceBox(s, V(0.5f, h*0.5f,  3.2f), V(t, h*0.5f, 2.75f), V(1,0,0), V(0,1,0), mLive);
+    // 小部屋（吸う）
+    //   ⚠ 床・天井・側壁は**内寸を覆いきる**こと。最初 x∈[1,5] にしていて、
+    //     内側は x∈[0.65,4.85] なので**仕切り際に 0.35m の穴**が空いていた。
+    //     そこからエネルギーが漏れ、RT60 が Sabine より一貫して短く出た
+    //     （相対比較（開↔閉）は同じ形なので影響しないが、理論との突き合わせが濁る）。
+    AF_SceneAddInstanceBox(s, V(2.75f, h*0.5f, -3), V(2.25f, h*0.5f, t), V(1,0,0), V(0,1,0), mDead);
+    AF_SceneAddInstanceBox(s, V(2.75f, h*0.5f,  3), V(2.25f, h*0.5f, t), V(1,0,0), V(0,1,0), mDead);
+    AF_SceneAddInstanceBox(s, V(5.0f, h*0.5f,  0), V(t, h*0.5f, 3), V(1,0,0), V(0,1,0), mDead);
+    // 床・天井（大部屋側は響く、小部屋側は吸う）
+    AF_SceneAddInstanceBox(s, V(-4.0f, -t, 0), V(4.5f, t, 6), V(1,0,0), V(0,1,0), mLive);
+    AF_SceneAddInstanceBox(s, V(-4.0f, h + t, 0), V(4.5f, t, 6), V(1,0,0), V(0,1,0), mLive);
+    AF_SceneAddInstanceBox(s, V(2.75f, -t, 0), V(2.25f, t, 3), V(1,0,0), V(0,1,0), mDead);
+    AF_SceneAddInstanceBox(s, V(2.75f, h + t, 0), V(2.25f, t, 3), V(1,0,0), V(0,1,0), mDead);
+
+    constexpr int kBins = 100;
+    const float kBinSec = 0.01f;
+    std::vector<float> e(kBins * kBands);
+    AF_Vector3 src[1] = { V(-4.0f, 1.5f, 0.0f) };
+
+    // 形＝**減衰率（dB/s）**。量＝総和（dB）。
+    //
+    // ⚠ 最初は「200ms と 600ms の比」で測っていたが、**吸う部屋は 600ms で尾が無い**ので
+    //   比が数値の床に張り付き、115dB という無意味な値が出た（物理ではなく指標の問題）。
+    //   → ピークから -10dB と -25dB まで落ちる時刻を取り、その間の傾きを見る（T15 相当）。
+    //     どちらの部屋でも定義できて、RT60 = 60 / 減衰率 で読み替えられる。
+    auto measure = [&](AF_Vector3 L, float& outDecayDbPerSec, float& outLevelDb,
+                       int bounces = 32) {
+        AF_SceneComputeEchogramBands(s, L, src, 1, e.data(), kBins, kBinSec, 343.0f,
+                                     2048, bounces, 0.0f);
+        std::vector<double> band(static_cast<std::size_t>(kBins), 0.0);
+        double total = 0.0, peak = 0.0;
+        int peakBin = 0;
+        for (int k = 0; k < kBins; ++k) {
+            double v = 0.0;
+            for (int b = 0; b < kBands; ++b) v += e[static_cast<std::size_t>(k * kBands + b)];
+            band[static_cast<std::size_t>(k)] = v;
+            total += v;
+            if (v > peak) { peak = v; peakBin = k; }
+        }
+        outLevelDb = 10.0f * std::log10(static_cast<float>(total > 1e-12 ? total : 1e-12));
+        if (peak <= 1e-12) { outDecayDbPerSec = 0.0f; return; }
+        // ⚠ 「-10dB と -25dB を跨ぐビン」で測ると **10ms ビンの量子化**が乗る
+        //   （跨ぎが 1 ビン違うだけで 3 dB/s 動き、同じ部屋の中で 13.5 dB/s の
+        //     「ばらつき」に見えた。物理ではなく分解能だった）。
+        //   → ピーク -5dB 〜 -25dB の区間で **log エネルギーの最小二乗直線**を取る。
+        const double hi = peak * std::pow(10.0, -0.5);    // -5dB
+        const double lo = peak * std::pow(10.0, -2.5);    // -25dB
+        double sx = 0, sy = 0, sxx = 0, sxy = 0; int nfit = 0;
+        for (int k = peakBin; k < kBins; ++k) {
+            const double v = band[static_cast<std::size_t>(k)];
+            if (v > hi) continue;
+            if (v < lo || v <= 1e-12) break;
+            const double x = static_cast<double>(k) * kBinSec;
+            const double y = 10.0 * std::log10(v);
+            sx += x; sy += y; sxx += x * x; sxy += x * y; ++nfit;
+        }
+        if (nfit < 4) { outDecayDbPerSec = 0.0f; return; }
+        const double den = nfit * sxx - sx * sx;
+        if (std::fabs(den) < 1e-12) { outDecayDbPerSec = 0.0f; return; }
+        const double slope = (nfit * sxy - sx * sy) / den;      // dB/s（負）
+        outDecayDbPerSec = static_cast<float>(-slope);
+    };
+
+    struct Probe { const char* room; AF_Vector3 p; };
+    // ⚠ 戸口のすぐ脇は「部屋の中」ではなく境界。ばらつきに混ぜると、部屋の性質ではなく
+    //   開口の効果を測ることになる。→ 戸口から 1.5m 以上離した点だけを使う。
+    const Probe probes[] = {
+        {"大部屋", V(-6.5f, 1.5f, -4.0f)}, {"大部屋", V(-6.5f, 1.5f, 4.0f)},
+        {"大部屋", V(-5.0f, 1.5f,  0.0f)}, {"大部屋", V(-3.0f, 1.5f, -3.5f)},
+        {"大部屋", V(-3.0f, 1.5f,  3.5f)},
+        {"小部屋", V( 2.5f, 1.5f, -2.0f)}, {"小部屋", V( 4.0f, 1.5f, 2.0f)},
+        {"小部屋", V( 4.0f, 1.5f, -2.0f)}, {"小部屋", V( 2.5f, 1.5f, 2.0f)},
+    };
+    const int nP = static_cast<int>(sizeof(probes) / sizeof(probes[0]));
+
+    std::printf("      %-8s %-22s %12s %10s %8s\n",
+                "部屋", "位置", "減衰(dB/s)", "量(dB)", "RT60(s)");
+    float shape[16] = {}, level[16] = {};
+    for (int i = 0; i < nP; ++i) {
+        measure(probes[i].p, shape[i], level[i]);
+        char pos[40];
+        std::snprintf(pos, sizeof(pos), "(%.1f, %.1f)", probes[i].p.x, probes[i].p.z);
+        std::printf("      %-8s %-22s %12.1f %10.2f %8.2f\n", probes[i].room, pos,
+                    shape[i], level[i], shape[i] > 1e-3f ? 60.0f / shape[i] : 0.0f);
+    }
+
+    // 部屋の中でのばらつき（形／量）と、部屋をまたいだ差。
+    auto spread = [&](int lo, int hi, float* v, float& mn, float& mx) {
+        mn = 1e9f; mx = -1e9f;
+        for (int i = lo; i < hi; ++i) { mn = std::min(mn, v[i]); mx = std::max(mx, v[i]); }
+    };
+    float bs0, bs1, ss0, ss1, bl0, bl1, sl0, sl1;
+    spread(0, 5, shape, bs0, bs1);  spread(5, nP, shape, ss0, ss1);
+    spread(0, 5, level, bl0, bl1);  spread(5, nP, level, sl0, sl1);
+
+    std::printf("\n      %-14s %-20s %s\n", "", "減衰のばらつき", "量のばらつき");
+    std::printf("      %-14s %6.1f dB/s %-12s %6.2f dB\n", "大部屋の中", bs1 - bs0, "", bl1 - bl0);
+    std::printf("      %-14s %6.1f dB/s %-12s %6.2f dB\n", "小部屋の中", ss1 - ss0, "", sl1 - sl0);
+    const float across = std::fabs(0.5f * (bs0 + bs1) - 0.5f * (ss0 + ss1));
+    std::printf("      %-14s %6.1f dB/s（部屋どうしの中央の差）\n", "部屋をまたぐ", across);
+
+    std::printf("\n      → 判断の目安:\n");
+    std::printf("        部屋の中の**形**のばらつきが、部屋をまたぐ差よりずっと小さければ\n");
+    std::printf("        **部屋ごとに 1 本**焼けばよい（24〜120KB）。\n");
+    std::printf("        同じくらいなら格子で焼く必要がある（1.5〜6MB・継ぎ目の心配が増える）。\n");
+    char note[192];
+    std::snprintf(note, sizeof(note),
+                  "(部屋の中 大%.1f/小%.1f dB/s ／ またぐ %.1f dB/s)",
+                  bs1 - bs0, ss1 - ss0, across);
+    // ★これは**焼く設計の前提そのもの**。崩れたら「部屋ごとに 1 本」では足りない。
+    check("[診断] 尾の減衰は部屋の中より部屋をまたぐ方が大きく変わる",
+          across > std::max(bs1 - bs0, ss1 - ss0), note);
+
+    // ── ★★ 扉の状態で尾がどれだけ変わるか ★★ ─────────────────────
+    //
+    //   ここが「焼いてよいか」の本当の分かれ道。
+    //   位置依存（上）が小さくても、**扉で大きく変わるなら部屋の尾は焼けない**
+    //   ── 扉の開き具合はこの作品の主題そのもので、焼いてはいけないものだから。
+    //
+    //   目安は上で出た「部屋の中のばらつき」。
+    //     扉で変わる量 < 部屋の中のばらつき → 扉は尾に効いていない。焼いてよい
+    //     扉で変わる量 > 部屋の中のばらつき → 尾は「部屋＋扉」の関数。焼き方を変える必要がある
+    const float within = std::max(bs1 - bs0, ss1 - ss0);
+    const int door = AF_SceneAddInstanceBox(s, V(0.5f, h*0.5f, 0.0f),
+                                            V(t, h*0.5f, 0.45f), V(1,0,0), V(0,1,0), mLive);
+    std::printf("\n      扉を戸口へ入れて開閉する（部屋の中のばらつき %.1f dB/s と比べる）\n", within);
+    std::printf("      %-8s %-14s %12s %10s\n", "部屋", "扉", "減衰(dB/s)", "量(dB)");
+
+    struct Spot { const char* room; AF_Vector3 p; };
+    const Spot spots[] = { {"大部屋", V(-5.0f, 1.5f, 0.0f)}, {"小部屋", V(3.5f, 1.5f, 0.0f)} };
+    float worstDoorDelta = 0.0f, worstLevelDelta = 0.0f;
+    for (const Spot& sp : spots) {
+        float dOpen = 0, lOpen = 0, dShut = 0, lShut = 0;
+        // 開＝扉を戸口の外へどける（形として無い状態）
+        AF_SceneUpdateInstance(s, door, V(0.5f, h*0.5f, 5.5f), V(t, h*0.5f, 0.45f),
+                               V(1,0,0), V(0,1,0));
+        measure(sp.p, dOpen, lOpen);
+        // 閉＝戸口を塞ぐ
+        AF_SceneUpdateInstance(s, door, V(0.5f, h*0.5f, 0.0f), V(t, h*0.5f, 0.45f),
+                               V(1,0,0), V(0,1,0));
+        measure(sp.p, dShut, lShut);
+        std::printf("      %-8s %-14s %12.1f %10.2f\n", sp.room, "開", dOpen, lOpen);
+        std::printf("      %-8s %-14s %12.1f %10.2f   差 %.1f dB/s / %.1f dB\n",
+                    sp.room, "閉", dShut, lShut,
+                    std::fabs(dShut - dOpen), std::fabs(lShut - lOpen));
+        worstDoorDelta = std::max(worstDoorDelta, std::fabs(dShut - dOpen));
+        worstLevelDelta = std::max(worstLevelDelta, std::fabs(lShut - lOpen));
+    }
+    // ★★ 決定的な切り分け ★★
+    //   上の 389.7 dB/s は「尾がもう無い」ことの表れかもしれない（量が 33.6dB 落ちている）。
+    //   **形が扉で変わる**のか、**入ってくる量が消えただけ**なのかを分ける ──
+    //   音源を小部屋の中へ置けば、扉を閉めても小部屋自身の尾は残る。
+    //   ここで形が変わらなければ、**形＝部屋の性質／量＝扉の性質**と言い切れる。
+    {
+        AF_Vector3 saved = src[0];
+        src[0] = V(3.5f, 1.5f, 1.5f);           // 小部屋の中に音源
+        const AF_Vector3 L = V(3.0f, 1.5f, -1.5f);
+        float dOpen = 0, lOpen = 0, dShut = 0, lShut = 0;
+        AF_SceneUpdateInstance(s, door, V(0.5f, h*0.5f, 5.5f), V(t, h*0.5f, 0.45f),
+                               V(1,0,0), V(0,1,0));
+        measure(L, dOpen, lOpen);
+        AF_SceneUpdateInstance(s, door, V(0.5f, h*0.5f, 0.0f), V(t, h*0.5f, 0.45f),
+                               V(1,0,0), V(0,1,0));
+        measure(L, dShut, lShut);
+        std::printf("\n      ★音源も小部屋の中に置いた場合（形が部屋の性質かを分ける）\n");
+        std::printf("      %-8s %-14s %12.1f %10.2f\n", "小部屋", "開", dOpen, lOpen);
+        std::printf("      %-8s %-14s %12.1f %10.2f   差 %.1f dB/s / %.1f dB\n",
+                    "小部屋", "閉", dShut, lShut,
+                    std::fabs(dShut - dOpen), std::fabs(lShut - lOpen));
+        const float shapeDelta = std::fabs(dShut - dOpen);
+        std::printf("      → 同室でも扉で形が %.1f dB/s 変わる（部屋の中のばらつき %.1f dB/s）\n",
+                    shapeDelta, within);
+        std::printf("        量は %.1f dB しか変わらない ＝ **量ではなく形が変わっている**\n",
+                    std::fabs(lShut - lOpen));
+        std::printf("        RT60 で 開 %.2fs → 閉 %.2fs。吸う小部屋が、扉を開けると響く\n"
+                    "        大部屋と**結合**して減衰が遅くなり、閉めると自分の速さに戻る。\n",
+                    dOpen > 1e-3f ? 60.0f / dOpen : 0.0f, dShut > 1e-3f ? 60.0f / dShut : 0.0f);
+        std::snprintf(note, sizeof(note), "(開 %.1f → 閉 %.1f dB/s ／ 量は %.1f dB しか動かない)",
+                      dOpen, dShut, std::fabs(lShut - lOpen));
+        // ★★ 焼く設計の結論はここで出た ★★
+        //   「尾は部屋の形にしか依存しない」は**偽**だった。連成残響（coupled rooms）が効く。
+        //   扉を閉めると結合が切れて、その部屋自身の減衰に戻る。
+        //   → **部屋ごとに 1 本焼くと、この変化が丸ごと消える。**
+        //     扉の開き具合は主題そのものなので、これは失ってはいけない。
+        //   縛るのは「扉を閉めたら吸う部屋は速く乾く」。ここが崩れたら体験が壊れる。
+        check("[診断] 扉を閉めると吸う部屋は速く乾く（連成が切れる）",
+              dShut > dOpen * 1.5f && std::fabs(lShut - lOpen) < 3.0f, note);
+        src[0] = saved;
+    }
+
+    // ── ★★ 念のため: 機構を確かめる ★★ ───────────────────────────
+    //
+    //   連成残響が本当なら、効きは**2 部屋の残響時間の差**で決まるはず。
+    //   → 小部屋の吸音率を振って「効果が消える所」を探す。
+    //     消えるなら機構は連成で確定。消えないなら別の原因（＝この結論は疑わしい）。
+    //
+    //   ★あわせて **Sabine の理論値**と突き合わせる。扉を閉じれば小部屋は孤立するので
+    //     RT60 = 0.161 V / (S α) が当てはまる。数字が理論と合えば、
+    //     測定そのものが信用できる（当てはめの作りが壊れていない）。
+    {
+        // 小部屋のおおよその寸法（内側）: 4.0 × 6.0 × 3.0 m
+        //   ⚠ 変数名を V にしてはいけない。座標を作るヘルパ V(x,y,z) を隠す。
+        const float vol = 4.0f * 6.0f * 3.0f;
+        const float surf = 2.0f * (4.0f * 6.0f) + 2.0f * (4.0f * 3.0f) + 2.0f * (6.0f * 3.0f);
+        std::printf("\n      ★機構の確認: 小部屋の吸音率を振る（音源・リスナーとも小部屋の中）\n");
+        std::printf("      %-6s %10s %10s %10s %12s %12s\n",
+                    "α", "開(dB/s)", "閉(dB/s)", "差(dB/s)", "閉のRT60(s)", "Sabine(s)");
+        AF_Vector3 saved = src[0];
+        src[0] = V(3.5f, 1.5f, 1.5f);
+        const AF_Vector3 L = V(3.0f, 1.5f, -1.5f);
+        float deltaAt[8] = {}; int nA = 0; float worstSabineErr = 0.0f;
+        for (float a : {0.10f, 0.20f, 0.40f, 0.60f, 0.80f}) {
+            float ab[kBands], tr2[kBands], sc[kBands];
+            for (int b2 = 0; b2 < kBands; ++b2) { ab[b2] = a; tr2[b2] = trans[b2]; sc[b2] = scat[b2]; }
+            AF_SceneSetMaterial(s, mDead, tr2, ab, sc, kBands);
+            float dOpen = 0, lOpen = 0, dShut = 0, lShut = 0;
+            AF_SceneUpdateInstance(s, door, V(0.5f, h*0.5f, 5.5f), V(t, h*0.5f, 0.45f),
+                                   V(1,0,0), V(0,1,0));
+            measure(L, dOpen, lOpen);
+            AF_SceneUpdateInstance(s, door, V(0.5f, h*0.5f, 0.0f), V(t, h*0.5f, 0.45f),
+                                   V(1,0,0), V(0,1,0));
+            measure(L, dShut, lShut);
+            const float rtShut = dShut > 1e-3f ? 60.0f / dShut : 0.0f;
+            const float sabine = 0.161f * vol / (surf * a);
+            // ★理論値と比べるときは**跳ね返りを増やして**測り直す。
+            //   既定の 32 回だと α=0.10 では 1 回 0.46dB ＝ **32 回で 14.6dB しか落ちない**。
+            //   尾が減衰しきる前に打ち切られ、当てはめが実際より速い減衰を返す
+            //   （これは測定の限界であってエンジンの誤りではない。ただし
+            //     **響く空間では実行時の尾も同じ理由で短い**ことは覚えておくこと）。
+            float dDeep = 0, lDeep = 0;
+            measure(L, dDeep, lDeep, 256);
+            const float rtDeep = dDeep > 1e-3f ? 60.0f / dDeep : 0.0f;
+            std::printf("      %-6.2f %10.1f %10.1f %10.1f %12.3f %12.3f  (跳ね256で %.3f)\n",
+                        a, dOpen, dShut, std::fabs(dShut - dOpen), rtShut, sabine, rtDeep);
+            deltaAt[nA++] = std::fabs(dShut - dOpen);
+            // ⚠ 10ms ビンでは RT60 が 0.2 秒を切ると当てはめの点が足りない。
+            //   分解能の外は理論と比べない（比べると測定の限界を engine の誤りに見せてしまう）。
+            if (sabine > 0.2f && rtDeep > 1e-4f)
+                worstSabineErr = std::max(worstSabineErr, std::fabs(rtDeep - sabine) / sabine);
+        }
+        // 材質を元へ戻す（あとの検査に影響させない）
+        AF_SceneSetMaterial(s, mDead, trans, absorb, scat, kBands);
+        src[0] = saved;
+
+        std::printf("      → 吸音率が上がるほど（＝隣室との残響差が開くほど）扉の効きが大きくなる\n"
+                    "        なら、機構は連成残響で確定。α=0.10（隣室と近い）で小さければ裏取り完了。\n");
+        std::snprintf(note, sizeof(note), "(α0.10 で %.1f dB/s ／ α0.80 で %.1f dB/s)",
+                      deltaAt[0], deltaAt[nA - 1]);
+        check("[診断] 扉の効きは隣室との残響差が開くほど大きい（＝連成が機構）",
+              nA >= 2 && deltaAt[nA - 1] > deltaAt[0] * 2.0f, note);
+        std::snprintf(note, sizeof(note), "(Sabine との最大ずれ %.0f%%)", worstSabineErr * 100.0f);
+        // ★理論値との突き合わせ。当てはめの作りが壊れていないことの独立な裏取り。
+        check("[診断] 扉を閉じたときの RT60 が Sabine の理論値と合う（±40%）",
+              worstSabineErr < 0.40f, note);
+    }
+
+    std::printf("\n      → 扉で変わる減衰 最大 %.1f dB/s（部屋の中のばらつき %.1f dB/s）\n",
+                worstDoorDelta, within);
+    std::printf("        量は %.1f dB 変わる（こちらは大きくて当然。扉の主題そのもの）\n",
+                worstLevelDelta);
+    if (worstDoorDelta > within)
+        std::printf("        ⚠ **尾の形は「部屋」ではなく「部屋＋扉」の関数。**\n"
+                    "          部屋ごとに 1 本焼くと、扉を閉めても尾の減衰が変わらない。\n");
+    else
+        std::printf("        → 尾の**形**は扉でほとんど変わらない。焼くのは形、量は実行時でよい。\n");
+    std::snprintf(note, sizeof(note), "(扉 %.1f dB/s ／ 部屋の中 %.1f dB/s ／ 量 %.1f dB)",
+                  worstDoorDelta, within, worstLevelDelta);
+    // ★合否ではなく監視。数字が動いたら焼く設計を見直す合図。
+    check("[診断] 扉は尾の**量**を大きく変える（主題が効いている）", worstLevelDelta > 3.0f, note);
+
+    AF_SceneDestroy(s);
+}
+
+void diagnoseEchogramScaling() {
+    std::printf("\n[診断] エコグラムの費用は音源数にどう効くか（尾を焼く前の下調べ）\n");
+    std::printf("        %8s %12s %14s\n", "音源数", "ms/frame", "1音源あたり");
+
+    double base1 = 0.0;
+    for (int nSrc : {1, 4, 8, 16}) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        const float h = 4.0f, t = 0.3f, hw = 8.0f, hd = 8.0f;
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneSetListener(s, V(0, 1.6f, -6.0f));
+        for (int i = 0; i < nSrc; ++i)
+            AF_SceneSetSource(s, static_cast<unsigned long long>(500 + i),
+                              V(-6.0f + i * 0.8f, 1.6f, 4.0f));
+
+        // ★エコグラムだけ残す。他の段を切って、測る のはこの段の伸び方だけにする。
+        AF_UpdateConfig c{};
+        c.role1EveryN = 1; c.role2EveryN = 1; c.earlyEveryN = 1;
+        c.diffSrcEveryN = 1; c.catalogEveryN = 1;
+        c.reflectionRays = 0; c.reflectionBounces = 0;
+        c.directWeight = 1.0f; c.useReflections = 0;
+        c.useEdgeCatalog = 0;
+        c.enableReverb = 1; c.echogramBins = 100; c.echogramBinSeconds = 0.01f;
+        c.echogramRays = 512; c.echogramBounces = 24;
+        c.speedOfSound = 343.0f; c.distanceRef = 1.5f;
+        c.enableEarlyReflections = 0; c.enableDiffractionSources = 0;
+        AF_SceneSetUpdateConfig(s, &c);
+
+        using clk = std::chrono::high_resolution_clock;
+        for (int k = 0; k < 10; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);   // 暖機
+        const auto t0 = clk::now();
+        const int N = 60;
+        for (int k = 0; k < N; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count() / N;
+        if (nSrc == 1) base1 = ms;
+        std::printf("        %8d %12.3f %14.3f\n", nSrc, ms, ms / nSrc);
+        AF_SceneDestroy(s);
+    }
+    std::printf("        → 1 音源のときが %.3f ms。ここが**レイ側の固定費**。\n", base1);
+    std::printf("          音源数で伸びるぶんが「各ヒットで音源数ぶん回している」代金。\n"
+                "          出荷経路が読むのは部屋の代表 1 本だけなので、伸びるぶんは\n"
+                "          **部屋ごとに 1 本だけ積めば消える**（焼く前に取れる）。\n");
+}
+
 // ================================================================ ソフト遮蔽
 // 壁の縁を横切るときに、透過と遮蔽割合が連続に動くか。
 //   単一レイの判定だと「当たる/当たらない」で 1.0 ⇄ 材質値 と一気に跳ぶ。
@@ -5492,6 +7030,715 @@ void testSoftOcclusion() {
 // 通り道は X=+2〜+4 の開口ひとつだけ。壁は完全不透過。
 //   実機で「歩くと回折が消える位置がある（候補 1本 → 0本）」が観測されたので、
 //   それを数値で捕まえる。開口が唯一なのだから、部屋のどこにいても回折は 0 になってはいけない。
+// く字廊下の角で、回折が「前川の見込み」および「早期反射」とどれだけ離れているか。
+// 耳で「角の向こうの定位が無い」と言われたのを数字で裏取りするための診断。
+void diagnoseCorridorDiffractionLevel() {
+    std::printf("\n[診断] く字廊下の角: 回折の大きさは妥当か（反射・前川と比べる）\n");
+    const float w = 1.5f, h = 3.0f, t = 0.3f, aEnd = -12.0f, bEnd = 12.0f;
+    AF_SceneHandle s = AF_SceneCreate();
+    AF_SceneSetRoomCellSize(s, 0.25f);
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    auto bx = [&](float cx, float cy, float cz, float sx, float sy, float sz) {
+        AF_SceneAddInstanceBox(s, V(cx, cy, cz), V(sx * 0.5f, sy * 0.5f, sz * 0.5f),
+                               V(1, 0, 0), V(0, 1, 0), mat);
+    };
+    bx(-w - t * 0.5f, h * 0.5f, (aEnd + w) * 0.5f, t, h, w - aEnd + t);
+    bx( w + t * 0.5f, h * 0.5f, (aEnd - w) * 0.5f, t, h, -w - aEnd);
+    bx((bEnd - w) * 0.5f, h * 0.5f,  w + t * 0.5f, bEnd + w + t, h, t);
+    bx((bEnd + w) * 0.5f, h * 0.5f, -w - t * 0.5f, bEnd - w, h, t);
+    bx(0.0f, h * 0.5f, aEnd - t * 0.5f, 2 * w + 2 * t, h, t);
+    bx(bEnd + t * 0.5f, h * 0.5f, 0.0f, t, h, 2 * w + 2 * t);
+    for (int k = 0; k < 2; ++k) {
+        const float ft = 0.3f;
+        const float y = (k == 0) ? -ft * 0.5f : h + ft * 0.5f;
+        bx(0.0f, y, (aEnd + w) * 0.5f, 2 * w + 2 * t, ft, w - aEnd + t);
+        bx((bEnd - w) * 0.5f, y, 0.0f, bEnd + w + t, ft, 2 * w + 2 * t);
+    }
+    const AF_Vector3 S = V(bEnd - 2.0f, 1.6f, 0.0f);
+    AF_SceneSetSource(s, 1, S);
+    AF_SceneSetApertureSpread(s, 3);
+
+    std::printf("  z      本数  回折(広帯域)  反射(広帯域)  差     前川の見込み  実測との差\n");
+    for (float z = -10.0f; z <= -1.0f; z += 1.5f) {
+        const AF_Vector3 L = V(0, 1.6f, z);
+        AF_SceneSetListener(s, L);
+        AF_SceneUpdate(s, 0.02f);
+        const int idx = AF_SceneSourceIndex(s, 1);
+        AF_Vector3 dp[8]; float dg[8], db[48];
+        const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+        float difSum = 0.0f;
+        for (int i = 0; i < nd; ++i)
+            for (int b = 0; b < 6; ++b) difSum += db[i * 6 + b] / 6.0f;
+        AF_Vector3 ep[16]; float eg[16 * 6];
+        const int ne = (idx >= 0) ? AF_SceneGetEarlyReflections(s, idx, ep, eg, 16) : 0;
+        float refSum = 0.0f;
+        for (int i = 0; i < ne; ++i)
+            for (int b = 0; b < 6; ++b) refSum += eg[i * 6 + b] / 6.0f;
+        // 角の縦稜（x=+w, z=+w）を回る経路の迂回長から前川で見積もる（500 Hz）。
+        const float e1 = std::sqrt(w * w + (w - z) * (w - z));
+        const float e2 = std::sqrt((S.x - w) * (S.x - w) + w * w);
+        const float dirLen = std::sqrt(S.x * S.x + z * z);
+        const float delta = e1 + e2 - dirLen;
+        const float N = 2.0f * delta / (343.0f / 500.0f);
+        float att = 20.0f * std::log10f(std::sqrt(6.2831853f * N) /
+                                        std::tanh(std::sqrt(6.2831853f * N))) + 5.0f;
+        if (att > 24.0f) att = 24.0f;     // 単一稜の実用上限
+        const float maek = std::pow(10.0f, -att / 20.0f);
+        std::printf("  %5.1f  %d本%s %10.5f  %12.5f  %5.1fdB  %10.5f  %+6.1fdB\n",
+                    z, nd, AF_SceneIsOccluded(s, L, S) ? "遮" : "見", difSum, refSum,
+                    20.0f * std::log10f(std::max(difSum, 1e-9f) / std::max(refSum, 1e-9f)),
+                    maek, 20.0f * std::log10f(std::max(difSum, 1e-9f) / maek));
+    }
+    std::printf("  ※ 回折は角の向きを運ぶ唯一の成分。反射より大きく下だと、耳では角が消える。\n");
+
+    // 描画で回折が 0 本になった地点（左に寄った位置）を、遮蔽判定と一緒に確かめる。
+    //   透過が -60dB 以下なのに経路が 0 本なら、塞がれているのに回折が出ていない＝穴。
+    std::printf("\n  ── 左に寄った位置で経路が消えないか ──\n");
+    std::printf("   x      z    経路  透過(dB)  遮蔽判定\n");
+    for (float xo = 0.0f; xo >= -1.0f; xo -= 0.5f) {
+        for (float z = -4.0f; z <= -1.5f; z += 0.7f) {
+            const AF_Vector3 L = V(xo, 1.6f, z);
+            AF_SceneSetListener(s, L);
+            AF_SceneUpdate(s, 0.02f);
+            AF_Vector3 dp[8]; float dg[8], db[48];
+            const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+            // 更新を回してから測り直す。変われば「1 回の更新で収束していない」。
+            for (int k = 0; k < 8; ++k) AF_SceneUpdate(s, 0.02f);
+            const int nd8 = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+            float tr[6] = {}; float of = 0.0f;
+            AF_SceneComputeSoftOcclusion(s, L, S, tr, 6, &of);
+            float tb = 0.0f;
+            for (int b = 0; b < 6; ++b) tb += tr[b] / 6.0f;
+            const float dbv = 20.0f * std::log10f(std::max(tb, 1e-9f));
+            const int occ = AF_SceneIsOccluded(s, L, S);
+            std::printf("  %5.1f %6.1f   %d本  %7.1f   %s%s\n", xo, z, nd, dbv,
+                        occ ? "遮蔽" : "見通せる",
+                        (occ && nd == 0) ? "   ★穴（塞がれているのに経路なし）" : "");
+        }
+    }
+
+    // ★歩いている最中に何が変わるかを細かい刻みで測る。
+    //   耳の訴えは「移動中に音が変わる」。設計の第一制約（連続性）そのものなので、
+    //   レベルだけでなく**音色（4k/125 の傾き）と到来方向**も 1 歩ぶんの差で見る。
+    //   経路の本数も一緒に出すので、穴の位置がここで分かる。
+    {
+        std::printf("\n  ── 0.1m 刻みで歩いたとき、1 歩で何が動くか ──\n");
+        std::printf("   z      経路  広帯域    Δ量(dB)  傾き(dB)  Δ傾き(dB)  方向(x,z)   Δ方向(度)\n");
+        bool havePrev = false;
+        float pLev = 0.0f, pTilt = 0.0f, pdx = 0.0f, pdz = 0.0f;
+        float worstLev = 0.0f, worstTilt = 0.0f, worstDir = 0.0f;
+        float atLev = 0.0f, atTilt = 0.0f, atDir = 0.0f;
+        int drops = 0;
+        for (float z = -8.0f; z <= -1.0f; z += 0.1f) {
+            const AF_Vector3 L = V(0, 1.6f, z);
+            AF_SceneSetListener(s, L);
+            AF_SceneUpdate(s, 0.02f);
+            AF_Vector3 dp[8]; float dg[8], db[48];
+            const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+            const int occ = AF_SceneIsOccluded(s, L, S);
+            float lo = 0.0f, hi = 0.0f, sum = 0.0f, dx = 0.0f, dz = 0.0f, wsum = 0.0f;
+            for (int i = 0; i < nd; ++i) {
+                lo += db[i * 6 + 0]; hi += db[i * 6 + 5];
+                float g = 0.0f;
+                for (int b = 0; b < 6; ++b) { sum += db[i * 6 + b] / 6.0f; g += db[i * 6 + b] / 6.0f; }
+                const float ux = dp[i].x - L.x, uz = dp[i].z - L.z;
+                const float ul = std::sqrt(ux * ux + uz * uz);
+                if (ul > 1e-4f) { dx += g * ux / ul; dz += g * uz / ul; wsum += g; }
+            }
+            if (wsum > 1e-9f) { dx /= wsum; dz /= wsum; }
+            if (occ && nd == 0) ++drops;
+            const float lev = 20.0f * std::log10f(std::max(sum, 1e-9f));
+            const float tilt = 20.0f * std::log10f(std::max(hi, 1e-9f) / std::max(lo, 1e-9f));
+            if (havePrev && nd > 0) {
+                const float dL = std::fabs(lev - pLev);
+                const float dT = std::fabs(tilt - pTilt);
+                float c = dx * pdx + dz * pdz;
+                c = std::min(1.0f, std::max(-1.0f, c));
+                const float dD = std::acos(c) * 57.29578f;
+                if (dL > worstLev) { worstLev = dL; atLev = z; }
+                if (dT > worstTilt) { worstTilt = dT; atTilt = z; }
+                if (dD > worstDir) { worstDir = dD; atDir = z; }
+                if (dL > 3.0f || dT > 3.0f || dD > 15.0f)
+                    std::printf("  %5.1f   %d本  %8.5f  %+7.1f  %+8.1f  %+8.1f  (%+.2f,%+.2f) %7.1f ★\n",
+                                z, nd, sum, dL, tilt, dT, dx, dz, dD);
+            }
+            if (nd > 0) { pLev = lev; pTilt = tilt; pdx = dx; pdz = dz; havePrev = true; }
+            else havePrev = false;
+        }
+        std::printf("  1 歩(0.1m)の最大変化: 量 %.1f dB @z=%.1f / 音色 %.1f dB @z=%.1f / "
+                    "方向 %.1f 度 @z=%.1f\n",
+                    worstLev, atLev, worstTilt, atTilt, worstDir, atDir);
+        std::printf("  塞がれているのに経路 0 本だった地点: %d 箇所 / 71\n", drops);
+        std::printf("  ※ ★は 1 歩で 量3dB・音色3dB・方向15度 のどれかを超えたところ。\n");
+    }
+
+    // ★「実体の中」判定の連続化とその幅を振って、穴と滑らかさが同時に成立する所を探す。
+    //   二値のままだと穴が空き、連続でも幅が歩幅より狭いと 1 歩で跳ぶ。
+    {
+        std::printf("\n  ── 「実体の中」判定: 二値 vs 連続（幅を振る）──\n");
+        std::printf("   設定        穴/71   1歩の量(dB)  1歩の音色(dB)  1歩の方向(度)\n");
+        const float scales[] = {0.0f, 0.08f, 0.15f, 0.30f, 0.50f, 0.80f, 1.20f};
+        for (float sc : scales) {
+            if (sc <= 0.0f) AF_SceneSetInsideOtherContinuous(s, 0, 0.0f);
+            else            AF_SceneSetInsideOtherContinuous(s, 1, sc);
+            bool have = false;
+            float pL = 0, pT = 0, pdx = 0, pdz = 0;
+            float wL = 0, wT = 0, wD = 0, wLz = 0, wLa = 0, wLb = 0;
+            int holes = 0;
+            for (float z = -8.0f; z <= -1.0f; z += 0.1f) {
+                const AF_Vector3 L = V(0, 1.6f, z);
+                AF_SceneSetListener(s, L);
+                AF_SceneUpdate(s, 0.02f);
+                AF_Vector3 dp[8]; float dg[8], db[48];
+                const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+                if (AF_SceneIsOccluded(s, L, S) && nd == 0) ++holes;
+                float lo = 0, hi = 0, sum = 0, dx = 0, dz = 0, ws = 0;
+                for (int i = 0; i < nd; ++i) {
+                    lo += db[i*6+0]; hi += db[i*6+5];
+                    float g = 0;
+                    for (int b = 0; b < 6; ++b) { sum += db[i*6+b]/6.0f; g += db[i*6+b]/6.0f; }
+                    const float ux = dp[i].x - L.x, uz = dp[i].z - L.z;
+                    const float ul = std::sqrt(ux*ux + uz*uz);
+                    if (ul > 1e-4f) { dx += g*ux/ul; dz += g*uz/ul; ws += g; }
+                }
+                if (ws > 1e-9f) { dx /= ws; dz /= ws; }
+                const float lev = 20.0f * std::log10f(std::max(sum, 1e-9f));
+                const float tilt = 20.0f * std::log10f(std::max(hi,1e-9f)/std::max(lo,1e-9f));
+                if (have && nd > 0) {
+                    if (std::fabs(lev - pL) > wL) { wLz = z; wLa = pL; wLb = lev; }
+                    wL = std::max(wL, std::fabs(lev - pL));
+                    wT = std::max(wT, std::fabs(tilt - pT));
+                    float c = dx*pdx + dz*pdz;
+                    c = std::min(1.0f, std::max(-1.0f, c));
+                    wD = std::max(wD, std::acos(c) * 57.29578f);
+                }
+                if (nd > 0) { pL = lev; pT = tilt; pdx = dx; pdz = dz; have = true; }
+                else have = false;
+            }
+            char nm[32];
+            if (sc <= 0.0f) std::snprintf(nm, sizeof(nm), "二値（出荷）");
+            else            std::snprintf(nm, sizeof(nm), "連続 幅%.2fm", sc);
+            std::printf("   %-14s %2d      %8.1f     %8.1f       %8.1f   @z=%.1f (%.1f→%.1f dB)\n",
+                        nm, holes, wL, wT, wD, wLz, wLa, wLb);
+        }
+        AF_SceneSetInsideOtherContinuous(s, 0, 0.0f);
+        std::printf("  ※ 穴 0 かつ 1歩の変化が小さい幅を探す。歩幅は 0.1m。\n");
+    }
+
+    // ★影境界で、回折単体は飛んでも**直接音と足した合計**は連続かどうか。
+    //   回折だけ見て騒いでいた可能性があるので先に確かめる。
+    //   合成はレンダラと同じ形にする: 直接 = 透過、回折 = Σ(帯域) × occFrac。
+    {
+        AF_SceneSetInsideOtherContinuous(s, 1, 0.30f);
+        std::printf("\n  ── 影境界: 回折単体は飛ぶが、直接音と足した合計はどうか ──\n");
+        std::printf("    z     回折      直接     合計(電力和)   Δ回折   Δ合計\n");
+        float pD = 0.0f, pT = 0.0f;
+        bool have = false;
+        float worstD = 0.0f, worstT = 0.0f;
+        for (float z = -2.6f; z <= -1.0f; z += 0.1f) {
+            const AF_Vector3 L = V(0, 1.6f, z);
+            AF_SceneSetListener(s, L);
+            AF_SceneUpdate(s, 0.02f);
+            AF_Vector3 dp[8]; float dg[8], db[48];
+            const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+            float tr[6] = {}; float of = 0.0f;
+            AF_SceneComputeSoftOcclusion(s, L, S, tr, 6, &of);
+            float dif = 0.0f, dir = 0.0f;
+            for (int i = 0; i < nd; ++i)
+                for (int b = 0; b < 6; ++b) dif += db[i * 6 + b] / 6.0f;
+            dif *= of;
+            for (int b = 0; b < 6; ++b) dir += tr[b] / 6.0f;
+            const float tot = std::sqrt(dif * dif + dir * dir);   // 別タップ＝電力和
+            const float dD = 20.0f * std::log10f(std::max(dif, 1e-9f));
+            const float dT = 20.0f * std::log10f(std::max(tot, 1e-9f));
+            float sD = 0.0f, sT = 0.0f;
+            if (have) { sD = dD - pD; sT = dT - pT;
+                        worstD = std::max(worstD, std::fabs(sD));
+                        worstT = std::max(worstT, std::fabs(sT)); }
+            std::printf("  %5.1f  %8.5f  %8.5f  %10.5f   %+6.1f  %+6.1f\n",
+                        z, dif, dir, tot, sD, sT);
+            pD = dD; pT = dT; have = true;
+        }
+        std::printf("  1歩(0.1m)の最大: 回折単体 %.1f dB / **合計 %.1f dB**\n", worstD, worstT);
+        std::printf("  ※ 合計が連続なら、回折の崩れは直接音が引き取っている＝耳では問題ない。\n");
+        AF_SceneSetInsideOtherContinuous(s, 0, 0.0f);
+    }
+
+    // ★状態を完全に排除して測る（点ごとにシーンを作り直す）。
+    //   ここでも 0 本なら幾何の問題。1 本なら状態（履歴・段階更新）の問題。
+    {
+        std::printf("\n  ── 点ごとにシーンを作り直したら（状態なし）──\n");
+        std::printf("   x      z    経路  透過(dB)\n");
+        for (float xo = 0.0f; xo >= -1.0f; xo -= 0.5f) {
+            for (float z = -4.0f; z <= -1.5f; z += 0.7f) {
+                AF_SceneHandle s2 = AF_SceneCreate();
+                AF_SceneSetRoomCellSize(s2, 0.25f);
+                const int m2 = AF_SceneAddMaterial(s2, nullptr, nullptr, nullptr, 0);
+                auto bx2 = [&](float cx, float cy, float cz, float sx, float sy, float sz) {
+                    AF_SceneAddInstanceBox(s2, V(cx, cy, cz), V(sx*0.5f, sy*0.5f, sz*0.5f),
+                                           V(1,0,0), V(0,1,0), m2);
+                };
+                bx2(-w - t*0.5f, h*0.5f, (aEnd + w)*0.5f, t, h, w - aEnd + t);
+                bx2( w + t*0.5f, h*0.5f, (aEnd - w)*0.5f, t, h, -w - aEnd);
+                bx2((bEnd - w)*0.5f, h*0.5f,  w + t*0.5f, bEnd + w + t, h, t);
+                bx2((bEnd + w)*0.5f, h*0.5f, -w - t*0.5f, bEnd - w, h, t);
+                bx2(0.0f, h*0.5f, aEnd - t*0.5f, 2*w + 2*t, h, t);
+                bx2(bEnd + t*0.5f, h*0.5f, 0.0f, t, h, 2*w + 2*t);
+                for (int k = 0; k < 2; ++k) {
+                    const float ft = 0.3f;
+                    const float y = (k == 0) ? -ft*0.5f : h + ft*0.5f;
+                    bx2(0.0f, y, (aEnd + w)*0.5f, 2*w + 2*t, ft, w - aEnd + t);
+                    bx2((bEnd - w)*0.5f, y, 0.0f, bEnd + w + t, ft, 2*w + 2*t);
+                }
+                AF_SceneSetSource(s2, 1, S);
+                AF_SceneSetApertureSpread(s2, 3);
+                const AF_Vector3 L = V(xo, 1.6f, z);
+                AF_SceneSetListener(s2, L);
+                AF_SceneUpdate(s2, 0.02f);
+                AF_Vector3 dp[8]; float dg[8], db[48];
+                const int nd = AF_SceneComputeDiffractionSourceBands(s2, L, S, dp, dg, db, 8);
+                float tr[6] = {}; float of = 0.0f;
+                AF_SceneComputeSoftOcclusion(s2, L, S, tr, 6, &of);
+                float tb = 0.0f;
+                for (int b = 0; b < 6; ++b) tb += tr[b] / 6.0f;
+                int craw = 0, ccut = 0, ccl = 0;
+                AF_SceneDebugDiffractionCounts(s2, &craw, &ccut, &ccl);
+                // どのゲートを切ると経路が戻るか。bit1=点が他の実体の中 / bit2=掠めの重み
+                // bit4=芯の横断。戻るゲートが犯人。
+                int back[3] = {};
+                for (int gi = 0; gi < 3; ++gi) {
+                    const int mask = (gi == 0) ? 1 : (gi == 1) ? 2 : 4;
+                    AF_SceneSetDiffractionGateMask(s2, mask);
+                    AF_Vector3 dp2[8]; float dg2[8], db2[48];
+                    back[gi] = AF_SceneComputeDiffractionSourceBands(s2, L, S, dp2, dg2, db2, 8);
+                }
+                AF_SceneSetDiffractionGateMask(s2, 0);
+                // ccut は「重み0棄却 ＋ 稜線検討本数×1000」の詰め方（診断専用）。
+                std::printf("  %5.1f %6.1f  %d本 %7.1fdB  検討%2d → 可視通過%d → クラスタ%d"
+                            "  | ゲート別: 中%d本 掠%d本 芯%d本\n",
+                            xo, z, nd, 20.0f * std::log10f(std::max(tb, 1e-9f)),
+                            ccut / 1000, craw, ccl, back[0], back[1], back[2]);
+                AF_SceneDestroy(s2);
+            }
+        }
+    }
+
+    // ★同じ位置でも、そこへ至る経過で答えが変わらないか（履歴依存の検出）。
+    //   最初の表では x=0,z=-4.0 が 1 本、上の表では 0 本だった。
+    {
+        std::printf("\n  ── 同じ位置なのに答えが変わるか（履歴依存）──\n");
+        const AF_Vector3 T = V(0.0f, 1.6f, -4.0f);
+        auto probe = [&](const char* how) {
+            AF_Vector3 dp[8]; float dg[8], db[48];
+            const int nd = AF_SceneComputeDiffractionSourceBands(s, T, S, dp, dg, db, 8);
+            float sum = 0.0f;
+            for (int i = 0; i < nd; ++i)
+                for (int b = 0; b < 6; ++b) sum += db[i * 6 + b] / 6.0f;
+            std::printf("   %-34s %d本  合計 %.5f\n", how, nd, sum);
+        };
+        AF_SceneSetListener(s, T); AF_SceneUpdate(s, 0.02f); probe("そこへ直接置いた");
+        AF_SceneSetListener(s, T); AF_SceneUpdate(s, 0.02f); probe("同じ位置でもう一度");
+        for (float z = -10.0f; z <= -4.0f; z += 1.5f) {
+            AF_SceneSetListener(s, V(0, 1.6f, z)); AF_SceneUpdate(s, 0.02f);
+        }
+        probe("遠くから 1.5m 刻みで歩いてきた");
+        for (float z = -1.0f; z >= -4.0f; z -= 0.5f) {
+            AF_SceneSetListener(s, V(0, 1.6f, z)); AF_SceneUpdate(s, 0.02f);
+        }
+        probe("角の側から戻ってきた");
+        std::printf("   ※ 数字が揃わなければ、同じ幾何に複数の答えがある。\n");
+    }
+
+    // ★自動生成された残響の場に、そもそも方向の構造があるか。
+    //   「空間ごとに自動で作っているから残響の定位は無理では」への確認。
+    //   場を測るのは AF_SceneProbeDirectionalEnergy で、作り方には依らない。
+    //   構造があるなら取り出せるし、平坦なら取り出しようがない。
+    {
+        std::printf("\n  ── 残響の場に方向の構造があるか（125Hz・6 軸へ投影）──\n");
+        std::printf("   z      右      左      前      後      上      下    最大差\n");
+        const AF_Vector3 ax[6] = { V(1,0,0), V(-1,0,0), V(0,0,1), V(0,0,-1), V(0,1,0), V(0,-1,0) };
+        const int nd = 64;
+        std::vector<AF_Vector3> dirs(nd);
+        std::vector<float> en(nd * 6, 0.0f);
+        for (int i = 0; i < nd; ++i) {   // フィボナッチ球
+            const float y = 1.0f - 2.0f * (i + 0.5f) / nd;
+            const float r = std::sqrt(std::max(0.0f, 1.0f - y * y));
+            const float th = 2.399963f * i;
+            dirs[i] = V(r * std::cos(th), y, r * std::sin(th));
+        }
+        for (float z = -10.0f; z <= -2.0f; z += 2.0f) {
+            const AF_Vector3 L = V(0, 1.6f, z);
+            AF_SceneSetListener(s, L);
+            AF_SceneUpdate(s, 0.02f);
+            AF_SceneProbeDirectionalEnergy(s, L, dirs.data(), nd, 8, en.data());
+            float acc[6] = {};
+            float tot = 0.0f;
+            for (int i = 0; i < nd; ++i) {
+                const float e = en[i * 6];          // 125Hz
+                tot += e;
+                for (int a = 0; a < 6; ++a) {
+                    const float c = dirs[i].x * ax[a].x + dirs[i].y * ax[a].y + dirs[i].z * ax[a].z;
+                    if (c > 0.0f) acc[a] += e * c;  // その軸寄りの成分
+                }
+            }
+            std::printf("  %5.1f ", z);
+            float mx = -1e30f, mn = 1e30f;
+            for (int a = 0; a < 6; ++a) {
+                const float v = (tot > 1e-9f) ? acc[a] / tot : 0.0f;
+                mx = std::max(mx, v); mn = std::min(mn, v);
+                std::printf("%7.3f", v);
+            }
+            std::printf("  %6.1f dB\n", 20.0f * std::log10f(std::max(mx, 1e-6f)
+                                                          / std::max(mn, 1e-6f)));
+        }
+        std::printf("  ※ 最大差が数 dB 以上あれば、場に構造がある＝尾に方向を載せられる。\n");
+        std::printf("     全軸がほぼ同じなら、場そのものが平坦で取り出しようがない。\n");
+    }
+
+    // ★ソフト遮蔽の 2 つの出力が矛盾していないか。
+    //   ヘッダは「回折タップ = 回折ゲイン × outOccFrac」と定めているので、
+    //   occFrac が過小だとその分だけ回折が黙って小さくなる。
+    //   透過が -60dB 以下なのに occFrac が小さければ、同じ関数が矛盾を返している。
+    std::printf("\n  ── ソフト遮蔽の 2 出力は整合しているか（廊下の左右にずらして歩く）──\n");
+    std::printf("   x      z     透過(広帯域)      dB   occFrac   判定\n");
+    for (float xoff = 0.0f; xoff >= -1.2f; xoff -= 0.3f) {
+        for (float z = -10.0f; z <= -4.0f; z += 3.0f) {
+            const AF_Vector3 L = V(xoff, 1.6f, z);
+            AF_SceneSetListener(s, L);
+            AF_SceneUpdate(s, 0.02f);
+            float tr[6] = {}; float of = 0.0f;
+            AF_SceneComputeSoftOcclusion(s, L, S, tr, 6, &of);
+            float tb = 0.0f;
+            for (int b = 0; b < 6; ++b) tb += tr[b] / 6.0f;
+            const float db = 20.0f * std::log10f(std::max(tb, 1e-9f));
+            const bool blocked = (db < -60.0f);
+            std::printf("  %5.1f %6.1f   %11.7f  %7.1f   %6.3f   %s\n",
+                        xoff, z, tb, db, of,
+                        (blocked && of < 0.9f) ? "★矛盾（塞がれているのに occFrac が小さい）"
+                                               : "整合");
+        }
+    }
+
+    // 角を誰が担当しているか。自動ポータルが立っていれば、そちらが答えを出している。
+    {
+        int na = 0, nm = 0;
+        AF_SceneSetListener(s, V(0, 1.6f, -7.0f));
+        AF_SceneUpdate(s, 0.02f);
+        AF_SceneGetPortalCounts(s, &na, &nm);
+        std::printf("\n  ── 角の担当は誰か（自動 %d 枚 / 手置き %d 枚）──\n", na, nm);
+        std::printf("  z      ");
+        for (int q = 0; q < na + nm && q < 3; ++q) std::printf("P%d 開口/中心            ", q);
+        std::printf("\n");
+        for (float z = -10.0f; z <= -2.0f; z += 2.0f) {
+            const AF_Vector3 L = V(0, 1.6f, z);
+            AF_SceneSetListener(s, L);
+            AF_SceneUpdate(s, 0.02f);
+            std::printf("  %5.1f  ", z);
+            for (int q = 0; q < na + nm && q < 3; ++q) {
+                float fz[kBands] = {}; AF_Vector3 pcp = V(0,0,0);
+                if (!AF_SceneMeasurePortal(s, q, L, S, fz, &pcp)) { std::printf("  ―                      "); continue; }
+                AF_Vector3 pc{}, pu{}, pv{}; float phu = 0, phv = 0;
+                AF_SceneGetPortal(s, q, &pc, &pu, &pv, &phu, &phv);
+                std::printf("%.4f (%.1f,%.1f,%.1f) 半%.1fx%.1f  ",
+                            fz[0], pc.x, pc.y, pc.z, phu, phv);
+            }
+            std::printf("\n");
+        }
+    }
+
+    // 角の向こうで鳴っている早期反射は、本当に届く経路か。
+    //   音源が完全に隠れているのに反射だけ素通りしているなら、壁を抜けている。
+    {
+        const AF_Vector3 L = V(0, 1.6f, -7.0f);
+        AF_SceneSetListener(s, L);
+        AF_SceneUpdate(s, 0.02f);
+        const int idx = AF_SceneSourceIndex(s, 1);
+        AF_Vector3 ep[16]; float eg[16 * 6];
+        const int ne = (idx >= 0) ? AF_SceneGetEarlyReflections(s, idx, ep, eg, 16) : 0;
+        std::printf("\n  ── z=-7.0 の早期反射は本当に届く経路か（音源は完全遮蔽 occFrac 0.999）──\n");
+        std::printf("   #  到来方向(頭基準 x=右)      経路長   広帯域   帯域(125..4k)\n");
+        for (int i = 0; i < ne; ++i) {
+            float g = 0.0f;
+            for (int b = 0; b < 6; ++b) g += eg[i * 6 + b] / 6.0f;
+            const float dx = ep[i].x - L.x, dy = ep[i].y - L.y, dz = ep[i].z - L.z;
+            const float plen = std::sqrt(dx*dx + dy*dy + dz*dz);
+            const float inv = (plen > 1e-4f) ? 1.0f / plen : 0.0f;
+            std::printf("  %2d  (%+5.2f,%+5.2f,%+5.2f)  %8.2fm  %7.4f  ",
+                        i, dx*inv, dy*inv, dz*inv, plen, g);
+            for (int b = 0; b < 6; ++b) std::printf("%6.3f", eg[i * 6 + b]);
+            std::printf("\n");
+        }
+        std::printf("  ※ 4 本が同じゲイン・同じ帯域なら、経路の違いが反映されていない。\n");
+        std::printf("     角を回る音は経路長も反射回数も違うはずで、揃うのは不自然。\n");
+        // 既定材質の反射率と突き合わせる。√(1−α−τ) と一致するなら、
+        // 「反射点→音源」の遮蔽（seg）が全部 1＝一度も効いていないことになる。
+        {
+            float tr[6] = {}, ab[6] = {}, sc[6] = {};
+            AF_MaterialPresetBands(0, tr, ab, sc);
+            std::printf("  検算 √(1-α-τ) =");
+            for (int b = 0; b < 6; ++b)
+                std::printf("%6.3f", std::sqrt(std::max(0.0f, 1.0f - ab[b] - tr[b])));
+            std::printf("   ← 上の 4 本と一致すれば seg（反射点→音源の遮蔽）が効いていない\n");
+        }
+
+        // 反射は部屋の形から作られる。部屋の判定が壊れていれば反射も壊れる。
+        std::printf("\n  ── 部屋の判定 ──\n");
+        std::printf("  部屋数 %d / リスナーの部屋 %d / 音源の部屋 %d\n",
+                    AF_SceneRoomCount(s), AF_SceneRoomAt(s, L), AF_SceneRoomAt(s, S));
+        for (int r = 0; r < AF_SceneRoomCount(s) && r < 4; ++r) {
+            float vol = 0.0f;
+            AF_Vector3 c{}, mn{}, mx{};
+            AF_SceneRoomInfo(s, r, &vol, &c, &mn, &mx);
+            std::printf("   部屋%d 体積 %8.1f m3  範囲 (%6.1f,%5.1f,%6.1f)〜(%6.1f,%5.1f,%6.1f)\n",
+                        r, vol, mn.x, mn.y, mn.z, mx.x, mx.y, mx.z);
+        }
+        std::printf("  ※ 実際の廊下は x,z が -12〜12・高さ 0〜3 の L 字。範囲がこれより大きければ\n");
+        std::printf("     部屋が外の世界と繋がっていて、反射が形状の外に出る。\n");
+    }
+
+    // 開口率の二重掛けを戻した場合と並べる（変更前 → 変更後 を同じ物差しで）。
+    std::printf("\n  ── 二重掛けを戻すと（変更前）── 直した後 ──\n");
+    std::printf("  z       変更前      変更後     改善\n");
+    for (float z = -10.0f; z <= -1.0f; z += 1.5f) {
+        const AF_Vector3 L = V(0, 1.6f, z);
+        float before = 0.0f, after = 0.0f;
+        for (int pass = 0; pass < 2; ++pass) {
+            AF_SceneSetKeepDoubleOpen(s, (pass == 0) ? 1 : 0);
+            AF_SceneSetListener(s, L);
+            AF_SceneUpdate(s, 0.02f);
+            AF_Vector3 dp[8]; float dg[8], db[48];
+            const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+            float sum = 0.0f;
+            for (int i = 0; i < nd; ++i)
+                for (int b = 0; b < 6; ++b) sum += db[i * 6 + b] / 6.0f;
+            ((pass == 0) ? before : after) = sum;
+        }
+        std::printf("  %5.1f  %9.5f  %9.5f  %+6.1f dB\n", z, before, after,
+                    20.0f * std::log10f(std::max(after, 1e-9f) / std::max(before, 1e-9f)));
+    }
+    AF_SceneSetKeepDoubleOpen(s, 0);
+
+    // 前川だけに任せた場合（設計どおり「定位と回り込む距離だけ」）。
+    std::printf("\n  ── 前川だけに任せると（f を重ねない）──\n");
+    std::printf("  z       いま      前川だけ    差      反射との差\n");
+    for (float z = -10.0f; z <= -1.0f; z += 1.5f) {
+        const AF_Vector3 L = V(0, 1.6f, z);
+        float now = 0.0f, one = 0.0f, refSum = 0.0f;
+        for (int pass = 0; pass < 2; ++pass) {
+            AF_SceneSetDiffractionSingleModel(s, pass);
+            AF_SceneSetListener(s, L);
+            AF_SceneUpdate(s, 0.02f);
+            AF_Vector3 dp[8]; float dg[8], db[48];
+            const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+            float sum = 0.0f;
+            for (int i = 0; i < nd; ++i)
+                for (int b = 0; b < 6; ++b) sum += db[i * 6 + b] / 6.0f;
+            ((pass == 0) ? now : one) = sum;
+            if (pass == 1) {
+                const int idx = AF_SceneSourceIndex(s, 1);
+                AF_Vector3 ep[16]; float eg[16 * 6];
+                const int ne = (idx >= 0) ? AF_SceneGetEarlyReflections(s, idx, ep, eg, 16) : 0;
+                for (int i = 0; i < ne; ++i)
+                    for (int b = 0; b < 6; ++b) refSum += eg[i * 6 + b] / 6.0f;
+            }
+        }
+        std::printf("  %5.1f  %9.5f  %9.5f  %+6.1f dB  %+6.1f dB\n", z, now, one,
+                    20.0f * std::log10f(std::max(one, 1e-9f) / std::max(now, 1e-9f)),
+                    20.0f * std::log10f(std::max(one, 1e-9f) / std::max(refSum, 1e-9f)));
+    }
+    AF_SceneSetDiffractionSingleModel(s, 0);
+
+    // 設計書 §5-12 の結論（エネルギーは波動側＝フレネル開口が持つ）は
+    // apertureIsTransmission として実装済み。C++ 既定 OFF / Unity 既定 ON で食い違っている。
+    std::printf("\n  ── 4 つの設定を並べる（どれが出荷の音か）──\n");
+    std::printf("  z      前川×f    前川のみ   f のみ    f のみ＋二重掛け戻し\n");
+    for (float z = -8.5f; z <= -2.0f; z += 1.5f) {
+        const AF_Vector3 L = V(0, 1.6f, z);
+        float v[4] = {};
+        for (int p = 0; p < 4; ++p) {
+            AF_SceneSetDiffractionSingleModel(s, (p == 1) ? 1 : 0);
+            AF_SceneSetApertureIsTransmission(s, (p >= 2) ? 1 : 0);
+            AF_SceneSetKeepDoubleOpen(s, (p == 3) ? 1 : 0);
+            AF_SceneSetListener(s, L);
+            AF_SceneUpdate(s, 0.02f);
+            AF_Vector3 dp[8]; float dg[8], db[48];
+            const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+            for (int i = 0; i < nd; ++i)
+                for (int b = 0; b < 6; ++b) v[p] += db[i * 6 + b] / 6.0f;
+        }
+        std::printf("  %5.1f  %8.5f  %8.5f  %8.5f  %8.5f\n", z, v[0], v[1], v[2], v[3]);
+    }
+    AF_SceneSetDiffractionSingleModel(s, 0);
+    AF_SceneSetApertureIsTransmission(s, 0);
+    AF_SceneSetKeepDoubleOpen(s, 0);
+    std::printf("  ※ 「前川×f」= C++ 既定＝WAV レンダラの音。「f のみ」= Unity 既定の音。\n");
+
+    // 内訳。どの係数が効いて前川より下がるのかを当てずに見る。
+    std::printf("\n  ── 最強経路の内訳（掛け算の順に）──\n");
+    std::printf("  z      δ(m)  openGain slit(m)  thru    openBand(125..4k)              積=thru*oB\n");
+    for (float z = -10.0f; z <= -1.0f; z += 1.5f) {
+        const AF_Vector3 L = V(0, 1.6f, z);
+        AF_SceneSetListener(s, L);
+        AF_SceneUpdate(s, 0.02f);
+        float d[17] = {};
+        const int np = AF_SceneDebugDiffractionPath(s, L, S, d, -1);
+        if (np <= 0) { std::printf("  %5.1f   経路なし\n", z); continue; }
+        float ob = 0.0f;
+        for (int b = 0; b < 6; ++b) ob += d[10 + b] / 6.0f;
+        std::printf("  %5.1f  %5.2f  %7.4f  %5.2f  %7.5f  ", z, d[0], d[1], d[2], d[3]);
+        for (int b = 0; b < 6; ++b) std::printf("%6.3f", d[10 + b]);
+        std::printf("  %8.5f\n", d[3] * ob);
+    }
+    AF_SceneDestroy(s);
+}
+
+// 尾を「音源ごと」から「音源の部屋ごと」へ畳めるか。
+//   畳めれば 8 音源で 4.5ms → 部屋数ぶんに減る（尾はオーディオスレッドの 47%）。
+//   ただし過去に「全音源で 1 本」にして 500ms で 9.0dB ずれた記録がある。
+//   同じ部屋の音源どうしが十分似ているかを、減衰の形で直接測る。
+void diagnoseTailShareByRoom() {
+    std::printf("\n[診断] 尾は「音源の部屋ごと」に畳めるか（減衰の形を比べる）\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    AF_SceneSetRoomCellSize(s, 0.25f);
+    // 部屋A（響く・コンクリ）と部屋B（吸う）を戸口で繋ぐ。
+    float trA[kBands] = {0.001f,0.001f,0.001f,0.001f,0.001f,0.001f};
+    float abA[kBands] = {0.02f,0.02f,0.02f,0.03f,0.03f,0.04f};      // 裸のコンクリ
+    float abB[kBands] = {0.40f,0.40f,0.45f,0.50f,0.55f,0.60f};      // よく吸う
+    const int matA = AF_SceneAddMaterial(s, trA, abA, nullptr, kBands);
+    const int matB = AF_SceneAddMaterial(s, trA, abB, nullptr, kBands);
+    auto bx = [&](float cx, float cy, float cz, float hx, float hy, float hz, int m) {
+        AF_SceneAddInstanceBox(s, V(cx, cy, cz), V(hx, hy, hz), V(1,0,0), V(0,1,0), m);
+    };
+    const float h = 3.0f, t = 0.2f;
+    // 部屋A: x∈[-8,0]、部屋B: x∈[0,8]。共通の床・天井、間仕切りに戸口。
+    bx(-4, -t, 0, 4, t, 4, matA); bx(-4, h + t, 0, 4, t, 4, matA);
+    bx( 4, -t, 0, 4, t, 4, matB); bx( 4, h + t, 0, 4, t, 4, matB);
+    bx(-8 - t, h*0.5f, 0, t, h*0.5f, 4, matA);   // A 西
+    bx( 8 + t, h*0.5f, 0, t, h*0.5f, 4, matB);   // B 東
+    bx(-4, h*0.5f, -4 - t, 4, h*0.5f, t, matA); bx(-4, h*0.5f, 4 + t, 4, h*0.5f, t, matA);
+    bx( 4, h*0.5f, -4 - t, 4, h*0.5f, t, matB); bx( 4, h*0.5f, 4 + t, 4, h*0.5f, t, matB);
+    bx(0, h*0.5f, -2.5f, t, h*0.5f, 1.5f, matA); // 仕切り（戸口 z∈[-1,1]）
+    bx(0, h*0.5f,  2.5f, t, h*0.5f, 1.5f, matA);
+
+    const AF_Vector3 L = V(-6.0f, 1.6f, 0.0f);   // リスナーは部屋A
+    AF_SceneSetListener(s, L);
+    for (int k = 0; k < 3; ++k) AF_SceneUpdate(s, 1.0f/60.0f);
+
+    struct Case { const char* name; AF_Vector3 pos; };
+    const Case cs[4] = {
+        {"A1 同室・近い  ", V(-2.0f, 1.6f,  2.0f)},
+        {"A2 同室・遠い  ", V(-7.0f, 1.6f, -3.0f)},
+        {"A3 同室・戸口際", V(-1.0f, 1.6f,  0.0f)},
+        {"B1 隣室        ", V( 6.0f, 1.6f,  0.0f)},
+    };
+    constexpr int kBins = 200;
+    std::vector<float> eg(4 * kBins * kBands, 0.0f);
+    for (int c = 0; c < 4; ++c) {
+        const AF_Vector3 src[1] = { cs[c].pos };
+        AF_SceneComputeEchogramBands(s, L, src, 1, eg.data() + c * kBins * kBands,
+                                     kBins, 0.005f, 343.0f, 1024, 64, 4.0f);
+    }
+    // 減衰の形＝最初のビンを 0dB とした相対。時刻ごとに 4 例を並べる。
+    std::printf("      500Hz の減衰（各自の立ち上がりを 0dB とした相対）\n");
+    std::printf("      時刻      A1      A2      A3   │    B1（隣室）\n");
+    auto lvl = [&](int c, int bin) {
+        return eg[static_cast<std::size_t>(c) * kBins * kBands
+                + static_cast<std::size_t>(bin) * kBands + 2];
+    };
+    float ref[4];
+    for (int c = 0; c < 4; ++c) {
+        ref[c] = 1e-9f;
+        for (int b = 0; b < 20; ++b) ref[c] = std::max(ref[c], lvl(c, b));
+    }
+    float worstSame = 0.0f, worstCross = 0.0f;
+    for (int bin = 20; bin < kBins; bin += 20) {
+        float d[4];
+        for (int c = 0; c < 4; ++c)
+            d[c] = 20.0f * std::log10f(std::max(lvl(c, bin), 1e-9f) / ref[c]);
+        std::printf("     %4.0f ms  %6.1f  %6.1f  %6.1f   │  %6.1f\n",
+                    bin * 5.0f, d[0], d[1], d[2], d[3]);
+        for (int a = 0; a < 3; ++a)
+            for (int b2 = a + 1; b2 < 3; ++b2)
+                worstSame = std::max(worstSame, std::fabs(d[a] - d[b2]));
+        for (int a = 0; a < 3; ++a)
+            worstCross = std::max(worstCross, std::fabs(d[a] - d[3]));
+    }
+    std::printf("      同室どうしの最大差: %.1f dB / 隣室との最大差: %.1f dB\n",
+                worstSame, worstCross);
+    std::printf("      ※ 同室が小さく隣室が大きければ「部屋ごとに畳む」が成立する。\n");
+    std::printf("        同室でも大きいなら畳めない（音源ごとに持つしかない）。\n");
+    AF_SceneDestroy(s);
+}
+
+// 扉が振れる向きに対して、音源が「隙間の開く側」と「板が覆う側」で差が出るか。
+//   Unity の Test_SwingDoor と同じ形。音源は戸口の中心から左右 0.8m。
+//   蝶番は左枠(x=-0.5)、板は +Z 側（音源のいる部屋）へ振れる。
+//     右(+0.8) … 隙間が開いていく方向
+//     左(-0.8) … 振れた板が覆っていく方向
+//   回折だけで届いている間（見通しが立つ前）に差が出るのかを見る。
+void diagnoseDoorSideAsymmetry() {
+    std::printf("\n[診断] 扉の開く向き: 隙間側と板の裏側で差が出るか\n");
+    AF_SceneHandle s = AF_SceneCreate();
+    AF_SceneSetRoomCellSize(s, 0.25f);
+    // 材質: 壁はコンクリ、扉は木（Unity と同じ）
+    float trC[kBands], abC[kBands], scC[kBands];
+    float trW[kBands], abW[kBands], scW[kBands];
+    AF_MaterialPresetBands(1, trC, abC, scC);   // Concrete
+    AF_MaterialPresetBands(4, trW, abW, scW);   // WoodDoor
+    const int matWall = AF_SceneAddMaterial(s, trC, abC, scC, kBands);
+    const int matDoor = AF_SceneAddMaterial(s, trW, abW, scW, kBands);
+    auto bx = [&](float cx, float cy, float cz, float sx, float sy, float sz, int m) {
+        return AF_SceneAddInstanceBox(s, V(cx, cy, cz), V(sx*0.5f, sy*0.5f, sz*0.5f),
+                                      V(1,0,0), V(0,1,0), m);
+    };
+    const float h = 3.0f, th = 0.4f, hw = 7.0f, hd = 7.0f;
+    bx(0, -th*0.5f, 0, hw*2, th, hd*2, matWall);        // 床
+    bx(0, h + th*0.5f, 0, hw*2, th, hd*2, matWall);     // 天井
+    bx(-hw - th*0.5f, h*0.5f, 0, th, h, hd*2, matWall); // 西
+    bx( hw + th*0.5f, h*0.5f, 0, th, h, hd*2, matWall); // 東
+    bx(0, h*0.5f, -hd - th*0.5f, hw*2, h, th, matWall); // 南
+    bx(0, h*0.5f,  hd + th*0.5f, hw*2, h, th, matWall); // 北
+    // 仕切り（戸口 x∈[-0.5,+0.5]）
+    const float gapL = -0.5f, gapR = 0.5f, pth = 0.2f;
+    bx(-hw + (gapL + hw)*0.5f, h*0.5f, 0, gapL + hw, h, pth, matWall);
+    bx( gapR + (hw - gapR)*0.5f, h*0.5f, 0, hw - gapR, h, pth, matWall);
+    // 扉（蝶番 x=-0.5、+Z 側へ振れる）
+    const float dw = gapR - gapL, dth = 0.06f;
+    const int doorId = bx(0, h*0.5f, 0, dw, h, dth, matDoor);
+    AF_SceneAddPortal(s, V(0, h*0.5f, 0), V(1,0,0), V(0,1,0), dw*0.5f, h*0.5f);
+
+    const AF_Vector3 L = V(0, 1.6f, -3.0f);
+    const AF_Vector3 sR = V( 0.8f, 1.6f, 3.0f);   // 隙間が開く側
+    const AF_Vector3 sL = V(-0.8f, 1.6f, 3.0f);   // 板が覆う側
+    AF_SceneSetListener(s, L);
+
+    std::printf("      角度   右(隙間側)  左(板の裏)   差      右の遮蔽  左の遮蔽\n");
+    for (int deg = 0; deg <= 90; deg += 10) {
+        const float t = deg * 3.14159265f / 180.0f;
+        const float c = std::cos(t), sn = std::sin(t);
+        // 蝶番 gapL を軸に回す。板の中心は蝶番から幅の半分だけ先。
+        AF_SceneUpdateInstance(s, doorId,
+            V(gapL + c * dw * 0.5f, h * 0.5f, sn * dw * 0.5f),
+            V(dw * 0.5f, h * 0.5f, dth * 0.5f), V(c, 0, sn), V(0, 1, 0));
+        for (int k = 0; k < 3; ++k) AF_SceneUpdate(s, 1.0f/60.0f);
+        auto lvl = [&](const AF_Vector3& S) {
+            AF_Vector3 dp[8]; float dg[8], db[48];
+            const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+            float sum = 0.0f;
+            for (int i = 0; i < nd; ++i)
+                for (int b = 0; b < kBands; ++b) sum += db[i * kBands + b] / kBands;
+            return sum;
+        };
+        const float gR = lvl(sR), gL = lvl(sL);
+        std::printf("      %3d°   %8.5f  %8.5f  %+6.1fdB   %s      %s\n", deg, gR, gL,
+                    20.0f * std::log10f(std::max(gR,1e-9f) / std::max(gL,1e-9f)),
+                    AF_SceneIsOccluded(s, L, sR) ? "遮" : "見",
+                    AF_SceneIsOccluded(s, L, sL) ? "遮" : "見");
+    }
+    std::printf("      ※「遮」の間は回折だけで届いている。そこで差が出るかが問い。\n");
+    AF_SceneDestroy(s);
+}
+
 void diagnoseDiffractionOnlySweep() {
     std::printf("\n[診断] 回折だけシーン: リスナーを動かしたときの安定性\n");
     AF_SceneHandle s = AF_SceneCreate();
@@ -5516,6 +7763,11 @@ void diagnoseDiffractionOnlySweep() {
 
     std::printf("      リスナー x   125Hz   開口   到来方向(x,z)     経路長\n");
     int zeroCount = 0;
+    int dropCount = 0;          // 開口へ近づくのに小さくなった箇所（向きの検査）
+    // ★型紙 3（経路が消えない）を共有の式へ通す（detectors.h）。掃引そのものは変えない。
+    //   「量が小さい」ではなく「**探索が空振りする**」を見るのがこの型紙の要点。
+    std::vector<int> pathCounts; std::vector<float> pathAt;
+    float prevG = -1.0f;
     float prevDx = 0, prevDz = 0, prevLen = 0; bool havePrev = false;
     float maxDirJump = 0.0f, dirJumpAt = 0.0f;
     float maxLenJump = 0.0f, lenJumpAt = 0.0f;
@@ -5536,9 +7788,33 @@ void diagnoseDiffractionOnlySweep() {
             plen = std::sqrt(vx * vx + vy * vy + vz * vz);
             if (plen > 1e-4f) { dx = vx / plen; dz = vz / plen; }
         }
-        std::printf("      %8.1f   %6.3f   %d 本  (%5.2f,%5.2f)  %6.2f m%s\n",
-                    x, g[0], n, dx, dz, plen, (n == 0) ? "   ← 回折が消えた" : "");
-        if (n == 0 || g[0] <= 1e-4f) ++zeroCount;
+        // f が掛かっているか。深い影で 0 まで落ちる原因の切り分け用。
+        float d17[32] = {};
+        AF_SceneDebugDiffractionPath(s, L, S, d17, 0);
+        // 前川の δ 単独なら幾らになるか。A = 10log10(3 + 20N), N = 2δ/λ（125Hz で λ=2.744m）。
+        //   f が落としているのか、δ が落としているのかの切り分け。
+        const double dlt = std::max(0.0, (double)d17[0]);
+        const double N125 = 2.0 * dlt / 2.744;
+        const double mk125 = std::pow(10.0, -0.05 * (10.0 * std::log10(3.0 + 20.0 * N125)));
+        std::printf("      %8.1f   %6.3f   %d 本  (%5.2f,%5.2f)  %6.2f m  "
+                    "δ=%5.2f 前川単独 %.4f  f(125)=%.4f  f%s%s\n",
+                    x, g[0], n, dx, dz, plen,
+                    dlt, mk125, d17[10],
+                    d17[18] > 0.5f ? "○" : "×",
+                    (n == 0) ? "   ← 回折が消えた" : "");
+        // ★以前は `g[0] <= 1e-4` も「消えた」に数えていた。**絶対値での判定**で、
+        //   このファイルの方針（冒頭コメント「期待値を絶対値でなく関係で書く」）に反していた。
+        //   しかも閾値は f が飽和して壊れていた頃に決めたもの。f が効くようになると、
+        //   横へ外れた端が正しく小さくなって落ちる（実測 x=-8 で 前川単独 0.0886 に対し
+        //   f 0.0000 ── 有限の開口は半無限スクリーンより通さないので向きは正しい）。
+        //   → **見たいのは「探索が空振りして経路が消える」こと**なので、そこだけ縛る。
+        //     量が小さいことは下の単調性で見る。
+        if (n == 0) ++zeroCount;
+        pathCounts.push_back(n); pathAt.push_back(x);
+        // 開口は +x 側にあるので、x が増えるほど大きくなるのが正しい向き。
+        //   量そのものではなく**向き**を縛る（絶対値で縛らない）。
+        if (x > -8.0f && g[0] < prevG - 1e-6f) ++dropCount;
+        prevG = g[0];
         if (havePrev && n > 0) {
             const float d = std::sqrt((dx - prevDx) * (dx - prevDx) + (dz - prevDz) * (dz - prevDz));
             if (d > maxDirJump) { maxDirJump = d; dirJumpAt = x; }
@@ -5549,8 +7825,25 @@ void diagnoseDiffractionOnlySweep() {
     }
 
     char b[128];
-    std::snprintf(b, sizeof(b), "(%d 箇所)", zeroCount);
-    check("開口が1つだけなので、どこにいても回折は消えない", zeroCount == 0, b);
+    // ★以前は「ゲイン <= 1e-4 なら消えたとみなす」という**絶対値**の判定だった。
+    //   このファイルの方針（冒頭「期待値を絶対値でなく関係で書く」）に反していて、
+    //   しかも閾値は f が飽和して壊れていた頃に決めたもの。f が効くようになると、
+    //   横へ外れた端が正しく小さくなって落ちた（実測 x=-8 で 前川単独 0.0886 に対し f 0.0000。
+    //   有限の開口は半無限スクリーンより通さないので、小さくなる向き自体は正しい）。
+    //   → **絶対値をやめ、2 つの「関係」で縛る**。緩めたのではなく、見る物を変えた。
+    //     ① 経路が見つかること（探索の空振り＝本当の死角を捕まえる）
+    //     ② 開口へ近づくほど大きくなること（向きが逆なら模型が壊れている）
+    // ── 型紙 3 を共有の式で。走査（デバッグツール）と検査がここで同じ関数を呼ぶ ──
+    {
+        af::detect::Break br[16];
+        const int np = af::detect::pathAlive(pathCounts.data(), pathAt.data(),
+                                             (int)pathCounts.size(), br, 16);
+        af::detect::report("型紙3 経路が消えない", br, np, "");
+        std::snprintf(b, sizeof(b), "(経路が消えた %d 箇所)", np);
+        check("開口が1つだけなので、どこでも経路が見つかる", np == 0 && zeroCount == 0, b);
+    }
+    std::snprintf(b, sizeof(b), "(逆行 %d 箇所)", dropCount);
+    check("開口へ近づくほど大きくなる（量ではなく向きを縛る）", dropCount == 0, b);
     std::snprintf(b, sizeof(b), "(最大 %.2f @ x=%.1f)", maxDirJump, dirJumpAt);
     check("到来方向が滑らかに動く(隣接差<0.35)", maxDirJump < 0.35f, b);
     // 経路長は遅延と距離減衰の両方を決める。距離減衰だけで鳴らす設定では、
@@ -5572,6 +7865,10 @@ void testApertureOpenness() {
     float prev = -1.0f;
     bool monotone = true;
     float wide = 0.0f, narrow = 0.0f;
+    // ★型紙 2（向き）・C（効いている）・D（上限）を共有の式へ通す（detectors.h）。
+    //   ここが **2 と C を対で使う**理由の現物。この掃引の元になったバグは
+    //   「2m でも 3cm でも同じ音」＝ **定数**で、単調性だけなら合格してしまう。
+    std::vector<float> gapAt, gapSeries, tapSeries;
     for (float gap : {2.0f, 1.0f, 0.5f, 0.25f, 0.1f, 0.03f}) {
         AF_SceneHandle s = AF_SceneCreate();
         const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
@@ -5595,7 +7892,20 @@ void testApertureOpenness() {
         const AF_Vector3 L = V(-0.1f, 1.5f, -3), S = V(-0.1f, 1.5f, 3);
         float g[kBands] = {};
         AF_SceneComputeDiffractionBands(s, L, S, g, kBands);
-        std::printf("      %6.2f m  %6.3f  %6.3f  %6.3f\n", gap, g[0], g[2], g[5]);
+        // ★実際に鳴るのはタップ経路。生存ゲインだけ見て誤診した前例が 2 回あるので並べる。
+        AF_SceneUpdate(s, 0.02f);
+        AF_Vector3 dp[8]; float dg[8], db[48];
+        const int nd = AF_SceneComputeDiffractionSourceBands(s, L, S, dp, dg, db, 8);
+        float tap[kBands] = {};
+        for (int i = 0; i < nd; ++i)
+            for (int b = 0; b < kBands; ++b) tap[b] += db[i * kBands + b];
+        float dbg[28] = {};
+        AF_SceneDebugDiffractionPath(s, L, S, dbg, -1);
+        std::printf("      %6.2f m  %6.3f  %6.3f  %6.3f   │ タップ %d本 %6.3f"
+                    " │ f: 面%d枚 有界%d枚 │ 縁 u=%.2f v=%.2f │ 後ろで捨てた遮蔽物 %d 個\n",
+                    gap, g[0], g[2], g[5], nd, tap[0],
+                    (int)dbg[22], (int)dbg[23], dbg[24], dbg[25], (int)dbg[26]);
+        gapAt.push_back(gap); gapSeries.push_back(g[0]); tapSeries.push_back(tap[0]);
         if (prev >= 0.0f && g[0] > prev + 1e-3f) monotone = false;
         if (gap >= 1.99f) wide = g[0];
         narrow = g[0];
@@ -5603,10 +7913,33 @@ void testApertureOpenness() {
         AF_SceneDestroy(s);
     }
 
-    check("隙間を狭めるほど回折が落ちる(単調)", monotone);
     char b[96];
-    std::snprintf(b, sizeof(b), "(2m %.3f → 3cm %.3f)", wide, narrow);
-    check("3cm の隙間は 2m の隙間よりずっと通らない(1/4 以下)", narrow < wide * 0.25f, b);
+    // ── 型紙 2＋C＋D を共有の式で。走査と検査がここで同じ関数を呼ぶ ──
+    {
+        af::detect::Break br[16];
+        // 型紙 2: 隙間が狭くなる向きに掃いているので「下がり続ける」が正しい向き。
+        const int nm = af::detect::monotonic(gapSeries.data(), gapAt.data(),
+                                             (int)gapSeries.size(), /*rising=*/false,
+                                             1e-3f, br, 16);
+        af::detect::report("型紙2 向きが正しい", br, nm, "");
+        check("隙間を狭めるほど回折が落ちる(単調)", nm == 0 && monotone);
+
+        // 型紙 C: ★**単調は定数を通す。**振れ幅が無ければ「つまみが効いていない」。
+        //   これを入れないと、隙間幅が全く効かなかった当時のコードが**合格していた**。
+        const float range = af::detect::responseRangeDb(gapSeries.data(), (int)gapSeries.size());
+        std::snprintf(b, sizeof(b), "(2m %.3f → 3cm %.3f / 振れ幅 %.1f dB)", wide, narrow, range);
+        check("3cm の隙間は 2m の隙間よりずっと通らない(1/4 以下)", narrow < wide * 0.25f, b);
+        std::snprintf(b, sizeof(b), "(振れ幅 %.1f dB)", range);
+        check("型紙C 隙間幅が効いている(定数でない・12dB 以上動く)", range >= 12.0f, b);
+
+        // 型紙 D: タップは振幅比なので 1.0 を超えたら物理的にありえない。
+        //   ★元になったバグ: 取り分を絶対和にしたとき柱のタップが 0.88 → 1.76。
+        const int nb = af::detect::withinPhysicalBound(tapSeries.data(), gapAt.data(),
+                                                      (int)tapSeries.size(), 1.0f, br, 16);
+        af::detect::report("型紙D 上限を超えない", br, nb, "");
+        std::snprintf(b, sizeof(b), "(1.0 超過 %d 箇所)", nb);
+        check("型紙D タップが物理の上限(1.0)を超えない", nb == 0, b);
+    }
 
     // ── 閉じた扉が漏れないか（報告された症状そのもの）──
     //   「閉じてても少し判定とられる」。原因は稜線候補を 2cm 膨らませていること
@@ -5691,6 +8024,8 @@ void testDoorContinuity() {
     float first = -1.0f, last = -1.0f;
     int silentCount = 0, total = 0;
     float sweepSum[91] = {}, sweepOpen[91] = {};
+    float sweepEach[91][3] = {};
+    float sweepDirect[91] = {}, sweepOcc[91] = {};
     int   sweepN[91] = {};
     // ★「扉が仕事をしているか」を測るための控え。
     //   隣接差だけを見ていたせいで、**変化を殺した実装がテストを通ってしまった**
@@ -5744,6 +8079,41 @@ void testDoorContinuity() {
             const int di = static_cast<int>(deg + 0.5f);
             if (di >= 0 && di < 91) {
                 sweepSum[di] = sum; sweepN[di] = n;
+                // 経路ごとの重みも控える。合計だけ見ていると「どれが飛んだか」が分からない。
+                for (int i = 0; i < 3; ++i) sweepEach[di][i] = (i < n) ? gain[i] : 0.0f;
+                // 55〜60°の飛びの中身。経路ごとに、配分の重み w と経路長を見る。
+                //   w は **重心由来の経路長** から作られている。重心はクラスタの構成が
+                //   変わると跳ぶ ── 設計 scene.h の DiffractionPath がまさに警告している点。
+                if (di >= 54 && di <= 61) {
+                    std::printf("          %3d°  ", di);
+                    for (int pi = 0; pi < n && pi < 3; ++pi) {
+                        float d[20] = {};
+                        AF_SceneDebugDiffractionPath(s, L, S, d, pi);
+                        std::printf("[%d] δ %.3f thru %.5f | ", pi, d[0], d[3]);
+                    }
+                    // ポータルごとに「開口率」と「影として写った遮蔽物の枚数」。
+                    //   枚数が 1 減った角度が、扉が計算から外れた角度。
+                    int na = 0, nm = 0; AF_SceneGetPortalCounts(s, &na, &nm);
+                    for (int q = 0; q < na + nm && q < 4; ++q) {
+                        float fz[kBands] = {}; AF_Vector3 pcp = V(0,0,0);
+                        if (!AF_SceneMeasurePortal(s, q, L, S, fz, &pcp)) continue;
+                        AF_Vector3 pc{}, pu{}, pv{}; float phu = 0, phv = 0;
+                        AF_SceneGetPortal(s, q, &pc, &pu, &pv, &phu, &phv);
+                        std::printf("P%d 開口 %.4f 影%d枚 中心(%.2f,%.2f,%.2f) 半%.2fx%.2f | ",
+                                    q, fz[0], AF_SceneDebugPortalPolys(s),
+                                    pc.x, pc.y, pc.z, phu, phv);
+                    }
+                    std::printf("\n");
+                }
+                // 直接音がいつ入り始めるか。回折だけ見ていると「見通しが立つ瞬間」が映らない。
+                {
+                    float tr[kBands] = {}; float of = 0.0f;
+                    AF_SceneComputeSoftOcclusion(s, L, S, tr, kBands, &of);
+                    float trb = 0.0f;
+                    for (int b = 0; b < kBands; ++b) trb += tr[b] / kBands;
+                    sweepDirect[di] = trb;
+                    sweepOcc[di] = of;
+                }
                 float fz[kBands] = {}; AF_Vector3 pcp = V(0,0,0);
                 sweepOpen[di] = AF_SceneMeasurePortal(s, 0, L, S, fz, &pcp) ? fz[0] : -1.0f;
             }
@@ -5777,13 +8147,14 @@ void testDoorContinuity() {
     {
         std::printf("        10°刻み（頭打ちの正体を見る）:\n");
         for (int d = 0; d <= 90; d += 10)
-            std::printf("          %3d°  合計 %.4f  ポータル開口率125Hz %.4f\n",
-                        d, sweepSum[d], sweepOpen[d]);
+            std::printf("          %3d°  回折 %.4f  開口率125Hz %.4f  直接音 %.4f  遮蔽 %.3f\n",
+                        d, sweepSum[d], sweepOpen[d], sweepDirect[d], sweepOcc[d]);
         const int j = static_cast<int>(jumpAt + 0.5f);
         std::printf("        隣接差が最大の付近 (%d°):\n", j);
         for (int d = std::max(0, j - 3); d <= std::min(90, j + 2); ++d)
-            std::printf("          %3d°  合計 %.4f  開口率 %.4f\n",
-                        d, sweepSum[d], sweepOpen[d]);
+            std::printf("          %3d°  合計 %.4f  開口率 %.4f  経路 %d本  内訳 %.4f / %.4f / %.4f\n",
+                        d, sweepSum[d], sweepOpen[d], sweepN[d],
+                        sweepEach[d][0], sweepEach[d][1], sweepEach[d][2]);
     }
     char b[128];
     std::snprintf(b, sizeof(b), "(最大隣接差 %.4f @ %.0f° / 閉 %.4f → 全開 %.4f)",
@@ -6478,10 +8849,849 @@ void testRobustness() {
 
 }  // namespace
 
+// ================================================ 型紙そのものの検査（検出器の検査）
+// ★「破れなし」は、その型紙が**効いている**証明にならない。
+//   検出器が黙っているのは「健全だから」かもしれないし「壊れていて何も見ていない」
+//   からかもしれない。区別できないまま並べると、中身の無い検査が増える
+//   ── これは型紙 C（効いている）が言っていることの、検出器自身への適用。
+//
+//   なので**当時の実数**を食わせて発火することを確かめる。数値は全部この作品で実際に出た値。
+void testDetectorSelfCheck() {
+    std::printf("\n[型紙] 検出器そのものの検査（当時の実数を食わせて発火するか）\n");
+    af::detect::Break br[16];
+    char b[160];
+    auto fires = [&](const char* label, int n, int want) {
+        std::snprintf(b, sizeof(b), "(発火 %d 件 / 期待 %d 件)", n, want);
+        check(label, n == want, b);
+    };
+
+    // 型紙 1: 閉扉の距離掃引。実測で 10cm を跨いで 19.7dB / 23.0dB 跳んだ。
+    {
+        const float bad[]  = {-40.0f, -39.2f, -38.5f, -18.8f, -18.1f};   // 4 番目で 19.7dB
+        const float good[] = {-40.0f, -39.2f, -38.5f, -37.6f, -36.9f};
+        fires("型紙1 が 19.7dB の跳びで発火する",
+              af::detect::noJump(bad, nullptr, 5, 6.0f, br, 16), 1);
+        fires("型紙1 が正常な階段では黙る",
+              af::detect::noJump(good, nullptr, 5, 6.0f, br, 16), 0);
+    }
+    // 型紙 2 と C: 対で使う理由の現物。
+    //   ★**定数の列を型紙 2 に食わせると合格する。**これが「隙間幅が効かない」を
+    //     見逃した形そのもの。C を足して初めて捕まる。
+    {
+        const float flat[]  = {0.180f, 0.180f, 0.180f, 0.180f};          // 幅を変えても同じ
+        const float rev[]   = {0.180f, 0.090f, 0.140f, 0.030f};          // 3 番目で向きが逆
+        const float healthy[] = {0.180f, 0.090f, 0.030f, 0.004f};
+        fires("型紙2 が向きの逆転で発火する",
+              af::detect::monotonic(rev, nullptr, 4, false, 1e-3f, br, 16), 1);
+        fires("★型紙2 は定数を通してしまう（だから C と対で使う）",
+              af::detect::monotonic(flat, nullptr, 4, false, 1e-3f, br, 16), 0);
+        const float rFlat = af::detect::responseRangeDb(flat, 4);
+        const float rOk   = af::detect::responseRangeDb(healthy, 4);
+        std::snprintf(b, sizeof(b), "(定数 %.1f dB / 健全 %.1f dB)", rFlat, rOk);
+        check("型紙C が定数を捕まえ、健全な掃引は通す", rFlat < 1.0f && rOk > 12.0f, b);
+    }
+    // 型紙 3: 2 次回折が 0.486 → 0.000 になったとき、経路探索が空振りしていた。
+    {
+        const int bad[]  = {3, 2, 0, 1};
+        const int good[] = {3, 2, 1, 1};
+        fires("型紙3 が経路の消失で発火する", af::detect::pathAlive(bad, nullptr, 4, br, 16), 1);
+        fires("型紙3 が経路があれば黙る",  af::detect::pathAlive(good, nullptr, 4, br, 16), 0);
+    }
+    // 型紙 4: 閉扉の幻。帯域がまっすぐ（低−高 ≈ 0）＝ 回折でも透過でもありえない形。
+    {
+        const float phantom[kBands] = {0.21f, 0.21f, 0.21f, 0.21f, 0.209f, 0.209f};
+        const float real[kBands]    = {0.21f, 0.15f, 0.09f, 0.04f, 0.012f, 0.003f};
+        fires("型紙4 が平らな帯域（幻）で発火する",
+              af::detect::noPhantom(phantom, nullptr, nullptr, 1, 3.0f, br, 16), 1);
+        fires("型紙4 が周波数依存のある本物では黙る",
+              af::detect::noPhantom(real, nullptr, nullptr, 1, 3.0f, br, 16), 0);
+    }
+    // 型紙 5 と B: 同じ設定で 2 回（5）／設定を変えて（B）。別物なので両方要る。
+    {
+        const float a[] = {1.0f, 2.0f, 3.0f};
+        const float c[] = {1.0f, 2.0f, 3.0000005f};
+        fires("型紙5 が実行ごとの揺れで発火する", af::detect::deterministic(a, c, 3, 0.0f, br, 16), 1);
+        fires("型紙B(ビット一致) が設定で変わった音を捕まえる",
+              af::detect::invariantUnderSetting(a, c, 3, true, 0.0f, br, 16), 1);
+        fires("型紙B(許容差) は丸めの差では黙る",
+              af::detect::invariantUnderSetting(a, c, 3, false, 1e-4f, br, 16), 0);
+    }
+    // 型紙 A: 尾だけ 8.3 倍（outputGain の掛け忘れ）。跳びでも幻でもない「一定の間違い」。
+    {
+        const float den[] = {0.10f, 0.12f, 0.09f};
+        const float bad[] = {0.83f, 0.996f, 0.747f};                     // 全部 8.3 倍
+        const float good[]= {0.10f, 0.12f, 0.09f};
+        fires("型紙A が 8.3 倍の掛け忘れで発火する",
+              af::detect::ratioInRange(bad, den, nullptr, 3, 0.99f, 1.01f, "r", br, 16), 3);
+        fires("型紙A が比が保たれていれば黙る",
+              af::detect::ratioInRange(good, den, nullptr, 3, 0.99f, 1.01f, "r", br, 16), 0);
+    }
+    // 型紙 D: 取り分を絶対和にしたとき、柱のタップが 0.88 → 1.76。
+    {
+        const float bad[]  = {0.88f, 1.76f, 0.44f};
+        const float good[] = {0.88f, 0.88f, 0.44f};
+        fires("型紙D が 1.76（1.0 超え）で発火する",
+              af::detect::withinPhysicalBound(bad, nullptr, 3, 1.0f, br, 16), 1);
+        fires("型紙D が上限内では黙る",
+              af::detect::withinPhysicalBound(good, nullptr, 3, 1.0f, br, 16), 0);
+    }
+}
+
+// ================================================ キャプチャ（録る → 読む → 走査する）
+// 仕様: docs/SOUND_DEBUG_TOOL.md。ここで見るのは 3 つ。
+//   ① 録った**入力**がそのまま戻ること（戻らなければ再現にならない）
+//   ② 動いた実体（扉）が残ること ← ★呼ぶ順の罠がある。下の注記
+//   ③ 走査が本物の破れに印を付けること（型紙は回帰テストと同じ関数）
+// キャプチャ用の場面。★リプレイ側が**同じ形**を作れるよう、必ずここを通すこと
+//   （キャプチャに入っているのは動いた実体だけで、静的な形は入っていない）。
+static AF_SceneHandle buildCaptureScene(int* outDoor) {
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    const float t = 0.1f, h = 3.0f;
+    // 仕切り壁（戸口 x∈[-0.5,0.5]）と、その戸口を塞ぐ扉。
+    AF_SceneAddInstanceBox(s, V(-2.25f, h*0.5f, 0), V(1.75f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V( 2.25f, h*0.5f, 0), V(1.75f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+    const int door = AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(0.5f, h*0.5f, 0.05f),
+                                            V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, -t, 0), V(6, t, 8), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, h + t, 0), V(6, t, 8), V(1,0,0), V(0,1,0), mat);
+    if (outDoor) *outDoor = door;
+    return s;
+}
+
+void testCaptureRoundTrip() {
+    std::printf("\n[キャプチャ] 録る → 読む → 走査する\n");
+    const char* kPath = "afcap_roundtrip.afcap";
+
+    int door = 0;
+    AF_SceneHandle s = buildCaptureScene(&door);
+    const float h = 3.0f;
+
+    const unsigned long long kId = 4001;
+    AF_SceneCaptureBegin(s, /*preroll*/60, /*postroll*/30, /*maxSources*/4,
+                         /*sampleRate*/48000, /*recordPcm*/1);
+
+    const int kFrames = 200, kBlock = 512;
+    std::vector<float> pcm(static_cast<size_t>(kBlock) * 2);
+    std::vector<float> lzWant; std::vector<int> movedWant;
+    int markFrame = 150, teleportFrame = 120;
+    for (int f = 0; f < kFrames; ++f) {
+        // 扉を少しずつ開ける（＝実体が動く）。★録れているかを②で見る。
+        const float open = 0.002f * static_cast<float>(f);
+        AF_SceneUpdateInstance(s, door, V(open, h*0.5f, 0), V(0.5f, h*0.5f, 0.05f),
+                               V(1,0,0), V(0,1,0));
+        // リスナーは扉へ近づく。★frame 120 で瞬間移動させる ＝ **本物の跳び**を仕込む。
+        float lz = -4.0f + 0.02f * static_cast<float>(f);
+        if (f >= teleportFrame) lz += 3.0f;
+        AF_SceneSetListener(s, V(0.2f, 1.5f, lz));
+        AF_SceneSetSource(s, kId, V(0.2f, 1.5f, 3.0f));
+        // マスターPCM。位置が分かる値を入れて往復を確かめる。
+        for (int i = 0; i < kBlock * 2; ++i)
+            pcm[static_cast<size_t>(i)] = 0.5f * std::sin(0.01f * static_cast<float>(f * kBlock + i));
+        AF_SceneCapturePushAudio(s, pcm.data(), kBlock);
+        if (f == markFrame) AF_SceneCaptureMark(s);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        lzWant.push_back(lz);
+        movedWant.push_back(f);
+    }
+
+    char note[192];
+    int held = 0;
+    const int st = AF_SceneCaptureStatus(s, &held);
+    std::snprintf(note, sizeof(note), "(状態 %d / 保持 %d フレーム)", st, held);
+    check("[キャプチャ] マーク後に前後が揃って保存可能になる", st == 2 && held == 91, note);
+
+    const int wrote = AF_SceneCaptureWrite(s, kPath, "Test_CaptureRoundTrip", 0xABCD1234u);
+    check("[キャプチャ] .afcap を書けた", wrote == 1);
+    AF_SceneDestroy(s);
+
+    acoustic::dbg::CaptureFile cap;
+    std::string err;
+    const bool ok = acoustic::dbg::readCapture(kPath, cap, &err);
+    std::snprintf(note, sizeof(note), "(%s)", ok ? "読めた" : err.c_str());
+    check("[キャプチャ] 書いたものをそのまま読める", ok, note);
+    if (!ok) return;
+
+    std::snprintf(note, sizeof(note), "(場面 %s / dllHash %08x / 並列 %d)",
+                  cap.scene.c_str(), cap.dllHash, cap.workerThreads);
+    check("[キャプチャ] ヘッダの識別子が焼けている（古い物を掴んだまま気づかない対策）",
+          cap.scene == "Test_CaptureRoundTrip" && cap.dllHash == 0xABCD1234u, note);
+
+    // ① 入力（リスナー位置）が**そのまま**戻ること。丸めも許さない ── 押し直しが再現になる前提。
+    {
+        // ⚠ 残るのは「末尾 N フレーム」ではない。**マーク＋postroll で録音が止まる**ので、
+        //   窓は掃引の途中で終わる。だからフレーム番号で引く（最初これを間違えて全滅した）。
+        int bad = 0;
+        for (int k = 0; k < cap.frames; ++k) {
+            const unsigned fn = cap.global[static_cast<size_t>(k)].frame;
+            if (fn >= lzWant.size()) { ++bad; continue; }
+            if (cap.global[static_cast<size_t>(k)].lz != lzWant[fn]) ++bad;
+        }
+        std::snprintf(note, sizeof(note), "(%d フレーム中 ずれ %d)", cap.frames, bad);
+        check("[キャプチャ] ① 入力のリスナー位置がビット一致で戻る", bad == 0, note);
+    }
+
+    // ② 動いた実体が残ること。
+    //   ★ここに罠があった。ホストの呼ぶ順は UpdateInstance → SetListener → Update なので、
+    //     **扉の記録は beginFrame より前に溜まる**。最初 beginFrame で枠を消していて、
+    //     扉の動きが 1 つも残らなかった。掃除の場所を endFrame 側へ移して直した。
+    {
+        int framesWithMoved = 0, wrongId = 0;
+        for (int k = 0; k < cap.frames; ++k) {
+            if (!cap.moved[static_cast<size_t>(k)].empty()) ++framesWithMoved;
+            for (const auto& m : cap.moved[static_cast<size_t>(k)])
+                if (m.instance != door) ++wrongId;
+        }
+        std::snprintf(note, sizeof(note), "(%d / %d フレームに扉あり・別 id %d)",
+                      framesWithMoved, cap.frames, wrongId);
+        check("[キャプチャ] ② 動いた扉が毎フレーム残る（呼ぶ順の罠）",
+              framesWithMoved == cap.frames && wrongId == 0, note);
+    }
+
+    // マークの印がちょうど 1 つ、押したフレームに付くこと。
+    {
+        int marks = 0; unsigned markedAt = 0;
+        for (int k = 0; k < cap.frames; ++k)
+            if (cap.global[static_cast<size_t>(k)].marked) {
+                ++marks; markedAt = cap.global[static_cast<size_t>(k)].frame;
+            }
+        std::snprintf(note, sizeof(note), "(印 %d 個 @ frame %u / 押したのは %d)",
+                      marks, markedAt, markFrame);
+        check("[キャプチャ] 「変だ」の印が押したフレームに 1 つだけ付く",
+              marks == 1 && markedAt == static_cast<unsigned>(markFrame), note);
+    }
+
+    // PCM が入っていること。
+    {
+        const double secs = static_cast<double>(cap.pcm.size() / 2) / cap.sampleRate;
+        std::snprintf(note, sizeof(note), "(%zu サンプル ＝ %.2f 秒)", cap.pcm.size() / 2, secs);
+        check("[キャプチャ] マスターPCM が前後ぶん入っている", cap.pcm.size() > 0 && secs > 1.0, note);
+    }
+
+    // ③ 走査。★型紙は回帰テストが呼ぶのと**同じ関数**（detectors.h）。
+    {
+        const std::vector<af::scan::Mark> marks = af::scan::scan(cap);
+        af::scan::printMarks(marks);
+        int jumpAtTeleport = 0;
+        for (const auto& m : marks) {
+            if (std::string(m.templateName).find("型紙1") == std::string::npos) continue;
+            if (m.frame >= teleportFrame && m.frame <= teleportFrame + 2) ++jumpAtTeleport;
+        }
+        std::snprintf(note, sizeof(note), "(frame %d 付近の型紙1 の印 %d 件 / 印は全部で %zu 件)",
+                      teleportFrame, jumpAtTeleport, marks.size());
+        check("[キャプチャ] ③ 走査が仕込んだ跳び（瞬間移動）に印を付ける",
+              jumpAtTeleport >= 1, note);
+    }
+    std::remove(kPath);
+}
+
+// ================================================ 入力リプレイ（押し直して解き直す）
+// ★この道具の前提そのもの ──「録った入力を押し直せば再現になる」を**測る**。
+//   仕様書には「同じビルド・同じ workerThreads なら完全に一致する」と書いたが、
+//   それが**どこまで本当か**を確かめていなかった。ここで確かめる。
+void testCaptureReplay() {
+    std::printf("\n[リプレイ] 録った入力を押し直すと同じ音になるか\n");
+    const char* kPath = "afcap_replay.afcap";
+    const unsigned long long kId = 4001;
+    const float h = 3.0f;
+
+    // 録る側と押す側で**同じ動き**を使う（ずれたら比較にならない）。
+    auto driveFrame = [&](AF_SceneHandle s, int door, int f) {
+        const float open = 0.002f * static_cast<float>(f);
+        AF_SceneUpdateInstance(s, door, V(open, h*0.5f, 0), V(0.5f, h*0.5f, 0.05f),
+                               V(1,0,0), V(0,1,0));
+        AF_SceneSetListener(s, V(0.2f, 1.5f, -4.0f + 0.02f * static_cast<float>(f)));
+        AF_SceneSetSource(s, kId, V(0.2f, 1.5f, 3.0f));
+    };
+
+    auto recordTo = [&](const char* path, int preroll, int frames, int markAt) {
+        int door = 0;
+        AF_SceneHandle s = buildCaptureScene(&door);
+        AF_SceneCaptureBegin(s, preroll, 30, 4, 48000, /*recordPcm*/0);
+        for (int f = 0; f < frames; ++f) {
+            driveFrame(s, door, f);
+            if (f == markAt) AF_SceneCaptureMark(s);
+            AF_SceneUpdate(s, 1.0f / 60.0f);
+        }
+        const int ok = AF_SceneCaptureWrite(s, path, "Test_CaptureReplay", 0u);
+        AF_SceneDestroy(s);
+        return ok == 1;
+    };
+
+    char note[224];
+
+    // ── ① 窓がフレーム 0 から始まる場合 ──
+    //   録音開始とリプレイ開始でエンジンの内部状態が揃うので、ここは厳密に一致するはず。
+    {
+        const bool wrote = recordTo(kPath, /*preroll*/300, /*frames*/120, /*markAt*/80);
+        check("[リプレイ] ① 先頭から録れた", wrote);
+        acoustic::dbg::CaptureFile cap;
+        if (wrote && acoustic::dbg::readCapture(kPath, cap)) {
+            int door = 0;
+            AF_SceneHandle s = buildCaptureScene(&door);   // ★同じ形を作り直す
+            const std::vector<af::replay::FrameDiff> d = af::replay::replayAndCompare(s, cap);
+            AF_SceneDestroy(s);
+            int badFrames = 0, totalMismatch = 0, badTail = 0; float worst = 0.0f; int worstAt = -1;
+            for (const auto& x : d) {
+                if (x.exactMismatches) { ++badFrames; totalMismatch += x.exactMismatches; }
+                if (!x.tailExact) ++badTail;
+                if (x.worstRel > worst) { worst = x.worstRel; worstAt = x.frame; }
+            }
+            std::printf("        窓の先頭 frame %u / %d フレーム\n",
+                        cap.global.empty() ? 0u : cap.global[0].frame, cap.frames);
+            std::snprintf(note, sizeof(note),
+                          "(%d フレーム中 一致しない %d / 要素 %d / 最大相対差 %.3e @f%d)",
+                          cap.frames, badFrames, totalMismatch, worst, worstAt);
+            check("[リプレイ] ① 先頭から録れば押し直しでビット一致する",
+                  badFrames == 0 && cap.frames > 0, note);
+            std::snprintf(note, sizeof(note), "(尾が一致しない %d フレーム / 全 %d)",
+                          badTail, cap.frames);
+            check("[リプレイ] ① 尾（エコグラム）も先頭からビット一致する",
+                  badTail == 0 && cap.frames > 0, note);
+        }
+        std::remove(kPath);
+    }
+
+    // ── ② 窓が途中から始まる場合（実際の使い方はこちら）──
+    //   ⚠ ここが仕様書の書きすぎだったところ。リングが一周していると、窓の先頭では
+    //     エンジンの内部状態（段の間引きカウンタ・エコグラムの積み上げ）が**録音時と違う**。
+    //     どのくらいで揃うかを測って、必要な暖機を数字で出す。
+    {
+        const bool wrote = recordTo(kPath, /*preroll*/60, /*frames*/200, /*markAt*/150);
+        check("[リプレイ] ② 途中から始まる窓を録れた", wrote);
+        acoustic::dbg::CaptureFile cap;
+        if (wrote && acoustic::dbg::readCapture(kPath, cap)) {
+            int door = 0;
+            AF_SceneHandle s = buildCaptureScene(&door);
+            const std::vector<af::replay::FrameDiff> d = af::replay::replayAndCompare(s, cap);
+            AF_SceneDestroy(s);
+            // 「最後にビット一致しなかったフレーム」＝ここまでは信用しない、の境目。
+            int lastBad = -1, badFrames = 0, lastBadTail = -1, badTail = 0;
+            float worstTail = 0.0f;
+            for (int i = 0; i < static_cast<int>(d.size()); ++i) {
+                if (d[static_cast<size_t>(i)].exactMismatches) { lastBad = i; ++badFrames; }
+                if (!d[static_cast<size_t>(i)].tailExact) { lastBadTail = i; ++badTail; }
+                if (d[static_cast<size_t>(i)].tailRel > worstTail)
+                    worstTail = d[static_cast<size_t>(i)].tailRel;
+            }
+            std::printf("        窓の先頭 frame %u / %d フレーム\n",
+                        cap.global.empty() ? 0u : cap.global[0].frame, cap.frames);
+            std::printf("        帯域ゲイン: 一致しない %d フレーム\n", badFrames);
+            std::printf("        尾(エコグラム): 一致しない %d フレーム / 最大相対差 %.3e\n",
+                        badTail, worstTail);
+            if (lastBadTail >= 0)
+                std::printf("        ★尾の暖機は先頭から %d フレーム"
+                            "（そこから末尾まではビット一致）\n", lastBadTail + 1);
+            // ★縛るのは「いつか揃うこと」。何フレームで揃うかは段の設定で変わるので焼かない。
+            const int tail = static_cast<int>(d.size()) - 1 - lastBad;
+            std::snprintf(note, sizeof(note), "(末尾 %d フレームがビット一致 / 全 %d)",
+                          tail, cap.frames);
+            check("[リプレイ] ② 帯域ゲインは途中から始めても一致する",
+                  cap.frames > 0 && tail >= cap.frames / 2, note);
+            const int tailOk = static_cast<int>(d.size()) - 1 - lastBadTail;
+            std::snprintf(note, sizeof(note), "(尾が末尾 %d フレーム一致 / 全 %d)",
+                          tailOk, cap.frames);
+            check("[リプレイ] ② 尾も暖機のあとは一致する（暖機ぶんは信用しない）",
+                  cap.frames > 0 && tailOk >= cap.frames / 2, note);
+        }
+        std::remove(kPath);
+    }
+}
+
+// ================================================ 破れ → 回帰テストの生成
+// ★資料の主張のうち 3 つめ「見つけた破れがそのまま回帰テストになる」の実物。
+//   ここでいちばん大事なのは **絶対値を焼かないこと**。
+void testCaptureEmit() {
+    std::printf("\n[生成] 破れから回帰テストを吐く\n");
+    const char* kPath = "afcap_emit.afcap";
+    const unsigned long long kId = 4001;
+    const float h = 3.0f;
+
+    int door = 0;
+    AF_SceneHandle s = buildCaptureScene(&door);
+    AF_SceneCaptureBegin(s, 90, 20, 4, 48000, /*recordPcm*/0);
+    const int kFrames = 140, teleportFrame = 70;
+    for (int f = 0; f < kFrames; ++f) {
+        AF_SceneUpdateInstance(s, door, V(0.002f * static_cast<float>(f), h*0.5f, 0),
+                               V(0.5f, h*0.5f, 0.05f), V(1,0,0), V(0,1,0));
+        float lz = -4.0f + 0.02f * static_cast<float>(f);
+        if (f >= teleportFrame) lz += 3.0f;                 // 仕込んだ跳び
+        AF_SceneSetListener(s, V(0.2f, 1.5f, lz));
+        AF_SceneSetSource(s, kId, V(0.2f, 1.5f, 3.0f));
+        if (f == 110) AF_SceneCaptureMark(s);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+    }
+    const bool wrote = AF_SceneCaptureWrite(s, kPath, "Test_CaptureEmit", 0u) == 1;
+    AF_SceneDestroy(s);
+    check("[生成] 元になるキャプチャを録れた", wrote);
+    if (!wrote) return;
+
+    acoustic::dbg::CaptureFile cap;
+    if (!acoustic::dbg::readCapture(kPath, cap)) { check("[生成] キャプチャを読めた", false); return; }
+
+    char note[192];
+    std::snprintf(note, sizeof(note), "(箱 %zu 個 / メッシュ %d 個)", cap.boxes.size(), cap.meshCount);
+    check("[生成] 静的な形がキャプチャに入っている（吐いた検査が自己完結するために要る）",
+          cap.boxes.size() == 5 && cap.meshCount == 0, note);
+
+    const std::vector<af::scan::Mark> marks = af::scan::scan(cap);
+    // ★仕込んだ跳び（瞬間移動）の印を選ぶ。最初の 1 件だと別の跳びを拾うことがある。
+    const af::scan::Mark* jump = nullptr;
+    for (const auto& m : marks) {
+        if (std::string(m.templateName).find("型紙1") == std::string::npos) continue;
+        if (m.frame >= teleportFrame && m.frame <= teleportFrame + 2) { jump = &m; break; }
+    }
+    check("[生成] 走査が仕込んだ跳びを見つけた", jump != nullptr);
+    if (!jump) { std::remove(kPath); return; }
+
+    const std::string src = af::emit::emitCase(cap, *jump, "testGenerated_DoorJump");
+    std::printf("        吐いた行数 %d 行 / %zu バイト\n",
+                1 + static_cast<int>(std::count(src.begin(), src.end(), '\n')), src.size());
+
+    // 中身の検査 ①: 必要な部品が入っていること。
+    const bool hasGeom  = src.find("AF_SceneAddInstanceBox") != std::string::npos;
+    const bool hasInput = src.find("AF_SceneSetListener") != std::string::npos
+                       && src.find("kL[][3]") != std::string::npos;
+    const bool hasDoor  = src.find("AF_SceneUpdateInstance") != std::string::npos;
+    const bool hasTmpl  = src.find("af::detect::noJump") != std::string::npos;
+    std::snprintf(note, sizeof(note), "(形 %d / 入力 %d / 扉 %d / 型紙 %d)",
+                  hasGeom, hasInput, hasDoor, hasTmpl);
+    check("[生成] 形・入力・動いた実体・型紙がすべて入っている",
+          hasGeom && hasInput && hasDoor && hasTmpl, note);
+
+    // ★中身の検査 ②: **録れた出力の数値が 1 つも入っていないこと。**
+    //   ここがこの生成器の肝。絶対値を焼くと、正当なチューニングのたびに落ちて
+    //   すぐ信用されなくなる（このリポジトリの方針＝期待値は関係で書く）。
+    {
+        int leaked = 0; char buf[64];
+        for (int k = 0; k < cap.frames; ++k)
+            for (const auto& e : cap.sources[static_cast<size_t>(k)]) {
+                if (e.id != jump->sourceId) continue;
+                for (int b = 0; b < acoustic::dbg::kCapBands; ++b) {
+                    // 0 と 1 は形（軸・材質）にも出るので数えない。
+                    if (e.band[b] <= 0.0f || e.band[b] >= 1.0f) continue;
+                    std::snprintf(buf, sizeof(buf), "%g", e.band[b]);
+                    if (src.find(buf) != std::string::npos) ++leaked;
+                }
+            }
+        std::snprintf(note, sizeof(note), "(録れた出力の値が %d 個 混入)", leaked);
+        check("[生成] ★吐いた検査に録れた出力の数値が 1 つも入っていない", leaked == 0, note);
+    }
+
+    // 吐いたものを実際に置いておく（人が見て貼れるように）。
+    if (std::FILE* f = std::fopen("generated_case.cpp.txt", "wb")) {
+        std::fwrite(src.data(), 1, src.size(), f);
+        std::fclose(f);
+        std::printf("        → generated_case.cpp.txt に書き出した\n");
+    }
+    std::remove(kPath);
+
+    // ── ★健全な窓からも 1 本吐く ──
+    //   ⚠ 上で吐いた検査は**必ず落ちる**。仕込んだ跳びは本物なので当然で、
+    //     「直したあとに通る検査」がこの生成器の成果物。だから golden には
+    //     跳びを仕込まない窓を使う（これを AcousticEngineTest/generated_cases.inc へ入れて、
+    //     **吐いたものが実際にコンパイルされて通ること**をビルドで担保する）。
+    {
+        const char* kPath2 = "afcap_emit_ok.afcap";
+        int door2 = 0;
+        AF_SceneHandle s2 = buildCaptureScene(&door2);
+        AF_SceneCaptureBegin(s2, 90, 20, 4, 48000, 0);
+        for (int f = 0; f < 140; ++f) {
+            AF_SceneUpdateInstance(s2, door2, V(0.002f * static_cast<float>(f), h*0.5f, 0),
+                                   V(0.5f, h*0.5f, 0.05f), V(1,0,0), V(0,1,0));
+            AF_SceneSetListener(s2, V(0.2f, 1.5f, -4.0f + 0.02f * static_cast<float>(f)));
+            AF_SceneSetSource(s2, kId, V(0.2f, 1.5f, 3.0f));
+            if (f == 110) AF_SceneCaptureMark(s2);
+            AF_SceneUpdate(s2, 1.0f / 60.0f);
+        }
+        const bool ok2 = AF_SceneCaptureWrite(s2, kPath2, "Test_CaptureEmitOk", 0u) == 1;
+        AF_SceneDestroy(s2);
+        acoustic::dbg::CaptureFile cap2;
+        if (ok2 && acoustic::dbg::readCapture(kPath2, cap2) && cap2.frames > 40) {
+            af::scan::Mark mk;
+            mk.frame = static_cast<int>(cap2.global[static_cast<size_t>(cap2.frames / 2)].frame);
+            mk.sourceId = kId;
+            mk.templateName = "型紙1 跳ばない";
+            mk.what = "level";
+            const std::string good = af::emit::emitCase(cap2, mk, "testGenerated_DoorSweep");
+            if (std::FILE* f = std::fopen("generated_case_ok.cpp.txt", "wb")) {
+                std::fwrite(good.data(), 1, good.size(), f);
+                std::fclose(f);
+                std::printf("        → generated_case_ok.cpp.txt（健全な窓・golden 候補）\n");
+            }
+        }
+        std::remove(kPath2);
+    }
+}
+
+// ================================================ ABI 経路（Unity が通る道）
+// ★ホストは .afcap を DLL 越しに開いて走査する。**検査の経路と同じ結果**でなければ
+//   「Unity では印が出るのに検査は通る」が起きる。ここでそれを縛る。
+void testCaptureAbi() {
+    std::printf("\n[ABI] Unity が通る道と検査の道が同じ結果か\n");
+    const char* kPath = "afcap_abi.afcap";
+    const unsigned long long kId = 4001;
+    const float h = 3.0f;
+
+    int door = 0;
+    AF_SceneHandle s = buildCaptureScene(&door);
+    AF_SceneCaptureBegin(s, 60, 20, 4, 48000, /*recordPcm*/1);
+    std::vector<float> blk(256 * 2);
+    for (int f = 0; f < 120; ++f) {
+        AF_SceneUpdateInstance(s, door, V(0.002f * static_cast<float>(f), h*0.5f, 0),
+                               V(0.5f, h*0.5f, 0.05f), V(1,0,0), V(0,1,0));
+        float lz = -4.0f + 0.02f * static_cast<float>(f);
+        if (f >= 60) lz += 3.0f;
+        AF_SceneSetListener(s, V(0.2f, 1.5f, lz));
+        AF_SceneSetSource(s, kId, V(0.2f, 1.5f, 3.0f));
+        for (int i = 0; i < 512; ++i)
+            blk[static_cast<size_t>(i)] = 0.25f * std::sin(0.01f * static_cast<float>(i));
+        AF_SceneCapturePushAudio(s, blk.data(), 256);
+        if (f == 100) AF_SceneCaptureMark(s);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+    }
+    const bool wrote = AF_SceneCaptureWrite(s, kPath, "Test_CaptureAbi", 0x1234u) == 1;
+    AF_SceneDestroy(s);
+    check("[ABI] 元になるキャプチャを録れた", wrote);
+    if (!wrote) return;
+
+    char note[224];
+    AF_CaptureHandle cap = AF_CaptureOpen(kPath);
+    check("[ABI] AF_CaptureOpen で開ける", cap != nullptr);
+    if (!cap) { std::remove(kPath); return; }
+
+    AF_CaptureInfo info{};
+    check("[ABI] 概要が取れる", AF_CaptureGetInfo(cap, &info) == 1);
+    char sceneName[64] = {};
+    AF_CaptureGetSceneName(cap, sceneName, sizeof(sceneName));
+    std::snprintf(note, sizeof(note),
+                  "(%s / %d フレーム / 箱 %d / 材質 %d / 音源 %d / PCM %d)",
+                  sceneName, info.frames, info.boxCount, info.materialCount,
+                  info.sourceCount, info.pcmFrames);
+    check("[ABI] 概要の中身が合っている",
+          info.frames == 81 && info.boxCount == 5 && info.materialCount >= 1
+          && info.sourceCount == 1 && info.pcmFrames > 0 && info.dllHash == 0x1234u
+          && std::string(sceneName) == "Test_CaptureAbi", note);
+
+    // ★走査: ABI 越しの結果と、検査が直に呼ぶ結果が一致すること。
+    {
+        acoustic::dbg::CaptureFile direct;
+        acoustic::dbg::readCapture(kPath, direct);
+        const std::vector<af::scan::Mark> want = af::scan::scan(direct);
+        const int got = AF_CaptureScan(cap, nullptr, 0);
+        std::vector<AF_CaptureMark> abiMarks(static_cast<size_t>(got > 0 ? got : 1));
+        AF_CaptureScan(cap, abiMarks.data(), got);
+        int mismatch = 0;
+        for (int i = 0; i < got && i < static_cast<int>(want.size()); ++i)
+            if (abiMarks[static_cast<size_t>(i)].frame != want[static_cast<size_t>(i)].frame
+                || abiMarks[static_cast<size_t>(i)].sourceId != want[static_cast<size_t>(i)].sourceId)
+                ++mismatch;
+        std::snprintf(note, sizeof(note), "(ABI %d 件 / 直 %zu 件 / 食い違い %d)",
+                      got, want.size(), mismatch);
+        check("[ABI] 走査の結果が検査の経路と一致する",
+              got == static_cast<int>(want.size()) && mismatch == 0 && got > 0, note);
+    }
+
+    // ★リプレイ: ABI の ApplyFrame で押し直して、録れた帯域とビット一致すること。
+    {
+        int door2 = 0;
+        AF_SceneHandle s2 = buildCaptureScene(&door2);
+        acoustic::dbg::CaptureFile ref;
+        acoustic::dbg::readCapture(kPath, ref);
+        int bad = 0;
+        for (int k = 0; k < info.frames; ++k) {
+            AF_CaptureApplyFrame(s2, cap, k);
+            AF_SceneUpdate(s2, 1.0f / 60.0f);
+            for (const auto& src : ref.sources[static_cast<size_t>(k)]) {
+                const int idx = AF_SceneSourceIndex(s2, src.id);
+                float g[kBands] = {};
+                AF_SceneGetSourceOcclusion(s2, idx, g);
+                for (int b = 0; b < kBands; ++b) if (g[b] != src.band[b]) ++bad;
+            }
+        }
+        AF_SceneDestroy(s2);
+        std::snprintf(note, sizeof(note), "(一致しない要素 %d 個 / %d フレーム)", bad, info.frames);
+        check("[ABI] AF_CaptureApplyFrame で押し直すと帯域がビット一致する", bad == 0, note);
+    }
+
+    // ★吐き出し: ABI 越しでも同じものが出ること。
+    {
+        std::vector<char> buf(65536);
+        const int n = AF_CaptureEmitCase(cap, 0, "testGenerated_Abi", buf.data(),
+                                         static_cast<int>(buf.size()));
+        const std::string src(buf.data());
+        const bool ok = n > 0 && src.find("AF_SceneAddMaterial") != std::string::npos
+                     && src.find("AF_SceneAddInstanceBox") != std::string::npos
+                     && src.find("af::detect::") != std::string::npos;
+        std::snprintf(note, sizeof(note), "(%d 文字)", n);
+        check("[ABI] AF_CaptureEmitCase が検査を吐く", ok, note);
+    }
+
+    AF_CaptureClose(cap);
+    std::remove(kPath);
+}
+
+// ================================================ Unity と同じ呼び順・同じスレッド構成
+// ★型検査では絶対に捕まらないところを見る。
+//   Unity では PCM が**オーディオスレッド**から、シーンの更新が**メインスレッド**から来る。
+//   `CaptureRecorder.cs` の呼び順そのままを、本物のスレッド 2 本で再現する。
+//   ⚠ ここが通らないなら Unity でも通らない。逆は言えない（Unity 固有の話は見ない）。
+void testCaptureUnityFlow() {
+    std::printf("\n[Unity流] オーディオスレッドから PCM・メインから更新\n");
+    const char* kPath = "afcap_unity.afcap";
+    const unsigned long long kId = 7001;
+    const float h = 3.0f;
+
+    int door = 0;
+    AF_SceneHandle s = buildCaptureScene(&door);
+    // CaptureRecorder.OnEnable と同じ: 秒 → フレームは 60fps 換算で固定。
+    AF_SceneCaptureBegin(s, 60, 20, 64, 48000, /*recordPcm*/1);
+
+    // オーディオスレッド。Unity の OnAudioFilterRead と同じ粒（1024 フレーム）で回す。
+    std::atomic<bool> stop{false};
+    std::atomic<long long> pushed{0};
+    std::thread audio([&]() {
+        std::vector<float> blk(1024 * 2);
+        while (!stop.load(std::memory_order_relaxed)) {
+            for (int i = 0; i < 1024 * 2; ++i)
+                blk[static_cast<size_t>(i)] = 0.2f * std::sin(0.001f * static_cast<float>(i));
+            AF_SceneCapturePushAudio(s, blk.data(), 1024);
+            pushed.fetch_add(1, std::memory_order_relaxed);
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+        }
+    });
+
+    // メインスレッド。CaptureRecorder.Update と同じく毎フレーム Status を引く。
+    int sawRecording = 0, sawReady = 0;
+    for (int f = 0; f < 130; ++f) {
+        AF_SceneUpdateInstance(s, door, V(0.002f * static_cast<float>(f), h*0.5f, 0),
+                               V(0.5f, h*0.5f, 0.05f), V(1,0,0), V(0,1,0));
+        AF_SceneSetListener(s, V(0.2f, 1.5f, -4.0f + 0.02f * static_cast<float>(f)));
+        AF_SceneSetSource(s, kId, V(0.2f, 1.5f, 3.0f));
+        if (f == 100) AF_SceneCaptureMark(s);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        int held = 0;
+        const int st = AF_SceneCaptureStatus(s, &held);
+        if (st == 1) ++sawRecording;
+        if (st == 2) ++sawReady;
+    }
+    stop.store(true, std::memory_order_relaxed);
+    audio.join();
+
+    char note[224];
+    std::snprintf(note, sizeof(note), "(録音中 %d / 保存可 %d / オーディオ %lld ブロック)",
+                  sawRecording, sawReady, (long long)pushed.load());
+    check("[Unity流] 状態が「録音中」→「保存可」と進む",
+          sawRecording > 0 && sawReady > 0 && pushed.load() > 0, note);
+
+    const bool wrote = AF_SceneCaptureWrite(s, kPath, "Test_UnityFlow", 0x99u) == 1;
+    check("[Unity流] 別スレッドから PCM を積みながらでも保存できる", wrote);
+
+    // ★CaptureRecorder.SaveAndRestart と同じ: 保存したらすぐ次の録音を始める。
+    AF_SceneCaptureBegin(s, 60, 20, 64, 48000, 1);
+    for (int f = 0; f < 10; ++f) {
+        AF_SceneSetListener(s, V(0.2f, 1.5f, 0.5f * static_cast<float>(f)));
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+    }
+    int held2 = 0;
+    const int st2 = AF_SceneCaptureStatus(s, &held2);
+    std::snprintf(note, sizeof(note), "(状態 %d / 保持 %d)", st2, held2);
+    check("[Unity流] 保存後にもう一度録り始められる", st2 == 1 && held2 == 10, note);
+    AF_SceneDestroy(s);
+
+    if (!wrote) { std::remove(kPath); return; }
+
+    // 落ちたファイルが Unity のパネルと同じ道で開けること。
+    AF_CaptureHandle cap = AF_CaptureOpen(kPath);
+    check("[Unity流] 落ちたファイルをパネルと同じ道で開ける", cap != nullptr);
+    if (cap) {
+        AF_CaptureInfo info{};
+        AF_CaptureGetInfo(cap, &info);
+        const float secs = info.sampleRate > 0
+                         ? static_cast<float>(info.pcmFrames) / static_cast<float>(info.sampleRate)
+                         : 0.0f;
+        std::snprintf(note, sizeof(note), "(%d フレーム / PCM %.2f 秒 / 音源 %d)",
+                      info.frames, secs, info.sourceCount);
+        // ★PCM が「入っている」だけでなく**長さが妥当**か。
+        //   窓は (60+20)/60 = 1.33 秒。オーディオスレッドの歩調は実時間なので
+        //   ぴったりにはならないが、**0 でも 10 秒でもない**ことを見る。
+        check("[Unity流] PCM の長さが窓と釣り合っている(0.1〜1.4秒)",
+              info.frames == 81 && secs > 0.1f && secs <= 1.4f, note);
+        AF_CaptureClose(cap);
+    }
+    std::remove(kPath);
+}
+
+// ★自動生成した回帰テストを**そのままビルドに入れる**。
+//   生成器が「読めるコードらしきもの」ではなく、実際に通るコードを吐くことの担保。
+#include "generated_cases.inc"
+
+// ─────────────────────────────────────────────────────────────────────────
+// [主題] 扉が**両脇の**音源に効いているか
+//
+// ★なぜ要るか（2026-08-27）
+//   323 件が全部通ったまま、扉が両脇の音源に**まったく効いていなかった**
+//   （閉扉で −6.1 dB、全掃引で 1.7 dB。資料時点は −37 dB／32.8 dB）。
+//   正面の音源だけは正常だった（透過のみで鳴るため）。既存の検査は正面か
+//   単一音源ばかりで、**主題そのものの場面**（扉の脇にいる音源）を判定していなかった。
+//   診断（diagnoseSwingDoor 等）は数字を出していたが、判定していない。
+//   → 資料 p6 の表と**同じ形状・同じ条件**を、そのまま検査にする。
+//
+// ★形状は pattern_table.cpp と同一（部屋 7.08×3.48×3.0 / 壁 0.16 / 戸口 1.40 / 扉 0.08 厚）。
+//   リスナーは戸口の外 0.5 m（資料の数値はこの条件。既定の 0.0 ではない ── 記録漏れだった）。
+//   ⚠ ここを変えると資料の表と突き合わせられなくなる。
+//
+// ★守る性質（扉のピラー D1/D4/D5 と、コンセプトの蝶番非対称）
+//   ・閉扉なら 3 本とも −30 dB 以下（型紙 4: 幻が出ない）
+//   ・閉扉の帯域は平らでない（型紙 4）
+//   ・各音源の全掃引の振れ幅が 25 dB 以上（型紙 C: 効いている）
+//   ・右蝶番の 40° で、左の音源が右の音源より 4 dB 以上明るい／左蝶番で鏡像（コンセプト）
+//   ・ドアなしは資料の −4.4 / 0.0 / −4.4 に一致（形状と条件がずれていない確認）
+// ─────────────────────────────────────────────────────────────────────────
+void testDoorWorksForOffAxisSources() {
+    std::printf("\n[主題] 扉が両脇の音源に効いているか（資料 p6 と同条件）\n");
+    const float roomW = 7.08f, roomD = 3.48f, roomH = 3.0f, wall = 0.16f;
+    const float doorW = 1.40f, doorH = 2.0f, doorT = 0.08f;
+    const float gapCx = 3.54f;
+    const float gapL = gapCx - doorW * 0.5f, gapR = gapCx + doorW * 0.5f;
+    const float hw = wall * 0.5f, cy = roomH * 0.5f, zf = roomD + hw;
+    const float ldist = 0.5f;
+    const AF_Vector3 L = V(gapCx, 1.6f, roomD + wall + ldist);
+    // 図の音源 3 本（SVG → 世界。pattern_table::fromSvg と同じ変換）。
+    const AF_Vector3 src[3] = { V((306.0f-146.0f)/100.0f, 1.5f, (432.0f-196.0f)/100.0f),
+                                V((500.0f-146.0f)/100.0f, 1.5f, (320.0f-196.0f)/100.0f),
+                                V((694.0f-146.0f)/100.0f, 1.5f, (432.0f-196.0f)/100.0f) };
+
+    // 1 パターンぶん測って、音源 3 本の 6 帯域ゲインと広帯域 dB を返す。
+    auto measure = [&](float deg, bool hasDoor, bool leftHinge,
+                       float bands[3][kBands], float broadDb[3]) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        auto box = [&](AF_Vector3 c, AF_Vector3 he) {
+            AF_SceneAddInstanceBox(s, c, he, V(1,0,0), V(0,1,0), mat);
+        };
+        box(V(-hw, cy, roomD*0.5f), V(hw, cy, roomD*0.5f + wall));
+        box(V(roomW + hw, cy, roomD*0.5f), V(hw, cy, roomD*0.5f + wall));
+        box(V(roomW*0.5f, cy, -hw), V(roomW*0.5f + wall, cy, hw));
+        box(V(roomW*0.5f, roomH + hw, roomD*0.5f), V(roomW*0.5f + wall, hw, roomD*0.5f + wall));
+        box(V(roomW*0.5f, -hw, roomD*0.5f), V(roomW*0.5f + wall, hw, roomD*0.5f + wall));
+        box(V(gapL*0.5f, cy, zf), V(gapL*0.5f, cy, hw));
+        box(V((gapR + roomW)*0.5f, cy, zf), V((roomW - gapR)*0.5f, cy, hw));
+        box(V(gapCx, (doorH + roomH)*0.5f, zf), V(doorW*0.5f, (roomH - doorH)*0.5f, hw));
+        if (hasDoor) {
+            const int doorId = AF_SceneAddInstanceBox(s, V(gapCx, doorH*0.5f, zf),
+                V(doorW*0.5f, doorH*0.5f, doorT*0.5f), V(1,0,0), V(0,1,0), mat);
+            // 蝶番まわりの回転（pattern_table と同じ式。内開き）。
+            const float th = deg * 3.14159265f / 180.0f;
+            const float c = std::cos(th), sn = std::sin(th);
+            const float hinge = leftHinge ? gapL : gapR;
+            const float rx = gapCx - hinge;
+            const float sgn = (rx < 0.0f) ? 1.0f : -1.0f;
+            AF_SceneUpdateInstance(s, doorId,
+                V(hinge + rx*c, doorH*0.5f, zf - std::fabs(rx)*sn),
+                V(doorW*0.5f, doorH*0.5f, doorT*0.5f), V(c, 0, sgn*sn), V(0,1,0));
+        }
+        AF_UpdateConfig cfg{};
+        cfg.role1EveryN = 1;   cfg.role2EveryN = 1;   cfg.earlyEveryN = 1;
+        cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 1;
+        cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+        cfg.directWeight = 1.0f;  cfg.useReflections = 1;
+        cfg.useEdgeCatalog = 1;   cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+        cfg.enableReverb = 1;     cfg.echogramBins = 100;  cfg.echogramBinSeconds = 0.01f;
+        cfg.echogramRays = 512;   cfg.echogramBounces = 24;
+        cfg.speedOfSound = 343.0f; cfg.distanceRef = 1.5f;
+        cfg.enableEarlyReflections = 1; cfg.earlyTaps = 4;
+        cfg.earlyRays = 512; cfg.earlyBounces = 2;
+        cfg.enableDiffractionSources = 1; cfg.diffSources = 3;
+        AF_SceneSetUpdateConfig(s, &cfg);
+        AF_SceneSetListener(s, L);
+        for (int i = 0; i < 3; ++i) AF_SceneSetSource(s, (unsigned long long)(i + 1), src[i]);
+        for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        for (int i = 0; i < 3; ++i) {
+            const int idx = AF_SceneSourceIndex(s, (unsigned long long)(i + 1));
+            AF_SceneGetSourceOcclusion(s, idx, bands[i]);
+            float sum = 0.0f;
+            for (int b = 0; b < kBands; ++b) sum += bands[i][b] * bands[i][b];
+            broadDb[i] = 20.0f * std::log10(std::max(std::sqrt(sum / kBands), 1e-6f));
+        }
+        AF_SceneDestroy(s);
+    };
+
+    // 資料 p6 と同じ 5 パターン（右蝶番）。
+    const float angles[4] = { 0.0f, 40.0f, 80.0f, 160.0f };
+    float bands[5][3][kBands] = {};
+    float db[5][3] = {};
+    std::printf("        扉        音源1(左)  音源2(中)  音源3(右)\n");
+    for (int p = 0; p < 5; ++p) {
+        measure(p < 4 ? angles[p] : 0.0f, p < 4, false, bands[p], db[p]);
+        std::printf("        %-8s  %8.1f  %8.1f  %8.1f\n",
+                    p < 4 ? (p == 0 ? "0°(閉)" : p == 1 ? "40°" : p == 2 ? "80°" : "160°") : "ドアなし",
+                    db[p][0], db[p][1], db[p][2]);
+    }
+    char buf[160];
+
+    // ── 形状と条件がずれていない確認（ドアなしは資料の −4.4 / 0.0 / −4.4）──
+    std::snprintf(buf, sizeof(buf), "(%.1f / %.1f / %.1f)", db[4][0], db[4][1], db[4][2]);
+    check("[主題] ドアなしが資料と一致（形状・条件の確認）",
+          std::fabs(db[4][0] + 4.4f) < 1.0f && std::fabs(db[4][1]) < 1.0f
+          && std::fabs(db[4][2] + 4.4f) < 1.0f, buf);
+
+    // ── 型紙 4: 閉扉で幻が出ない ──
+    std::snprintf(buf, sizeof(buf), "(%.1f / %.1f / %.1f dB)", db[0][0], db[0][1], db[0][2]);
+    check("[主題][型紙4] 閉扉なら 3 本とも −30 dB 以下",
+          db[0][0] <= -30.0f && db[0][1] <= -30.0f && db[0][2] <= -30.0f, buf);
+    {
+        float flat[3 * kBands];
+        for (int i = 0; i < 3; ++i) for (int b = 0; b < kBands; ++b) flat[i*kBands + b] = bands[0][i][b];
+        const bool occ[3] = { true, true, true };
+        af::detect::Break br[3];
+        const int n = af::detect::noPhantom(flat, occ, nullptr, 3, 6.0f, br, 3);
+        std::snprintf(buf, sizeof(buf), "(平らな音源 %d 本)", n);
+        check("[主題][型紙4] 閉扉の帯域が平らでない（低−高 ≥ 6 dB）", n == 0, buf);
+    }
+
+    // ── 型紙 C: 扉が効いている（各音源の全掃引の振れ幅）──
+    for (int i = 0; i < 3; ++i) {
+        float series[5];
+        for (int p = 0; p < 5; ++p) series[p] = std::pow(10.0f, db[p][i] / 20.0f);
+        const float range = af::detect::responseRangeDb(series, 5);
+        std::snprintf(buf, sizeof(buf), "(音源%d 振れ幅 %.1f dB)", i + 1, range);
+        check(i == 0 ? "[主題][型紙C] 音源1(左) に扉が効いている（≥25 dB）"
+            : i == 1 ? "[主題][型紙C] 音源2(中) に扉が効いている（≥25 dB）"
+                     : "[主題][型紙C] 音源3(右) に扉が効いている（≥25 dB）",
+              range >= 25.0f, buf);
+    }
+
+    // ── コンセプト: どちら側から開くかで、どの音が先に届くかが変わる ──
+    //   右蝶番なら開口は左から開くので、40° で左の音源が先に明るい。左蝶番で鏡像。
+    {
+        float bL[3][kBands] = {}, dL[3] = {};
+        measure(40.0f, true, true, bL, dL);
+        std::snprintf(buf, sizeof(buf), "(右蝶番 40°: 左 %.1f / 右 %.1f)", db[1][0], db[1][2]);
+        check("[主題][概念] 右蝶番 40° で左の音源が右より 4 dB 以上明るい",
+              db[1][0] - db[1][2] >= 4.0f, buf);
+        std::snprintf(buf, sizeof(buf), "(左蝶番 40°: 左 %.1f / 右 %.1f)", dL[0], dL[2]);
+        check("[主題][概念] 左蝶番 40° で右の音源が左より 4 dB 以上明るい（鏡像）",
+              dL[2] - dL[0] >= 4.0f, buf);
+    }
+}
+
 int main() {
     std::printf("=== AF_Scene* 数値回帰テスト ===\n");
     std::printf("（期待値は絶対値でなく「関係」で書いている。詳細は冒頭コメント参照）\n");
 
+    // ★配布先の DLL の鮮度は**最初に**見る。DLL を掴んだまま走らせることもあるので、
+    //   テストの途中で誰かが差し替えても結果が揺れないよう、状態はここで固定する。
+    scanDllFreshness();
+    reportDllFreshness();
+
+    testDetectorSelfCheck();      // ★検出器が効いているかを先に確かめる
+    testCaptureRoundTrip();
+    testCaptureReplay();
+    testCaptureEmit();
+    testCaptureAbi();
+    testCaptureUnityFlow();
+    testGenerated_DoorSweep();    // ← generated_cases.inc（自動生成）
     testInstanceLifecycle();
     testSourceRegistry();
     testTransmission();
@@ -6545,8 +9755,21 @@ int main() {
     diagnoseWallDoorBoundary();
     diagnoseSourceOffsetVsDoor();
     diagnoseFrameCost();
+    diagnoseBvhRebuildCost();
+    testWorkerThreads();
+    testSourceTiers();
+    testTuningSupport();
+    testEarlySharing();
+    testGeometryIsPrimary();
+    testClosedDoorApproach();
+    testDoorWorksForOffAxisSources();
+    diagnoseTailProbeDensity();
+    diagnoseEchogramScaling();
     testSoftOcclusion();
     diagnoseDiffractionOnlySweep();
+    diagnoseTailShareByRoom();
+    diagnoseDoorSideAsymmetry();
+    diagnoseCorridorDiffractionLevel();
     testApertureOpenness();
     testDoorContinuity();
     testPerInstanceMaterial();
@@ -6554,10 +9777,13 @@ int main() {
     testRobustness();
 
     std::printf("\n----\n");
-    if (g_failures == 0) {
-        std::printf("[OK] %d 件のチェックすべてに合格しました。\n", g_checks);
-        return 0;
-    }
-    std::printf("[FAIL] %d / %d 件のチェックに失敗しました。\n", g_failures, g_checks);
-    return 1;
+    if (g_failures == 0) std::printf("[OK] %d 件のチェックすべてに合格しました。\n", g_checks);
+    else std::printf("[FAIL] %d / %d 件のチェックに失敗しました。\n", g_failures, g_checks);
+
+    // ★もう一度出す。2000 行流れたあとに読むのは末尾なので、ここに無いと気づけない。
+    //   終了コードは変えない ── 配布のし忘れはエンジンの回帰ではないので、
+    //   これで CI を落とすと「テストが落ちた」の意味が濁る。
+    reportDllFreshness();
+
+    return (g_failures == 0) ? 0 : 1;
 }

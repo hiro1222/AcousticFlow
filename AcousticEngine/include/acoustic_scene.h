@@ -53,6 +53,12 @@ ACOUSTIC_API int AF_SceneAddMaterial(AF_SceneHandle scene,
                                      const float* scattering,
                                      int numBands);
 
+/* 材質の現在値を読む。書けた帯域数を返す（不要な出力は NULL 可）。
+ *   調整の道具が「いま幾つか」を出すのに要る。値が見えないと追い込めない。 */
+ACOUSTIC_API int AF_SceneGetMaterial(AF_SceneHandle scene, int materialId,
+                                     float* outTransmission, float* outAbsorption,
+                                     float* outScattering, int count);
+
 /* 既存の材質の中身を書き換える。成功で 1。引数の意味は AF_SceneAddMaterial と同じ。
  * その材質を使っているインスタンスが**一斉に**変わる（「部屋をコンクリからガラスへ」）。
  * 材質はクエリのたびにテーブルを引き直しているので、次のフレームから効く。
@@ -309,6 +315,210 @@ ACOUSTIC_API void AF_SceneUpdatePortal(AF_SceneHandle scene, int id, AF_Vector3 
  * 手置きのポータルは消えない。自動生成ぶんだけがリストの末尾で入れ替わる。
  * 幾何が変わって部屋グラフが作り直されると自動で追随する。 */
 ACOUSTIC_API void AF_SceneSetAutoPortals(AF_SceneHandle scene, int enable);
+
+/* 音源ごとの段（遮蔽・回折／早期反射／回折二次音源）を何コアで回すか。1 以下＝直列。
+ *   既定は 1（直列）。並列にしても**結果はビット一致**（音源ごとに自分の枠にしか
+ *   書かない段だけを割るので、各音源の計算順も丸めも変わらない）。
+ *   ⚠ スレッドはシーンが持ち、AF_SceneDestroy で join する。
+ *      **シーンを破棄する前に再生を止めること。**
+ *   ⚠ 診断カウンタは thread_local。並列時は呼び出し元スレッドのぶんしか読めない。 */
+ACOUSTIC_API void AF_SceneSetWorkerThreads(AF_SceneHandle scene, int threads);
+ACOUSTIC_API int  AF_SceneGetWorkerThreads(AF_SceneHandle scene);
+
+/* ── 音源の段 ─────────────────────────────────────────────────────────
+ * どこまで解くかを**音源ごとに固定**する（オーサリング）。
+ *   0 = 厳密   … 回折の合成まで解く。体験の芯（扉の奥の音・探しているベル）
+ *   1 = 簡易   … 遮蔽の音量と帯域カーブだけ。回り込みの方向は出ない
+ *   2 = バーチャル … 解かない。ホストは再生位置だけ進める
+ * 既定は 0（厳密）＝ 既存のホストの音は変わらない。
+ *
+ * ⚠ 距離で自動に切り替えないこと。歩くだけで段が変わり、切り替わりが聞こえる
+ *   （同じ音源が場面によって別の仕組みで鳴る＝決めごと #1）。
+ *
+ * ★2D の音（UI・音楽・ナレーション）に段はない。**音源として登録しない**。
+ *   エンジンが返せる答えが存在しないので、「何もしない段」を作るとホストの判断が
+ *   エンジン側へ漏れる。 */
+/* 【調整支援】リスナー→音源の直線の透過損失を**誰が担っているか**を大きい順に返す。
+ *   outLossDb は帯域平均の透過損失(dB, 正)。大きいほどよく遮っている＝担い手。
+ *   戻り値は書けた数。
+ *
+ * ★「この地点でこう聞こえてほしい」に合わせるとき、いちばん困るのは
+ *   **どの材質を触れば効くのか分からない**こと。それを engine が名指しする。
+ * ⚠ 診断であって、音の経路を増やす物ではない。鳴るのは合成後の 1 つのまま（決めごと #1）。
+ * ⚠ 透過だけを見る。回り込み（回折）が担っている帯域では、ここを触っても動かない。
+ *   透過ぶんは AF_SceneComputeSoftOcclusion、合成後は AF_SceneGetSourceOcclusion で採れるので、
+ *   その差が回折の取り分になる。**触る前にどちらが担っているかを確かめること。** */
+ACOUSTIC_API int AF_SceneTransmissionCarriers(AF_SceneHandle scene,
+                                              AF_Vector3 listener, AF_Vector3 source,
+                                              int* outInstance, int* outMaterial,
+                                              float* outLossDb, int maxCount);
+
+ACOUSTIC_API void AF_SceneSetSourceTier(AF_SceneHandle scene, unsigned long long id, int tier);
+
+/* 自由音場で聞こえなくなる距離(m)。0 以下＝自動でバーチャルへ落とさない（既定）。
+ *
+ * ⚠ 距離だけでは判定していない。臨界距離 rc = 0.057√(V/RT60) より遠くでは
+ *   **残響が直接音を上回り、しかも距離でほとんど減らない**。だから
+ *   「rc <= この半径」の部屋（＝響く部屋）では自動バーチャルを使わない。
+ *   自由音場の直接音だけで切ると、響く部屋で聞こえている音を黙らせる。
+ * 出入りの閾は分けてある（入り = 半径 / 出 = 半径 × 1.25）。 */
+ACOUSTIC_API void AF_SceneSetSourceAudibleRadius(AF_SceneHandle scene,
+                                                 unsigned long long id, float metres);
+
+/* いま実際に使われている段（自動バーチャルの結果を含む）。index は AF_SceneSourceIndex。
+ * 見つからなければ -1。診断・検証用。 */
+ACOUSTIC_API int AF_SceneGetSourceTierEffective(AF_SceneHandle scene, int index);
+
+/* この音源の尾（後期残響）を担っている代表音源の index。範囲外は -1。
+ *
+ * ★尾は**部屋の形にしか依存しない**ので、同じ部屋の音源は 1 本を共有する。
+ *   代表は「同じ部屋のいちばん若い index」で決め打ち。位置で選ぶと音源が動くたび
+ *   代表が入れ替わり、尾の形が乗り換わって**段差**になる。
+ *   部屋が取れない（屋外）音源は自分自身が代表。
+ *
+ * ⚠ ホスト側で同じ規則を持たないこと。2 箇所にあると、片方だけ変えたときに
+ *   「エンジンが計算した代表」と「ホストが読む代表」がずれる。
+ * ★AF_SceneGetEchogramBands はどの index でも部屋の尾を返すので、
+ *   尾を引くだけならこれを呼ぶ必要はない。IR の作り直しを
+ *   「代表が変わったときだけ」に絞りたいホスト向け。 */
+ACOUSTIC_API int AF_SceneGetTailShapeIndex(AF_SceneHandle scene, int index);
+
+/* ============================================================================
+ * キャプチャ ── 「入力」と「音響の出力」を常時録っておき、あとから走査する。
+ *   仕様: docs/SOUND_DEBUG_TOOL.md
+ *
+ * 使い方:
+ *   起動時に AF_SceneCaptureBegin。以後は何もしなくてよい（Update の中で溜まる）。
+ *   「いま変だった」と思ったら AF_SceneCaptureMark。押した時点の**前** preroll と
+ *   **後** postroll が揃うと Status が 2 になり、AF_SceneCaptureWrite で保存できる。
+ *
+ * ★録るのは結果ではなく**入力**なので、押し直せばそれが再現になる。
+ *   録音後に走査して破れを見つけ、そこから回帰テストを生やす（型紙は detectors.h）。
+ * ========================================================================== */
+
+/* 録音を始める。0 以下を渡した項目は既定値（preroll 21秒・postroll 5秒・64音源・48kHz）。 */
+ACOUSTIC_API void AF_SceneCaptureBegin(AF_SceneHandle scene, int prerollFrames,
+                                       int postrollFrames, int maxSources,
+                                       int sampleRate, int recordPcm);
+
+/* 録音を止める。溜めた分は保持される。 */
+ACOUSTIC_API void AF_SceneCaptureEnd(AF_SceneHandle scene);
+
+/* 段の間引きの位相（8要素）。
+ *   [0]catalog [1]diffSrc [2]early [3]echoRaySlice [4]staggered [5]echoPrimed
+ * ★入力リプレイで**尾を再現する**ために要る。これを戻さないと、エコグラムの
+ *   レイを撃つフレームが録音時とずれ、扉が動き続けるかぎり永久に一致しない
+ *   （実測: 91 フレーム全部が不一致・最大 15.5% ずれ）。 */
+ACOUSTIC_API void AF_SceneDebugGetStagePhase(AF_SceneHandle scene, int* out8);
+ACOUSTIC_API void AF_SceneDebugSetStagePhase(AF_SceneHandle scene, const int* in8);
+
+/* ============================================================================
+ * 録った .afcap を**開いて調べる**（ホスト側の道具用）
+ *
+ * ★走査（型紙を当てる）は DLL の中で回す。
+ *   理由: 回帰テストが呼ぶのと**同じ関数**でなければ意味がないから
+ *   （「道具は見つけたのに検査は通る」が起きる）。C# へ写経すると必ずずれる。
+ * ⚠ ただし AF_SceneUpdate の経路からは呼ばない。判定は**録音後**であること自体が
+ *   設計（検出器を後で良くしたら昔のキャプチャに付け直せる）。
+ * ========================================================================== */
+
+typedef void* AF_CaptureHandle;
+
+typedef struct AF_CaptureInfo {
+    int frames;
+    int sampleRate;
+    int maxSources;
+    int preroll;
+    int postroll;
+    int workerThreads;
+    int markedFrame;
+    unsigned int dllHash;
+    int boxCount;
+    int meshCount;        /* >0 なら C++ の検査には吐けない場面 */
+    int materialCount;
+    int pcmFrames;
+    int sourceCount;      /* キャプチャに出てくる音源の種類数 */
+} AF_CaptureInfo;
+
+typedef struct AF_CaptureMark {
+    unsigned long long sourceId;
+    int   frame;
+    float seconds;
+    float amount;
+    int   reserved;
+    /* ⚠ 中身は **UTF-8**。C# 側で ByValTStr（既定 Ansi）で受けると化ける。
+     *   byte[] で受けて自分で UTF-8 として読むこと（Native.Utf8）。 */
+    char  templateName[40];   /* 例: "型紙1 跳ばない" */
+    char  what[24];           /* 例: "level" */
+} AF_CaptureMark;
+
+/* 開く。失敗で NULL。使い終わったら必ず AF_CaptureClose。 */
+ACOUSTIC_API AF_CaptureHandle AF_CaptureOpen(const char* path);
+ACOUSTIC_API void AF_CaptureClose(AF_CaptureHandle cap);
+
+/* 概要。成功で 1。 */
+ACOUSTIC_API int AF_CaptureGetInfo(AF_CaptureHandle cap, AF_CaptureInfo* out);
+/* 録音時の場面名。書けた文字数を返す。 */
+ACOUSTIC_API int AF_CaptureGetSceneName(AF_CaptureHandle cap, char* buf, int bufSize);
+/* 音源 id の一覧。書けた数を返す。 */
+ACOUSTIC_API int AF_CaptureGetSourceIds(AF_CaptureHandle cap,
+                                        unsigned long long* out, int maxOut);
+
+/* 型紙を当てて印を集める。見つかった数を返す（out が足りなければ maxOut まで）。 */
+ACOUSTIC_API int AF_CaptureScan(AF_CaptureHandle cap, AF_CaptureMark* out, int maxOut);
+
+/* 連続した同じ印をひとまとめにしたもの。
+ * ★実機のキャプチャで要ると分かった: 閉扉の幻は**何秒も続く**ので、
+ *   生のままだと 382 件並んで読めない（まとめると 5 か所だった）。
+ * ⚠ count が 1 か 100 かは**意味が違う**（瞬きか、続いているか）。必ず長さも見ること。 */
+typedef struct AF_CaptureRun {
+    unsigned long long sourceId;
+    int   firstFrame;
+    int   lastFrame;
+    int   count;          /* 続いたフレーム数 */
+    int   reserved;
+    float firstSeconds;
+    float lastSeconds;
+    float worst;          /* 続いたあいだの最大の破れ量 */
+    float reserved2;
+    char  templateName[40];   /* UTF-8 */
+    char  what[24];           /* UTF-8 */
+} AF_CaptureRun;
+
+/* まとめた印。まとまり方は AfCapScan（コマンドライン）とまったく同じ。 */
+ACOUSTIC_API int AF_CaptureScanRuns(AF_CaptureHandle cap, AF_CaptureRun* out, int maxOut);
+
+/* マスターPCM（interleaved stereo）。書けたフレーム数を返す。 */
+ACOUSTIC_API int AF_CaptureGetPcm(AF_CaptureHandle cap, float* outInterleaved, int maxFrames);
+
+/* 入力リプレイ: frameIndex のフレームの**入力**を scene へ押す。
+ *   ⚠ 形（静的なジオメトリ）は呼び手が用意しておくこと。この関数は形に触らない。
+ *   ⚠ frameIndex == 0 のときに段の間引きの位相も戻す。**必ず 0 から順に呼ぶこと**。
+ *      飛ばして呼ぶと尾が再現しない（docs/SOUND_DEBUG_TOOL.md §3.1）。 */
+ACOUSTIC_API int AF_CaptureApplyFrame(AF_SceneHandle scene, AF_CaptureHandle cap,
+                                      int frameIndex);
+
+/* 印 1 つ → C++ の回帰テストを吐く。書けた文字数を返す（0 なら吐けない場面）。
+ *   ★吐くのは「入力」と「どの性質を縛るか」だけ。**録れた出力の数値は入らない**。 */
+ACOUSTIC_API int AF_CaptureEmitCase(AF_CaptureHandle cap, int markIndex,
+                                    const char* testName, char* buf, int bufSize);
+
+/* 「いま変だった」を押す。2 回目以降は前後が揃うまで無視される。 */
+ACOUSTIC_API void AF_SceneCaptureMark(AF_SceneHandle scene);
+
+/* 0=止まっている 1=録っている 2=前後が揃った（保存できる）。
+   outFramesHeld に保持中のフレーム数を書く（NULL 可）。 */
+ACOUSTIC_API int AF_SceneCaptureStatus(AF_SceneHandle scene, int* outFramesHeld);
+
+/* マスターPCM を渡す（interleaved stereo）。
+   ⚠ オーディオスレッドから呼ぶこと。内部でロックも確保もしない。 */
+ACOUSTIC_API void AF_SceneCapturePushAudio(AF_SceneHandle scene,
+                                           const float* interleavedStereo, int frames);
+
+/* .afcap として保存する。成功で 1。
+   sceneName / dllHash はヘッダに焼く識別子（開いたときに現物と照合するため）。 */
+ACOUSTIC_API int AF_SceneCaptureWrite(AF_SceneHandle scene, const char* path,
+                                      const char* sceneName, unsigned int dllHash);
 /* これ未満の断面積(m2)の開口はポータルにしない。格子の量子化ノイズで
  * ありもしない戸口が並ぶのを防ぐ。既定 0.25 m2。 */
 ACOUSTIC_API void AF_SceneSetAutoPortalMinArea(AF_SceneHandle scene, float m2);
@@ -337,6 +547,22 @@ ACOUSTIC_API int  AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* ou
 ACOUSTIC_API int AF_SceneDebugPortalPolys(AF_SceneHandle scene);
 /* 【計測用】直近の開口積分の 125Hz の分子・分母・積分範囲。 */
 ACOUSTIC_API void AF_SceneDebugPortalIntegral(AF_SceneHandle scene, double* numer, double* denom, float* limU);
+
+/* 【診断】最強の回折経路の内訳。out17 は 17 要素。戻り値は経路数（0 なら遮蔽なし／経路なし）。
+ *   [0]=δ / [1]=openGain / [2]=slitWidth / [3]=thru(低域加重の広帯域)
+ *   [4..9]=gain[6]（前川×openGain 済み）/ [10..15]=openBand[6] / [16]=nSpread */
+/* 回折の減衰を前川だけに任せる（フレネル積分 f を重ねて掛けない）。既定 OFF。
+ *   前川は f の近似なので、両方掛けるのは同じ物理を二度数えること。
+ *   ON にすると回折は「開口への定位」と「回り込むぶんの距離」だけを運ぶ。 */
+ACOUSTIC_API void AF_SceneSetDiffractionSingleModel(AF_SceneHandle scene, int on);
+
+ACOUSTIC_API void AF_SceneDebugDiffractionCounts(AF_SceneHandle scene, int* raw, int* cut, int* clusters);
+
+ACOUSTIC_API void AF_SceneSetInsideOtherContinuous(AF_SceneHandle scene, int on, float scale);
+
+ACOUSTIC_API void AF_SceneSetKeepDoubleOpen(AF_SceneHandle scene, int on);
+ACOUSTIC_API int AF_SceneDebugDiffractionPath(AF_SceneHandle scene, AF_Vector3 listener,
+                                              AF_Vector3 source, float* out17, int which);
 
 ACOUSTIC_API void AF_SceneSetEdgePortals(AF_SceneHandle scene, int enable);
 ACOUSTIC_API void AF_SceneSetEdgePortalSpan(AF_SceneHandle scene, float k);
@@ -581,16 +807,10 @@ ACOUSTIC_API int AF_SceneTraceReflectionPath(AF_SceneHandle scene,
                                              AF_Vector3* outPoints, int maxPoints);
 
 /* 【B: キューブマップ エッジカタログ】リスナー中心に res²×6面のレイを撒き、深度不連続で
- * シルエット稜線を拾ってカタログ化する。以降 diffraction はこのカタログの稜線を優先し、
- * 有効な迂回が無ければ箱コーナー探索へフォールバック。1回撒けば全音源で共有（リスナー係留）。
- *   res=面解像度(例16〜32) / maxDist=レイ到達距離。毎フレーム or 低レートで呼ぶ。 */
+ * シルエット稜線を拾ってカタログ化する。1回撒けば全音源で共有（リスナー係留）。 */
 ACOUSTIC_API void AF_SceneBuildEdgeCatalog(AF_SceneHandle scene, AF_Vector3 listener,
                                            int res, float maxDist);
-
-/* カタログの稜線数（デバッグ用）。 */
 ACOUSTIC_API int AF_SceneEdgeCatalogCount(AF_SceneHandle scene);
-
-/* カタログを消す（箱コーナー探索に戻す）。 */
 ACOUSTIC_API void AF_SceneClearEdgeCatalog(AF_SceneHandle scene);
 
 /* 【早期反射タップ(A)】source→…→listener の主要な初期反射を最大 maxTaps 本抽出する。

@@ -72,6 +72,45 @@ namespace AcousticFlow
         private volatile float _wet = 1f, _srcLevel = 1f;
         private float _splitMs = 120f;   // 早期↔後期の境目。急に動かさない（下の解説）
         private int _tailEchoVersion = -1;   // 最後に取り込んだエコグラムの版
+        private int _tailShapeIndex = -1;    // 最後に尾の形を引いた代表音源の index
+        private IntPtr _tailBus = IntPtr.Zero;   // 預けている共有バス（Zero=自前で畳む）
+        private int _tailBusFrames = 0;
+        private bool _tailWasVirtual = false;   // 直前がバーチャル段だったか（戻すため）
+
+        // 尾の畳み込みを共有バスへ預ける。**メインスレッドからだけ呼ぶこと。**
+        //   ⚠ バスへ預けると、この音源の rmsTail は 0 になる（計器はバス側の rms()）。
+        private void AttachTailBus(int shapeIndex, AcousticFlowSceneDemo.SourceTaps ts)
+        {
+            var renderer = TailBusHost;
+            if (renderer == null || !renderer.enableSharedTail) { DetachTailBus(); return; }
+            var bus = renderer.GetOrCreateBus(shapeIndex, tailSeconds, _tailBusFrames);
+            if (bus == IntPtr.Zero) { DetachTailBus(); return; }
+            // 代表＝尾の形の出どころが自分。その 1 本だけが IR をバスへ入れる。
+            bool isOwner = (shapeIndex == ts.EngineIndex);
+            _tailBus = bus;
+            if (_voice != IntPtr.Zero) Native.AF_VoiceSetTailBus(_voice, bus, isOwner ? 1 : 0);
+        }
+
+        /// 共有バスから外して自前の畳み込みに戻す。バスを壊す前に必ず呼ぶこと。
+        public void DetachTailBus()
+        {
+            if (_voice != IntPtr.Zero && _tailBus != IntPtr.Zero)
+                Native.AF_VoiceSetTailBus(_voice, IntPtr.Zero, 0);
+            _tailBus = IntPtr.Zero;
+            _tailShapeIndex = -1;   // 次のフレームで組み直させる（自前の器には IR が無い）
+            _tailEchoVersion = -1;
+        }
+
+        private TailBusRenderer _tailBusHost;
+        private TailBusRenderer TailBusHost
+        {
+            get
+            {
+                if (_tailBusHost == null)
+                    _tailBusHost = FindFirstObjectByType<TailBusRenderer>();
+                return _tailBusHost;
+            }
+        }
         private float[] _lastEarGain;        // 最後に焼き込んだ左右バランス
 
         // 尾の左右バランスが意味のある量だけ変わったか。エコグラムより速く動くので、
@@ -137,6 +176,7 @@ namespace AcousticFlow
             _hrtf = LoadHrtf();
             Native.AF_VoiceSetHrtf(_voice, _hrtf);
 
+            _tailBusFrames = cfg.maxFrames;
             _dry = new float[cfg.maxFrames];
             _outL = new float[cfg.maxFrames];
             _outR = new float[cfg.maxFrames];
@@ -187,7 +227,8 @@ namespace AcousticFlow
             if (ts == null) return;
 
             Native.AF_VoiceSetOutputGain(_voice, outputGain);
-            Native.AF_VoiceSetTailLevel(_voice, tailLevel);
+            // 【道具A】尾のゲート。IrConvolver 側と同じ意味にそろえる。
+            Native.AF_VoiceSetTailLevel(_voice, IrConvolver.Solo.PassTail ? tailLevel : 0f);
             Native.AF_VoiceSetScatterDiffusion(_voice, scatterDiffusion);
             Native.AF_VoiceSetHrtfEnabled(_voice, enableHrtf ? 1 : 0);
 
@@ -216,8 +257,14 @@ namespace AcousticFlow
             if (mix <= 0f) mix = 25f;
             int n = Mathf.Min(ts.Count, _taps.Length);
             int nb = AcousticEngine.NumBands;
+            // 【道具A】経路単位のソロ／ミュート。既定（素通し）のときは判定ごと飛ばす。
+            //   落としたぶんは詰めて渡すので、エンジンには「そのタップは無かった」ように見える。
+            bool soloOn = !IrConvolver.Solo.IsDefault;
+            int w = 0;
             for (int i = 0; i < n; i++)
             {
+                if (soloOn && ts.Type != null && i < ts.Type.Length
+                    && !IrConvolver.Solo.AllowsType(ts.Type[i])) continue;
                 int o = i * nb;
                 float rl = (i == 0) ? 1f : reflectionLevel;
                 var t = new Native.AFVoiceTap
@@ -241,10 +288,10 @@ namespace AcousticFlow
                     Vector3 dl = ts.DirLocal[i];
                     t.dirX = dl.x; t.dirY = dl.y; t.dirZ = dl.z;
                 }
-                _taps[i] = t;
+                _taps[w++] = t;
             }
-            Native.AF_VoiceSetTaps(_voice, _taps, n);
-            tapCount = n;
+            Native.AF_VoiceSetTaps(_voice, _taps, w);
+            tapCount = w;
 
             // ── 後期尾。重いので数フレームに1回 ──
             //
@@ -260,15 +307,53 @@ namespace AcousticFlow
             {
                 _frameCounter = 0;
                 var scene = AcousticFlowSceneDemo.SharedScene;
-                int echoVer = AcousticFlowSceneDemo.Status.EchogramVersion;
+
+                // ★バーチャル段は尾も鳴らさない。
+                //   段はシーン側（何を解くか）の話だが、**オーディオスレッドの費用は別の天井**。
+                //   実測: 音源 1 本の音声スレッド負荷 4.27% のうち**尾が 1.95%（46%）**。
+                //   ここを止めないと「解かないのに一番高い部分は鳴り続ける」ことになる。
+                //   ⚠ 可聴限界より下でしか選ばれない段なので、止めても聞こえ方に出ない。
+                bool isVirtual = (scene != null && scene.IsValid && ts.EngineIndex >= 0
+                                  && scene.GetSourceTierEffective(ts.EngineIndex) == 2);
+                if (isVirtual)
+                {
+                    if (_tailBus != IntPtr.Zero) DetachTailBus();
+                    Native.AF_VoiceSetTailLevel(_voice, 0f);
+                    _tailEchoVersion = -1;   // 復帰したら組み直させる
+                    _tailWasVirtual = true;
+                }
+                else if (_tailWasVirtual)
+                {
+                    Native.AF_VoiceSetTailLevel(_voice, tailLevel);   // 戻す
+                    _tailWasVirtual = false;
+                }
+                int echoVer = isVirtual ? _tailEchoVersion
+                                        : AcousticFlowSceneDemo.Status.EchogramVersion;
                 var earNow = AcousticFlowSceneDemo.Status.TailEarBandGain;
                 bool earChanged = EarGainChanged(earNow);
-                if (scene != null && scene.IsValid && (echoVer != _tailEchoVersion || earChanged))
+                // 代表音源（尾の形の出どころ）が変わったら、エコグラム版が同じでも組み直す。
+                //   これを見ないと、部屋をまたいだ瞬間に古い部屋の形が残る。
+                int shapeNow = ts.TailShapeIndex >= 0 ? ts.TailShapeIndex : ts.EngineIndex;
+                bool shapeChanged = (shapeNow != _tailShapeIndex);
+                if (scene != null && scene.IsValid
+                    && (echoVer != _tailEchoVersion || earChanged || shapeChanged))
                 {
                     _tailEchoVersion = echoVer;
+                    // ★尾の形が変わったら、預ける共有バスも張り替える（形＝バスの鍵）。
+                    //   IR が違う音源を同じバスへ入れると、片方の部屋の響きがもう片方に付く。
+                    //   代表（TailShapeIndex == 自分の EngineIndex）だけが IR をバスへ入れる。
+                    //   0 本だとバスに IR が入らず尾が丸ごと鳴らないので、ここを間違えないこと。
+                    if (shapeChanged || _tailBus == System.IntPtr.Zero) AttachTailBus(shapeNow, ts);
+                    _tailShapeIndex = shapeNow;
                     // ★自分が担当する音源のエコグラムを引く。以前は全音源の和しか無かったので、
                     //   別の部屋の音源も同じ尾で鳴っていた。
-                    int bins = scene.GetEchogramBands(ts.EngineIndex, _echo, _echo.Length / nb);
+                    // ★尾の**形**は同じ部屋の代表音源から引く（TailShapeIndex）。
+                    //   量（下の dg）は自分のものを使うので、部屋の響きは共有しつつ
+                    //   「どれだけ送るか」は音源ごとに残る。実測の分解に基づく:
+                    //     形（200→600ms の傾き） 同室 1.3dB 以内 / 隣室 2.6〜3.9dB ずれ
+                    //     量（オフセット）        同室でも 3〜4dB 開く
+                    int shapeIdx = ts.TailShapeIndex >= 0 ? ts.TailShapeIndex : ts.EngineIndex;
+                    int bins = scene.GetEchogramBands(shapeIdx, _echo, _echo.Length / nb);
                     if (bins > 0)
                     {
                         // 尾の絶対レベルの基準になる直接音ゲイン。
@@ -324,6 +409,10 @@ namespace AcousticFlow
             int frames = data.Length / channels;
             if (frames > _dry.Length) { Array.Clear(data, 0, data.Length); return; }
 
+            // 【道具10】このブロックの実費。IrConvolver 側と同じやり方で測る
+            //   （C++ 経路の音源が予算メータに出てこないと、実機の内訳が見えない）。
+            long meterT0 = System.Diagnostics.Stopwatch.GetTimestamp();
+
             for (int f = 0; f < frames; f++)
             {
                 float s = 0f;
@@ -359,6 +448,23 @@ namespace AcousticFlow
                 }
                 else data[b] = (_outL[f] + _outR[f]) * 0.5f;
             }
+
+            if (sourceIndex >= 0 && sourceIndex < IrConvolver.Scope.MaxMeteredSources)
+            {
+                float ms = (float)((System.Diagnostics.Stopwatch.GetTimestamp() - meterT0) * 1000.0
+                                   / System.Diagnostics.Stopwatch.Frequency);
+                IrConvolver.Scope.BlockMs[sourceIndex] =
+                    Mathf.Lerp(IrConvolver.Scope.BlockMs[sourceIndex], ms, k);
+                IrConvolver.Scope.BlockFrames[sourceIndex] = frames;
+                if (sourceIndex > IrConvolver.Scope.MeteredMax) IrConvolver.Scope.MeteredMax = sourceIndex;
+                // 【道具A】音源ごとの出力。★消す前の量を出す（比べるために要る）。
+                IrConvolver.Scope.OutRms[sourceIndex] =
+                    Mathf.Lerp(IrConvolver.Scope.OutRms[sourceIndex], m.rmsOut, k);
+            }
+
+            // 【道具A】音源ごとのミュート／ソロ。★計算は止めない
+            //   （止めるとエンジン側の遅延線が進まず、解除で音が飛ぶ＝連続性の事故になる）。
+            if (!IrConvolver.Solo.AllowsSource(sourceIndex)) Array.Clear(data, 0, data.Length);
         }
     }
 }

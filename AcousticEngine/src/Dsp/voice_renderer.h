@@ -30,6 +30,7 @@
 #include "hrtf_processor.h"
 #include "nonuniform_convolver.h"
 #include "reverb_tail_ir.h"
+#include "tail_bus.h"
 
 namespace af {
 namespace dsp {
@@ -219,6 +220,18 @@ public:
                       float fadeMs, float smoothMs, float smoothGrowth, float envAlpha,
                       float directGain, float targetRatio,
                       const float* earBandGain = nullptr, int earBandGainLen = 0) {
+        // ★★ 共有バスに預けていて自分が代表でないなら、**IR を組まない** ★★
+        //   同じ部屋の音源は同じエコグラムを渡してくるので、出来る IR は代表とまったく同じ。
+        //   組んで捨てるだけの仕事だった。実測: 代表でない 1 本 0.521 ms、
+        //   8 本なら 1 回の組み直しで **3.645 ms が無駄**。しかも組み直しは
+        //   数フレームに 1 回まとめて走るので、そのフレームだけの山になる。
+        //   ★必要なのは tailGain_（＝音源ごとの尾の量）だけで、これは IR に依存しない。
+        //   ⚠ 戻り値（尾のエネルギー比）はホストが捨てているので 1.0 を返してよい。
+        //     使うようになったら、ここが嘘をつくことになるので注意。
+        if (tailBus_ && !tailBusOwner_) {
+            tailGain_ = ReverbTailIr::calibrateGain(directGain, targetRatio);
+            return 1.0f;
+        }
         const float ratio = tailIr_.build(echoBands, binCount, binMs, startMs, fadeMs,
                                           smoothMs, smoothGrowth, envAlpha,
                                           earBandGain, earBandGainLen);
@@ -236,6 +249,15 @@ public:
         //   コストはクロスフェード中だけ倍（0.205 → 0.41 ms/block）。
         // ★入れ替えるのはクロスフェードが有効なときだけ。無効時に入れ替えると、
         //   FDL（過去の入力）が空の器へ切り替わって尾が無音になる（実測 -227dB）。
+        // ★共有バスを使っているときは、IR はバスが持つ。
+        //   代表の音源だけが入れる。全員が入れると、同じ IR で何度もクロスフェードが始まり、
+        //   その間ずっと 2 面ぶん畳むことになって集約した意味が消える。
+        //   ⚠ tailGain_ は**音源ごとに**計算し続ける。これが音源ごとの尾の量になる。
+        if (tailBus_) {   // ここへ来るのは代表だけ（代表でない側は上で帰っている）
+            tailBus_->setIr(ir, len);
+            tailGain_ = ReverbTailIr::calibrateGain(directGain, targetRatio);
+            return ratio;
+        }
         if (tailXfadeLen_ > 0 && tailCur().hasIr()) {
             // 役割を入れ替える。今鳴っている方が「古い側」になり、空いた方に新 IR を入れる。
             // 進行中のクロスフェードは打ち切る（3 重に重ねない）。
@@ -249,6 +271,17 @@ public:
         tailGain_ = ReverbTailIr::calibrateGain(directGain, targetRatio);
         return ratio;
     }
+
+    /// 尾の畳み込みを共有バスへ預ける。null で自前に戻る（既定）。
+    ///   isOwner=true の音源だけが IR をバスへ入れる（部屋の代表）。
+    ///   ⚠ **同じ IR を使う音源だけ**を同じバスへ入れること。違う部屋を混ぜると、
+    ///     片方の部屋の響きがもう片方に付く。
+    ///   ⚠ owner を 1 本も差さないとバスに IR が入らず、尾が丸ごと鳴らない。
+    void setTailBus(TailBus* bus, bool isOwner) {
+        tailBus_ = bus;
+        tailBusOwner_ = isOwner;
+    }
+    const TailBus* tailBus() const { return tailBus_; }
 
     /// クロスフェードの長さ(ms)。0 で即差し替え（旧挙動）。
     void setTailCrossfadeMs(float ms) {
@@ -283,7 +316,7 @@ public:
         int done = 0;
         while (done < frames) {
             const int n = std::min(frames - done, maxFrames_);
-            renderChunk(input + done, n, outL + done, outR + done, m);
+            renderChunk(input + done, n, outL + done, outR + done, m, done);
             done += n;
         }
         const float inv = 1.0f / static_cast<float>(std::max(1, frames));
@@ -298,7 +331,8 @@ public:
 private:
     static float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 
-    void renderChunk(const float* input, int n, float* outL, float* outR, Metering& m) {
+    void renderChunk(const float* input, int n, float* outL, float* outR, Metering& m,
+                     int dstOffset = 0) {
         // ① 後期尾はブロック単位（周波数領域）。サンプルループより前に済ませる。
         std::fill(tailOutL_.begin(), tailOutL_.begin() + n, 0.0f);
         std::fill(tailOutR_.begin(), tailOutR_.begin() + n, 0.0f);
@@ -317,14 +351,39 @@ private:
         } else {
             tailXfading_ = false;
         }
-        float* dst[2] = { tailOutL_.data(), tailOutR_.data() };
-        if (tailGain_ > 0.0f && tailCur().hasIr() && wNew > 0.0f)
-            tailCur().processAdd(input, 0, n, dst, 0, tailGain_ * lvl * wNew);
-        if (tailXfading_ && tailGainOld_ > 0.0f && tailOld().hasIr() && wOld > 0.0f)
-            tailOld().processAdd(input, 0, n, dst, 0, tailGainOld_ * lvl * wOld);
-        if (tailXfading_) {
-            tailXfade_ += n;
-            if (tailXfade_ >= tailXfadeLen_) { tailXfading_ = false; tailXfade_ = 0; }
+        // ★★ 共有バスがあるなら、自前では畳まず**送るだけ** ★★
+        //   畳み込みは線形なので conv(IR, Σ gᵢ·xᵢ) = Σ conv(IR, gᵢ·xᵢ)。
+        //   音源ごとのレベル（tailGain_ × lvl）は足す前に掛けるので、
+        //   **音源ごとの尾の量は保たれる**。減るのは畳み込みの回数だけ。
+        //   ⚠ IR が違う音源を同じバスへ入れてはいけない。部屋ごとに 1 本。
+        //   ⚠ クロスフェードもバスが持つ（IR がバス側にあるので）。
+        //   ⚠ この音源の rmsTail は 0 になる。計器はバス側の rms() を見ること。
+        if (tailBus_) {
+            // 送るだけ。tailOutL_/R_ は上で 0 埋め済みなので、この音源からは尾が出ない。
+            //
+            // ★★ outputGain_ を**ここで掛ける** ★★
+            //   自前で畳むとき、尾は他の段と一緒に最後で `l *= outputGain_` を受ける。
+            //   バスへ回すとリスナー側で足されるので、**その 1 回を通らない**。
+            //   掛け忘れると尾だけ 1/outputGain 倍（既定 0.6 なら 1.67 倍、
+            //   負荷検証シーンの 0.12 なら **8.3 倍**）大きくなる。実機で「聞こえ方が壊れる」
+            //   と報告されて分かった。
+            //   ⚠ 検査が見逃したのは setOutputGain(1.0f) で回していたから。
+            //     **等倍だと掛け忘れが見えない。**検査側は音源ごとに違う値にしてある。
+            //   ⚠ AudioSource の volume はホスト側で OnAudioFilterRead の後に掛かるので、
+            //     ここでは拾えない。音源ごとに volume を変えるなら outputGain に寄せること。
+            if (tailGain_ > 0.0f)
+                tailBus_->add(input, n, tailGain_ * lvl * outputGain_, dstOffset);
+            tailXfading_ = false;   // クロスフェードはバスが持つ
+        } else {
+            float* dst[2] = { tailOutL_.data(), tailOutR_.data() };
+            if (tailGain_ > 0.0f && tailCur().hasIr() && wNew > 0.0f)
+                tailCur().processAdd(input, 0, n, dst, 0, tailGain_ * lvl * wNew);
+            if (tailXfading_ && tailGainOld_ > 0.0f && tailOld().hasIr() && wOld > 0.0f)
+                tailOld().processAdd(input, 0, n, dst, 0, tailGainOld_ * lvl * wOld);
+            if (tailXfading_) {
+                tailXfade_ += n;
+                if (tailXfade_ >= tailXfadeLen_) { tailXfading_ = false; tailXfade_ = 0; }
+            }
         }
 
         // ② HRTF はブロック境界で HRIR を取り込む（方向変化のクロスフェード開始）。
@@ -340,8 +399,9 @@ private:
         for (int f = 0; f < n; ++f) {
             const float dry = input[f];
 
-            float l, r, scatSend, directMono, difMono;
-            early_.processSample(dry, hrtfActive, l, r, scatSend, directMono, difMono);
+            float l, r, scatSendL, scatSendR, directMono, difMono;
+            early_.processSample(dry, hrtfActive, l, r,
+                                 scatSendL, scatSendR, directMono, difMono);
 
             // 直接音を HRTF で両耳化して足す（パンの代わり）。
             float dirL = 0.0f, dirR = 0.0f;
@@ -367,8 +427,13 @@ private:
             m.rmsEarly += (eL * eL + eR * eR) * 0.5f;
 
             // ③ 散乱スメア：拡散成分を allpass で撹拌して時間方向に滲ませる。
-            const float scL = diffL_.process(scatSend, scatterDiffusion_);
-            const float scR = diffR_.process(scatSend, scatterDiffusion_);
+            //   ★左右別の送りを、それぞれの拡散器へ通す。オールパスは元から 2 本なので
+            //     コストは変わらないが、**散乱が方向を持つ**ようになる。
+            //     モノラル 1 本を 2 本の拡散器へ通していたときは、左右のレベルが必ず同じ＝
+            //     構造的に ILD が 0 で、しかも散乱が出力の 100〜179% を占めていた
+            //     （実測・く字廊下）。方向を持つ成分がその下に埋もれていた。
+            const float scL = diffL_.process(scatSendL, scatterDiffusion_);
+            const float scR = diffR_.process(scatSendR, scatterDiffusion_);
             m.rmsScatter += (scL * scL + scR * scR) * 0.5f;
             l += scL; r += scR;
 
@@ -397,6 +462,10 @@ private:
     HrtfProcessor hrtfDif_;
     // 並走クロスフェード用に 2 面持つ。役割は tailUseB_ で入れ替える
     // （NonUniformConvolver は atomic を持つので swap できない）。
+    // 共有バス。null なら自前で畳む（既定＝これまでどおり）。
+    //   バスを差すと、この音源は尾を**送るだけ**になり、畳み込みは 1 回に集約される。
+    TailBus* tailBus_ = nullptr;
+    bool tailBusOwner_ = false;    // この音源が IR をバスへ入れる係か（部屋の代表）
     NonUniformConvolver tailConvA_;
     NonUniformConvolver tailConvB_;
     bool tailUseB_ = false;

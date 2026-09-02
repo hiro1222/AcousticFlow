@@ -265,21 +265,109 @@ namespace AcousticFlow.EditorTools
             //   扉だけ弱くすれば漏れてくる方向が扉になる ── 閉めていても気配が出る。
             doorGo.AddComponent<AcousticSurface>().material = AcousticMaterialPreset.WoodDoor;
 
-            // 音源2つ。扉が振れる向きに対して左右に置き、聞こえ始める順序の違いを出す。
-            //   音源0（右・+X 側）… 隙間が開く方向。早い角度からダイレクトになる
-            //   音源1（左・-X 側）… 振れた扉の板が覆う方向。最後まで透過のまま
-            //   ※戸口が幅1mなので、直線が戸口を通るのは音源の X が概ね ±1m 以内のとき。
-            //     それを超えると壁側で遮られるため、左右とも ±0.8m に置く。
-            var srcRight = new Vector3(0.8f, 1.6f, 3f);
-            var srcLeft = new Vector3(-0.8f, 1.6f, 3f);
-            var srcs = AddDemo(listener, srcRight, AcousticMaterialPreset.Concrete,
-                               new[] { "Right", "Left" });
-            srcs[1].position = srcLeft;   // 音源1だけ左へ（畳み込み器ごと動く）
+            // ★音源は 1 本、戸口の正面（x = 0）から始める。
+            //   以前は左右 2 本（Right +0.8 / Left -0.8）で「聞こえ始める順序の差」を
+            //   見せていたが、収録では**同時に 2 本鳴っていると何が変わったのか分からない**。
+            //   聞き分けたい差は収録卓の 7/8/9（x = -1 / 0 / +1）でテイクを分けて出す。
+            //   x = 0 は直線が戸口のど真ん中を通るので、扉が開くと直接音が抜けてくる。
+            //
+            //   鳴らすのは画面収録の WAV。既定の kTestClipPath は市販楽曲なので、
+            //   収録した動画をそのまま人に見せられない（§7.6）。
+            AddDemo(listener, new Vector3(0f, 1.6f, 3f),
+                    AcousticMaterialPreset.Concrete,
+                    names: null, clipPath: kScreenRecClipPath);
+
+            // ★収録卓。手で 5/6 を押すとテイクごとに開く速さが変わるので、
+            //   開 3s → 停 2s → 閉 3s を固定で流せるようにしておく。
+            //   音源の X も 3 箇所（-1 / 0 / +1）に決め打ちで飛ばせる。
+            //   リスナー z=-3 / 音源 z=+3 なので、直線が z=0 を横切る X は音源の X の半分:
+            //     x=0 → 0.00（戸口 ±0.5 のど真ん中）/ x=±1 → 0.50（**戸口の縁ちょうど**）。
+            //   ±1 は影境界の上なので、跳ねが残っていればここでいちばん出る置き方。
+            {
+                var rigGo = new GameObject("DoorSweepLab");
+                var rig = rigGo.AddComponent<DoorSweepLab>();
+                rig.door = door;
+                rig.sourceIndex = 0;         // 音源は 1 本だけ
+                rig.openAngleDeg = 120f;     // SwingDoor の上限まで開ける
+                rig.sourceXs = new[] { -1f, 0f, 1f };
+            }
 
             Save(scene, "Test_SwingDoor.unity",
-                "扉の開き角: 5/6 キーで扉を開閉（Inspector の SwingDoor.angleDeg でも可）。" +
-                "右(+X)の音源が先に抜けてきて、左(-X)は扉の板に覆われて最後まで透過のまま。" +
+                "扉の開き角: 音源 1 本・戸口の正面(x=0)・画面収録 WAV。" +
+                "T キー／画面のボタンで 開3s(0→120°)→停2s→閉3s を固定で流せる（収録用）。" +
+                "7/8/9 で音源の X を -1 / 0 / +1 へ（±1 は横切る点が戸口の縁ちょうど＝影境界の上）。" +
+                "5/6 キーで手動の開閉、Inspector の SwingDoor.angleDeg でも可。" +
                 "開閉の2状態ではなく、途中の角度すべてで連続に変わることを確認する。");
+        }
+
+        // ── 広さ と 隣室 を同じ場面で比べる（比較動画の素材用）──────────────
+        // ★何のためにあるか
+        //   この作品が音で伝えるものは 2 つある ── 同じ部屋の残響（広さで変わる）と、
+        //   隣の部屋のこもり（壁 1 枚と扉の開き角で変わる）。別々のシーンで見せると
+        //   条件が揃わないので比べられない。ここは 1 つのシーンに両方を入れて、
+        //   **広さ・扉の角度を固定したまま立つ側だけを入れ替える**。
+        //
+        //   1/2/3 で広さ（片側の部屋 30 / 320 / 4320 m3 ≒ 10 倍刻み）
+        //   Enter で 音源と同じ部屋 ⇄ 隣の部屋（戸口からの距離は両側で同じ＝鏡像）
+        //   5/6   で扉の開き角（SwingDoor の既定キー）
+        //
+        // ★ポータルは置いていない
+        //   両側とも閉じた部屋なので、戸口は C1 の自動生成で出る（板の表: 屋内⇄屋内 は
+        //   自動生成される）。手置きすると広さを変えるたびに追従させる必要が出るので、
+        //   ここでは自動に任せる。**屋外に面した開口が無いシーンだから成立する**。
+        //
+        // ★Enter を SceneDemo から譲ってもらっている
+        //   AcousticFlowSceneDemo は Enter を「音源0のみ足音ループ」に使っている。
+        //   このシーンだけ enableFootstepToggleKey を OFF にする（既定は ON のままなので
+        //   他のシーンの効き方は変わらない）。
+        [MenuItem("AcousticFlow/Test Scenes/Room Compare (広さと隣室の比較)")]
+        public static void RoomCompareScene()
+        {
+            var scene = NewScene();
+            var listener = MakeListener(new Vector3(0f, 1.6f, -2.1f));
+
+            var labGo = new GameObject("RoomCompareLab");
+            var lab = labGo.AddComponent<RoomCompareLab>();
+            lab.sizeIndex = 1;          // 中から始める
+            lab.inSourceRoom = false;   // 最初は隣の部屋（こもって聞こえる側）
+            lab.listener = listener;
+            lab.EnsurePieces();
+
+            // 音源は奥の部屋。ApplyNow が正しい奥行きへ置き直すので、ここは仮置き。
+            // ★壁は Concrete ではなく Default にしてある（Test_SwingDoor は Concrete）。
+            //   Concrete は α = 0.02〜0.07 でほとんど吸わないので、大の部屋で
+            //   Sabine の RT60 が 12.8 秒になり、どの広さでも残響に溺れて比べられない。
+            //   Default(α = 0.10〜0.40) だと 小 0.55 / 中 1.12 / 大 2.69 秒（500Hz）と
+            //   広さ 1 段ごとにほぼ 2 倍になり、階段として聞き取れる。
+            //   透過は Default TL 31〜52dB / 扉 WoodDoor 15〜27dB なので、
+            //   「漏れているのは扉」という落差は Concrete でなくても保たれる。
+            var srcs = AddDemo(listener, new Vector3(0f, 1.6f, 7.3f), AcousticMaterialPreset.Default);
+            lab.source = srcs[0];
+
+            var demo = Object.FindFirstObjectByType<AcousticFlowSceneDemo>();
+            if (demo != null) demo.enableFootstepToggleKey = false;   // Enter を台へ譲る
+
+            // ★扉だけ弱い材質にする。現実の部屋で音が漏れるのは壁ではなく扉。
+            //   壁を一様に弱くすると、どこから漏れているか分からなくなる（Test_SwingDoor と同じ理由）。
+            if (lab.door != null && lab.door.GetComponent<AcousticSurface>() == null)
+                lab.door.gameObject.AddComponent<AcousticSurface>().material =
+                    AcousticMaterialPreset.WoodDoor;
+
+            lab.ApplyNow();   // 形と立ち位置を確定させてから保存する（Awake を待たない）
+
+            // ★扉と仕切りの明度差を付ける。何度開いているかは音を判断する前提情報なので、
+            //   見て分からないと確認にならない。
+            if (lab.door != null) Tint(lab.door.transform, new Color(0.95f, 0.55f, 0.15f));
+            foreach (string n in new[] { "Partition_L", "Partition_R", "Partition_Top" })
+            {
+                Transform p = labGo.transform.Find(n);
+                if (p != null) Tint(p, new Color(0.30f, 0.33f, 0.40f));
+            }
+
+            Save(scene, "Test_RoomCompare.unity",
+                "広さと隣室の比較: 1/2/3 で広さ（片側 30/320/4320 m3）、Enter で居る部屋を切替、" +
+                "5/6 で扉の開き角。立ち位置は仕切りに対して鏡像なので戸口からの距離は両側で同じ。" +
+                "部屋を跨ぐと音源までの距離が変わるため、音量ではなく HUD の『こもり倍率』で比べること。");
         }
 
         // ── 回折だけを聴く：透過・反射・残響を全部落とす ──
@@ -644,14 +732,135 @@ namespace AcousticFlow.EditorTools
         //   音源の位置＝畳み込み器の位置になるので、ズレる余地も消える。
         //
         //   names に渡した数だけ音源を作る（例: {"Right","Left"} → IrConvolver_Right/Left）。
+        // ── 多音源（負荷検証）──────────────────────────────────────────────
+        // ★何のためにあるか
+        //   「音源数に比例する費用」を減らす手を今日いくつも入れたのに、**確かめる場が
+        //   手元に無かった**。他のテストシーンは音源 1〜2 本で、どれも効果が出ない本数。
+        //   ゲームレーンのシーンを借りないと検証できない状態は依存として良くない。
+        //
+        // ★ここで確かめる 3 つ（全部「音源が多いときだけ効く」もの）
+        //   ・sharedTailBus         尾の畳み込みを部屋ごとに 1 回へ（音声スレッド）
+        //   ・workerThreads         音源ごとの段を複数コアへ（メインスレッド）
+        //   ・段（厳密/簡易/バーチャル） 何をどこまで解くか
+        //
+        // ★部屋を 2 つにしてある
+        //   尾の形は部屋ごとなので、バスも部屋ごとに 1 本になる。1 部屋だけだと
+        //   「形が違う音源を混ぜたら壊れる」経路を一度も通らず、**壊れていても気づけない**。
+        //
+        // ★遮蔽された音源を混ぜてある
+        //   遮蔽時だけ回折の合成が走る（実測 6 倍高い）。見通せる音源だけだと、
+        //   いちばん高い経路を測らずに「軽い」と言うことになる。
+        [MenuItem("AcousticFlow/Test Scenes/Many Sources (多音源・負荷)")]
+        public static void ManySources()
+        {
+            var scene = NewScene();
+            var listener = MakeListener(new Vector3(0f, 1.6f, -8f));
+
+            // 主室（響かせる。尾が費用の主なので、尾が出ない部屋で測っても意味がない）。
+            MakeBox("Floor", new Vector3(0f, -0.5f, 0f), new Vector3(30f, 1f, 40f));
+            MakeBox("Ceil", new Vector3(0f, 6.5f, 0f), new Vector3(30f, 1f, 40f));
+            MakeBox("W_Left", new Vector3(-12f, 3f, 0f), new Vector3(1f, 7f, 40f));
+            MakeBox("W_Right", new Vector3(12f, 3f, 0f), new Vector3(1f, 7f, 40f));
+            MakeBox("W_Back", new Vector3(0f, 3f, -14f), new Vector3(30f, 7f, 1f));
+
+            // 仕切り＋戸口（幅 2m）。この向こうが第 2 室 ＝ 尾の形が別になる。
+            MakeBox("Div_L", new Vector3(-7f, 3f, 6f), new Vector3(11f, 7f, 0.5f));
+            MakeBox("Div_R", new Vector3(7f, 3f, 6f), new Vector3(11f, 7f, 0.5f));
+            MakeBox("W_Far", new Vector3(0f, 3f, 14f), new Vector3(30f, 7f, 1f));
+
+            // 主室の中の衝立。ここの裏の音源が「遮蔽された音源」になる。
+            var scr = MakeBox("Screen", new Vector3(0f, 3f, -2f), new Vector3(8f, 7f, 0.4f));
+            Tint(scr, new Color(0.85f, 0.55f, 0.35f));
+
+            // 音源 16 本。ゲームレーンの実測（声 15 本で DSP CPU 109.5%）に合わせた本数。
+            var pos = new List<Vector3>();
+            var names = new List<string>();
+            for (int i = 0; i < 6; i++) {            // 見通せる（安い）
+                pos.Add(new Vector3(-9f + i * 3.6f, 1.6f, -11f));
+                names.Add("Open" + i);
+            }
+            for (int i = 0; i < 6; i++) {            // 衝立の裏（高い＝回折の合成が走る）
+                pos.Add(new Vector3(-6f + i * 2.4f, 1.6f, 1f));
+                names.Add("Occl" + i);
+            }
+            for (int i = 0; i < 4; i++) {            // 第 2 室（尾の形が別＝バスが 2 本になる）
+                pos.Add(new Vector3(-6f + i * 4f, 1.6f, 10f));
+                names.Add("Room2_" + i);
+            }
+
+            var srcs = AddDemoAt(listener, pos.ToArray(), AcousticMaterialPreset.Concrete,
+                                 names.ToArray());
+            Save(scene, "Test_ManySources.unity",
+                "多音源（負荷検証）: 見通せる 6 / 衝立の裏 6 / 第2室 4 = 16 本。"
+                + "AcousticFlowSceneDemo の sharedTailBus・workerThreads・"
+                + "occlusionUpdateEveryFrames を振って、耳と数字の両方で確かめる。"
+                + "★音声スレッドの負荷は Unity の Profiler → Audio（DSP CPU）で見ること。"
+                + "画面の音響 ms はメインスレッドしか見ていないので 1% も動かない。");
+        }
+
+        // 位置を音源ごとに指定できる AddDemo。負荷検証は散らばっていないと意味がない
+        // （同じ点に重ねると遮蔽も距離も全部同じになり、1 本を 16 回測るのと変わらない）。
+        private static Transform[] AddDemoAt(Transform listener, Vector3[] positions,
+                                             AcousticMaterialPreset material, string[] names)
+        {
+            // ★負荷検証は C++ 経路だけ載せる。
+            //   IrConvolver は**無効でも Awake が走る**ので、16 本ぶんの HRTF 読み込みと
+            //   18 分割の畳み込み器を確保してしまう。鳴らさない物の起動費用とメモリが
+            //   測定に乗ると、何を測っているのか分からなくなる。
+            //   （A/B の Y キーは効かなくなる。負荷検証にそれは要らない）
+            var srcs = new Transform[positions.Length];
+            for (int i = 0; i < positions.Length; i++)
+                srcs[i] = AddVoiceOnly(positions[i], i, "Src_" + names[i]);
+
+            var go = new GameObject("AcousticFlowSceneDemo");
+            var demo = go.AddComponent<AcousticFlowSceneDemo>();
+            demo.listener = listener;
+            demo.source = srcs[0];
+            var extra = new Transform[positions.Length - 1];
+            for (int i = 1; i < positions.Length; i++) extra[i - 1] = srcs[i];
+            demo.extraSources = extra;
+            demo.sourceEvents = names;
+            demo.autoCollectBoxColliders = true;
+            demo.occluderMaterial = material;
+            demo.firstPersonCamera = true;
+            demo.distanceRef = 4f;
+            return srcs;
+        }
+
+        // C++ 経路だけの音源。負荷検証用（AddConvolver は C# 経路も載せる）。
+        private static Transform AddVoiceOnly(Vector3 pos, int sourceIndex, string name)
+        {
+            var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            go.name = name;
+            go.transform.position = pos;
+            go.transform.localScale = Vector3.one * 0.4f;
+            var src = go.AddComponent<AudioSource>();
+            var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(kTestClipPath);
+            if (clip == null) clip = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Audio/TokyoGeto.wav");
+            if (clip != null) src.clip = clip;
+
+            var voice = go.AddComponent<VoiceConvolver>();
+            voice.sourceIndex = sourceIndex;
+            voice.tailLevel = 0.3f;
+            // 16 本が同じ楽曲を鳴らすので、既定 0.6 のままだと確実に割れる。
+            voice.outputGain = 0.12f;
+            voice.enabled = false;      // Demo 側の useCppDsp が上げる
+            return go.transform;
+        }
+
+        // clipPath を渡すと、その WAV を鳴らす音源になる（省略時は kTestClipPath）。
+        //   ★シーンごとに素材を変えたい場面がある。収録用シーンは市販曲を避けたいし、
+        //     定位を見るなら過渡音のほうが良い。既定は変えずに、渡せるようにだけしてある。
         private static Transform[] AddDemo(Transform listener, Vector3 srcPos,
                                            AcousticMaterialPreset material,
-                                           string[] names = null)
+                                           string[] names = null,
+                                           string clipPath = null)
         {
             string[] events = names ?? new[] { "Main" };
             var srcs = new Transform[events.Length];
             for (int i = 0; i < events.Length; i++)
-                srcs[i] = AddConvolver(srcPos, i, name: "IrConvolver_" + events[i]).transform;
+                srcs[i] = AddConvolver(srcPos, i, clipPath,
+                                       name: "IrConvolver_" + events[i]).transform;
 
             var go = new GameObject("AcousticFlowSceneDemo");
             var demo = go.AddComponent<AcousticFlowSceneDemo>();
@@ -679,6 +888,11 @@ namespace AcousticFlow.EditorTools
         private const string kTestClipPath =
             "Assets/Audio/ロクデナシ「ブリザード」 Rokudenashi - Blizzard【Official Music Video】 - Rokudenashi (128k).wav";
         private const string kTransientClipPath = "Assets/Audio/Footstep_Asphalt.mp3";
+
+        // 画面収録の音声。**収録用シーンはこれを鳴らす。**
+        //   kTestClipPath は市販楽曲なので、画面収録した動画をそのまま人に見せられない
+        //   （§7.6 の商用曲問題）。こちらは自前の素材なのでその制約が無い。
+        private const string kScreenRecClipPath = "Assets/Audio/画面録画-2026-08-24-192052.wav";
 
         // 音源 sourceIndex ぶんの畳み込み器。遅延も到来方向も遮蔽も音源ごとに違うので、
         // 鳴らしたい音源 1 つにつき 1 つ置く。clip を渡さなければ既定の足音を使う。

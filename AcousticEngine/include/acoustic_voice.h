@@ -99,6 +99,42 @@ typedef struct AF_VoiceMetering {
 ACOUSTIC_API AF_VoiceHandle AF_VoiceCreate(const AF_VoiceConfig* cfg);
 ACOUSTIC_API void AF_VoiceDestroy(AF_VoiceHandle voice);
 
+/* ── 尾の共有バス（段階②）─────────────────────────────────────────────
+ * 後期残響の畳み込みを**音源で共有する**。
+ *
+ * ★近似ではない。畳み込みは線形なので、同じ IR に対して
+ *     conv(IR, g1·x1) + conv(IR, g2·x2) = conv(IR, g1·x1 + g2·x2)
+ *   が厳密に成り立つ。音源ごとのレベル g は足す前に掛けるので、
+ *   **音源ごとの尾の量は保たれる**。減るのは畳み込みの回数だけ。
+ *   実測: 音源 8 本で 1 ブロック 2.345 → 0.404 ms（**5.81 倍**）、出力の差は -123.7dB 下。
+ *
+ * ⚠ **同じ IR を使う音源だけ**を同じバスへ入れること（＝部屋ごとに 1 本）。
+ *   違う部屋を混ぜると、片方の部屋の響きがもう片方に付く。
+ * ⚠ 代表の音源（isOwner=1）を 1 本差すこと。1 本も差さないとバスに IR が入らず、
+ *   **尾が丸ごと鳴らない**。全員を代表にすると、同じ IR で何度もクロスフェードが
+ *   始まって 2 面ぶん畳むことになり、集約した意味が消える。
+ *
+ * ★呼ぶ場所（Unity）
+ *   音源の OnAudioFilterRead が呼ばれる順は保証されないので、「全員が送ってから畳む」を
+ *   素直に書けない。**AudioListener に付けたフィルタは全音源のミックス後に走る**ので、
+ *   そこで AF_TailBusRender を 1 回呼ぶ。これなら遅延を足さずに順序が保証される。
+ *   ⚠ 音源が 1 本も送っていないブロックでも呼ぶこと。畳み込み器の遅延線を進めないと、
+ *     次に送りが来たときに尾が飛ぶ。 */
+typedef void* AF_TailBusHandle;
+
+ACOUSTIC_API AF_TailBusHandle AF_TailBusCreate(int sampleRate, float tailSeconds,
+                                               int firstBlock, int capBlock, int maxFrames);
+ACOUSTIC_API void AF_TailBusDestroy(AF_TailBusHandle bus);
+ACOUSTIC_API void AF_TailBusSetCrossfadeMs(AF_TailBusHandle bus, float ms);
+/* 溜まった送りを 1 回畳んで outL/outR へ**足す**（上書きしない）。 */
+ACOUSTIC_API void AF_TailBusRender(AF_TailBusHandle bus, int frames, float* outL, float* outR);
+/* 直前ブロックの尾の RMS（左）。バスに預けた音源の rmsTail は 0 になるので、計器はこちら。 */
+ACOUSTIC_API float AF_TailBusRms(AF_TailBusHandle bus);
+ACOUSTIC_API int AF_TailBusHasIr(AF_TailBusHandle bus);
+
+/* この音源の尾を共有バスへ預ける。bus=NULL で自前の畳み込みに戻る（既定）。 */
+ACOUSTIC_API void AF_VoiceSetTailBus(AF_VoiceHandle voice, AF_TailBusHandle bus, int isOwner);
+
 /* タップ集合を差し替える。切替は次のブロックからクロスフェードして行われる。 */
 ACOUSTIC_API void AF_VoiceSetTaps(AF_VoiceHandle voice, const AF_VoiceTap* taps, int count);
 

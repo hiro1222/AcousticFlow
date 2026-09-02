@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- P/Invoke のマーシャリングが本当に効いているかを**実行して**確かめる小道具。
+       tools/check_csharp.ps1 は型検査までしか見ない（マーシャリング属性は型では出ない）。
+       使い方は Program.cs の先頭を参照。XML コメントに連続ハイフンは書けないので
+       コマンド例はここに置かない。 -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <AssemblyName>AfMarshalProbe</AssemblyName>
+    <RootNamespace>AfMarshalProbe</RootNamespace>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+</Project>

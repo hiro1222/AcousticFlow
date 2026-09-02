@@ -2172,7 +2172,7 @@ MonoBehaviour:
   echogramRays: 512
   echogramBounces: 24
   reverbUpdateEveryFrames: 4
-  enableDirectionalTail: 0
+  enableDirectionalTail: 1
   probeRays: 64
   probeBounces: 10
   probeUpdateEveryFrames: 8

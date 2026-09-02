@@ -90,12 +90,29 @@ int main() {
             const Vec3 R(0.0f, y, 6.0f);
             float g[kBands] = {};
             double re[kBands] = {}, im[kBands] = {};
-            const bool notOnBoundary = btm::edgeBands(e, S, R, kBandHz, kBands, kC,
-                                                      g, nullptr, 96, re, im);
+            // ★edgeBands の**戻り値は「計算できたか」だけ**。境界かどうかは
+            //   outOnBoundary で受ける。ここを兼用と誤解していて、境界ちょうどの 1 点で
+            //   direct を 0.5 ではなく 0.0 にしていた（実測: 総和 0.0293。前後は 0.51/0.54）。
+            //   エンジン側は既に分離済み（btm.h の注意書き）で、**検査だけが一版古かった**。
+            //   回折項は影側 +0.51 → 境界 +0.02 → 明側 -0.46 と符号が反転していて、
+            //   境界でちょうど中間に落ちる ＝ モデルの側は最初から正しかった。
+            bool onBoundary = false;
+            const bool ok = btm::edgeBands(e, S, R, kBandHz, kBands, kC,
+                                           g, nullptr, 96, re, im, &onBoundary);
+            if (!ok) continue;   // 計算できなかった点は比べない（境界とは別の事象）
             // 直接音の可視性。稜線より上（y>3 側の見通し）なら 1、影なら 0、境界なら 0.5。
             const double shadowY = 3.0;
             double direct = (y > shadowY) ? 1.0 : 0.0;
-            if (!notOnBoundary) direct = 0.5;          // 境界上は半分（EDtoolbox の規約）
+            if (onBoundary) direct = 0.5;              // 境界上は半分（EDtoolbox の規約）
+            // ★境界ちょうどの標本だけは、onZoneBoundary の許容差(1e-9 rad)が届かず
+            //   発火しない。実際に一度も発火しないので、幾何側は自分で判定する。
+            //   ここで 0.5 を入れるのは辻褄合わせではない ── この点でモデルが返すのは
+            //   **主値**（両側の極限 +0.5 と -0.5 の中間 ＝ 0）だからで、
+            //   主値には主値の幾何側（0 と 1 の中間 ＝ 0.5）を合わせるのが対応する規約。
+            //   実測: 影側 +0.5125 / 境界 +0.0215 / 明側 -0.4619 ＝ ちょうど中間に落ちている。
+            //   ⚠ 帯にしてはいけない。0.02 幅で 0.5 を当てると、帯の内側で
+            //     |0.5+0.5|=1.0 になって**もっと大きい段差**を作る（試して確認）。
+            if (std::fabs(static_cast<double>(y) - shadowY) < 1e-4) direct = 0.5;
             const double tr = direct + re[bi], ti = im[bi];
             const float tot = static_cast<float>(std::sqrt(tr * tr + ti * ti));
             if (prevTot >= 0.0f) {

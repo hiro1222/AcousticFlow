@@ -31,6 +31,51 @@ namespace AcousticFlow
             return Native.AF_SceneAddMaterial(_handle, t, a, s, n);
         }
 
+        // ── 調整支援 ──────────────────────────────────────────────────
+        /// この直線の透過損失を担っている遮蔽物を、大きい順に返す（件数を返す）。
+        ///   ⚠ **透過だけ**を見ます。回り込み（回折）が担っている帯域では、
+        ///     ここに出た材質を触っても音は動きません。触る前に内訳を確かめること。
+        public int TransmissionCarriers(Vector3 listener, Vector3 source,
+                                        int[] instance, int[] material, float[] lossDb)
+        {
+            if (_handle == IntPtr.Zero || instance == null) return 0;
+            try
+            {
+                return Native.AF_SceneTransmissionCarriers(
+                    _handle, new AFVector3(listener), new AFVector3(source),
+                    instance, material, lossDb, instance.Length);
+            }
+            catch (System.Exception) { return 0; }
+        }
+
+        /// 材質の現在値を読む（書けた帯域数）。
+        public int GetMaterial(int materialId, float[] transmission,
+                               float[] absorption = null, float[] scattering = null)
+        {
+            if (_handle == IntPtr.Zero || transmission == null) return 0;
+            try
+            {
+                return Native.AF_SceneGetMaterial(_handle, materialId, transmission,
+                                                  absorption, scattering, transmission.Length);
+            }
+            catch (System.Exception) { return 0; }
+        }
+
+        /// 材質を書き換える。**その材質を使っている実体が一斉に変わります。**
+        ///   次のフレームから効きます（BVH は形状だけなので再構築も起きない）。
+        public bool SetMaterial(int materialId, float[] transmission,
+                                float[] absorption = null, float[] scattering = null)
+        {
+            if (_handle == IntPtr.Zero || transmission == null) return false;
+            try
+            {
+                return Native.AF_SceneSetMaterial(_handle, materialId, transmission,
+                                                  absorption, scattering,
+                                                  transmission.Length) != 0;
+            }
+            catch (System.Exception) { return false; }
+        }
+
         // OBB インスタンスを追加し instanceId を返す（失敗 -1）。
         //   right/up は transform.right / transform.up をそのまま渡せる（内部で正規直交化）。
         public int AddInstanceBox(Vector3 center, Vector3 halfExtents,
@@ -611,6 +656,145 @@ namespace AcousticFlow
             try { Native.AF_SceneSetAutoPortals(_handle, on ? 1 : 0); }
             catch (System.Exception) { }   // 古い DLL。ABI 照合の側で警告が出る
         }
+        // 音源ごとの段を何コアで回すか。1 以下＝直列（既定）。
+        //   中で値の変化を見ているので毎フレーム押してよい（変わったときだけ作り直す）。
+        //   ⚠ Unity は既に全コアでジョブを回している。増やしすぎると食い合って
+        //     音響は速くなったのに他が遅くなる。上げたら必ず全体のフレーム時間で確かめること。
+        public void SetWorkerThreads(int n)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneSetWorkerThreads(_handle, n); }
+            catch (System.Exception) { }   // 古い DLL。ABI 照合の側で警告が出る
+        }
+        public int GetWorkerThreads()
+        {
+            if (_handle == IntPtr.Zero) return 0;
+            try { return Native.AF_SceneGetWorkerThreads(_handle); }
+            catch (System.Exception) { return 0; }
+        }
+
+        /// 音源の段。どこまで解くかを**音源ごとに固定**する。
+        ///   Exact   … 回折の合成まで。体験の芯（扉の奥の音・探しているベル）
+        ///   Simple  … 遮蔽の音量と帯域カーブだけ。回り込みの方向は出ない
+        ///   Virtual … 解かない。ホストは再生位置だけ進める
+        /// ⚠ 距離で自動に切り替えないこと。歩くだけで段が変わると切り替わりが聞こえる。
+        /// ★2D の音（UI・音楽・ナレーション）に段はない。**音源として登録しない**。
+        public enum SourceTier { Exact = 0, Simple = 1, Virtual = 2 }
+
+        public void SetSourceTier(ulong id, SourceTier tier)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneSetSourceTier(_handle, id, (int)tier); }
+            catch (System.Exception) { }   // 古い DLL。ABI 照合の側で警告が出る
+        }
+
+        /// 自由音場で聞こえなくなる距離(m)。0 以下＝自動バーチャルを使わない。
+        /// ⚠ 響く部屋ではエンジンが自動バーチャルを止める（残響は距離で減らないため）。
+        public void SetSourceAudibleRadius(ulong id, float metres)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneSetSourceAudibleRadius(_handle, id, metres); }
+            catch (System.Exception) { }
+        }
+
+        /// いま実際に使われている段（自動バーチャルの結果込み）。見つからなければ -1。
+        public int GetSourceTierEffective(int index)
+        {
+            if (_handle == IntPtr.Zero) return -1;
+            try { return Native.AF_SceneGetSourceTierEffective(_handle, index); }
+            catch (System.Exception) { return -1; }
+        }
+
+        // ── キャプチャ（サウンドデバッグツール）──────────────────────
+        //   起動時に CaptureBegin を呼んだら、あとは何もしなくてよい（Update の中で溜まる）。
+        //   「いま変だった」と思ったら CaptureMark。前後が揃うと Status が 2 になる。
+
+        /// 録音を始める。0 以下の項目は既定（前 21 秒・後 5 秒・64 音源・48kHz）。
+        public void CaptureBegin(int prerollFrames = 0, int postrollFrames = 0,
+                                 int maxSources = 0, int sampleRate = 0, bool recordPcm = true)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneCaptureBegin(_handle, prerollFrames, postrollFrames,
+                                              maxSources, sampleRate, recordPcm ? 1 : 0); }
+            catch (System.Exception) { }
+        }
+
+        /// この音源の尾を担っている代表音源の index。範囲外は -1。
+        /// ★規則（同じ部屋のいちばん若い index）はエンジン側に 1 つだけ。
+        public int GetTailShapeIndex(int index)
+        {
+            if (_handle == IntPtr.Zero) return -1;
+            try { return Native.AF_SceneGetTailShapeIndex(_handle, index); }
+            catch (System.Exception) { return -1; }
+        }
+
+        /// いまエッジカタログに載っている稜線の本数（計器表示用）。
+        public int EdgeCatalogCount()
+        {
+            if (_handle == IntPtr.Zero) return 0;
+            try { return Native.AF_SceneEdgeCatalogCount(_handle); }
+            catch (System.Exception) { return 0; }
+        }
+
+        /// 段の間引きの位相（8要素）。入力リプレイで尾を再現するために要る。
+        public int[] DebugGetStagePhase()
+        {
+            var p = new int[8];
+            if (_handle == IntPtr.Zero) return p;
+            try { Native.AF_SceneDebugGetStagePhase(_handle, p); }
+            catch (System.Exception) { }
+            return p;
+        }
+
+        /// ⚠ リスナー位置を押したあとに呼ぶこと（周回の基準点を合わせるため）。
+        public void DebugSetStagePhase(int[] phase8)
+        {
+            if (_handle == IntPtr.Zero || phase8 == null || phase8.Length < 8) return;
+            try { Native.AF_SceneDebugSetStagePhase(_handle, phase8); }
+            catch (System.Exception) { }
+        }
+
+        public void CaptureEnd()
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneCaptureEnd(_handle); }
+            catch (System.Exception) { }
+        }
+
+        /// 「いま変だった」を押す。前後が揃うまで 2 回目以降は無視される。
+        public void CaptureMark()
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneCaptureMark(_handle); }
+            catch (System.Exception) { }
+        }
+
+        /// 0=止まっている 1=録っている 2=前後が揃った（保存できる）。
+        public int CaptureStatus(out int framesHeld)
+        {
+            framesHeld = 0;
+            if (_handle == IntPtr.Zero) return 0;
+            try { return Native.AF_SceneCaptureStatus(_handle, out framesHeld); }
+            catch (System.Exception) { return 0; }
+        }
+
+        /// ⚠ オーディオスレッドから呼ぶこと（OnAudioFilterRead）。
+        public void CapturePushAudio(float[] interleavedStereo, int frames)
+        {
+            if (_handle == IntPtr.Zero || interleavedStereo == null) return;
+            try { Native.AF_SceneCapturePushAudio(_handle, interleavedStereo, frames); }
+            catch (System.Exception) { }
+        }
+
+        /// .afcap として保存する。成功で true。
+        ///   sceneName / dllHash はヘッダに焼く識別子（開いたときに現物と照合するため）。
+        public bool CaptureWrite(string path, string sceneName, uint dllHash)
+        {
+            if (_handle == IntPtr.Zero || string.IsNullOrEmpty(path)) return false;
+            try { return Native.AF_SceneCaptureWrite(_handle, path, sceneName, dllHash) != 0; }
+            catch (System.Exception) { return false; }
+        }
+
         public void SetAutoPortalMinArea(float m2)
         {
             if (_handle == IntPtr.Zero) return;
@@ -775,14 +959,6 @@ namespace AcousticFlow
             return n;
         }
 
-        // B: キューブマップ エッジカタログ構築（リスナー中心・全音源共有）。res=面解像度。
-        public void BuildEdgeCatalog(Vector3 listener, int res, float maxDist)
-        {
-            if (_handle == IntPtr.Zero) return;
-            Native.AF_SceneBuildEdgeCatalog(_handle, new AFVector3(listener), res, maxDist);
-        }
-        public int EdgeCatalogCount => _handle != IntPtr.Zero ? Native.AF_SceneEdgeCatalogCount(_handle) : 0;
-        public void ClearEdgeCatalog() { if (_handle != IntPtr.Zero) Native.AF_SceneClearEdgeCatalog(_handle); }
 
         public int InstanceCount => _handle != IntPtr.Zero ? Native.AF_SceneInstanceCount(_handle) : 0;
 

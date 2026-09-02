@@ -89,6 +89,47 @@ AF_VoiceHandle AF_VoiceCreate(const AF_VoiceConfig* cfg) {
 
 void AF_VoiceDestroy(AF_VoiceHandle voice) { delete asVoice(voice); }
 
+// ── 尾の共有バス（段階②）──
+namespace {
+af::dsp::TailBus* asBus(AF_TailBusHandle h) { return static_cast<af::dsp::TailBus*>(h); }
+}  // namespace
+
+AF_TailBusHandle AF_TailBusCreate(int sampleRate, float tailSeconds,
+                                  int firstBlock, int capBlock, int maxFrames) {
+    const int sr = orDefault(sampleRate, 48000);
+    const float sec = orDefault(tailSeconds, 1.0f);
+    const int tailSamples = static_cast<int>(sec * static_cast<float>(sr));
+    return new (std::nothrow) af::dsp::TailBus(tailSamples,
+                                               orDefault(firstBlock, 64),
+                                               orDefault(capBlock, 8192),
+                                               orDefault(maxFrames, 4096), sr);
+}
+
+void AF_TailBusDestroy(AF_TailBusHandle bus) { delete asBus(bus); }
+
+void AF_TailBusSetCrossfadeMs(AF_TailBusHandle bus, float ms) {
+    if (af::dsp::TailBus* b = asBus(bus)) b->setCrossfadeMs(ms);
+}
+
+void AF_TailBusRender(AF_TailBusHandle bus, int frames, float* outL, float* outR) {
+    if (af::dsp::TailBus* b = asBus(bus)) b->render(frames, outL, outR);
+}
+
+float AF_TailBusRms(AF_TailBusHandle bus) {
+    af::dsp::TailBus* b = asBus(bus);
+    return b ? b->rms() : 0.0f;
+}
+
+int AF_TailBusHasIr(AF_TailBusHandle bus) {
+    af::dsp::TailBus* b = asBus(bus);
+    return (b && b->hasIr()) ? 1 : 0;
+}
+
+void AF_VoiceSetTailBus(AF_VoiceHandle voice, AF_TailBusHandle bus, int isOwner) {
+    if (af::dsp::VoiceRenderer* v = asVoice(voice))
+        v->setTailBus(asBus(bus), isOwner != 0);
+}
+
 void AF_VoiceSetTaps(AF_VoiceHandle voice, const AF_VoiceTap* taps, int count) {
     af::dsp::VoiceRenderer* v = asVoice(voice);
     if (!v) return;

@@ -12,6 +12,17 @@ target_link_libraries(AcousticEngineTest PRIVATE AcousticEngine)
 add_executable(SceneRegressionTest scene_regression.cpp)
 target_link_libraries(SceneRegressionTest PRIVATE AcousticEngine)
 
+# ★配布先の DLL が古くないかを、テストの冒頭と末尾で見るための道。
+#   DLL を Unity へ配るのは CMake に入れていない（手作業）。Unity が開いていると
+#   DLL を掴むので、ビルド後の自動コピーはビルドを止めるか、黙って失敗するかの
+#   どちらかになる。**ビルドは止めず、数字を読む直前に気づける**ほうを採った。
+#   → 2026-08-22 に実際に 1 日ぶん配り忘れ、エディタでは前日のエンジンが鳴っていた。
+#   パスはここで焼く（実行時の作業ディレクトリに依存させない）。
+target_compile_definitions(SceneRegressionTest PRIVATE
+    AF_BUILT_DLL_PATH="$<TARGET_FILE:AcousticEngine>"
+    AF_UNITY_DLL_PATH="${CMAKE_SOURCE_DIR}/UnityDemo/Assets/Plugins/x86_64/AcousticEngine.dll"
+    AF_DIST_DLL_PATH="${CMAKE_SOURCE_DIR}/DistDemo/Assets/Plugins/x86_64/AcousticEngine.dll")
+
 # エンジン単体で音を作って WAV へ書き出すツール。
 #   Unity はネイティブ DLL をロックするので、音の調整のたびに閉じる必要があって遅い。
 #   これなら数秒で回る。デモ動画の素材作りにも使える。
@@ -33,3 +44,14 @@ target_compile_features(BtmRegressionTest PRIVATE cxx_std_17)
 #   現実の扉の開閉を収録して、エンジンのカーブと重ねて比べるために使う。
 add_executable(AfAnalyzeWav analyze_wav.cpp)
 target_compile_features(AfAnalyzeWav PRIVATE cxx_std_17)
+
+# 資料の「扉の開き具合」の図（patterns_all.svg）に載せる数値を実測する。
+#   図と数字が同じ配置から出ていることを、コマンド 1 本で再現できるようにするためのもの。
+add_executable(AfPatternTable pattern_table.cpp)
+target_link_libraries(AfPatternTable PRIVATE AcousticEngine)
+
+# 録れた .afcap をコマンド 1 本で走査する。
+#   ★型紙は Unity のパネルが呼ぶのと同じ関数（Debug/detectors.h）。
+#     走査の答えを 2 つ持たせないため。
+add_executable(AfCapScan afcap_scan.cpp)
+target_link_libraries(AfCapScan PRIVATE AcousticEngine)

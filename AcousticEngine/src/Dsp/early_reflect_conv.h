@@ -189,11 +189,13 @@ public:
 
     /// オーディオスレッド：1サンプル。
     ///   outL/outR   : 鏡面成分（直接音は hrtfActive のとき含まれない）
-    ///   outDiffuse  : 拡散送り（呼び出し側の拡散器へ）
+    ///   outDiffuseL/R : 拡散送り（呼び出し側の拡散器へ）。**左右別**。
+    ///                   モノラル 1 本だと、左右のオールパスへ通しても両耳差が作れない。
     ///   outDirect   : 直接音タップのモノラル値（HRTF で両耳化する用）
     ///   outHrtfMono : hrtfWeight>0 のタップのモノラル和（**別方向の** HRTF で両耳化する用）
     void processSample(float x, bool hrtfActive,
-                       float& outL, float& outR, float& outDiffuse, float& outDirect,
+                       float& outL, float& outR,
+                       float& outDiffuseL, float& outDiffuseR, float& outDirect,
                        float& outHrtfMono) {
         // 6 帯域に分ける。低域を抜き取った残りを次へ送るので、足すと元に戻る。
         const int wp = writePos_ & ringMask_;
@@ -205,7 +207,8 @@ public:
         }
         ring_[bandIndex(kNumBands - 1, wp)] = rest;
 
-        outL = 0.0f; outR = 0.0f; outDiffuse = 0.0f; outDirect = 0.0f; outHrtfMono = 0.0f;
+        outL = 0.0f; outR = 0.0f; outDirect = 0.0f; outHrtfMono = 0.0f;
+        outDiffuseL = 0.0f; outDiffuseR = 0.0f;
 
         // 補間の進み具合。0..1。
         //   ★from_ は「補間の出発点」で不変。進捗はここでだけ読む。
@@ -235,7 +238,18 @@ public:
             }
             const float gDiff = a.gDiff + (b.gDiff - a.gDiff) * t;
             const float gSpec = a.gSpec + (b.gSpec - a.gSpec) * t;
-            outDiffuse += tv * gDiff;
+            // ★拡散ぶんも**そのタップの方向へ**送る。
+            //   以前はモノラル 1 本に足し込んでいたので、呼び出し側で左右のオールパスに
+            //   通しても**左右のレベルが同じ**＝構造的に ILD が 0 だった。
+            //   散乱は「その面から来る」音なので、方向を捨てる理由がない。
+            //   実測（く字廊下・角の向こう）: 出力に占める割合は
+            //     タップ（方向あり）57〜119% に対し 散乱（方向なし）100〜179%。
+            //   方向を持たない成分のほうが大きく、回折を +12.9dB 上げても
+            //   その上から被さって定位が消えていた。実測 |ILD| 0.2dB。
+            //   左右別に送ってもオールパスは元から 2 本なので**コストは増えない**。
+            const float dv = tv * gDiff;
+            outDiffuseL += dv * (a.panL + (b.panL - a.panL) * t);
+            outDiffuseR += dv * (a.panR + (b.panR - a.panR) * t);
             const float sp = tv * gSpec;
 
             // ── 軽量な両耳化 ──
@@ -316,15 +330,19 @@ public:
     void processAdd(const float* input, int inOffset, int n, bool hrtfActive,
                     float* outL, float* outR, int outOffset, float gain,
                     float* outDiffuse = nullptr, float* outDirectMono = nullptr,
-                    float* outHrtfMono = nullptr) {
+                    float* outHrtfMono = nullptr, float* outDiffuseR = nullptr) {
         if (!input || !outL || !outR) return;
         beginBlock();
         for (int i = 0; i < n; ++i) {
-            float l, r, d, dir, hm;
-            processSample(input[inOffset + i], hrtfActive, l, r, d, dir, hm);
+            float l, r, dL, dR, dir, hm;
+            processSample(input[inOffset + i], hrtfActive, l, r, dL, dR, dir, hm);
             outL[outOffset + i] += l * gain;
             outR[outOffset + i] += r * gain;
-            if (outDiffuse) outDiffuse[i] = d;
+            // ★モノラルに畳む互換経路は置かない。panL²+panR²=1 の量を 1 本へ潰すと
+            //   パンに依って power が変わる（ハード左のタップで 0.75 に落ちた）。
+            //   拡散送りは左右そのまま受け取ること。
+            if (outDiffuse) outDiffuse[i] = dL;
+            if (outDiffuseR) outDiffuseR[i] = dR;
             if (outDirectMono) outDirectMono[i] = dir;
             if (outHrtfMono) outHrtfMono[i] = hm;
         }

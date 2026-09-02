@@ -1,0 +1,1089 @@
+<!doctype html>
+<!--
+════════════════════════════════════════════════════════════════════════
+  編集のしかた（パワポは不要。このファイルはただのテキストです）
+════════════════════════════════════════════════════════════════════════
+
+  1) このファイルをメモ帳・VS Code などで開く
+  2) 「>」と「<」に挟まれた**日本語だけ**を書き換える
+         例:  <div class="ttl">AcousticFlow</div>
+                             ^^^^^^^^^^^^ ここだけ直す
+  3) 保存したら、PowerShell で下を実行して PDF を作り直す
+
+         powershell -ExecutionPolicy Bypass -File portfolio\build.ps1
+
+  ── よく直す場所 ────────────────────────────────────────────
+     表紙の氏名・開発期間・連絡先 …… このすぐ下、class="meta" のところ
+     各ページの見出し             …… class="tab tab-ttl"
+     各ページの導入文             …… class="brief"
+
+  ── 触らないほうがよいもの ──────────────────────────────
+     <div class="...">  や  </div>   …… タグを消すと崩れます
+     <svg> ... </svg>                …… 平面図。数字は座標です
+     style.css                       …… 見た目の設計
+
+  ⚠ **文章を長くすると、ページからはみ出して静かに切れます。**
+     build.ps1 が出す「枚数 18 枚」が変わったら、どこかが溢れた合図です。
+     大きく増やしたときは、PDF を目で確かめてください。
+
+  ⚠ **数字は書き換えないでください。**すべて実測で、測り直しの手順があります。
+     時間の数字（ms・倍率・%）は測るたびに 5〜15% 振れるので概数で書いてあります。
+     音響の数字（dB）は再現するので、そのままです。
+════════════════════════════════════════════════════════════════════════
+-->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>AcousticFlow 紹介資料（下書き）</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ══ 1 表紙 ══ -->
+<div class="page c-top cover">
+  <div class="draft">下書き</div>
+  <div class="eyebrow">SOUND ENGINE　＋　AUTHORING TOOLS</div>
+  <div class="ttl">AcousticFlow</div>
+  <div class="en">HYBRID GEOMETRIC ACOUSTICS</div>
+  <div class="sub">変わる所だけ実行時に解く、<br>ハイブリッドの幾何音響エンジン</div>
+  <div class="lead">コンセプト ── <b style="color:#5fe0dc">周辺環境の変化を、音によって伝える。</b><br>
+  扉がどれだけ開いているか、部屋に入る瞬間、柱の陰に回り込んだこと。それが音で分かる。</div>
+  <div class="lead" style="margin-top:4mm">
+  この資料は <b style="color:#5fe0dc">2 つ</b>のことを述べます ──
+  ゲームに積む<b style="color:#dbe3ee">音響エンジン「AcousticFlow」</b>（p2–p10）と、
+  それを作るために書いた<b style="color:#dbe3ee">開発環境「Sounding」</b>（p11–p16）。</div>
+  <div class="chips">
+    <div class="chip"><div class="v" style="font-size:5.2mm">扉の開き具合</div><div class="k">閉／半開／全開ではなく、連続量として</div></div>
+    <div class="chip"><div class="v" style="font-size:5.2mm">部屋に入る瞬間</div><div class="k">響きが切り替わるのではなく、変わっていく</div></div>
+    <div class="chip"><div class="v" style="font-size:5.2mm">陰に回り込む音</div><div class="k">遮られたことも、どちらから来たかも</div></div>
+  </div>
+  <div class="bars">
+    <i style="height:34%;background:linear-gradient(180deg,#16c1c1,#12a3b5)"></i>
+    <i style="height:62%;background:linear-gradient(180deg,#1cb9cd,#1f97c9)"></i>
+    <i style="height:88%;background:linear-gradient(180deg,#2aaedd,#3a8ede)"></i>
+    <i style="height:46%;background:linear-gradient(180deg,#3ba3e2,#4a83e2)"></i>
+    <i style="height:100%;background:linear-gradient(180deg,#4c96e8,#5b5bd6)"></i>
+    <i style="height:58%;background:linear-gradient(180deg,#5a86e6,#5b5bd6)"></i>
+    <i style="height:76%;background:linear-gradient(180deg,#6376e2,#6a4fd0)"></i>
+    <i style="height:40%;background:linear-gradient(180deg,#6a6ae0,#7b4fce)"></i>
+  </div>
+  <div class="meta">
+    <div><b>氏名</b>＿＿＿＿＿＿</div>
+    <div><b>開発期間</b>＿＿＿＿＿＿</div>
+    <div><b>制作形態</b>個人制作（企画・設計・実装・検証）</div>
+    <div><b>開発環境</b>C++17 ／ C# ／ Unity 6000.0</div>
+    <div><b>外部ライブラリ</b>なし（単一 DLL・GPU 不使用）</div>
+    <div><b>連絡先</b>＿＿＿＿＿＿</div>
+  </div>
+</div>
+
+<!-- ══ 2 コンセプト ══ -->
+<div class="page c-top">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">コンセプト</div>
+    <div class="tab tab-cat">CONCEPT</div>
+    <div class="pno">2</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    <b class="k">周辺環境の変化を、音によって伝える。</b><br>
+    扉がどれだけ開いているか、部屋に入る瞬間、柱の陰に回り込んだこと ── <b>それが音で分かる</b>エンジンです。
+  </div>
+  <div class="body">
+    <div class="cols">
+      <div class="col" style="flex:1.15">
+        <h2>体験の中心にあるループ</h2>
+        <p>扉は誰でも知っていて、基本的に閉まっていて、奥は見えない。<strong>けれど音は漏れる。</strong>だから人は閉じた扉の前で一度その奥を想像し、開けた瞬間に答え合わせが起きます。</p>
+        <div class="flow">
+          <div class="b">閉じた扉</div><div class="a">▶</div>
+          <div class="b">かすかに漏れる音</div><div class="a">▶</div>
+          <div class="b">奥を想像する</div><div class="a">▶</div>
+          <div class="b">開ける</div><div class="a">▶</div>
+          <div class="b">答え合わせ</div>
+        </div>
+        <div class="call">
+          <strong>「かすかに漏れる」と「開けると広がる」を演出で作ってはいけない。</strong>
+          そうすると聴いているのは物理ではなく作り手が用意した反応になり、想像との答え合わせが成立しません。<strong>ここが技術要件の出どころです。</strong>
+        </div>
+      </div>
+      <div class="col">
+        <h2>このループから決まった、要る性質</h2>
+        <table>
+          <tr><th style="width:34%">性質</th><th>理由</th></tr>
+          <tr><td><strong>連続であること</strong></td><td>段差があると「開いた／閉じた」の 2 値にしか聞こえず、<strong>どのくらい</strong>という情報が消える</td></tr>
+          <tr><td><strong>音色が動くこと</strong></td><td>音量だけでは「近い／遠い」と区別できない。隙間の幅が帯域に出る必要がある</td></tr>
+          <tr><td><strong>扉が音の量も響きも変えること</strong></td><td>扉の角度は連続量で、事前に列挙できない。しかも<b>扉は残響の減衰そのものを変えます</b>（連成／p3）。だから音のエネルギーは焼けない</td></tr>
+        </table>
+        <p class="tiny" style="margin-top:2mm">逆に、個々の音響現象を物理的に厳密に解くことは目的にしていません。<strong>数 dB の誤差は気づかれませんが、不連続は「間違い」として即座に聞こえます。</strong></p>
+      </div>
+    </div>
+    <h2 style="margin-top:5mm">コンセプトを支えている 2 本の柱</h2>
+    <div class="cols">
+      <div class="col">
+        <div class="call"><strong>① 開口の向きと開き具合で、音の入り方が決まる</strong>（p5–p6）<br>
+        <strong>開口が向いた方向から順に入ってくる。</strong>入る前はこもり、入りきると素通しになる。</div>
+      </div>
+      <div class="col">
+        <div class="call"><strong>② 周辺空間から残響を作る</strong>（p7–p8）<br>
+        まわりの形と材質から部屋を見つけ、<strong>その場所の響きを実行時に組み立てる。</strong></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 3 仕様・技術① ══ -->
+<div class="page c-sys">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">仕様・技術 ① ハイブリッド ── 変わるものだけ実行時に解く</div>
+    <div class="tab tab-cat">SYSTEM OVERVIEW ── HYBRID</div>
+    <div class="pno">3</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    <b class="k">構造は前もって整え、音のエネルギーは全部その場で解く。</b><br>
+    だから扉を閉めれば部屋が乾き、洞窟に壁を置けば響きが変わる。切り分けの規則は 3 つ。
+  </div>
+  <div class="body cols">
+    <div class="col">
+      <h2>それぞれが得意なこと</h2>
+      <table>
+        <tr><th style="width:20%"></th><th>実行時に解く</th><th>焼く</th></tr>
+        <tr><td><strong>得意</strong></td><td>形が変わっても<strong>すぐ追従する</strong></td><td>探索を尽くせるので<strong>音が良い</strong></td></tr>
+        <tr><td><strong>苦手</strong></td><td>時間が無いので探索を打ち切る＝品質が落ちる</td><td>形が変わると古くなる</td></tr>
+      </table>
+      <div class="call" style="margin-top:3mm">
+        ここを取り違えて<strong>「こだわる所を実行時に」と切ると、こだわる所ほど品質が落ちます。</strong>
+        判断の軸は品質へのこだわりではなく、<strong>その成分が変わるかどうか</strong>です。
+      </div>
+      <div class="warnbox" style="margin-top:3mm"><strong>★この判断を一度間違えました。</strong>「部屋の形」と「音の通り道」を同じものだと思っていた。<strong>部屋の形は動かないが、音が通る道には扉が入ります。</strong>測って初めて分かりました（右）。</div>
+      <h2 style="margin-top:4mm">実行時に解き切ろうとすると出る限界（実測）</h2>
+      <table>
+        <tr><th>症状</th><th class="n" style="width:36%">実測</th></tr>
+        <tr><td>回折候補が死角で点滅する</td><td class="n">51 点中 22 点・切替 11 回</td></tr>
+        <tr><td>経路探索の空振り</td><td class="n">5 箇所で像が壁を抜ける</td></tr>
+        <tr><td>深い影で開口積分が 0 になる</td><td class="n">前川なら −21 dB の所が無音</td></tr>
+        <tr><td>音源あたりの費用（遮蔽時）</td><td class="n">6.0 ms/本 <span class="tiny">※Unity 実機・共有前</span></td></tr>
+      </table>
+      <p class="tiny" style="margin-top:2mm">どれも「その場で探索している」ことから来ています。動かない形は、時間をかけて解いたほうが良い音になります。</p>
+    </div>
+    <div class="col">
+      <h2>切り分けの規則（2 つとも守る）</h2>
+      <div class="call">
+        <strong>① 「変わるか」で切る。</strong>こだわりの度合いでは切らない。<br>
+        <span class="tiny">変わる → 実行時（追従のため／品質は妥協する）　変わらない → 焼く（品質のため）</span>
+      </div>
+      <div class="call" style="margin-top:2.5mm">
+        <strong>② 混ぜ方は「成分で」。</strong>距離や領域では切らない。<br>
+        <span class="tiny">近い／遠いで切ると境目で答えが入れ替わって崖になる ── 第一制約（p17）に反する</span>
+      </div>
+      <div class="call" style="margin-top:2.5mm">
+        <strong>③ 焼けるのは「構造」だけ。「エネルギー」は焼けない。</strong><br>
+        <span class="tiny">動く物が通り道に入る量は焼けない ── 実測で「尾も焼けない」と分かった（下）</span>
+      </div>
+      <table style="margin-top:3mm">
+        <tr><th style="width:30%">成分</th><th>種類</th><th>解き方</th></tr>
+        <tr><td>部屋の分割・戸口の矩形</td><td>構造</td><td><strong>焼く</strong>（実装済み）</td></tr>
+        <tr><td>静的な稜線（角・柱）</td><td>構造</td><td><strong>焼く</strong><span class="status st-plan">これから</span></td></tr>
+        <tr><td>直接音の遮蔽・回折・開口</td><td>エネルギー</td><td><strong>実行時</strong>（主題）</td></tr>
+        <tr><td>早期反射</td><td>エネルギー</td><td><strong>実行時</strong>（共有で解決）</td></tr>
+        <tr><td>残響の尾</td><td>エネルギー</td><td><strong>実行時</strong><span class="status st-done">実測で確定</span></td></tr>
+      </table>
+      <h2 style="margin-top:4mm">★「尾は焼ける」を実測で撤回しました</h2>
+      <p>尾は部屋の形にしか依存しない、と考えて<strong>焼く側に置いていました</strong>。測ったら違いました。</p>
+      <table style="margin-top:2mm">
+        <tr><th>吸う小部屋（音源も同室）</th><th class="n">減衰</th><th class="n">RT60</th><th class="n">音量</th></tr>
+        <tr><td>扉 開</td><td class="n">181 dB/s</td><td class="n">0.33 s</td><td class="n">13.50 dB</td></tr>
+        <tr><td>扉 閉</td><td class="n"><strong>447 dB/s</strong></td><td class="n"><strong>0.13 s</strong></td><td class="n">13.56 dB</td></tr>
+      </table>
+      <p style="margin-top:2mm"><strong>音量は 0.1 dB しか動かないのに、減衰の形が 266 dB/s 変わります。</strong>連成残響 ── 扉が開いていると響く隣室とつながって減衰が遅くなり、閉めると自分の速さに戻る。<strong>部屋ごとに 1 本焼くと、この変化が丸ごと消えます。</strong></p>
+      <p class="tiny" style="margin-top:2mm">裏取り: 小部屋の吸音率を振ると、扉の効きは<strong>隣室との残響差</strong>で決まった（α 0.10 で 1.0 dB/s ＝ ほぼゼロ、α 0.60 で 158 dB/s）。<strong>一般論として尾が焼けないのではなく、この作品の狙いが焼けなくしている。</strong></p>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 4 仕様・技術② ══ -->
+<div class="page c-sys">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">仕様・技術 ② 構成と、ホストとの境界</div>
+    <div class="tab tab-cat">ARCHITECTURE</div>
+    <div class="pno">4</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    ホストは<b class="k">形と材質と音源を渡し、結果を鳴らすだけ</b>。音をどうするかはエンジンが決めます。<br>
+    <b>ホストが良かれと思って音をいじると、必ず二重に掛かります。</b>
+  </div>
+  <div class="body cols">
+    <div class="col" style="flex:1.15">
+      <div class="fig">
+        <svg viewBox="0 0 900 210" style="width:100%;height:44mm;display:block">
+          <defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+            <path d="M0,0 L7,3 L0,6 z" fill="#16c1c1"/></marker></defs>
+          <rect x="8" y="10" width="270" height="190" rx="6" fill="#f2fbfb" stroke="#16c1c1"/>
+          <text x="24" y="34" font-size="14" font-weight="700" fill="#0e9c9c">Unity ホスト（C#）</text>
+          <text x="24" y="58" font-size="12" fill="#2b3240">形・材質・音源を渡す</text>
+          <text x="24" y="78" font-size="12" fill="#2b3240">結果を鳴らすだけ</text>
+          <text x="24" y="108" font-size="11" fill="#6b7280">AcousticScene / AcousticMaterial</text>
+          <text x="24" y="128" font-size="11" fill="#6b7280">Status（毎フレームのスナップショット）</text>
+          <text x="24" y="148" font-size="11" fill="#6b7280">配列は参照共有 ＝ GC ゼロ</text>
+          <text x="24" y="176" font-size="11" fill="#6b7280">ワーカー数を指定（既定 4）</text>
+
+          <rect x="310" y="10" width="272" height="190" rx="6" fill="#fff" stroke="#16c1c1" stroke-width="2"/>
+          <text x="326" y="34" font-size="14" font-weight="700" fill="#0e9c9c">音響エンジン（C++17 / DLL）</text>
+          <text x="326" y="58" font-size="12" fill="#2b3240">外部依存なし・GPU 不使用</text>
+          <text x="326" y="84" font-size="11" fill="#6b7280">遮蔽 / 透過 / 回折 / 開口</text>
+          <text x="326" y="102" font-size="11" fill="#6b7280">早期反射・エコグラム</text>
+          <text x="326" y="120" font-size="11" fill="#6b7280">部屋グラフ（ボクセル / Sabine）</text>
+          <text x="326" y="138" font-size="11" fill="#6b7280">ワーカープール（音源で分割）</text>
+          <text x="326" y="156" font-size="11" fill="#6b7280">ボイスレンダリング（C++ DSP）</text>
+          <text x="326" y="182" font-size="11" font-weight="700" fill="#0e9c9c">C API 1 本（acoustic_scene.h）</text>
+
+          <rect x="614" y="10" width="278" height="88" rx="6" fill="#fff" stroke="#e5e7eb"/>
+          <text x="630" y="34" font-size="13" font-weight="700" fill="#1a1f2b">DSP 経路 A（C#）</text>
+          <text x="630" y="56" font-size="11" fill="#6b7280">IrConvolver ── 試作と A/B の土俵</text>
+          <text x="630" y="76" font-size="11" fill="#6b7280">反復が安い場所で先に試す</text>
+
+          <rect x="614" y="112" width="278" height="88" rx="6" fill="#fff" stroke="#e5e7eb"/>
+          <text x="630" y="136" font-size="13" font-weight="700" fill="#1a1f2b">DSP 経路 B（C++）</text>
+          <text x="630" y="158" font-size="11" fill="#6b7280">VoiceConvolver → AF_Voice*</text>
+          <text x="630" y="178" font-size="11" fill="#6b7280">出荷経路・尾は共有バス</text>
+
+          <line x1="280" y1="105" x2="306" y2="105" stroke="#16c1c1" stroke-width="2" marker-end="url(#ar)"/>
+          <line x1="584" y1="54" x2="610" y2="54" stroke="#16c1c1" stroke-width="2" marker-end="url(#ar)"/>
+          <line x1="584" y1="156" x2="610" y2="156" stroke="#16c1c1" stroke-width="2" marker-end="url(#ar)"/>
+        </svg>
+        <div class="cap">DSP 経路を 2 本持っているのは移植を検証するため。両方を同じ計器で A/B し、C++／C# の食い違いを 5 件見つけた</div>
+      </div>
+      <h2 style="margin-top:4mm">オーディオスレッドで守っていること</h2>
+      <ul>
+        <li>ロックを取らない／毎フレームの確保をしない（<strong>GC ゼロ</strong>）</li>
+        <li>オーディオスレッドから配列を辿らない（必要な値はメインで写す）</li>
+        <li>IR の差し替えは参照の入れ替え＋クロスフェード<br>
+          <span class="tiny">1 つの器で差し替えると、遅延線に残った入力が新しい IR で畳み直され、実測 +1.97 dB のふくらみが 0.35 秒続く</span></li>
+      </ul>
+    </div>
+    <div class="col">
+      <h2>ホスト側に課した契約</h2>
+      <table>
+        <tr><th style="width:44%">契約</th><th>破ると起きること</th></tr>
+        <tr><td><strong>音量も遮蔽もホストで触らない</strong></td><td>エンジンの遮蔽と二重に掛かり、壁裏で音が消える</td></tr>
+        <tr><td><strong>見えないコライダーを置かない</strong></td><td>何も無い場所から早期反射が返る ── <strong>音が世界について嘘をつく</strong></td></tr>
+        <tr><td><strong>一つの問いに答えを二つ持たせない</strong></td><td>物理側の答えと食い違い、定位が濁る</td></tr>
+        <tr><td><strong>材質はエンジン側を正とする</strong></td><td>両側に表を持っていた時期、<strong>透過が 6〜8 dB ずれていた</strong></td></tr>
+      </table>
+      <div class="call" style="margin-top:3mm">
+        <strong>口約束にしない。</strong>材質プリセットは 1 か所から配り、C++／C# の値の一致を自動で突き合わせ、黙って劣化する箇所（格子の自動降格など）は警告を出します。
+      </div>
+      <h2 style="margin-top:4mm">1 音源あたりの実費</h2>
+      <table>
+        <tr><td>直接音のみ</td><td class="n">約 0.01 ms</td></tr>
+        <tr><td>＋早期反射・HRTF・後期尾</td><td class="n">約 0.31 ms（約 3 %）</td></tr>
+        <tr><td>＋回折 HRTF・反射の両耳化</td><td class="n">約 0.47 ms（約 4 %）</td></tr>
+      </table>
+      <p class="tiny">1 ブロック＝512 フレーム＝10.67 ms。全部入りでも<strong>実時間の約 23 倍速</strong>。</p>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 5 コンセプト① 体験としての扉 ══ -->
+<div class="page c-sys">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">コンセプト ① なぜ「扉」なのか</div>
+    <div class="tab tab-cat">CONCEPT 1 ── WHY THE DOOR</div>
+    <div class="pno">5</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    扉は <b class="k">「どのくらい」を伝えられる</b> 数少ない対象です。開いた／閉じたの 2 値ではなく、<br>
+    <b>プレイヤー自身が連続量を作れる</b> ── 音響エンジンを見せる題材として、これ以上のものがありません。
+  </div>
+  <div class="body cols">
+    <div class="col" style="flex:1.1">
+      <h2>題材として優れている 4 つの理由</h2>
+      <table>
+        <tr><th style="width:30%">理由</th><th>効いていること</th></tr>
+        <tr><td><strong>誰でも知っている</strong></td><td>説明が要らない。音がどう変わるべきかを<strong>プレイヤーが既に知っている</strong>ので、答え合わせが成立する</td></tr>
+        <tr><td><strong>自分で起こせる</strong></td><td>聞かされるのではなく、<strong>手を動かした結果として音が変わる。</strong>変化の主語がプレイヤーになる</td></tr>
+        <tr><td><strong>一度に全部が動く</strong></td><td>遮蔽・回折・開口・残響が<strong>同時に変わる。</strong>1 つの操作で音響の全成分が試される</td></tr>
+        <tr><td><strong>閉じていれば隠せる</strong></td><td><strong>隠せるから、開けたときに情報が生まれる。</strong>閉じた扉は「想像の余地」を作る装置でもある</td></tr>
+      </table>
+      <div class="call" style="margin-top:3mm">
+        <strong>とくに 2 つ目が重要です。</strong>環境音が勝手に変わるのを聞かされても「そういう演出」で終わります。
+        <strong>自分が半分だけ開けた結果として半分だけ変わる</strong>から、音が世界の状態を語っていると分かる。
+      </div>
+    </div>
+    <div class="col">
+      <h2>どう聞こえるか</h2>
+      <table>
+        <tr><th style="width:34%">扉の状態</th><th>聞こえ方</th></tr>
+        <tr><td>ほぼ閉じている</td><td>低域だけが漏れる。こもって、方向が曖昧</td></tr>
+        <tr><td>少し開く</td><td>中域が入りはじめ、輪郭が出る</td></tr>
+        <tr><td>大きく開く</td><td>高域まで通り、開口の方向に定位する</td></tr>
+      </table>
+      <p style="margin-top:2mm">この 3 段が<strong>連続に繋がっている</strong>必要があります。途中に段差があると「開いた／閉じた」の 2 値に戻ってしまい、<strong>「どのくらい」という情報がまるごと消えます</strong>（p17）。</p>
+      <div class="call" style="margin-top:3mm">
+        <strong>現実の扉を収録して確かめた形も同じでした。</strong>開くと低域は <strong>+2.6 dB</strong> しか動かないのに、<strong>1 kHz は +10.3 dB</strong> 動く ── <strong>音量ではなく音色が開く</strong>という構造は現実そのものです。
+      </div>
+      <p class="tiny" style="margin-top:3mm">※ この「形」は採用しましたが、開閉差の<strong>絶対量</strong>は現実（8.4 dB）ではなくゲームとして必要なコントラスト（約 20 dB）を採っています。判断の経緯は p18 ②。</p>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 6 コンセプト① 実測 ══ -->
+<div class="page c-sys">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">コンセプト ① 開口の向きと開き具合で、音の入り方が決まる</div>
+    <div class="tab tab-cat">CONCEPT 1 ── APERTURE</div>
+    <div class="pno">6</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    扉を開けていくと、<b class="k">開口が向いた方向から順に</b>音が入ってきます。<br>
+    <b>開き具合が「どれだけ」を、開口の向きが「どこから」を決める。</b>同じ部屋で扉の角度だけを振って実測しました。
+  </div>
+  <div class="body">
+    <div class="pats">
+      <div class="pat">
+        <svg viewBox="0 0 740 490"><g class="plan">
+          <path class="w" d="M0,380 L0,0 L740,0 L740,380 L440,380 L440,364 L724,364 L724,16 L16,16 L16,364 L300,364 L300,380 Z"/>
+          <rect class="dr" x="300" y="360" width="140" height="8"/>
+          <circle class="s" cx="176" cy="252" r="15"/><circle class="s" cx="370" cy="140" r="15"/><circle class="s" cx="564" cy="252" r="15"/>
+          <text class="sl" x="176" y="296">1</text><text class="sl" x="370" y="184">2</text><text class="sl" x="564" y="296">3</text>
+          <path class="li" d="M370,414 l20,34 l-40,0 Z"/>
+        </g></svg>
+        <div class="pl">0°（閉）</div>
+      </div>
+      <div class="pat">
+        <svg viewBox="0 0 740 490"><g class="plan">
+          <path class="w" d="M0,380 L0,0 L740,0 L740,380 L440,380 L440,364 L724,364 L724,16 L16,16 L16,364 L300,364 L300,380 Z"/>
+          <path class="arc" d="M300,364 A140,140 0 0,1 332.8,274.0"/>
+          <rect class="dr" x="300" y="360" width="140" height="8" transform="rotate(40 440 364)"/>
+          <circle class="s" cx="176" cy="252" r="15"/><circle class="s" cx="370" cy="140" r="15"/><circle class="s" cx="564" cy="252" r="15"/>
+          <text class="sl" x="176" y="296">1</text><text class="sl" x="370" y="184">2</text><text class="sl" x="564" y="296">3</text>
+          <path class="li" d="M370,414 l20,34 l-40,0 Z"/>
+        </g></svg>
+        <div class="pl">40°</div>
+      </div>
+      <div class="pat">
+        <svg viewBox="0 0 740 490"><g class="plan">
+          <path class="w" d="M0,380 L0,0 L740,0 L740,380 L440,380 L440,364 L724,364 L724,16 L16,16 L16,364 L300,364 L300,380 Z"/>
+          <path class="arc" d="M300,364 A140,140 0 0,1 415.7,226.1"/>
+          <rect class="dr" x="300" y="360" width="140" height="8" transform="rotate(80 440 364)"/>
+          <circle class="s" cx="176" cy="252" r="15"/><circle class="s" cx="370" cy="140" r="15"/><circle class="s" cx="564" cy="252" r="15"/>
+          <text class="sl" x="176" y="296">1</text><text class="sl" x="370" y="184">2</text><text class="sl" x="564" y="296">3</text>
+          <path class="li" d="M370,414 l20,34 l-40,0 Z"/>
+        </g></svg>
+        <div class="pl">80°</div>
+      </div>
+      <div class="pat">
+        <svg viewBox="0 0 740 490"><g class="plan">
+          <path class="w" d="M0,380 L0,0 L740,0 L740,380 L440,380 L440,364 L724,364 L724,16 L16,16 L16,364 L300,364 L300,380 Z"/>
+          <path class="arc" d="M300,364 A140,140 0 0,1 571.6,316.1"/>
+          <rect class="dr" x="300" y="360" width="140" height="8" transform="rotate(160 440 364)"/>
+          <circle class="s" cx="176" cy="252" r="15"/><circle class="s" cx="370" cy="140" r="15"/><circle class="s" cx="564" cy="252" r="15"/>
+          <text class="sl" x="176" y="296">1</text><text class="sl" x="370" y="184">2</text><text class="sl" x="564" y="296">3</text>
+          <path class="li" d="M370,414 l20,34 l-40,0 Z"/>
+        </g></svg>
+        <div class="pl">160°</div>
+      </div>
+      <div class="pat">
+        <svg viewBox="0 0 740 490"><g class="plan">
+          <path class="w" d="M0,380 L0,0 L740,0 L740,380 L440,380 L440,364 L724,364 L724,16 L16,16 L16,364 L300,364 L300,380 Z"/>
+          <circle class="s" cx="176" cy="252" r="15"/><circle class="s" cx="370" cy="140" r="15"/><circle class="s" cx="564" cy="252" r="15"/>
+          <text class="sl" x="176" y="296">1</text><text class="sl" x="370" y="184">2</text><text class="sl" x="564" y="296">3</text>
+          <path class="li" d="M370,414 l20,34 l-40,0 Z"/>
+        </g></svg>
+        <div class="pl">ドアなし</div>
+      </div>
+
+    </div>
+
+    <div class="cols" style="margin-top:4mm">
+      <div class="col" style="flex:1.35">
+        <table>
+          <tr><th style="width:24%">パターン</th><th class="n">音源1（左）</th><th class="n">音源2（正面）</th><th class="n">音源3（右・蝶番側）</th></tr>
+          <tr><td><strong>0°（閉）</strong></td><td class="n">−36.9</td><td class="n">−36.3</td><td class="n">−37.0</td></tr>
+          <tr><td>40°</td><td class="n">−4.1</td><td class="n">−8.9</td><td class="n">−11.1</td></tr>
+          <tr><td>80°</td><td class="n">−4.3</td><td class="n">0.0</td><td class="n">−10.4</td></tr>
+          <tr><td>160°</td><td class="n">−4.4</td><td class="n">0.0</td><td class="n">−5.5</td></tr>
+          <tr><td><strong>ドアなし</strong>（基準）</td><td class="n">−4.4</td><td class="n">0.0</td><td class="n">−4.4</td></tr>
+        </table>
+        <p class="tiny" style="margin-top:2mm">● 音源／▲ リスナー（戸口の正面・外側）。部屋 7.08 × 3.48 × 3.0 m ／ 戸口 1.40 m 幅 ／ 壁厚 0.16 m ／ 蝶番は右端・内開き。値は帯域別の生存ゲイン（透過⊕回折⊕反射）を dB にしたもの。<strong>この表は測定用の実行ファイル 1 本で再現できます。</strong></p>
+        <p class="tiny" style="margin-top:1.5mm">★見るのは <strong>いちばん下の「ドアなし」との差</strong>です。音源1・3 は斜めから覗く位置なので、扉が無くても<strong>戸口の縁（壁）</strong>に −4.4 dB 分だけ遮られます。<strong>扉の効果と、戸口そのものの効果は別物</strong>です。</p>
+      </div>
+      <div class="col">
+        <div class="call">
+          <strong>① 開口が向いた側から順に入ってくる。</strong>
+          蝶番は右なので、隙間はまず左から開きます。<strong>音源1 と 音源3 は左右対称＝距離が同じ</strong>なのに、入ってくる順が違う ── <strong>距離ではなく開口の向きが決めています。</strong>
+        </div>
+        <div class="call" style="margin-top:2.5mm">
+          <strong>★蝶番を左へ振ると、きれいに鏡像になります。</strong>
+          <table style="margin-top:1.5mm">
+            <tr><th>40°</th><th class="n">音源1</th><th class="n">音源2</th><th class="n">音源3</th></tr>
+            <tr><td>蝶番 右</td><td class="n"><strong>−4.1</strong></td><td class="n">−8.9</td><td class="n">−11.1</td></tr>
+            <tr><td>蝶番 左</td><td class="n">−11.0</td><td class="n">−8.9</td><td class="n"><strong>−4.0</strong></td></tr>
+          </table>
+          <span class="tiny">入る側だけが入れ替わり、中央の音源2 は <b>−8.9 のまま動かない</b>。<strong>幾何がそのまま出ている</strong>ことの確認です。</span>
+        </div>
+        <div class="call" style="margin-top:2.5mm">
+          <strong>② 閉じているときは「こもる」だけで、位置が分からない。</strong>
+          3 本とも −36.3〜−37.0 dB とほぼ同じ値で、<strong>低域−高域は +21.3 dB</strong>（扉板を透過してくる低域だけが残る）。<strong>開けた瞬間に分かれる</strong> ── これが p2 の「答え合わせ」です。
+        </div>
+        <p class="tiny" style="margin-top:2.5mm">★<strong>4 点だけでなく全域を 10° 刻み・境目は 1° 刻みで振って形を確かめました</strong>（音源3・広帯域 dB）。
+        閉 <b>−37.0</b> → 10° −14.0 → 20° −12.1 → 40° −11.1 → 60° −10.6 → <b>80° −10.4</b>
+        → 120° −11.1 → 140° −6.5 → 160° <b>−5.5</b> → ドアなし −4.4。<strong>閉から 80° までは素直に良くなります。</strong><br>
+        ⚠ ただし <strong>89°→90°→91° に段差があり、そこは信用できません</strong>（−10.2 → −17.3 → −12.7）。
+        <strong>1° で 7 dB 突出し、そのあと 2.5 dB 低い枝に移って 30° 以上戻らない</strong> ── 板が壁とちょうど直角になる退化した配置で分岐がぶれています。
+        <strong>連続性に反するのでこれはバグ</strong>で、未解決として p19 に挙げています。<strong>この表の角度は、その区間を避けて選んでいます。</strong><br>
+        ★<strong>外開きにすると 40° で 3 本とも一気に開きます</strong> ── 板が音源側ではなくリスナー側に立つからで、<strong>「どちらへ開くか」まで音が変わる</strong>ことの実測です。</p>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ══ 7 コンセプト② 残響 ══ -->
+<div class="page c-sys">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">コンセプト ② 周辺空間から残響を作る</div>
+    <div class="tab tab-cat">CONCEPT 2 ── ROOM</div>
+    <div class="pno">7</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    残響プリセットを置くのではなく、<b class="k">まわりの形と材質から部屋を見つけて、その場所の響きを組み立てます。</b><br>
+    部屋を作れば響き、壁を壊せば響きが変わる ── <b>作者が響きを指定する場所がありません。</b>
+  </div>
+  <div class="body shot">
+    <div class="stage">
+      <div class="ph grow">★図：これから撮る（S1）<br><br>
+        Scene ビュー：抽出された部屋を色分け表示<br>
+        2 部屋＋戸口。扉を開けると開口が立つところ<br><br>
+        <span class="tiny">部屋ごとに色／リスナーの占有割合を数字で重ねる</span></div>
+      <div class="chips" style="margin-top:3mm">
+        <div class="chip"><div class="v">約 3.4 ms</div><div class="k">全再構築（0.25 m 格子）</div></div>
+        <div class="chip"><div class="v">約 2.4 ms</div><div class="k">壁を壊したときの差分更新</div></div>
+        <div class="chip"><div class="v">12.3 µs</div><div class="k">部屋の占め方 1 回</div></div>
+      </div>
+    </div>
+    <div class="side">
+      <div class="sflow"><span class="s1">ボクセル化</span><span class="a">→</span><span class="s2">部屋を抽出</span><span class="a">→</span><span class="s3">Sabine</span></div>
+      <div class="sitem"><span class="sdot t"></span><div><b>形を刻む</b>
+        <p>セル 0.25 m ／ 約 74,000 ボクセル。シーンをそのまま刻みます。</p></div></div>
+      <div class="sitem"><span class="sdot b"></span><div><b>閉じた空間を見つける</b>
+        <p>天井が無ければ部屋にしない（屋外が吸われる）。16 ボクセル未満は捨てる（隙間を部屋と誤認する）。</p></div></div>
+      <div class="sitem"><span class="sdot i"></span><div><b>響きを求める</b>
+        <p>体積・表面積・帯域別の吸音率から <b>RT60 = 0.161V / ΣSα</b> で求めます。</p></div></div>
+      <div class="sitem"><span class="sdot w"></span><div><b>占有割合で混ぜる</b>
+        <p>リスナーがどの部屋にどれだけ属しているかで混ぜる。戸口では両方が効きます。</p></div></div>
+      <div class="sgoal"><b>黙って劣化しないようにした。</b>格子が上限に当たるとセルが自動で粗くなりますが、それが無警告だったため「なぜか音が変わった」の原因に。いまは降格を検知して警告します。</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 8 コンセプト② 響かせ方 ══ -->
+<div class="page c-sys">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">コンセプト ② 響きを「どちらから」まで出す</div>
+    <div class="tab tab-cat">CONCEPT 2 ── REVERB</div>
+    <div class="pno">8</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    残響時間が合っているだけでは「部屋に入った」は伝わりません。<br>
+    <b class="k">いつ・どちらから返ってくるか</b>まで作って、はじめて空間の形が聞こえます。
+  </div>
+  <div class="body">
+    <div class="fig">
+      <svg viewBox="0 0 1000 210" style="width:100%;height:40mm;display:block">
+        <line x1="40" y1="170" x2="975" y2="170" stroke="#c9d1dc" stroke-width="1.5"/>
+        <text x="500" y="200" font-size="13" fill="#6b7280" text-anchor="middle">時間 →</text>
+
+        <!-- 直接音 -->
+        <rect x="60" y="40" width="9" height="130" rx="3" fill="#16c1c1"/>
+        <text x="64" y="30" font-size="13" font-weight="700" fill="#0e9c9c" text-anchor="middle">直接音</text>
+
+        <!-- 早期反射（離散のタップ） -->
+        <rect x="170" y="78" width="8" height="92" rx="3" fill="#3aa8d8"/>
+        <rect x="215" y="92" width="8" height="78" rx="3" fill="#3aa8d8"/>
+        <rect x="252" y="86" width="8" height="84" rx="3" fill="#3aa8d8"/>
+        <rect x="300" y="104" width="8" height="66" rx="3" fill="#3aa8d8"/>
+        <rect x="344" y="112" width="8" height="58" rx="3" fill="#3aa8d8"/>
+        <rect x="392" y="120" width="8" height="50" rx="3" fill="#3aa8d8"/>
+        <text x="280" y="60" font-size="13" font-weight="700" fill="#2b7fae" text-anchor="middle">早期反射（方向つき）</text>
+
+        <!-- 後期残響（密な尾） -->
+        <path d="M470,170 C560,128 700,146 830,158 C900,164 940,167 960,169 L960,170 Z" fill="#c7cbf0"/>
+        <path d="M470,138 C580,150 720,160 960,169" fill="none" stroke="#5b5bd6" stroke-width="2.5"/>
+        <text x="700" y="112" font-size="13" font-weight="700" fill="#4a4ac4" text-anchor="middle">後期残響（密で拡散）</text>
+
+        <!-- 境目 -->
+        <line x1="440" y1="26" x2="440" y2="170" stroke="#9aa3b2" stroke-width="1" stroke-dasharray="5 4"/>
+        <text x="440" y="20" font-size="12" fill="#6b7280" text-anchor="middle">mixing time ≒ √V（部屋の広さで決まる）</text>
+
+        <text x="64" y="188" font-size="11" fill="#6b7280" text-anchor="middle">方向・距離</text>
+        <text x="280" y="188" font-size="11" fill="#6b7280" text-anchor="middle">部屋の大きさ・形</text>
+        <text x="700" y="188" font-size="11" fill="#6b7280" text-anchor="middle">材質・広さの実感</text>
+      </svg>
+      <div class="cap">1 発の音が耳へ届くまで。区間ごとに作り方も、担っている情報も違う</div>
+    </div>
+
+    <div class="cols" style="margin-top:4mm">
+      <div class="col">
+        <h2>区間ごとに作り方を変えている</h2>
+        <table>
+          <tr><th style="width:26%">区間</th><th>作り方</th></tr>
+          <tr><td>直接音</td><td>遮蔽・回折を通した 6 帯域</td></tr>
+          <tr><td>早期反射</td><td>像源法。<strong>方向つきのタップ</strong></td></tr>
+          <tr><td>後期残響</td><td>エコグラム → IR 畳み込み</td></tr>
+        </table>
+        <p class="tiny" style="margin-top:2mm">境目に <strong>mixing time ≒ √V</strong> を使うのは、RT60 × 係数だと特大の部屋で遠壁の反射（100〜300 ms）が早期の窓から漏れるためです。</p>
+      </div>
+      <div class="col">
+        <h2>★尾に方向を持たせた</h2>
+        <p>後期残響は本来ほぼ拡散ですが、開口が片側にあれば<strong>そちら側から強く返ります。</strong>耳ごと×6 帯域のバランスを持たせ、<strong>音量は変えずに「どちらから響くか」だけを変えています。</strong></p>
+        <div class="call" style="margin-top:2.5mm">
+          <strong>ここがコンセプトに効く場所です。</strong>戸口の手前と奥で、音量ではなく<strong>響きの向き</strong>が変わる ── それが「部屋に入った」の正体になります。
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 9 性能 ══ -->
+<div class="page c-perf">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">性能 ── フレームの実測</div>
+    <div class="tab tab-cat">PERFORMANCE</div>
+    <div class="pno">9</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    ホスト既定の <b class="k">4 コア</b> で、60fps の予算 16.7 ms に対して音響が使うのは <b class="k">平均 12〜15 % / 最悪 34〜47 %</b>。<br>
+    1 コアなら平均 26〜29 %。<b>並列にしても結果は直列とビット一致</b>です（p10）。
+  </div>
+  <div class="body cols">
+    <div class="col">
+      <h2>60fps の 1 フレーム（16.7 ms）のうち、音響が使う量</h2>
+      <div class="budget">
+        <div class="brow"><span class="blab">平均</span><div class="btrack"><div class="bfill" style="width:13%">2.0〜2.5 ms</div></div><span class="bpct">15%</span></div>
+        <div class="brow"><span class="blab">最悪</span><div class="btrack"><div class="bfill w" style="width:40%">5.7〜7.8 ms</div></div><span class="bpct">47%</span></div>
+        <div class="bscale"><span>0</span><span>16.7 ms ＝ 1 フレームの予算</span></div>
+      </div>
+      <p class="tiny" style="margin-top:1mm">4 コア（ホスト既定）・<b>4 回測った範囲</b>。1 コアなら平均 4.4〜4.9 ms（26〜29 %）。別勘定の<b>音声スレッドは実機で 45 %</b>。</p>
+      <h2>内訳（その処理を切ったときの差）</h2>
+      <table>
+        <tr><th>処理</th><th class="n">取り分</th></tr>
+        <tr><td><strong>残響エコグラム</strong></td><td class="n"><strong>約 25 %</strong></td></tr>
+        <tr><td>反射込み遮蔽</td><td class="n">約 23 %</td></tr>
+        <tr><td>回折二次音源</td><td class="n">約 10 %</td></tr>
+        <tr><td>エッジカタログ</td><td class="n">−3 〜 +8 %</td></tr>
+        <tr><td>早期反射</td><td class="n">約 8 %</td></tr>
+        <tr><td>部屋分割・自動ポータル</td><td class="n">約 0 %</td></tr>
+      </table>
+      <div class="call" style="margin-top:2.5mm"><strong>残響は 48〜51 % だった処理です。</strong>尾を<strong>部屋ごとに共有</strong>して 約 25 % まで落ちました（音源 16 本で 16.8 → 約 2.6 ms）。<strong>焼かずに消えた無駄</strong>でした。</div>
+      <table style="margin-top:2.5mm">
+        <tr><th>共有の前後</th><th class="n">音源 4</th><th class="n">音源 8</th><th class="n">音源 16</th></tr>
+        <tr><td>音源ごとに計算</td><td class="n">5.4</td><td class="n">10.7</td><td class="n">16.8 ms</td></tr>
+        <tr><td><strong>部屋ごとに共有</strong></td><td class="n"><strong>2.4</strong></td><td class="n"><strong>2.5</strong></td><td class="n"><strong>2.6 ms</strong></td></tr>
+      </table>
+      <p class="tiny" style="margin-top:1.5mm"><strong>音源数でほぼ伸びなくなりました。</strong>残るのはレイ側の固定費だけです。</p>
+      <div class="warnbox" style="margin-top:2.5mm"><strong>★時間の数字は 2 桁までしか意味がありません。</strong>同じ条件で 4 回測ると 1 コア平均が <strong>4.4〜4.9 ms</strong> に振れ、取り分の小さい処理は<strong>符号すら安定しません</strong>。<strong>だからこのページは範囲か概数で書いています。</strong><br>
+      <span class="tiny">★対照的に、<strong>音響の値（p6 の表）は 3 回とも 1 桁も違わず一致</strong>します。時間は測定、音響は計算 ── <strong>どちらの数字なのかで信頼度が違う</strong>ことは、読む側にも分かる形にしています。</span></div>
+    </div>
+    <div class="col">
+      <h2>測って分かった、直感と違うこと</h2>
+      <div class="call"><strong>コストは「音源の本数」ではなく「遮蔽された音源の数」で効きます。</strong></div>
+      <table style="margin-top:3mm">
+        <tr><th>シーン</th><th class="n">音源</th><th class="n">遮蔽</th><th class="n">フレーム</th></tr>
+        <tr><td>神殿</td><td class="n">3</td><td class="n">0.00</td><td class="n">3.30 ms</td></tr>
+        <tr><td>洞窟</td><td class="n">3</td><td class="n">0.92</td><td class="n">14.41 ms</td></tr>
+      </table>
+      <p style="margin-top:2mm">同じ本数で 4 倍以上違います。見通せていれば回折の探索が要らないためです。<strong>「本数 × 1 本あたりのコスト」という見積りが成立しない</strong>ので、ツール側でも推定ではなく実測を出す設計にしました（p12 ①）。</p>
+      <p class="tiny" style="margin-top:1.5mm">※ この 2 行だけ <strong>Unity 実機で採った値</strong>で、尾の共有を入れる前のものです。<strong>比（4 倍以上）は変わりませんが、絶対値はいまはもっと小さくなります。</strong>左の表はすべて現在のエンジンの実測です。</p>
+      <h2 style="margin-top:4mm">なぜ GPU を使わないか</h2>
+      <p><strong>ゲームの GPU 予算は、すでに描画が使い切っているからです。</strong>音響が取りに行くと描画と食い合い、CPU へ戻す待ちも増えます。CPU の予算内に収まるなら、そのほうが組み込みやすい。<br>
+      <span class="tiny">※ 使わないと決めたのではなく、まだ必要になっていないという状態です（p19）。</span></p>
+      <div class="warnbox" style="margin-top:3mm"><strong>この表はシーン側（フレーム）の話です。</strong>音声スレッドは別勘定で、実機で <strong>75 → 45 %</strong> まで下げました。<strong>ベイク化しても音声スレッドは 1 % も下がりません</strong>（声を鳴らすのは実行時なので）。ここを下げる手は段の振り分け（p10 ③）です。</div>
+      <div class="call" style="margin-top:3mm"><strong>残響が Sabine の理論値と ±6〜16 % で一致します。</strong>扉を閉じて部屋を孤立させ、<code>RT60 = 0.161V/(Sα)</code> と突き合わせた実測です（α 0.2 で 0.507 s vs 理論 0.537 s）。<strong>速さだけでなく、模型が合っていることも数字で言えます。</strong></div><p class="tiny"></p>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 10 最適化 ══ -->
+<div class="page c-perf">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">性能 ── 速くするために入れた 3 つ</div>
+    <div class="tab tab-cat">OPTIMIZATION</div>
+    <div class="pno">10</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    どれも <b class="k">「音を変えずに速くする」</b> ことを条件にしました。<br>
+    速くなった代わりに音が変わったなら、それは最適化ではなく<b>仕様変更</b>です。
+  </div>
+  <div class="body cols">
+    <div class="col">
+      <h2>① 音源ごとに複数コアへ割る</h2>
+      <div class="bars2">
+        <div class="b2row"><span class="b2lab">1 コア</span><div class="b2track"><div class="b2fill dim" style="width:100%"></div></div><span class="b2val">約 4.7 ms</span></div>
+        <div class="b2row"><span class="b2lab">2 コア</span><div class="b2track"><div class="b2fill" style="width:59%"></div></div><span class="b2val">約 2.8</span></div>
+        <div class="b2row"><span class="b2lab"><b>4 コア（既定）</b></span><div class="b2track"><div class="b2fill hi" style="width:47%"></div></div><span class="b2val"><b>約 2.2</b></span></div>
+        <div class="b2row"><span class="b2lab">8 コア</span><div class="b2track"><div class="b2fill" style="width:38%"></div></div><span class="b2val">約 1.8</span></div>
+        <div class="b2note">4 コアで <b>約 2.1 倍</b>、8 コアで約 2.6 倍（4 回測った範囲は 2.0〜2.2 倍）。頭打ちなのは <b>音源ごとに割れない処理</b>（エッジカタログ・部屋の検出）が残るため。</div>
+      </div>
+      <div class="call" style="margin-top:2.5mm">
+        <strong>結果はビット一致。</strong>遮蔽・回折の段は<strong>音源ごとに自分の枠にしか書かない</strong>ので、割っても計算順も丸めも変わりません。テストで毎回突き合わせています。
+      </div>
+      <p class="tiny" style="margin-top:2mm">★エンジンの既定はスレッドなしで、ホストが 4 を指定します。検査ハーネスを直列に保てば厳密差分で回帰を判定でき続けるため、そして Unity は既に全コアでジョブを回しているためです。</p>
+    </div>
+    <div class="col">
+      <h2>② 後期残響の尾を音源で共有する</h2>
+      <div class="bars2">
+        <div class="b2row"><span class="b2lab">音源ごとに畳む</span><div class="b2track"><div class="b2fill dim" style="width:100%"></div></div><span class="b2val">約 1.7 ms</span></div>
+        <div class="b2row"><span class="b2lab"><b>共有バス</b></span><div class="b2track"><div class="b2fill hi" style="width:19%"></div></div><span class="b2val"><b>約 0.32 ms</b></span></div>
+        <div class="b2note">音源 8 本・1 ブロック。<b>約 5.3 倍</b>／畳み込みの分割数 <b>104 → 13</b>（これは数えた値なので正確）。出力の差は <b>−123.5 dB（＝一致）</b>。</div>
+      </div>
+      <p style="margin-top:1mm">同じ部屋の音源は同じ IR を使うので、畳み込みは <span class="tiny">conv(IR, g1·x1) + conv(IR, g2·x2) = conv(IR, g1·x1 + g2·x2)</span> で<strong>厳密に 1 回にまとめられます。近似ではありません。</strong></p>
+
+      <h2 style="margin-top:4mm">③ 音源ごとに「解く深さ」を段で決める</h2>
+      <div class="bars2">
+        <div class="b2row"><span class="b2lab">厳密</span><div class="b2track"><div class="b2fill dim" style="width:100%"></div></div><span class="b2val">約 4.1 ms</span></div>
+        <div class="b2row"><span class="b2lab">簡易</span><div class="b2track"><div class="b2fill" style="width:53%"></div></div><span class="b2val">約 2.2</span></div>
+        <div class="b2row"><span class="b2lab"><b>バーチャル</b></span><div class="b2track"><div class="b2fill hi" style="width:31%"></div></div><span class="b2val"><b>約 1.3</b></span></div>
+        <div class="b2note">音源 12 本。バーチャルで <b>約 3.2 倍</b>。</div>
+      </div>
+      <div class="warnbox" style="margin-top:2mm">
+        <strong>落とす条件は距離ではなく「残響が担っているか」。</strong>残響半径が聞こえる半径より内側なら落として構わない ── 逆に響く部屋では落としません。往復を防ぐヒステリシスも入れています。
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 11 中扉 開発環境 ══ -->
+<div class="page c-tool divider">
+  <div class="draft">下書き</div>
+  <div class="eyebrow">PART 2 ── AUTHORING TOOLS</div>
+  <div class="ttl">開発環境</div>
+  <div class="en">TOOLS THAT MADE THE ENGINE</div>
+  <div class="sub">ここから 5 枚は、<b>エンジンではなく、エンジンを作るために書いた道具</b>の話です。</div>
+
+  <div class="two">
+    <div class="dcard">
+      <div class="dk">出荷するもの</div>
+      <div class="dv">AcousticFlow</div>
+      <div class="dn">ゲームに積む音響ライブラリ。<b>体験</b>をつくる。<br><span class="tiny">p2 – p10</span></div>
+    </div>
+    <div class="dsep">＋</div>
+    <div class="dcard hi">
+      <div class="dk">出荷しないもの</div>
+      <div class="dv">Sounding<span class="prov">仮称</span></div>
+      <div class="dn">積まない。<b>開発</b>をたすける。<br><span class="tiny">p12 – p16</span></div>
+    </div>
+  </div>
+
+  <div class="lead">
+    <b>分けたのは、Wwise が Sound Engine と Authoring を分けているのと同じ理由です。</b>
+    道具はゲームに積まれません。積まれないから、実行時の制約（確保しない・待たない・止まらない）から自由に作れます。
+  </div>
+
+  <div class="dwhy">
+    <b>なぜ要ったか</b> ── Unity はネイティブ DLL を掴んだまま離しません。
+    <b>音を一つ調整するたびに、Unity を閉じる</b>必要がありました。道具が増えるほどこの縛りが効きます。
+    エンジンだけで音を書き出せるようにしたのが最初の一手です（p16）。
+  </div>
+
+  <div class="dno">
+    <b>作らないと決めたもの</b> ── ミキサ／ボイス管理（優先度・スティール・上限）／ストリーミング。
+    <b>そこは Wwise の土俵</b>で、勝負にならない上に本題から離れます。再生は<b>試聴に足りるだけ</b>に留めました。
+  </div>
+</div>
+
+<!-- ══ 12 ツール① 計器 ══ -->
+<div class="page c-tool">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">開発支援ツール ① 音を、数字で見続ける<span class="status st-done">実装済み</span></div>
+    <div class="tab tab-cat">TOOL 1 ── METERS</div>
+    <div class="pno">12</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    音は<b class="k">鳴った先から消えていく</b>ので、印象では追い込めません。<br>
+    だから<b>鳴っているあいだ、ずっと数字が出ている</b>状態にしました。耳で気づいて、数字で切り分ける。
+  </div>
+  <div class="body shot">
+    <div class="stage">
+      <div class="ph grow">★図：これから撮る（S3）<br><br>
+        監視窓を並べた状態<br>
+        Status ／ Band ／ Output ／ Reverb ／ Scope<br><br>
+        <span class="tiny">Game ビューの HUD と同じ数字が出ているところ</span></div>
+      <div class="flow" style="margin-top:3mm">
+        <div class="b">Status<br><span class="tiny">全体の状態</span></div>
+        <div class="b">Band<br><span class="tiny">帯域別の通り</span></div>
+        <div class="b">Output<br><span class="tiny">出音のレベル</span></div>
+        <div class="b">Reverb<br><span class="tiny">エコグラム</span></div>
+        <div class="b">Scope<br><span class="tiny">波形</span></div>
+      </div>
+    </div>
+    <div class="side">
+      <div class="sflow"><span class="s1">出す</span><span class="a">→</span><span class="s2">比べる</span><span class="a">→</span><span class="s3">疑う</span></div>
+      <div class="sitem"><span class="sdot t"></span><div><b>段ごとに分けて出す</b>
+        <p>直接／早期反射／散乱／尾／最終出力を別々の数字で。<b>どこが鳴っていて、どこが鳴っていないか</b>が切り分けられます。</p></div></div>
+      <div class="sitem"><span class="sdot b"></span><div><b>音源ごとに出す</b>
+        <p>遮蔽・帯域生存・タップ数・回折δ、そして<b>音源ごとの実費（ms/block）</b>まで。推定ではなく実測です。</p></div></div>
+      <div class="sitem"><span class="sdot i"></span><div><b>同じ計器で A/B する</b>
+        <p>C# 経路と C++ 経路が<b>同じ計器へ書きます</b>。切り替えて数値が動かないことで移植の成否を判定しました（p4）。</p></div></div>
+      <div class="sitem"><span class="sdot w"></span><div><b>嘘を見えるようにする</b>
+        <p>読み込まれた HRTF の名前も出しています ── <b>「HRTF と表示されているのに中身は合成だった」</b>が実際に起きたので。</p></div></div>
+      <div class="sgoal"><b>数字が出ていないものは直せません。</b>不具合はほとんど「聞けば変だが、どこが変かは分からない」形で出ます。<b>計器は、耳と原因のあいだを繋ぎます。</b></div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 13 ツール② キャプチャ ══ -->
+<div class="page c-tool">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">開発支援ツール ② 変な音を、あとから解く<span class="status st-done">実装済み</span></div>
+    <div class="tab tab-cat">TOOL 2 ── CAPTURE</div>
+    <div class="pno">13</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    変な音は <b class="k">気づいたときには終わっています。</b>「録画開始」を押してからでは間に合わない。<br>
+    だから<b>常に録っておいて、押したらさかのぼって切り出す</b>。そして<b>判定は録ったあとにやる</b>。
+  </div>
+  <div class="body shot">
+    <div class="stage">
+      <div class="ph grow">★図：これから撮る（S4）<br><br>
+        キャプチャ一覧（F11 ／ Editor 窓）<br>
+        録れた .afcap と、走査で付いた印<br><br>
+        <span class="tiny">型紙ごとの内訳が出ている状態</span></div>
+      <div class="flow" style="margin-top:3mm">
+        <div class="b">変だと気づく<br><span class="tiny">F10 を押す</span></div><div class="a">▶</div>
+        <div class="b">.afcap<br><span class="tiny">前 21s ＋ 後 5s</span></div><div class="a">▶</div>
+        <div class="b">走査<br><span class="tiny">型紙 9 つ</span></div><div class="a">▶</div>
+        <div class="b"><b>回帰テストを吐く</b><br><span class="tiny">検査が 1 本増える</span></div>
+      </div>
+    </div>
+    <div class="side">
+      <div class="sflow"><span class="s1">録る</span><span class="a">→</span><span class="s2">走査する</span><span class="a">→</span><span class="s3">縛る</span></div>
+      <div class="sitem"><span class="sdot t"></span><div><b>出音そのものを録る</b>
+        <p>AudioListener に付けるので<b>全音源のミックス後</b>。マスター PCM に加えて、入力・静的な形・材質まで一緒に残します。</p></div></div>
+      <div class="sitem"><span class="sdot b"></span><div><b>判定は録ったあと</b>
+        <p>実時間で判定すると、録った瞬間の判定で固定されます。あとで回すから<b>検出器を良くすると昔のキャプチャに付け直せる</b>。</p></div></div>
+      <div class="sitem"><span class="sdot i"></span><div><b>走査と検査は同じ関数</b>
+        <p>型紙 9 つは DLL の中。写経しないので<b>「画面には印が出るのに検査は通る」が起きません</b>。</p></div></div>
+      <div class="sitem"><span class="sdot w"></span><div><b>押し直して解き直せる</b>
+        <p>入力を録ってあるので、同じ操作をもう一度エンジンに通せます。</p></div></div>
+      <div class="sgoal"><b>強いのは「常時録音」ではありません。</b>そのループは既存のミドルウェアにもあります。<b>検出器が、自分のエンジンで実際に出たバグから逆算して書かれている</b>こと ── 自分の模型の破れ方を知っている人にしか書けない検出器です。</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 14 ツール③ 実行時の編集 ══ -->
+<div class="page c-tool">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">開発支援ツール ③ 鳴らしたまま、音を触る<span class="status st-wip">保存は実装中</span></div>
+    <div class="tab tab-cat">TOOL 3 ── LIVE EDIT</div>
+    <div class="pno">14</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    止めて直して、また鳴らして ── では<b class="k">記憶の中の音と比べる</b>ことになります。<br>
+    <b>鳴らしたまま触って、その場で比べる。</b>そして良かった状態を残す。
+  </div>
+  <div class="body shot">
+    <div class="stage">
+      <div class="ph grow">★図：これから撮る（S5）<br><br>
+        音源タブ ── 寄与度順の一覧・経路ソロ・タップ内訳（6 帯域バー）<br><br>
+        <span class="tiny">音源が 3 本以上、寄与に差がついている状態</span></div>
+    </div>
+    <div class="side">
+      <div class="sflow"><span class="s1">選ぶ</span><span class="a">→</span><span class="s2">切る</span><span class="a">→</span><span class="s3">残す</span></div>
+      <div class="sitem"><span class="sdot t"></span><div><b>寄与度順に選ぶ</b>
+        <p>基準を<b>「実出力」と「経路ゲイン」</b>で切替。実際に届いている量と、届きやすさは別物なので混ぜません。</p></div></div>
+      <div class="sitem"><span class="sdot b"></span><div><b>経路単位でソロ／ミュート</b>
+        <p>直接音・反射・回折・後期残響を個別に。<b>回折だけ切ると痩せる</b>、が耳で分かります。</p></div></div>
+      <div class="sitem"><span class="sdot i"></span><div><b>音源ごとに解く深さを変える</b>
+        <p>厳密／簡易／バーチャルを実行時に指定。<b>重い音源を落として、音がどう変わるかをその場で聴けます</b>。</p></div></div>
+      <div class="sitem"><span class="sdot w"></span><div><b>良かった状態を残す</b><span class="status st-wip">実装中</span>
+        <p>いまは再生を止めると戻ります。決めた値を<b>シーンへ書き戻す</b>ところがこれからです。</p></div></div>
+      <div class="sgoal"><b>ソロを切り替えても音が飛びません。</b>取捨は IR の組み立て側でやり、既存のクロスフェードに乗せています。<b>計算そのものは止めていません</b> ── 止めると遅延線の状態が進まず、解除した瞬間に不連続が出るからです（p17）。</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 15 ツール④ 調整卓 ══ -->
+<div class="page c-tool">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">開発支援ツール ④ 聞こえ方から、壁の材質を決める<span class="status st-done">実装済み</span></div>
+    <div class="tab tab-cat">TOOL 4 ── TUNING（F9）</div>
+    <div class="pno">15</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    調整の単位は <b class="k">立っている場所での聞こえ方</b> であって、材質の数値ではありません。<br>
+    材質の表を睨んで 0.003 を 0.005 にする作業は<b>耳から遠すぎて追い込めない</b> ── そこを繋ぐ道具です。
+  </div>
+  <div class="body shot">
+    <div class="stage">
+      <div class="ph grow">★図：これから撮る（S6）<br><br>
+        F9 の調整卓 ── 内訳・担い手の一覧・2 つのつまみ・結果メッセージ<br><br>
+        <span class="tiny">「⚠ この経路の ○% は回り込みが担っています」が出ている状態</span></div>
+      <div class="flow" style="margin-top:3mm">
+        <div class="b">内訳を出す<br><span class="tiny">透過 / 回り込み</span></div><div class="a">▶</div>
+        <div class="b">担い手を<br>名指しさせる</div><div class="a">▶</div>
+        <div class="b">目標を置く<br><span class="tiny">総量 / こもり倍率</span></div><div class="a">▶</div>
+        <div class="b"><b>材質を書き換え</b><br><span class="tiny">その場で音が変わる</span></div>
+      </div>
+    </div>
+    <div class="side">
+      <div class="sflow"><span class="s1">つまみは 2 つだけ</span></div>
+      <div class="sitem"><span class="sdot t"></span><div><b>総量とこもり倍率</b>
+        <p>こもり倍率は 125 Hz ÷ 4 kHz。<b>扉の実測で使っている尺度と同じ</b>（閉 5.8 → 開 1.2）なので、耳の言葉のまま置けます。</p></div></div>
+      <div class="sitem"><span class="sdot b"></span><div><b>書き込み先は必ず材質</b>
+        <p>音源に EQ を掛ける形にすると、壁を動かしても補正が付いてこない ── <b>ただのミキサーになります</b>。</p></div></div>
+      <div class="sitem"><span class="sdot i"></span><div><b>届かない目標は突き返す</b>
+        <p>「この経路の 70% は回り込みが担っています」と返す。<b>効かないつまみを回し続けるのが最大の失敗</b>だから。</p></div></div>
+      <div class="sitem"><span class="sdot w"></span><div><b>担い手は人が選ぶ</b>
+        <p>自動で選ぶと、触るたびに相手が入れ替わる。「勝手に何かが変わった」を起こさないため。</p></div></div>
+      <div class="sgoal"><b>合うのは「その 1 点」だけ。それが狙いです。</b>材質は 1 枚で、聞く場所は無限にある。<b>どこでも目標どおりに鳴るなら、それは焼いたのと同じ。</b>代表の 1 点で演出を決め、残りは物理へ。</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 16 検証 ══ -->
+<div class="page c-tool">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">検証 ── 壊れたことに気づける状態を保つ</div>
+    <div class="tab tab-cat">VERIFICATION</div>
+    <div class="pno">16</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    音の不具合は「直したら別が壊れる」が起きやすく、しかも<b class="k">壊れたことに耳で気づけない</b>ことがあります。<br>
+    だから数値で押さえ、<b>Unity を開かずに音を確かめられる</b>ようにしました。
+  </div>
+  <div class="body cols">
+    <div class="col">
+      <h2>回帰テスト ── 全 447 件</h2>
+      <div class="chips">
+        <div class="chip"><div class="v">323</div><div class="k">シーン（幾何・回折・部屋）</div></div>
+        <div class="chip"><div class="v">117</div><div class="k">DSP（畳み込み・HRTF）</div></div>
+        <div class="chip"><div class="v">7</div><div class="k">BTM（解析解と突き合わせ）</div></div>
+      </div>
+      <p style="margin-top:2mm">次のような「壊れても耳では気づけないもの」を、毎回突き合わせています。</p>
+      <ul>
+        <li>並列と直列の結果が<strong>ビット一致</strong>するか</li>
+        <li>共有バスと個別畳み込みが一致するか（<strong>−123.5 dB</strong>）</li>
+        <li>C++ と C# の値が一致するか</li>
+        <li>扉の角度を振ったときにレベルが跳ばないか</li>
+        <li>残響が <strong>Sabine の理論値</strong>と合うか（±6〜16 %）</li>
+      </ul>
+      <div class="call" style="margin-top:2.5mm">
+        <strong>★期待値は「絶対値」ではなく「関係」で書いています。</strong>
+        <span class="tiny">フレーム 412 の 0.0837 を焼くと、正当な調整のたびに落ちて<strong>すぐ信用されなくなる</strong>。「開口へ近づくほど大きい」「並列でもビット一致」のように、性質だけを縛ります。</span>
+      </div>
+      <div class="call" style="margin-top:2.5mm">
+        <strong>★検査そのものも検査しています。</strong>
+        <span class="tiny">黙っている検査は「健全だから」か「壊れて何も見ていないから」か区別できません。<strong>わざと壊した入力を通して、ちゃんと落ちること</strong>を確かめてあります（破れの型紙 9 つ・C# の型検査とも）。</span>
+      </div>
+    </div>
+    <div class="col">
+      <h2>Unity を開かずに音を確認する</h2>
+      <p>Unity はネイティブ DLL をロックするため、エンジンを直すたびに Unity を閉じる必要があり、音を一度聴くのに数分かかっていました。</p>
+      <div class="call">
+        <strong>エンジンだけで WAV を書き出すツールを作りました。</strong>密閉した 2 部屋を戸口で繋ぎ、扉を 0°→90°→0° と動かしながらレンダリングします。<strong>数秒で回ります。</strong>
+      </div>
+      <p style="margin-top:3mm">音の調整の反復が「Unity を閉じて開き直す」から<strong>「コマンド 1 本」</strong>になりました。デモ動画の素材もここから作れます。</p>
+      <div class="ph grow" style="margin-top:3mm">★図：未作成<br>扉スイープの波形／スペクトログラム</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 17 失敗① ══ -->
+<div class="page c-end">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">失敗から決まった原則 ── 連続性</div>
+    <div class="tab tab-cat">WHAT WENT WRONG 1</div>
+    <div class="pno">17</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    潰してきた音の不具合は、ほぼ全部が同じ型でした ──
+    <b class="k">連続量に二値の判定を置くと、跨いだ瞬間に音が跳ぶ。</b>
+  </div>
+  <div class="body cols">
+    <div class="col" style="flex:1.05">
+      <div class="fig">
+        <svg viewBox="0 0 520 250" style="width:100%;height:52mm;display:block">
+          <!-- 軸 -->
+          <line x1="52" y1="20" x2="52" y2="205" stroke="#c9d1dc" stroke-width="1.5"/>
+          <line x1="52" y1="205" x2="500" y2="205" stroke="#c9d1dc" stroke-width="1.5"/>
+          <text x="10" y="26" font-size="12" fill="#6b7280">大</text>
+          <text x="10" y="205" font-size="12" fill="#6b7280">小</text>
+          <text x="4" y="120" font-size="12" fill="#6b7280">音量</text>
+          <text x="250" y="235" font-size="12" fill="#6b7280" text-anchor="middle">扉の角度・立ち位置などを少しずつ動かす →</text>
+
+          <!-- あるべき姿（連続） -->
+          <path d="M60,190 C160,180 250,120 330,90 C400,64 460,48 494,42"
+                fill="none" stroke="#16c1c1" stroke-width="3.5" stroke-linecap="round"/>
+          <text x="360" y="112" font-size="13" font-weight="700" fill="#0e9c9c">連続に動く（あるべき姿）</text>
+
+          <!-- 跳ぶ（二値判定） -->
+          <path d="M60,190 L268,178" fill="none" stroke="#c2603f" stroke-width="3.5" stroke-linecap="round"/>
+          <path d="M268,178 L268,86" fill="none" stroke="#c2603f" stroke-width="3.5" stroke-dasharray="6 5"/>
+          <path d="M268,86 L494,60" fill="none" stroke="#c2603f" stroke-width="3.5" stroke-linecap="round"/>
+          <circle cx="268" cy="178" r="5" fill="#c2603f"/>
+          <circle cx="268" cy="86" r="5" fill="#c2603f"/>
+          <text x="278" y="140" font-size="15" font-weight="700" fill="#c2603f">跳ぶ</text>
+          <text x="278" y="160" font-size="11" fill="#c2603f">最大 27.6 dB</text>
+          <text x="150" y="200" font-size="13" font-weight="700" fill="#c2603f">二値の判定が混ざると</text>
+
+          <!-- 判定の境目 -->
+          <line x1="268" y1="20" x2="268" y2="205" stroke="#e0a08c" stroke-width="1" stroke-dasharray="4 4"/>
+          <text x="268" y="16" font-size="11" fill="#c2603f" text-anchor="middle">判定が入れ替わる点</text>
+        </svg>
+        <div class="cap">「見通せているか」「矩形を横切るか」のような二値の判定を、連続に動く量の中に置いたときに起きること</div>
+      </div>
+      <div class="call" style="margin-top:3mm">
+        <strong>数 dB の誤差は誰も気づきませんが、不連続はその場で「バグ」として聞こえます。</strong>
+        だから正しさより先に連続性を守る、という順序にしました。
+      </div>
+    </div>
+    <div class="col">
+      <h2>実際に起きた 4 件（すべて実測）</h2>
+      <table>
+        <tr><th>症状</th><th class="n" style="width:22%">段差</th></tr>
+        <tr><td>影の境界で音が跳ぶ</td><td class="n">12.5 dB</td></tr>
+        <tr><td>音源を <strong>5 cm</strong> 動かすと落ちる</td><td class="n">8.8 dB</td></tr>
+        <tr><td>扉 20°→30° で跳ぶ</td><td class="n">14.9 dB</td></tr>
+        <tr><td>柱の陰へ <strong>0.1 m</strong> 入ると消える</td><td class="n">27.6 dB</td></tr>
+      </table>
+      <p class="tiny" style="margin-top:2mm">原因は毎回ちがって見えても、構造は同じ ──「見通せているか」「直線が矩形を横切るか」で処理を切り替えていた。</p>
+
+      <h2 style="margin-top:4mm">同じ原則で、厳密解を捨てた</h2>
+      <div class="bars2">
+        <div class="b2row"><span class="b2lab">UTD（厳密解）</span><div class="b2track"><div class="b2fill dim" style="width:100%;background:#c2603f"></div></div><span class="b2val">最大 17.6 dB</span></div>
+        <div class="b2row"><span class="b2lab"><b>前川の式</b></span><div class="b2track"><div class="b2fill hi" style="width:2%;background:#16c1c1"></div></div><span class="b2val"><b>跳ばない</b></span></div>
+        <div class="b2note">影の境界での段差。UTD は精度が高いが、稜線が乗り換わると飛ぶ。</div>
+      </div>
+      <p style="margin-top:1mm"><strong>「厳密だが跳ぶ」より「粗いが連続」を選びました。</strong></p>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 18 失敗② ══ -->
+<div class="page c-end">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">失敗と、そこで下した判断</div>
+    <div class="tab tab-cat">WHAT WENT WRONG 2</div>
+    <div class="pno">18</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    <b class="k">試して捨てた案も記録に残しています。</b>同じ検討を二度しないため、
+    そして<b>「試していない」と「試して捨てた」を区別する</b>ためです。
+  </div>
+  <div class="body cols">
+    <div class="col">
+      <h2>① 開口の測り方を 4 通り試して、全部失敗した</h2>
+      <p>「扉がどれだけ開いているか」を実形状から測る方法を 4 通り実装しましたが、いずれも<strong>連続性か安定性のどちらかを落としました</strong>（p17 の 8.8 dB はそのうちの 1 つ）。</p>
+      <p style="margin-top:2mm">最終的に、ホストが「ここが開口」と<strong>矩形だけを宣言</strong>し、開き具合・音色・定位は毎フレーム実形状から測る形にしました。</p>
+      <div class="warnbox" style="margin-top:3mm">
+        <strong>自分で歯止めを置いています。</strong>宣言が唯一の手段になると、音が抜ける場所を決めているのは幾何ではなく<strong>人の注記の網羅性</strong>になり、主張が崩れます。判定基準は<strong>「宣言を全部消しても音が出るか」</strong>。壁の真ん中に宣言を置いても開口率は 0 になるので、捏造はできません。
+      </div>
+    </div>
+    <div class="col">
+      <h2>② 実測と食い違ったとき、実測に合わせなかった</h2>
+      <p>現実の扉の開閉を収録して解析したところ、開閉の差は <strong>8.4 dB</strong> しかありませんでした。エンジンは約 <strong>20 dB</strong> です。</p>
+      <p style="margin-top:2mm">最初はこれを「エンジンが強すぎる」＝直すべき乖離として扱おうとしましたが、判断を変えました。</p>
+      <div class="call" style="margin-top:3mm">
+        <strong>実測は参照であって、合わせに行く目標ではない。</strong>収録できたのは 1 つの部屋の値にすぎず、ゲームとして必要なコントラストのほうが優先されます。
+      </div>
+      <p style="margin-top:3mm">ただし<strong>「形」は採用しました</strong>（p5）。開くと低域は +2.6 dB しか動かないのに 1 kHz は +10.3 dB 動く ── <strong>音色が開く</strong>という構造は現実そのものです。</p>
+    </div>
+    <div class="col">
+      <h2>③ 焼く／焼かないを、二度考え直した</h2>
+      <p>はじめは<strong>全部を実行時に解く</strong>設計で、それが売り文句でもありました。実測が実行時の不利を示したので（p3）、<strong>重い残響は焼く</strong>方針へ切り替えました。</p>
+      <div class="call" style="margin-top:2.5mm">
+        <strong>一度目の学び：手段を目的にしていた。</strong>「非ベイク」は品質のための手段だったのに看板になり、<strong>守るために品質を落としかけていた。</strong>
+      </div>
+      <p style="margin-top:3mm">ところが焼く前に測ったら、<strong>尾は焼けませんでした</strong>（p3）。扉で減衰そのものが変わるからです。焼く動機だった費用も、<strong>焼かずに部屋で共有するだけで 16.80 → 2.93 ms</strong> に消えていました。</p>
+      <div class="call" style="margin-top:2.5mm">
+        <strong>二度目の学び：作る前に測る。</strong>「尾は部屋にしか依存しない」は<strong>仮説</strong>でした。仕組みを作ってから気づいていたら、<strong>主題を殺した状態で完成させていた。</strong>
+      </div>
+      <p class="tiny" style="margin-top:3mm">この測定の途中でも 2 回間違えています ── 試験用の部屋に隙間が空いていて理論値と 37% ずれ、指標が数値の床に張り付いて 115 dB という無意味な値が出ました。<strong>出た数字を疑う手順</strong>が要る、という実例として記録しています。</p>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 19 今後 ══ -->
+<div class="page c-end">
+  <div class="draft">下書き</div>
+  <div class="head">
+    <div class="tab tab-ttl">今後の改善点</div>
+    <div class="tab tab-cat">NEXT</div>
+    <div class="pno">19</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  </div>
+  <div class="brief">
+    <b class="k">音の不具合はほとんどが「連続量に二値の判定を置いた」形</b>をしていて、原因は毎回ばらばらに見えても構造は同じでした。<br>
+    <b>正しさより連続性を先に守る</b>、という順序をこの制作で身につけました。
+  </div>
+  <div class="body cols">
+    <div class="col">
+      <h2>いま出来ていないこと</h2>
+      <table>
+        <tr><th style="width:42%">課題</th><th>いまの状態</th></tr>
+        <tr><td><strong>構造を焼く実装がこれから</strong></td><td>尾は<b>焼かないと確定</b>（p3）。残るのは<b>静的な稜線</b>を焼いて探索の点滅を消すこと。費用ではなく品質のための作業</td></tr>
+        <tr><td><strong>音源数の上限を測り直せていない</strong></td><td>共有バスで 1 本あたりの限界費用が下がったので、以前の実測（約 36 本）はもう当てはまらない</td></tr>
+        <tr><td>並列化が 4 コアで頭打ち</td><td>共有したレイの段（エコグラム・反射）は塊で割れるが、<b>音源ごとに割れない処理</b>（エッジカタログ・部屋の検出）が残る。4 コア 2.42 倍 → 8 コア 2.74 倍</td></tr>
+        <tr><td><strong>★閉じた扉の「幻」</strong></td><td>戸口の幅によっては、閉扉なのに <b>−11 dB・帯域がまっすぐ</b>という値が出る（正しくは −37 dB・低−高 +21 dB）。<b>幅 0.9/1.1/1.8 m で出て、1.4/2.2 m では出ない</b>という<b>非単調</b>な出方をする。部屋を 2.5 倍に広げても消えないので、原因は部屋ではなく<b>幅</b>。<b>未解決</b>。デバッグツールの型紙 4 が自動で拾える</td></tr>
+        <tr><td><strong>★扉が真横（90°）で不連続</strong></td><td>1° 刻みで振ると <b>89° −10.2 → 90° −17.3 → 91° −12.7</b>。<b>1° で 7 dB 突出し、そのあと 2.5 dB 低い枝へ移って 30° 以上戻らない</b>。さらに 90° の値は<b>同じプロセスで先に何を計算したかで −12.7 と −17.3 の間を揺れる</b>（単独 8 回では安定）。板が壁とちょうど直角になる退化した配置で分岐がぶれており、<b>初期化されていない値を読んでいる疑い</b>。<b>連続性が第一制約なので、これは最優先の未解決課題</b></td></tr>
+        <tr><td><strong>響く空間で尾が短い</strong></td><td>跳ね返りを 32 回で打ち切っているため、吸音の小さい空間（α≦0.2）は減衰しきる前に切れる。256 回にすると RT60 が 0.70 → 0.93 s</td></tr>
+        <tr><td>位相を扱わない</td><td>干渉・共鳴は表現できない。連続性を優先した結果の制約</td></tr>
+        <tr><td>GPU 未使用</td><td>レイの段がフレームの約半分を占める。規模が上がれば必要になる</td></tr>
+      </table>
+    </div>
+    <div class="col">
+      <h2>次にやること</h2>
+      <table>
+        <tr><td class="n" style="width:8%">1</td><td><strong>扉が真横のときの不連続を直す</strong>（1° で 7 dB。連続性が第一制約なので、ここが最優先）</td></tr>
+        <tr><td class="n">2</td><td><strong>閉じた扉の「幻」を直す</strong>（開口積分の分岐。戸口の幅で出方が変わる）</td></tr>
+        <tr><td class="n">3</td><td><strong>静的な稜線を焼く</strong>（探索の点滅を構成から消す。動く物の稜線は実行時に合流）</td></tr>
+        <tr><td class="n">4</td><td>キャプチャの入力リプレイを Unity 側から回せるようにする</td></tr>
+        <tr><td class="n">5</td><td>音声スレッド 45 % をさらに下げる（段の振り分け）</td></tr>
+        <tr><td class="n">6</td><td>実証用ゲーム Bell / Door の完成（制作中）</td></tr>
+      </table>
+      <div class="call" style="margin-top:4mm">
+        <strong>この作品で身につけたこと</strong>
+        <ul style="margin-top:2mm">
+          <li>症状 → 実測 → 原因 → 対策 → 再実測 で切り分ける</li>
+          <li>速くするときは「音が変わっていないこと」を先に担保する</li>
+          <li>採用しなかった案を記録に残す</li>
+        </ul>
+      </div>
+      <p class="tiny" style="margin-top:4mm">動画（90 秒）／実行可能ビルド／ソースコードを別途提出します。</p>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

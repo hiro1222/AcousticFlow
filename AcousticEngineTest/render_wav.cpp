@@ -90,7 +90,8 @@ float broadband(const float g[6]) {
 //     （早期反射 16.24 対 回折二次音源 0.0070）、そこを外すと聴く意味がない。
 //   ★A/B のために ear0 を渡すと反射タップの軽量な両耳化を切れる
 //     （＝等パワーパンだけの従来の鳴り方）。同じ歩きで 2 本作って聴き比べる。
-int renderCorridor(const char* outPath, bool earCues, bool useClick) {
+int renderCorridor(const char* outPath, bool earCues, bool useClick, bool noTail = false,
+                   bool oneModel = false) {
     std::printf("=== く字の廊下を歩く（回折だけの定位）===\n");
     std::printf("  反射タップの両耳化: %s\n",
                 earCues ? "ON（ITD＋帯域別ILD）" : "OFF（等パワーパンだけ）");
@@ -118,6 +119,9 @@ int renderCorridor(const char* outPath, bool earCues, bool useClick) {
     const AF_Vector3 S = V(bEnd - 2.0f, 1.6f, 0.0f);
     AF_SceneSetSource(s, 1, S);
     AF_SceneSetApertureSpread(s, 3);
+    // onemodel: 回折の減衰を前川だけに任せる（フレネル積分 f を重ねて掛けない）。
+    AF_SceneSetDiffractionSingleModel(s, oneModel ? 1 : 0);
+    std::printf("  回折の減衰: %s\n", oneModel ? "前川だけ（設計どおり）" : "前川 × f（いま）");
 
     AF_VoiceConfig cfg{};
     cfg.sampleRate = kSampleRate;
@@ -140,6 +144,9 @@ int renderCorridor(const char* outPath, bool earCues, bool useClick) {
     AF_VoiceSetHrtf(voice, hrtf);
     AF_VoiceSetHrtfEnabled(voice, 1);
     AF_VoiceSetEarCues(voice, earCues ? 1 : 0);
+    // notail: 後期尾を止める。尾は方向を持たないので、これで「定位を持つ成分だけ」を聴ける。
+    if (noTail) AF_VoiceSetTailLevel(voice, 0.0f);
+    std::printf("  後期尾: %s\n", noTail ? "OFF（定位を持つ成分だけ）" : "ON");
 
     const float seconds = 18.0f;
     const int total = static_cast<int>(seconds * kSampleRate);
@@ -160,11 +167,26 @@ int renderCorridor(const char* outPath, bool earCues, bool useClick) {
         AF_Vector3 L;
         if (u < 0.55f) {
             const float a = u / 0.55f;
-            L = V(0.0f, 1.6f, (aEnd + 2.0f) * (1.0f - a));
+            // ★廊下の**左寄り**を歩く。真ん中を歩くと角がずっと正面に来てしまい、
+            //   左右の手がかりが原理的に出ない（実測 |ILD| 0.53dB＝定位を試せていない）。
+            //   壁際を歩けば角の開口は右前方にあり、近づくにつれて右へ振れる。
+            //   角に着くまでに中央へ戻す（曲がるときに壁へめり込まないように）。
+            const float side = -0.9f * (1.0f - a * a);
+            L = V(side, 1.6f, (aEnd + 2.0f) * (1.0f - a));
         } else {
             const float a = (u - 0.55f) / 0.45f;
             L = V((bEnd - 4.0f) * a, 1.6f, 0.0f);
         }
+        // リスナーの向き。進行方向を向いて歩かせる。
+        // ここを回さないと世界座標のまま HRTF に入り、音源へ正面から近づいても
+        // ずっと真横で鳴り続ける（Unity 側は DirLocal で頭基準に直している）。
+        const float turn = std::min(1.0f, std::max(0.0f, (u - 0.45f) / 0.20f));
+        const float yaw = turn * 1.5707963f;              // +Z を向く → +X を向く
+        const float cy = std::cos(yaw), sy = std::sin(yaw);
+        // 頭基準へ: x=右成分, y=上成分, z=前成分
+        auto toLocalX = [&](float dx, float dz) { return dx * cy - dz * sy; };
+        auto toLocalZ = [&](float dx, float dz) { return dx * sy + dz * cy; };
+
         AF_SceneSetListener(s, L);
         AF_SceneUpdate(s, static_cast<float>(n) / kSampleRate);
         const int idx = AF_SceneSourceIndex(s, 1);
@@ -198,10 +220,10 @@ int renderCorridor(const char* outPath, bool earCues, bool useClick) {
                 sum += taps[nTaps].gain6[b];
             }
             const float inv = (plen > 1e-4f) ? 1.0f / plen : 0.0f;
-            taps[nTaps].dirX = dx * inv;
+            taps[nTaps].dirX = toLocalX(dx * inv, dz * inv);
             taps[nTaps].dirY = dy * inv;
-            taps[nTaps].dirZ = dz * inv;
-            const float xr = (dx * inv + 1.0f) * 0.5f;
+            taps[nTaps].dirZ = toLocalZ(dx * inv, dz * inv);
+            const float xr = (taps[nTaps].dirX + 1.0f) * 0.5f;
             taps[nTaps].panL = std::sqrt(1.0f - xr);
             taps[nTaps].panR = std::sqrt(xr);
             const float relMs = (plen - dd) / kSpeedOfSound * 1000.0f;
@@ -228,10 +250,10 @@ int renderCorridor(const char* outPath, bool earCues, bool useClick) {
             const float at = 4.0f / std::max(plen, 4.0f);
             for (int b = 0; b < 6; ++b) taps[nTaps].gain6[b] = eg6[i * 6 + b] * at * 0.35f;
             const float inv = (plen > 1e-4f) ? 1.0f / plen : 0.0f;
-            taps[nTaps].dirX = dx * inv;
+            taps[nTaps].dirX = toLocalX(dx * inv, dz * inv);
             taps[nTaps].dirY = dy * inv;
-            taps[nTaps].dirZ = dz * inv;
-            const float xr = (dx * inv + 1.0f) * 0.5f;
+            taps[nTaps].dirZ = toLocalZ(dx * inv, dz * inv);
+            const float xr = (taps[nTaps].dirX + 1.0f) * 0.5f;
             taps[nTaps].panL = std::sqrt(1.0f - xr);
             taps[nTaps].panR = std::sqrt(xr);
             const float relMs = (plen - dd) / kSpeedOfSound * 1000.0f;
@@ -245,7 +267,8 @@ int renderCorridor(const char* outPath, bool earCues, bool useClick) {
 
         float ad[3] = {0, 0, 1};
         if (idx >= 0) AF_SceneGetSourceArrivalDir(s, idx, ad);
-        AF_VoiceSetDirection(voice, V(ad[0], ad[1], ad[2]), 57.0f);
+        AF_VoiceSetDirection(voice, V(toLocalX(ad[0], ad[2]), ad[1],
+                                      toLocalZ(ad[0], ad[2])), 57.0f);
 
         if ((blockIndex % 16) == 0) {
             const AF_Vector3 srcArr[1] = { S };
@@ -270,14 +293,38 @@ int renderCorridor(const char* outPath, bool earCues, bool useClick) {
                 dry[static_cast<std::size_t>(i)] = (pink * 3.0f + wn * 0.15f) * 0.5f;
             }
         }
-        AF_VoiceRender(voice, dry.data(), n, bl.data(), br.data(), nullptr);
+        AF_VoiceMetering mt{};
+        AF_VoiceRender(voice, dry.data(), n, bl.data(), br.data(), &mt);
         for (int i = 0; i < n; ++i) {
             outL[static_cast<std::size_t>(pos + i)] = bl[static_cast<std::size_t>(i)];
             outR[static_cast<std::size_t>(pos + i)] = br[static_cast<std::size_t>(i)];
         }
-        if ((blockIndex % 128) == 0)
-            std::printf("    %5.1f 秒  位置 (%5.1f, %5.1f)  回折 %d本  反射 %d本\n",
-                        static_cast<float>(pos) / kSampleRate, L.x, L.z, nd, ne);
+        if ((blockIndex % 128) == 0) {
+            // 何が鳴っているのかを内訳で出す。定位が出ない原因の切り分け用。
+            const float gTrans = broadband(taps[0].gain6);
+            float gDif = 0.0f, gRef = 0.0f;
+            for (int i = 1; i < nTaps; ++i)
+                ((i <= nd) ? gDif : gRef) += broadband(taps[i].gain6);
+            const float dxBest = (bestDiff >= 0) ? taps[bestDiff].dirX : 0.0f;
+            // 反射タップが左右の情報を持っているか。ゲインで重み付けした左右成分の和。
+            //   ここが 0 に近ければ、反射は左右対称に届いていて定位を運べていない。
+            float refDx = 0.0f, refW = 0.0f;
+            for (int i = 1 + nd; i < nTaps; ++i) {
+                const float g = broadband(taps[i].gain6);
+                refDx += taps[i].dirX * g; refW += g;
+            }
+            refDx = (refW > 1e-6f) ? refDx / refW : 0.0f;
+            std::printf("    %5.1f 秒 位置(%5.1f,%5.1f) 回折%d本 反射%d本 | "
+                        "透過 %.4f 回折 %.4f 反射 %.4f | 回折の左右 %+.2f 反射の左右 %+.2f\n",
+                        static_cast<float>(pos) / kSampleRate, L.x, L.z, nd, ne,
+                        gTrans, gDif, gRef, dxBest, refDx);
+            // 出力の内訳。方向を持つのは直接音とタップだけで、散乱と尾は持たない。
+            const float tot = mt.rmsOut > 1e-12f ? mt.rmsOut : 1.0f;
+            std::printf("           出力の内訳: 直接 %4.1f%% / タップ %4.1f%% / "
+                        "散乱 %4.1f%% / 尾 %4.1f%%\n",
+                        100.0f * mt.rmsDirect / tot, 100.0f * mt.rmsEarly / tot,
+                        100.0f * mt.rmsScatter / tot, 100.0f * mt.rmsTail / tot);
+        }
         pos += n;
         ++blockIndex;
     }
@@ -299,12 +346,14 @@ int main(int argc, char** argv) {
     //     click … ドライ信号を過渡音にする（反射の粒が見える。ノイズは粒を隠す）
     if (argc > 1 && std::string(argv[1]) == "corridor") {
         const char* out = (argc > 2) ? argv[2] : "corridor.wav";
-        bool ear = true, clk = false;
+        bool ear = true, clk = false, nt = false, om = false;
         for (int a = 3; a < argc; ++a) {
             if (std::string(argv[a]) == "ear0") ear = false;
             if (std::string(argv[a]) == "click") clk = true;
+            if (std::string(argv[a]) == "notail") nt = true;
+            if (std::string(argv[a]) == "onemodel") om = true;
         }
-        return renderCorridor(out, ear, clk);
+        return renderCorridor(out, ear, clk, nt, om);
     }
     const char* outPath = (argc > 1) ? argv[1] : "door_sweep.wav";
     // 第2引数に btm を渡すと回折を BTM（有限楔の稜線積分）で出す。鳴らし比べ用。

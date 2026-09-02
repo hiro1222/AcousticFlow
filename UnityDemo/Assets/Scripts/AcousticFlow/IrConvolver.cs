@@ -47,6 +47,71 @@ namespace AcousticFlow
             public static volatile float PhysicalRatio;     // 圧縮前の物理比 (r/r_c)²（診断用）
             public static volatile float SplitMs;      // 早期↔後期の境目(ms)。部屋の大きさで動く
             public static volatile int ActiveParts;    // 実際に計算しているパーティション数
+
+            // 【道具10 音源予算メータ】audio thread の実測時間(ms/block)。添字は sourceIndex。
+            //   各インスタンスが自分の枠だけに書くので競合しない（float の書き込みは原子的）。
+            //   これが無いと予算メータが「1音源 0.292ms の実測値 × 本数」の推定になってしまい、
+            //   遮蔽の有無で実際には数倍違う（コストは遮蔽された音源数で効く）という実測と食い違う。
+            //   EMA で均してあるので、表示は「いまの平均的な 1 ブロックの代金」。
+            public const int MaxMeteredSources = 64;
+            public static readonly float[] BlockMs = new float[MaxMeteredSources];
+            public static readonly int[] BlockFrames = new int[MaxMeteredSources];
+            public static volatile int MeteredMax = -1;   // 実際に書かれた最大の sourceIndex
+
+            // 【道具A 寄与度順の一覧】音源ごとの出力 RMS。上の RmsOut は全音源まとめた 1 本なので、
+            //   「どれが実際に大きいか」がそれでは割れない。添字は sourceIndex。
+            //   ★ミュート中も「鳴っていたはずの量」を出す（消した音の大きさが見えないと比べられない）。
+            public static readonly float[] OutRms = new float[MaxMeteredSources];
+        }
+
+        /// 【道具A ソロ／ミュート】Editor が書き、メインスレッドの RebuildIr が読む。
+        ///
+        /// ★既定は素通し。何も切っていない状態では従来と 1 サンプルも変わらない。
+        ///   タップの取捨は IR の組み立て（RebuildIr＝メインスレッド）でやるので、
+        ///   audio thread に判定は増えない。しかも既存のクロスフェード（_pendingIr の
+        ///   参照swap）がそのまま効くので、ソロを切り替えても音が飛ばない。
+        public static class Solo
+        {
+            public const int MaxSources = 64;
+
+            public static int Only = -1;                       // -1 = 全部鳴らす。0以上ならその音源だけ
+            public static readonly bool[] Mute = new bool[MaxSources];
+            public static bool PassDirect = true;              // タップ種別 'D'
+            public static bool PassReflect = true;             // 'R'
+            public static bool PassDiffract = true;            // 'F'
+            public static bool PassTail = true;                // 後期尾（タップではないので別枠）
+
+            public static bool IsDefault
+            {
+                get
+                {
+                    if (Only >= 0) return false;
+                    if (!PassDirect || !PassReflect || !PassDiffract || !PassTail) return false;
+                    for (int i = 0; i < MaxSources; i++) if (Mute[i]) return false;
+                    return true;
+                }
+            }
+
+            public static bool AllowsSource(int idx)
+            {
+                if (idx < 0 || idx >= MaxSources) return true;
+                if (Only >= 0 && idx != Only) return false;
+                return !Mute[idx];
+            }
+
+            public static bool AllowsType(char t)
+            {
+                if (t == 'R') return PassReflect;
+                if (t == 'F') return PassDiffract;
+                return PassDirect;      // 'D' と、種別が入っていない古いデータ
+            }
+
+            public static void Reset()
+            {
+                Only = -1;
+                PassDirect = PassReflect = PassDiffract = PassTail = true;
+                for (int i = 0; i < MaxSources; i++) Mute[i] = false;
+            }
         }
 
         [Tooltip("ON: 内部テスト信号を畳み込む（ドライ素材不要）。OFF: このAudioSourceのクリップを畳み込む。")]
@@ -663,10 +728,15 @@ namespace AcousticFlow
             // 打ち切りは「早期↔後期の境目」。ここから先は尾の畳み込みが担当するので、
             // 早期タップが越境すると二重計上になる。
             int maxDelay = Mathf.CeilToInt(Mathf.Min(_splitMs, maxIrMs) * 0.001f * _sampleRate);
+            // 【道具A】経路単位のソロ／ミュート。既定（素通し）のときは判定ごと飛ばす。
+            bool soloOn = !Solo.IsDefault;
+            var tapType = ts.Type;
+
             var ir = new ConvTap[tc];
             int n = 0;
             for (int i = 0; i < tc && i < d.Length; i++)
             {
+                if (soloOn && tapType != null && i < tapType.Length && !Solo.AllowsType(tapType[i])) continue;
                 int ds = Mathf.RoundToInt(d[i] * 0.001f * _sampleRate);
                 if (ds < 0) ds = 0;
                 if (ds > maxDelay) continue;
@@ -734,6 +804,9 @@ namespace AcousticFlow
             // Awake 前に audio thread が来ることがある。準備前は無音を返す（掴んだ素材を素通しさせない）。
             if (!_ready) { System.Array.Clear(data, 0, data.Length); return; }
 
+            // 【道具10】このブロックの実費を測る。QPC 読みが 2 回だけなので実質ゼロ。
+            long meterT0 = System.Diagnostics.Stopwatch.GetTimestamp();
+
             var pending = Interlocked.Exchange(ref _pendingIr, null);
             if (pending != null)
             {
@@ -750,6 +823,11 @@ namespace AcousticFlow
             if (srcLv <= 0f) srcLv = 1f;
             bool useFdn = (tailMode == TailMode.Fdn) && enableReverbTail;
             float fdnWet = useFdn ? tailLevel * wet * srcLv : 0f;
+
+            // 【道具A】尾はタップではないので、ここで別に落とす。
+            //   遅延線と FDN 自体は回し続ける（止めると解除したときに状態が飛ぶ）。
+            float tailGate = Solo.PassTail ? 1f : 0f;
+            fdnWet *= tailGate;
 
             EnsureTailScratch(frames);
 
@@ -919,7 +997,7 @@ namespace AcousticFlow
                 }
 
                 // 実測尾を加算。
-                float tL = _tailOut[0][f], tR = _tailOut[1][f];
+                float tL = _tailOut[0][f] * tailGate, tR = _tailOut[1][f] * tailGate;
                 sumTail += (tL * tL + tR * tR) * 0.5f;
                 outL += tL; outR += tR;
 
@@ -954,6 +1032,24 @@ namespace AcousticFlow
             Scope.RmsScatter = Mathf.Lerp(Scope.RmsScatter, Mathf.Sqrt(sumScatter * inv), k);
             Scope.RmsTail = Mathf.Lerp(Scope.RmsTail, Mathf.Sqrt(sumTail * inv), k);
             Scope.RmsOut = Mathf.Lerp(Scope.RmsOut, Mathf.Sqrt(sumOut * inv), k);
+
+            // 【道具10】このブロックの実費を自分の枠へ。RMS と同じ k で均す。
+            if (sourceIndex >= 0 && sourceIndex < Scope.MaxMeteredSources)
+            {
+                float ms = (float)((System.Diagnostics.Stopwatch.GetTimestamp() - meterT0) * 1000.0
+                                   / System.Diagnostics.Stopwatch.Frequency);
+                Scope.BlockMs[sourceIndex] = Mathf.Lerp(Scope.BlockMs[sourceIndex], ms, k);
+                Scope.BlockFrames[sourceIndex] = frames;
+                if (sourceIndex > Scope.MeteredMax) Scope.MeteredMax = sourceIndex;
+
+                // 【道具A】音源ごとの出力。★消す前の量を出す（比べるために要る）。
+                Scope.OutRms[sourceIndex] = Mathf.Lerp(Scope.OutRms[sourceIndex], Mathf.Sqrt(sumOut * inv), k);
+            }
+
+            // 【道具A】音源ごとのミュート／ソロ。
+            //   ★ここで data を消すのは「計算を止めない」ため。計算ごと飛ばすと遅延線と
+            //     FDN の状態が進まず、解除したときに音が飛ぶ（それは連続性の事故そのもの）。
+            if (!Solo.AllowsSource(sourceIndex)) System.Array.Clear(data, 0, data.Length);
         }
 
         // 1つのIRを畳んで L/R と「拡散送り」を返す（6帯域×タップ×パン）。
