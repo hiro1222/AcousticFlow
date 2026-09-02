@@ -9674,6 +9674,30 @@ void testDoorWorksForOffAxisSources() {
         check("[主題][概念] 左蝶番 40° で右の音源が左より 4 dB 以上明るい（鏡像）",
               dL[2] - dL[0] >= 4.0f, buf);
     }
+
+    // ── 型紙 1: 板の縁を越える瞬間に跳ばない（扉のピラー D4）──
+    //   2026-09-02 の実測: 蝶番側の音源3 が 127° −15.1 → 128° −8.0 → 129° −5.5（2° で 9.6 dB）。
+    //   開いた板の縁が見通し線を横切る瞬間、直接経路の遮蔽判定が二値で切り替わっていた。
+    //   ★角度 1° あたり 3 dB を上限にする。半影の幅は帯域で違う（125Hz ≒ 40°、4kHz ≒ 8°）
+    //     ので、広帯域の値が滑らかでも高域は速く動く ── それは正しいが、二値で跳ぶのは別物。
+    {
+        float prev = 0.0f, maxStep = 0.0f, stepAt = 0.0f, last = 0.0f;
+        bool first = true;
+        for (float deg = 118.0f; deg <= 136.01f; deg += 1.0f) {
+            float b3[3][kBands] = {}, d3[3] = {};
+            measure(deg, true, false, b3, d3);
+            if (!first) {
+                const float s = std::fabs(d3[2] - prev);
+                if (s > maxStep) { maxStep = s; stepAt = deg; }
+            }
+            prev = d3[2]; last = d3[2]; first = false;
+        }
+        std::snprintf(buf, sizeof(buf), "(最大 %.1f dB/° @ %.0f°)", maxStep, stepAt);
+        check("[主題][型紙1] 蝶番側の音源が板の縁を越えるとき 1° で 3 dB 以上跳ばない",
+              maxStep <= 3.0f, buf);
+        std::snprintf(buf, sizeof(buf), "(136° で %.1f dB)", last);
+        check("[主題] 136° では蝶番側の音源も開いている（> −8 dB）", last > -8.0f, buf);
+    }
 }
 
 int main() {

@@ -38,11 +38,13 @@ function Build([string[]]$targets) {
   if ($LASTEXITCODE -ne 0) { throw "ビルド失敗 (exit $LASTEXITCODE)" }
 }
 
+# ⚠ exe の標準出力をパイプに乗せたまま return すると、呼び出し側の `| Out-Null` で
+#   **出力ごと捨てられる**（table の結果が空になった）。出力は素通しにして、終了コードだけ見る。
 function RunExe([string]$name, [string[]]$exeArgs) {
   $exe = Join-Path $bin $name
   if (-not (Test-Path $exe)) { throw "見つかりません: $exe（先に build）" }
   & $exe @exeArgs
-  return $LASTEXITCODE
+  if ($LASTEXITCODE -ne 0) { Write-Warning "$name exit $LASTEXITCODE" }
 }
 
 switch ($Cmd) {
@@ -71,7 +73,7 @@ switch ($Cmd) {
       if ($a -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { Set-Item -Path ("Env:" + $Matches[1]) -Value $Matches[2] }
       else { $exeArgs += $a }
     }
-    RunExe "AfPatternTable.exe" $exeArgs | Out-Null
+    RunExe "AfPatternTable.exe" $exeArgs
   }
 
   "pdf"    { & powershell -ExecutionPolicy Bypass -File (Join-Path $root "portfolio\build.ps1") }
