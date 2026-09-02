@@ -2132,15 +2132,31 @@ public:
         static thread_local std::vector<Poly> polys;
         polys.clear();
 
-        // 点をリスナーから面へ透視投影する。面より手前/後ろに回り込む点は捨てる。
-        const float planeD = dot(nrm, centerP - listener);
+        // 点を**投影の原点**（リスナー or 音源）から面へ透視投影する。面より手前/後ろに回り込む点は捨てる。
+        //
+        // ★2026-09-02: 影を**リスナー側と音源側の両方**から落とすようにした（下の side ループ）。
+        //   閉扉で両脇の音源が −6 dB しか落ちない不具合の根がここ。診断の数字:
+        //     縁u 0.73 / 縁v 1.00  ── 窓の上下の行が 100% 開いている
+        //   窓は 125 Hz のフレネル半径 ×3（≒ 6 m 角）で**建物より大きく**、床・天井・側壁の
+        //   **外側**（リスナーが立つ屋外）に窓がはみ出す。そこには何も無いので
+        //   リスナーから見ると「開いている」── だが**音源から見ればその領域は室内の壁に遮られて
+        //   いる**ので、音は通れない。片側からしか影を落とさないと、通れない領域を開口に数え、
+        //   窓の縁まで開いている＝半空間、と判定されて f を捨て前川へ落ちていた（openGain 1.0）。
+        //   窓の点が開口として意味を持つのは**両端から見えるとき**だけ。だから両側から影を落とし、
+        //   行ごとの和集合で塞ぐ。窓が部屋より大きいこと自体は変えていない（低域に必要）。
+        //   ⚠ 「窓を部屋の大きさに切る」は採らない ── 部屋という概念をコアに持たない方針
+        //     （2326 行付近の記録）。両側の影なら幾何だけで閉じる。
+        const float planeD  = dot(nrm, centerP - listener);
+        const float planeDs = dot(nrm, centerP - source);
+        Vec3  projOrigin = listener;     // side ループが差し替える
+        float projPlaneD = planeD;
         auto project = [&](const Vec3& q, float& ou, float& ov) -> bool {
-            const Vec3 dq = q - listener;
+            const Vec3 dq = q - projOrigin;
             const float den = dot(nrm, dq);
             if (std::fabs(den) < 1e-6f) return false;
-            const float t = planeD / den;
+            const float t = projPlaneD / den;
             if (t <= 0.0f) return false;
-            const Vec3 p = listener + dq * t;
+            const Vec3 p = projOrigin + dq * t;
             ou = dot(p - centerP, u);
             ov = dot(p - centerP, v);
             return true;
@@ -2173,6 +2189,14 @@ public:
         //   上の「頂点が 1 つでも後ろなら箱ごと捨てる」が偶然その役目を兼ねている。
         //   近平面クリップを入れるならこの除外も明示的に足す必要がある（試して確認済み。
         //   足すと 4 件の失敗が 2 件まで減ったが、それでも過剰遮蔽が残った）。
+        //
+        // ★side 0 = リスナーから、side 1 = 音源から。どちらの側でも「原点と積分面のあいだ」の帯に
+        //   切ってから投影する（面より向こうの物はその側からは面を塞げない）。
+        //   2 回分の影が polys に溜まり、行ごとの和集合で塞ぐ。
+        for (int side = 0; side < 2; ++side) {
+        projOrigin = (side == 0) ? listener : source;
+        projPlaneD = (side == 0) ? planeD   : planeDs;
+        if (std::fabs(projPlaneD) < 1e-6f) continue;   // 原点が面上（退化）。この側は塞げない
         for (const Instance& inst : instances_) {
             if (!inst.active || static_cast<int>(polys.size()) >= kMaxPoly) continue;
             if (inst.geomId >= 0 && inst.geomId < static_cast<int>(meshes_.size())
@@ -2232,8 +2256,8 @@ public:
                     vtx[i] = ob.center + ob.axisX * (ob.halfExtents.x * sx)
                                        + ob.axisY * (ob.halfExtents.y * sy)
                                        + ob.axisZ * (ob.halfExtents.z * sz);
-                    sN[i] = (std::fabs(planeD) > 1e-6f)
-                          ? dot(nrm, vtx[i] - listener) / planeD : 0.0f;
+                    sN[i] = (std::fabs(projPlaneD) > 1e-6f)
+                          ? dot(nrm, vtx[i] - projOrigin) / projPlaneD : 0.0f;
                 }
                 // ★★ 遮蔽物を「リスナーと積分面のあいだ」に切ってから投影する ★★
                 //
@@ -2285,6 +2309,7 @@ public:
                 if (pg.n >= 3) polys.push_back(pg);
             }
         }
+        }   // side ループ
         if (polys.empty()) continue;      // この面には影が無い＝この面は絞らない
 
         // ================= 開いている所を一度だけ解き、その上で帯域を回す =================

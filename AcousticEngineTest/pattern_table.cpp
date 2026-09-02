@@ -284,10 +284,11 @@ int main(int argc, char** argv) {
                 const int np = AF_SceneDebugDiffractionPath(
                     s, L, fromSvg(kSrc[i].sx, kSrc[i].sy, 1.5f), d28, 0);
                 std::printf("   [診断] %s 経路%d  フレネル=%s  面%d 有界%d 落%d  "
-                            "openGain %.4f  δ %.3f\n",
+                            "openGain %.4f  δ %.3f  縁u %.2f 縁v %.2f  slit %.2f\n",
                             kSrc[i].name, np,
                             (d28[18] > 0.5f) ? "はい" : "★いいえ(前川)",
-                            (int)d28[22], (int)d28[23], (int)d28[26], d28[1], d28[0]);
+                            (int)d28[22], (int)d28[23], (int)d28[26], d28[1], d28[0],
+                            d28[24], d28[25], d28[2]);
             }
 
             if (csv) {
