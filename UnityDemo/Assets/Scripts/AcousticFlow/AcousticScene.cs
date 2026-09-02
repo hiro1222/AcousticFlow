@@ -604,6 +604,12 @@ namespace AcousticFlow
                 return Native.AF_SceneRoomShareAt(_handle, new AFVector3(p), radius,
                                                   outRooms, outWeights, cap);
             }
+            catch (System.EntryPointNotFoundException)
+            {
+                // 古い DLL（Unity が掴んだまま差し替えられなかった時）。部屋どうしの割合で代用する。
+                //   屋外との境目で 0→1 と跳ぶが、鳴らないよりはよい。Unity を開き直せば新しい口が使われる。
+                return Native.AF_SceneRoomWeights(_handle, new AFVector3(p), radius, outRooms, outWeights, cap);
+            }
             catch (System.Exception) { return 0; }
         }
 

@@ -2507,6 +2507,13 @@ namespace AcousticFlow
             // リスナーのまわりの部屋の占め方（空間版。外の世界も分母）。外の世界の分 = 1 − 合計。
             //   ★部屋どうしの割合（GetRoomWeights）を使うと、外へ開く戸口の 1.8 m 手前で 0→1 と跳ぶ。
             int n = _scene.GetRoomShare(listener.position, roomBlendRadius, _ptRooms, _ptW);
+            if (n <= 0)
+            {
+                // 占め方が取れない（部屋グラフが無い・古い DLL）。部屋の中にいるならその部屋を 1 にして、
+                // 少なくとも従来どおり鳴らす（全部 0 にすると部屋の中で尾が消える）。
+                int here = _scene.RoomAt(listener.position);
+                if (here >= 0) { _ptRooms[0] = here; _ptW[0] = 1f; n = 1; }
+            }
             float sum = 0f;
             for (int i = 0; i < n; i++) sum += _ptW[i];
             float outsideW = Mathf.Clamp01(1f - sum);
