@@ -574,6 +574,11 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_TailBusHasIr(IntPtr bus);
 
+        // 点のまわりの部屋の占め方・空間版（外の世界も分母。合計 ≤ 1、残りが屋外）。扉の定点の (1−w) はこちら。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneRoomShareAt(IntPtr scene, AFVector3 p, float radius,
+                                                     [Out] int[] outRooms, [Out] float[] outWeights, int maxOut);
+
         // ── 扉の定点（隣の空間の響きを戸口の位置から鳴らす）──
         // 直近に Render したブロックの尾のモノラル（左右の平均）。Render の後、同じオーディオスレッドで読む。
         [DllImport(Dll, CallingConvention = Cc)]

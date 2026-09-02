@@ -3668,6 +3668,265 @@ void diagnoseCaveMouth() {
     AF_SceneDestroy(s);
 }
 
+// 歩行の連続性 ── 資料の部屋で決めた道を 5 cm 刻みで歩き、1 歩あたりの変化を種類ごとに印を付ける。
+//   道: 外（戸口の斜め前 4 m）→ 戸口をまたぐ → 部屋の中央 → 柱の裏（音源3 の影）。扉は右蝶番・内開き 60°。
+//   見る量（音源ごと）: 広帯域の生存 dB／低−高／回折の本数と開口率／到来方位（世界系）
+//   見る量（全体）: 部屋の占め方 w／エコグラムの総量と 200→600 ms の傾き（尾の形）
+//   印の種類:
+//     経路   … 回折の本数が変わる、フレネル可否が切り替わる（経路の生まれ消え）
+//     レベル … 生存が 1 歩で 2 dB 超
+//     方向   … 到来方位が 1 歩で 25° 超なのにレベルが 1 dB も動かない（像だけ飛ぶ）
+//     尾の形 … 傾きが 60 dB/s 超、または総量が 2 dB 超動く（IR の差し替えが跳ぶ原因）
+//     部屋   … 占め方 w が 1 歩で 0.15 超
+//   ★これはエンジンの**目標値**の連続性。ホストの周期の段と平滑は別の話（ここでは測れない）。
+//   同じ道を「稜線探索（既定）」と「稜線ポータル ON」の 2 回歩き、経路の印が減るかを比べる。
+void diagnoseWalkContinuity() {
+    std::printf("\n[診断] 歩行の連続性（外 → 戸口 → 中央 → 柱の裏、5 cm 刻み。扉 60° 内開き）\n");
+    const float roomW = 7.08f, roomD = 3.48f, roomH = 3.0f, wall = 0.16f;
+    const float doorW = 1.40f, doorH = 2.0f, doorT = 0.08f;
+    const float gapCx = 3.54f;
+    const float gapL = gapCx - doorW * 0.5f, gapR = gapCx + doorW * 0.5f;
+    const float hw = wall * 0.5f, cy = roomH * 0.5f, zf = roomD + hw;
+    const AF_Vector3 src[3] = { V((306.0f-146.0f)/100.0f, 1.5f, (432.0f-196.0f)/100.0f),
+                                V((500.0f-146.0f)/100.0f, 1.5f, (320.0f-196.0f)/100.0f),
+                                V((694.0f-146.0f)/100.0f, 1.5f, (432.0f-196.0f)/100.0f) };
+    bool useRefl = true;   // 「反射なし」の回で false（役割1 の反射込みレイが跳びの担い手かを切り分ける）
+    auto buildScene = [&](bool edgeP) -> AF_SceneHandle {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        auto box = [&](AF_Vector3 c, AF_Vector3 he) {
+            AF_SceneAddInstanceBox(s, c, he, V(1,0,0), V(0,1,0), mat);
+        };
+        box(V(-hw, cy, roomD*0.5f), V(hw, cy, roomD*0.5f + wall));
+        box(V(roomW + hw, cy, roomD*0.5f), V(hw, cy, roomD*0.5f + wall));
+        box(V(roomW*0.5f, cy, -hw), V(roomW*0.5f + wall, cy, hw));
+        box(V(roomW*0.5f, roomH + hw, roomD*0.5f), V(roomW*0.5f + wall, hw, roomD*0.5f + wall));
+        box(V(roomW*0.5f, -hw, roomD*0.5f), V(roomW*0.5f + wall, hw, roomD*0.5f + wall));
+        box(V(gapL*0.5f, cy, zf), V(gapL*0.5f, cy, hw));
+        box(V((gapR + roomW)*0.5f, cy, zf), V((roomW - gapR)*0.5f, cy, hw));
+        box(V(gapCx, (doorH + roomH)*0.5f, zf), V(doorW*0.5f, (roomH - doorH)*0.5f, hw));
+        // 柱（音源3 と「柱の裏」の道の間）
+        box(V(5.0f, cy, 1.2f), V(0.2f, cy, 0.2f));
+        // 扉 60°・右蝶番・内開き（pattern_table と同じ式）
+        const int doorId = AF_SceneAddInstanceBox(s, V(gapCx, doorH*0.5f, zf),
+            V(doorW*0.5f, doorH*0.5f, doorT*0.5f), V(1,0,0), V(0,1,0), mat);
+        {
+            const float th = 60.0f * 3.14159265f / 180.0f;
+            const float c = std::cos(th), sn = std::sin(th);
+            const float hinge = gapR, rx = gapCx - hinge;
+            const float sgn = (rx < 0.0f) ? 1.0f : -1.0f;
+            AF_SceneUpdateInstance(s, doorId, V(hinge + rx*c, doorH*0.5f, zf - std::fabs(rx)*sn),
+                V(doorW*0.5f, doorH*0.5f, doorT*0.5f), V(c, 0, sgn*sn), V(0,1,0));
+        }
+        AF_UpdateConfig cfg{};
+        cfg.role1EveryN = 1;   cfg.role2EveryN = 1;   cfg.earlyEveryN = 1;
+        cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 1;
+        cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+        cfg.directWeight = 1.0f;  cfg.useReflections = useRefl ? 1 : 0;
+        cfg.useEdgeCatalog = 1;   cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+        cfg.enableReverb = 1;     cfg.echogramBins = 100;  cfg.echogramBinSeconds = 0.01f;
+        // ★跳ね返り 24 回だと平均自由行程 2.6 m × 24 = 62 m ≒ 180 ms で尾が切れる
+        //   （実測: 200 ms −18.7 dB、300 ms 以降は無音）。尾の形を測るので 96 回にする。
+        cfg.echogramRays = 512;   cfg.echogramBounces = 96;
+        cfg.speedOfSound = 343.0f; cfg.distanceRef = 1.5f;
+        cfg.enableEarlyReflections = 1; cfg.earlyTaps = 4;
+        cfg.earlyRays = 512; cfg.earlyBounces = 2;
+        cfg.enableDiffractionSources = 1; cfg.diffSources = 3;
+        AF_SceneSetUpdateConfig(s, &cfg);
+        AF_SceneSetEdgePortals(s, edgeP ? 1 : 0);
+        // ★種の半径は戸口の半幅より大きくする。既定 0.6 m だと幅 1.40 m の戸口（半幅 0.70）の
+        //   真ん中が種になり、部屋の種と外の世界の種が戸口越しに繋がって部屋が 0 個になる
+        //   （実測: 部屋 0 個・中の 3 点が全部 -1）。洞窟の口 1.2 m は半幅 0.6 で境目だった。
+        AF_SceneSetRoomSeedRadius(s, 0.8f);
+        for (int i = 0; i < 3; ++i) AF_SceneSetSource(s, (unsigned long long)(i + 1), src[i]);
+        return s;
+    };
+    // 道（折れ線）を 5 cm 刻みに
+    const AF_Vector3 wp[5] = { V(gapCx - 1.5f, 1.6f, zf + 4.0f), V(gapCx - 0.2f, 1.6f, zf + 0.3f),
+                               V(gapCx - 0.2f, 1.6f, zf - 0.4f), V(3.54f, 1.6f, 1.74f), V(4.6f, 1.6f, 0.4f) };
+    const char* legName[4] = { "外→戸口", "戸口", "中へ", "柱の裏へ" };
+    struct Pt { AF_Vector3 p; int leg; float dist; };
+    std::vector<Pt> pts;
+    {
+        float acc = 0.0f;
+        for (int l = 0; l < 4; ++l) {
+            const float dx = wp[l+1].x - wp[l].x, dz = wp[l+1].z - wp[l].z;
+            const float len = std::sqrt(dx*dx + dz*dz);
+            const int n = std::max(1, static_cast<int>(len / 0.05f));
+            for (int k = (l == 0 ? 0 : 1); k <= n; ++k) {
+                const float t = static_cast<float>(k) / n;
+                pts.push_back({ V(wp[l].x + dx*t, 1.6f, wp[l].z + dz*t), l, acc + len * t });
+            }
+            acc += len;
+        }
+    }
+    struct Rec { float db[3], tilt[3], open[3], az[3], soft[3], dif[3], refl[3]; int np[3], fres[3], nref[3]; float w0, tot, slope; };
+    auto measureAt = [&](AF_SceneHandle s, const AF_Vector3& L, int roomIn, Rec& r) {
+        AF_SceneSetListener(s, L);
+        for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        for (int i = 0; i < 3; ++i) {
+            const int idx = AF_SceneSourceIndex(s, (unsigned long long)(i + 1));
+            float b6[kBands] = {};
+            AF_SceneGetSourceOcclusion(s, idx, b6);
+            double e2 = 0.0; for (int b = 0; b < kBands; ++b) e2 += b6[b] * b6[b];
+            r.db[i] = static_cast<float>(10.0 * std::log10(std::max(e2 / kBands, 1e-12)));
+            // 生存の合成前の 2 つの担い手（直接の半影＝振幅、回折＝ポータル混合後）。跳びの担い手を分ける。
+            float sft6[kBands] = {}, dif6[kBands] = {};
+            AF_SceneDebugSurvivalParts(s, L, src[i], sft6, dif6);
+            double s2 = 0.0, d2 = 0.0;
+            for (int b = 0; b < kBands; ++b) { s2 += sft6[b] * sft6[b]; d2 += dif6[b] * dif6[b]; }
+            r.soft[i] = static_cast<float>(10.0 * std::log10(std::max(s2 / kBands, 1e-12)));
+            r.dif[i]  = static_cast<float>(10.0 * std::log10(std::max(d2 / kBands, 1e-12)));
+            AF_Vector3 ep[16]; float eg6[16 * kBands] = {};
+            r.nref[i] = AF_SceneGetEarlyReflections(s, idx, ep, eg6, 16);
+            double re = 0.0;
+            for (int k = 0; k < r.nref[i]; ++k)
+                for (int b = 0; b < kBands; ++b) re += eg6[k * kBands + b] * eg6[k * kBands + b] / kBands;
+            r.refl[i] = static_cast<float>(10.0 * std::log10(std::max(re, 1e-12)));
+            r.tilt[i] = 20.0f * std::log10(std::max(b6[0], 1e-6f) / std::max(b6[5], 1e-6f));
+            float d28[28] = {};
+            r.np[i] = AF_SceneDebugDiffractionPath(s, L, src[i], d28, 0);
+            r.open[i] = d28[1];
+            r.fres[i] = (d28[18] > 0.5f) ? 1 : 0;
+            float ad[3] = {0, 0, 1};
+            AF_SceneGetSourceArrivalDir(s, idx, ad);
+            r.az[i] = std::atan2(ad[0], ad[2]) * 180.0f / 3.14159265f;
+        }
+        int ids[8]; float w[8];
+        const int n = AF_SceneRoomShareAt(s, L, 2.0f, ids, w, 8);   // 空間版（外の世界も分母）
+        r.w0 = 0.0f;
+        for (int i = 0; i < n; ++i) if (ids[i] == roomIn) r.w0 = w[i];
+        float echo[100 * kBands] = {};
+        const int bins = AF_SceneGetEchogramBands(s, -1, echo, 100);
+        double tot = 0.0, m1 = 0.0, m2 = 0.0; int c1 = 0, c2 = 0;
+        for (int k = 0; k < bins; ++k) {
+            double v = 0.0;
+            for (int b = 0; b < kBands; ++b) v += echo[k * kBands + b];
+            v /= kBands; tot += v;
+            if (v > 1e-14) {
+                if (k >= 20 && k < 30) { m1 += std::log10(v); ++c1; }   // 200〜290 ms
+                if (k >= 40 && k < 50) { m2 += std::log10(v); ++c2; }   // 400〜490 ms
+            }
+        }
+        r.tot = static_cast<float>(10.0 * std::log10(std::max(tot, 1e-12)));
+        r.slope = (c1 > 0 && c2 > 0) ? static_cast<float>(10.0 * (m2 / c2 - m1 / c1) / 0.2) : 0.0f;
+    };
+    auto run = [&](bool edgeP, const char* label) {
+        AF_SceneHandle s = buildScene(edgeP);
+        AF_SceneSetListener(s, wp[0]);
+        for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        const int roomIn = AF_SceneRoomAt(s, V(3.54f, 1.6f, 1.74f));
+        std::printf("      ── %s ──（%d 歩、部屋の中 = 部屋%d）\n", label, static_cast<int>(pts.size()), roomIn);
+        {
+            int nx = 0, ny = 0, nz = 0; float cell = 0.0f;
+            AF_SceneRoomGridDims(s, &nx, &ny, &nz, &cell);
+            std::printf("      部屋 %d 個 / 格子 %d×%d×%d セル %.2f / 中の 3 点の部屋 %d %d %d / 外 %d\n",
+                        AF_SceneRoomCount(s), nx, ny, nz, cell,
+                        AF_SceneRoomAt(s, V(1.5f, 1.6f, 1.5f)), AF_SceneRoomAt(s, V(3.54f, 1.6f, 1.74f)),
+                        AF_SceneRoomAt(s, V(5.5f, 1.6f, 2.4f)), AF_SceneRoomAt(s, wp[0]));
+        }
+        int nPath = 0, nLevel = 0, nDir = 0, nTail = 0, nRoom = 0, shown = 0;
+        float maxLv[3] = {0, 0, 0}; float maxLvAt[3] = {0, 0, 0};
+        float maxSlope = 0.0f, maxSlopeAt = 0.0f, maxW = 0.0f, maxWAt = 0.0f;
+        float totMin = 1e9f, totMax = -1e9f, slopeMin = 1e9f, slopeMax = -1e9f;
+        Rec prev{}; bool have = false;
+        for (const Pt& q : pts) {
+            Rec r{};
+            measureAt(s, q.p, roomIn, r);
+            totMin = std::min(totMin, r.tot); totMax = std::max(totMax, r.tot);
+            slopeMin = std::min(slopeMin, r.slope); slopeMax = std::max(slopeMax, r.slope);
+            if (have) {
+                char why[256]; int wl = 0; why[0] = 0;
+                bool flag = false;
+                for (int i = 0; i < 3; ++i) {
+                    if (r.db[i] < -50.0f && prev.db[i] < -50.0f) continue;   // 聞こえない所は見ない
+                    const float dl = std::fabs(r.db[i] - prev.db[i]);
+                    if (dl > maxLv[i]) { maxLv[i] = dl; maxLvAt[i] = q.dist; }
+                    const bool pathChg = (r.np[i] != prev.np[i]) || (r.fres[i] != prev.fres[i]);
+                    float dOpen = 0.0f;
+                    if (r.open[i] > 1e-4f && prev.open[i] > 1e-4f)
+                        dOpen = std::fabs(20.0f * std::log10(r.open[i] / prev.open[i]));
+                    float dAz = std::fabs(r.az[i] - prev.az[i]); if (dAz > 180.0f) dAz = 360.0f - dAz;
+                    if (pathChg || dOpen > 3.0f) {
+                        ++nPath; flag = true;
+                        wl += std::snprintf(why + wl, sizeof(why) - wl, " 音源%d:経路(本 %d→%d 開口 %.3f→%.3f)",
+                                            i + 1, prev.np[i], r.np[i], prev.open[i], r.open[i]);
+                    }
+                    if (dl > 2.0f) {
+                        ++nLevel; flag = true;
+                        // 担い手: 直接の半影／回折／早期反射（本数の変化も）のどれが動いたか。
+                        const float dsft = std::fabs(r.soft[i] - prev.soft[i]);
+                        const float ddif = std::fabs(r.dif[i] - prev.dif[i]);
+                        const float dref = std::fabs(r.refl[i] - prev.refl[i]);
+                        char who[96]; int q = 0; who[0] = 0;
+                        if (dsft > 2.0f) q += std::snprintf(who + q, sizeof(who) - q, "・半影%.1f", dsft);
+                        if (ddif > 2.0f) q += std::snprintf(who + q, sizeof(who) - q, "・回折%.1f", ddif);
+                        if (dref > 2.0f || r.nref[i] != prev.nref[i])
+                            q += std::snprintf(who + q, sizeof(who) - q, "・反射%.1f(%d→%d本)", dref, prev.nref[i], r.nref[i]);
+                        wl += std::snprintf(why + wl, sizeof(why) - wl, " 音源%d:レベル(%.1f→%.1f dB%s)",
+                                            i + 1, prev.db[i], r.db[i], who);
+                    }
+                    if (dAz > 25.0f && dl < 1.0f) {
+                        ++nDir; flag = true;
+                        wl += std::snprintf(why + wl, sizeof(why) - wl, " 音源%d:方向(%.0f°→%.0f°)",
+                                            i + 1, prev.az[i], r.az[i]);
+                    }
+                    if (wl > 200) break;
+                }
+                const float ds = std::fabs(r.slope - prev.slope), dt = std::fabs(r.tot - prev.tot);
+                if (ds > maxSlope) { maxSlope = ds; maxSlopeAt = q.dist; }
+                if (ds > 60.0f || dt > 2.0f) {
+                    ++nTail; flag = true;
+                    if (wl < 200) wl += std::snprintf(why + wl, sizeof(why) - wl, " 尾の形(傾き %.0f→%.0f dB/s 総量 %.1f→%.1f)",
+                                                      prev.slope, r.slope, prev.tot, r.tot);
+                }
+                const float dw = std::fabs(r.w0 - prev.w0);
+                if (dw > maxW) { maxW = dw; maxWAt = q.dist; }
+                if (dw > 0.15f) {
+                    ++nRoom; flag = true;
+                    if (wl < 200) wl += std::snprintf(why + wl, sizeof(why) - wl, " 部屋(w %.2f→%.2f)", prev.w0, r.w0);
+                }
+                if (flag && shown < 24) {
+                    ++shown;
+                    std::printf("        %5.2f m [%s] (%.2f, %.2f)%s\n", q.dist, legName[q.leg], q.p.x, q.p.z, why);
+                }
+            }
+            prev = r; have = true;
+        }
+        std::printf("      印の数: 経路 %d / レベル %d / 方向 %d / 尾の形 %d / 部屋 %d%s\n",
+                    nPath, nLevel, nDir, nTail, nRoom, (shown >= 24) ? "（表示は 24 行まで）" : "");
+        std::printf("      1 歩の最大: 音源1 %.1f dB(%.2f m) 音源2 %.1f dB(%.2f m) 音源3 %.1f dB(%.2f m) / "
+                    "尾の傾き %.0f dB/s(%.2f m) / 部屋 w %.2f(%.2f m)\n",
+                    maxLv[0], maxLvAt[0], maxLv[1], maxLvAt[1], maxLv[2], maxLvAt[2],
+                    maxSlope, maxSlopeAt, maxW, maxWAt);
+        std::printf("      尾の総量 %.1f〜%.1f dB / 200→600 ms の傾き %.0f〜%.0f dB/s（0 なら測れていない）\n",
+                    totMin, totMax, slopeMin, slopeMax);
+        {
+            // 尾の傾きが 0 のままなら、エコグラムのどのビンに何があるかを 1 点で見る（部屋の中央）。
+            AF_SceneSetListener(s, V(3.54f, 1.6f, 1.74f));
+            for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+            float echo[100 * kBands] = {};
+            const int bins = AF_SceneGetEchogramBands(s, -1, echo, 100);
+            std::printf("      エコグラム（部屋の中央、bins=%d）ビン別の広帯域エネルギー(dB):", bins);
+            const int ks[8] = {0, 2, 5, 10, 20, 30, 50, 80};
+            for (int q = 0; q < 8; ++q) {
+                const int k = ks[q];
+                if (k >= bins) break;
+                double v = 0.0;
+                for (int b = 0; b < kBands; ++b) v += echo[k * kBands + b];
+                std::printf(" [%dms] %.1f", k * 10, 10.0 * std::log10(std::max(v / kBands, 1e-15)));
+            }
+            std::printf("\n");
+        }
+        AF_SceneDestroy(s);
+    };
+    run(false, "稜線探索（今の既定）");
+    run(true,  "稜線ポータル ON（AF_SceneSetEdgePortals=1）");
+    useRefl = false;
+    run(false, "反射込みレイなし（useReflections=0。外の跳びが役割1 のレイ標本かを切り分ける）");
+    useRefl = true;
+}
+
 void diagnosePillarTimbre() {
     std::printf("\n[診断] 直線上に柱があるだけで音色が変わる理由\n");
     const float h = 4.0f, t = 0.3f, hw = 5.0f, hd = 6.0f;
@@ -10147,6 +10406,7 @@ int main() {
     diagnosePillarTimbre();
     diagnoseReverbSendWalk();
     diagnoseCaveMouth();
+    diagnoseWalkContinuity();
     diagnosePortalScope();
     diagnoseNonPlateBlocker();
     diagnoseApertureWidthCurve();

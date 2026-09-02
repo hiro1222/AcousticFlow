@@ -592,6 +592,20 @@ namespace AcousticFlow
             return Native.AF_SceneRoomWeights(_handle, new AFVector3(p), radius,
                                               outRooms, outWeights, cap);
         }
+        /// 空間版。外の世界も分母に入るので合計は 1 以下（残りが屋外）。
+        ///   屋外との境目で連続に混ぜたい量はこちら（GetRoomWeights は外へ開く戸口で 0→1 と跳ぶ）。
+        public int GetRoomShare(Vector3 p, float radius, int[] outRooms, float[] outWeights)
+        {
+            if (_handle == IntPtr.Zero || outRooms == null || outWeights == null) return 0;
+            int cap = Mathf.Min(outRooms.Length, outWeights.Length);
+            if (cap <= 0) return 0;
+            try
+            {
+                return Native.AF_SceneRoomShareAt(_handle, new AFVector3(p), radius,
+                                                  outRooms, outWeights, cap);
+            }
+            catch (System.Exception) { return 0; }
+        }
 
         // 上の割合で混ぜた実効体積(m3)。0 なら部屋の外。
         // 臨界距離 rc = 0.057√(V/RT60) にそのまま入れられる。

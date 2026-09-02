@@ -337,6 +337,12 @@ public:
         roomGraph();   // 汚れていれば作り直す
         return roomBuilder_.roomWeightsAt(p, radius, rooms, weights, maxOut);
     }
+    // 点のまわりで各部屋が占める「空間の中の割合」。外の世界も分母に入るので合計は 1 以下
+    //   （残りが屋外の分）。屋外との境目で連続に混ぜたい量はこちら（扉の定点が使う）。
+    int roomShare(const Vec3& p, float radius, int* rooms, float* weights, int maxOut) const {
+        roomGraph();
+        return roomBuilder_.roomWeightsAt(p, radius, rooms, weights, maxOut, true);
+    }
 
     // 点における帯域別の残響時間(s)。部屋ごとの Sabine 値を占め方で混ぜたもの。
     //   ★エコグラムから測ると (a) レイのばらつきがそのまま乗る (b) 「-60dB を超える最後の
@@ -4306,7 +4312,10 @@ public:
     //   回り込みを一切解かないので、費用のほぼ全部が消える。
     void computeDirectSoft(const Vec3& listener, const Vec3& source, float outGain[kNumBands],
                            int numSamples, float sourceRadius, float* outDetourDelta,
-                           bool skipDiffraction = false) const {
+                           bool skipDiffraction = false,
+                           float* outSoftAmp6 = nullptr, float* outDif6 = nullptr) const {
+        // outSoftAmp6 / outDif6: 【診断】合成前の 2 つの担い手（直接の半影＝振幅、回折＝ポータル混合後）。
+        //   歩行の走査で「どちらが跳んだか」を分けるための取り出し口。null なら書かない。
         using namespace scene_detail;
         Vec3 dir = source - listener;
         const float dist = length(dir);
@@ -4547,6 +4556,8 @@ public:
             //   回折側は既に「照らされていれば直接音込み」の総合値なので、
             //   後付けのフェードは要らない。max なので同じ縁を二重に数えない。
             outGain[b] = clamp01(std::max(soft, dif[b]));
+            if (outSoftAmp6) outSoftAmp6[b] = soft;
+            if (outDif6) outDif6[b] = dif[b];
         }
         if (outDetourDelta) *outDetourDelta = detourDelta;
     }

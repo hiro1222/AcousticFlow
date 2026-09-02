@@ -673,6 +673,19 @@ ACOUSTIC_API void AF_SceneSetRoomChamferFull(AF_SceneHandle scene, int full);
 ACOUSTIC_API int  AF_SceneRoomWeights(AF_SceneHandle scene, AF_Vector3 p, float radius,
                                       int* outRooms, float* outWeights, int maxOut);
 
+/* 【点のまわりの部屋の占め方・空間版】上と同じ球で測るが、「外の世界」も分母に入れる。
+ * 合計は 1 以下で、残りが屋外の分。屋外との境目で連続に混ぜたい量（扉の定点の (1−w)、
+ * 外へ出るときの残響の量）はこちらを使うこと。
+ * ★上の AF_SceneRoomWeights は部屋どうしの割合（合計 1）なので、外へ開く戸口では
+ *   球が部屋に触れた瞬間に 0→1 と跳ぶ（実測: 戸口の 1.8 m 手前で 1 歩に 0→1.00）。 */
+ACOUSTIC_API int  AF_SceneRoomShareAt(AF_SceneHandle scene, AF_Vector3 p, float radius,
+                                      int* outRooms, float* outWeights, int maxOut);
+
+/* 【診断】生存ゲインの合成前の 2 つの担い手（6 帯域）。outSoft6 = 直接の半影（振幅）、
+ * outDif6 = 回折（ポータル混合後）。生存 = 帯域ごとの max。歩行の走査で「どちらが跳んだか」を分ける用。 */
+ACOUSTIC_API int  AF_SceneDebugSurvivalParts(AF_SceneHandle scene, AF_Vector3 listener, AF_Vector3 source,
+                                             float* outSoft6, float* outDif6);
+
 /* 点における「実効的な部屋の体積」(m3)。上の割合で混ぜたもの。0 なら部屋の外。
  * 残響量の土台（臨界距離 rc = 0.057√(V/RT60)）にそのまま入れられる。
  * レベル全体の外形箱を V に使うと、狭い部屋でも広間でも同じ値になって残響量が合わない。 */

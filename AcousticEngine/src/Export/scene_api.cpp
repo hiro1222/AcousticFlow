@@ -977,6 +977,22 @@ int AF_SceneRoomWeights(AF_SceneHandle scene, AF_Vector3 p, float radius,
     return s->roomWeights(toVec3(p), radius, outRooms, outWeights, maxOut);
 }
 
+int AF_SceneRoomShareAt(AF_SceneHandle scene, AF_Vector3 p, float radius,
+                        int* outRooms, float* outWeights, int maxOut) {
+    Scene* s = asScene(scene);
+    if (!s || !outRooms || !outWeights || maxOut <= 0) return 0;
+    return s->roomShare(toVec3(p), radius, outRooms, outWeights, maxOut);
+}
+
+int AF_SceneDebugSurvivalParts(AF_SceneHandle scene, AF_Vector3 listener, AF_Vector3 source,
+                               float* outSoft6, float* outDif6) {
+    Scene* s = asScene(scene);
+    if (!s || !outSoft6 || !outDif6) return 0;
+    float g[6];
+    s->computeDirectSoft(toVec3(listener), toVec3(source), g, 8, 0.4f, nullptr, false, outSoft6, outDif6);
+    return 6;
+}
+
 float AF_SceneRoomVolumeAt(AF_SceneHandle scene, AF_Vector3 p, float radius) {
     Scene* s = asScene(scene);
     return s ? s->roomVolumeAt(toVec3(p), radius) : 0.0f;

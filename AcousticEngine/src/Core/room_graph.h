@@ -414,8 +414,12 @@ public:
     //   割合なら、部屋の真ん中では 100:0、戸口では 50:50 と連続に変わる。
     //   残響の体積も減衰時間も、この割合で混ぜれば境界で跳ねない。
     //   radius は戸口の幅の 1〜2 倍が目安（そのぶんの距離をかけて入れ替わる）。
+    //   ★shareOfSpace=true にすると「外の世界」（実体ではない部屋なし）も分母に入れる。
+    //     既定（false）は部屋どうしの割合（合計 1）で、外へ開く戸口では球が部屋に触れた瞬間に
+    //     0→1 と跳ぶ（実測: 戸口の 1.8 m 手前で 1 歩に 0→1.00）。屋外との境目で連続に
+    //     混ぜたい量（扉の定点の (1−w)、外へ出るときの残響の量）は true で引くこと。
     int roomWeightsAt(const Vec3& p, float radius, int* outRooms, float* outWeights,
-                      int maxOut) const {
+                      int maxOut, bool shareOfSpace = false) const {
         if (!outRooms || !outWeights || maxOut <= 0) return 0;
         const Grid& g = res_.grid;
         if (g.v.empty() || res_.rooms.empty()) return 0;
@@ -458,7 +462,13 @@ public:
                     const int vy = static_cast<int>(std::floor((p.y + dy - g.origin.y) / g.cell));
                     const int vz = static_cast<int>(std::floor((p.z + dz - g.origin.z) / g.cell));
                     const int rm = roomAtVoxel(vx, vy, vz);
-                    if (rm < 0) continue;                     // 実体の中／部屋の外は数えない
+                    if (rm < 0) {
+                        // 実体の中は数えない。部屋の外（外の世界／格子の外）は shareOfSpace のときだけ分母へ。
+                        if (shareOfSpace && (!g.inside(vx, vy, vz)
+                                             || g.v[static_cast<std::size_t>(g.index(vx, vy, vz))] != kSolid))
+                            totalW += wgt;
+                        continue;
+                    }
                     acc[static_cast<std::size_t>(rm)] += wgt;
                     totalW += wgt;
                 }
