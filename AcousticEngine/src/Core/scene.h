@@ -2808,6 +2808,8 @@ public:
     /// BTM（有限楔の稜線積分）で回折の帯域ゲインを出す。既定 OFF（前川＋開口積分）。
     ///   ON にすると前川の δ 減衰も開口率も使わず、BTM の値がそのまま帯域ゲインになる。
     void setUseBtm(int on) { useBtm_ = (on != 0); }
+    void setDirectPenumbra(int on) { directPenumbraFresnel_ = (on != 0); }
+    int directPenumbra() const { return directPenumbraFresnel_ ? 1 : 0; }
     int useBtm() const { return useBtm_ ? 1 : 0; }
     /// 楔の開き角(rad)。既定 1.5π＝箱の凸稜線。薄い衝立なら 2π。
     void setBtmWedgeAngle(float rad) { btmWedgeAngle_ = (rad > 0.1f) ? rad : 4.712389f; }
@@ -4177,9 +4179,6 @@ public:
         const Vec3 u = normalized(cross(dir, t));
         const Vec3 v = cross(dir, u);
 
-        const int N = numSamples < 1 ? 1 : numSamples;
-        float transAccum[kNumBands] = {0, 0, 0, 0, 0, 0};
-        int occCount = 0;
         // ★標本は**4 回対称**に置く。乱数で撒くと、左右対称なシーンの鏡像の位置で
         //   別の点を踏むので、同じ音になるべき所で差が出る（実測 0.28dB）。
         //
@@ -4192,27 +4191,117 @@ public:
         //
         //   ついでに決定的になる（乱数だとフレームごとにパターンが変わってちらつく。
         //   同じ理由で開口の標本にはフィボナッチ円盤を使っている）。
-        const int nQ = (N + 3) / 4;                       // 第 1 象限ぶん
         const float kGolden = 2.39996323f;                // 黄金角（半径方向に均す）
-        for (int q = 0; q < nQ; ++q) {
-            const float rr = sourceRadius
-                           * std::sqrt((static_cast<float>(q) + 0.5f) / static_cast<float>(nQ));
-            // 第 1 象限 (0, π/2) に収める。折り返して 4 象限を埋める。
-            const float a0 = std::fmod(kGolden * static_cast<float>(q), kPiF * 0.5f);
-            const float cs = std::cos(a0), sn = std::sin(a0);
-            const float sx[4] = { +1.0f, -1.0f, -1.0f, +1.0f };
-            const float sy[4] = { +1.0f, +1.0f, -1.0f, -1.0f };
-            for (int k = 0; k < 4; ++k) {
-                if (q * 4 + k >= N) break;
-                const Vec3 p = source + u * (rr * cs * sx[k]) + v * (rr * sn * sy[k]);
-                float g[kNumBands];
-                computeTransmission(listener, p, g);
-                for (int b = 0; b < kNumBands; ++b) transAccum[b] += g[b];
-                if (g[0] < 1.0f) ++occCount;  // このサンプルは壁を通った
+        const float sxq[4] = { +1.0f, -1.0f, -1.0f, +1.0f };
+        const float syq[4] = { +1.0f, +1.0f, -1.0f, -1.0f };
+        float softE[kNumBands];            // 帯域別の滑らかな直接透過（エネルギー）
+
+        if (directPenumbraFresnel_) {
+            // ★2026-09-02: 縁の半影を**帯域ごとのフレネル半径**で作る。
+            //
+            //   従来（下の else）は音源まわり半径 0.4 m 固定・8 点で、開いた扉の板の縁が音源の
+            //   見通し線を横切る瞬間に蝶番側の音源が 127° −15.1 → 129° −5.5 と **2° で 9.6 dB**
+            //   跳んでいた。物理の半影は r1 = √(λ d1 d2/(d1+d2)) で決まり低域ほど広い
+            //   （この場面で 125 Hz ≒ 1.0 m、4 kHz ≒ 0.18 m）。帯域共通の 1 つの円盤では
+            //   全帯域が同じ幅で動いて音色が動かず、しかも 8 段の階段になる。
+            //
+            //   構成: **見通し線に垂直な円盤を遮蔽物の深さに置き**、標本 p ごとに
+            //   listener→p と p→source の**両方**の透過を掛ける。重みは帯域別に 1/(1+(ρ/r1_b)²)
+            //   （開口積分と同じ核）。同じ標本を 6 帯域で重み付けし直すだけなので、
+            //   線分の本数は帯域数で増えない。
+            //   ⚠ 試して外した 2 案（記録）:
+            //     ・面に張る窓（apertureFresnelBands）→ 板が線を掠める角度では面が線に平行で
+            //       窓が張れず従来へ落ちる。崖の角度でこそ効かない。
+            //     ・音源側の円盤を 125 Hz の窓相当（4 m）まで広げる → 標本点が部屋の外へ出て
+            //       listener→p が室内を通らず素通し扱いになり、閉扉が −38.6 → −9.9 dB へ漏れた。
+            //   ⚠ 円盤は**当たりの手前 5 cm** に置く。板の中に置くと両線分が同じ板を二度数える。
+            //   ⚠ 費用: 最初の 2 環（8 点）を探りに使い、全部素通しなら lit として打ち切る。
+            //     見通しの利く音源は従来の 8 本 ×2 線分で済み、半影の中だけ 24 点 ×2 になる。
+            //   ★深さは**常に中点**（レイで当たりを探さない）。
+            //     当たりの手前に置く版を試したが、板が線から外れて当たりが消える瞬間に円盤が
+            //     中点へ移り、その 1° で 4.1 dB 跳んだ（二値の当たり判定を持ち込んでいた）。
+            //     中点の r1 は経路上の最大値なので半影はやや広めに出るが、連続。
+            //   ★環は**等比**（0.09 m → 3 m、比 2）に置き、帯域ごとにガウス重み × 環の面積で積む。
+            //     等間隔の環に 1/(1+x²) を掛ける版は、遠い環の本数が多くて高域まで引きずられ、
+            //     ドアなしの正面の音源が 0 → −3.8 dB に落ちた（4 kHz の r1 は 0.18 m しかない）。
+            //     等比なら各帯域が自分の尺度の環だけを実質的に見る。中心点も 1 本入れる。
+            constexpr float kBandHzS[kNumBands] = {125.0f, 250.0f, 500.0f, 1000.0f, 2000.0f, 4000.0f};
+            const float d1 = 0.5f * dist, d2 = 0.5f * dist;
+            float r1b[kNumBands];
+            for (int b = 0; b < kNumBands; ++b) {
+                const float lam = 343.0f / kBandHzS[b];
+                r1b[b] = std::max(std::sqrt(lam * d1 * d2 / dist), 1e-3f);
             }
+            const Vec3 c0 = listener + dir * d1;
+            constexpr int nRing = 11;                      // 比 √2 の 11 環（0.094 → 3 m）＋ 中心
+            constexpr float kRho0 = 0.09375f;              // 最内環 (3 m / 2^5)
+            float transW[kNumBands] = {0, 0, 0, 0, 0, 0};
+            float wSumB[kNumBands]  = {0, 0, 0, 0, 0, 0};
+            bool anyBlocked = false;
+            // 標本 1 点を積む。面積重み × 帯域別ガウス。
+            auto accum = [&](const Vec3& p, float rho, float area) {
+                float g1[kNumBands], g2[kNumBands];
+                computeTransmission(listener, p, g1);
+                computeTransmission(p, source, g2);
+                for (int b = 0; b < kNumBands; ++b) {
+                    const float g = g1[b] * g2[b];
+                    const float x = rho / r1b[b];
+                    const float w = area * std::exp(-x * x);
+                    transW[b] += w * g;
+                    wSumB[b]  += w;
+                    if (g < 0.999f) anyBlocked = true;
+                }
+            };
+            // ★外側 3 環（0.75/1.5/3 m）は 8 点にする。125 Hz の重みはここに集中していて、4 点だと
+            //   板の縁が 1 点を跨ぐたびに 1/8 ずつ跳んだ（125 Hz が −13.6 → −9.1 で 4.6 dB/°）。
+            //   8 点でも 4 回対称は保つ（角度を π/4 ずらした組を足すだけ）。
+            auto ring = [&](int q) {
+                const float rr = kRho0 * std::pow(1.41421356f, static_cast<float>(q));
+                const float a0 = std::fmod(kGolden * static_cast<float>(q), kPiF * 0.5f);
+                const float area = 0.707f * rr * rr;          // 比 √2 の環の面積 ∝ rr²（定数は正規化で消える）
+                const int nk = (q >= 6) ? 8 : 4;            // 0.75 m 以上の環は 8 点（低域の重みが集中する）
+                for (int k = 0; k < nk; ++k) {
+                    const float a = a0 + kPiF * 0.25f * static_cast<float>(k >> 2);   // 4 点 × 2 組（0°, 45°）
+                    const float cs = std::cos(a), sn = std::sin(a);
+                    const int j = k & 3;
+                    // ★v 側の鏡像対（j=2,3）は半径を 2^(1/8) だけずらす。4 回対称だと (+u,+v) と (+u,−v) が
+                    //   同じ u に並び、縦の縁が掃くとき 2 点が同時に反転して段が倍になる。x=0 の鏡像対
+                    //   （j=0↔1, 2↔3）は保つので、左右対称なシーンの一致は崩れない。
+                    const float rj = (j >= 2) ? rr * 1.0905f : rr;
+                    accum(c0 + u * (rj * cs * sxq[j]) + v * (rj * sn * syq[j]), rj, area);
+                }
+            };
+            // 探り: 中心・最内環・最外環（9 点）。全部素通しなら lit として打ち切る。
+            accum(c0, 0.0f, 0.35f * kRho0 * kRho0);
+            ring(0);
+            ring(nRing - 1);
+            if (anyBlocked) {
+                for (int q = 1; q < nRing - 1; ++q) ring(q);
+            }
+            for (int b = 0; b < kNumBands; ++b)
+                softE[b] = (wSumB[b] > 1e-12f) ? clamp01(transW[b] / wSumB[b]) : 1.0f;
+        } else {
+            // 従来: 音源まわり sourceRadius・numSamples 点・帯域共通。
+            const int N = numSamples < 1 ? 1 : numSamples;
+            float transAccum[kNumBands] = {0, 0, 0, 0, 0, 0};
+            const int nQ = (N + 3) / 4;                       // 第 1 象限ぶん
+            for (int q = 0; q < nQ; ++q) {
+                const float rr = sourceRadius
+                               * std::sqrt((static_cast<float>(q) + 0.5f) / static_cast<float>(nQ));
+                // 第 1 象限 (0, π/2) に収める。折り返して 4 象限を埋める。
+                const float a0 = std::fmod(kGolden * static_cast<float>(q), kPiF * 0.5f);
+                const float cs = std::cos(a0), sn = std::sin(a0);
+                for (int k = 0; k < 4; ++k) {
+                    if (q * 4 + k >= N) break;
+                    const Vec3 p = source + u * (rr * cs * sxq[k]) + v * (rr * sn * syq[k]);
+                    float g[kNumBands];
+                    computeTransmission(listener, p, g);
+                    for (int b = 0; b < kNumBands; ++b) transAccum[b] += g[b];
+                }
+            }
+            const float inv = 1.0f / static_cast<float>(N);
+            for (int b = 0; b < kNumBands; ++b) softE[b] = clamp01(transAccum[b] * inv);
         }
-        const float inv = 1.0f / static_cast<float>(N);
-        const float occFrac = static_cast<float>(occCount) * inv;
 
         // 回折：影境界で連続になる版を使う（diffractionContinuous 参照）。
         //   以前はここで「非遮蔽→全帯域1.0 / 遮蔽→UTD値」と二値で切り替えており、
@@ -4228,7 +4317,7 @@ public:
         //   実測で費用のほぼ全部がこの下（候補探索・ポータル支配・前川の合成）にある。
         //   ⚠ 段は音源ごとに固定なので、同じ音源が場面で別の答えを持つことはない（決めごと #1）。
         if (skipDiffraction) {
-            for (int b = 0; b < kNumBands; ++b) outGain[b] = clamp01(transAccum[b] * inv);
+            for (int b = 0; b < kNumBands; ++b) outGain[b] = softE[b];
             if (outDetourDelta) *outDetourDelta = 0.0f;
             return;
         }
@@ -4315,10 +4404,10 @@ public:
             // 透過はエネルギー、回折(前川)は振幅。**そのまま比べてはいけない**ので
             //   透過側を振幅へ揃える（material.h の単位規約）。
             //   揃えないと壁越しの成分が二乗ぶん小さく評価され、実測で 9dB 過小だった。
-            const float soft = std::sqrt(transAccum[b] * inv);   // 滑らかな直接透過（振幅）
+            const float soft = std::sqrt(softE[b]);   // 滑らかな直接透過（振幅）
             // 壁を抜ける成分と回り込む成分の大きい方を採る。
             //   回折側は既に「照らされていれば直接音込み」の総合値なので、
-            //   occFrac のような後付けのフェードは要らない。
+            //   後付けのフェードは要らない。max なので同じ縁を二重に数えない。
             outGain[b] = clamp01(std::max(soft, dif[b]));
         }
         if (outDetourDelta) *outDetourDelta = detourDelta;
@@ -6501,6 +6590,11 @@ private:
     int   autoPortalCount_ = 0;            // portals_ の末尾のうち自動生成ぶん
     std::vector<Portal> portals_;          // ホストが置く開口の矩形（トポロジはホストの担当）
     bool  useBtm_ = false;                 // BTM 経路（既定 OFF）
+    // 直接経路の半影を帯域別のフレネル半径で作る（2026-09-02、既定 ON）。
+    //   OFF で従来の「音源まわり 0.4 m・8 点・帯域共通」の円盤に戻る。
+    //   ★戻せるように残してある切り替え。新旧を同じビルドで聞き比べるためのもので、
+    //     採用が固まったら OFF 側ごと消す（同じ問いに 2 つの答えを常設しない）。
+    bool  directPenumbraFresnel_ = true;
     float btmWedgeAngle_ = 4.712389f;      // 1.5π＝箱の凸稜線
 
     float slitWidthRef_ = 0.35f;         // これより広ければ素通り(m)。500Hz の半波長あたり

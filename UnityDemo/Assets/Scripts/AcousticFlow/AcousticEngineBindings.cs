@@ -742,6 +742,11 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneSetUseBtm(IntPtr scene, int on);
 
+        // 直接経路の半影を帯域ごとのフレネル半径で作る。1=新（既定）/ 0=従来（0.4 m・8 点・帯域共通）。
+        // 新旧を同じビルドで聞き比べるための切り替え。採用が固まったら 0 側ごと消す予定。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetDirectPenumbra(IntPtr scene, int on);
+
         // 反射経路トレース：origin→dir を鏡面反射で maxBounces 回追い、通過点を outPoints に書く。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneTraceReflectionPath(

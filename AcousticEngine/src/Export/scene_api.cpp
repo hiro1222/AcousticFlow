@@ -1015,6 +1015,11 @@ void AF_SceneSetUseBtm(AF_SceneHandle scene, int on) {
     if (s) s->setUseBtm(on);
 }
 
+void AF_SceneSetDirectPenumbra(AF_SceneHandle scene, int on) {
+    Scene* s = asScene(scene);
+    if (s) s->setDirectPenumbra(on);
+}
+
 void AF_SceneSetApertureDeltaWeight(AF_SceneHandle scene, float w) {
     Scene* s = asScene(scene);
     if (s) s->setApertureDeltaWeight(w);

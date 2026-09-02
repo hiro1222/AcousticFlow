@@ -246,6 +246,12 @@ int main(int argc, char** argv) {
             if (std::atoi(d2) == 0) { cfg.enableDiffractionSources = 0; AF_SceneSetUpdateConfig(s, &cfg); }
         }
 
+        // ★AF_PENUMBRA=0 で直接経路の半影を従来（0.4 m・8 点・帯域共通）へ戻す。
+        //   新旧を同じビルドで比べるためのもの。既定は新（帯域別フレネル半径）。
+        if (const char* pn = std::getenv("AF_PENUMBRA")) {
+            if (std::atoi(pn) == 0) AF_SceneSetDirectPenumbra(s, 0);
+        }
+
         // ★AF_BTM=1 で回折を BTM 経路に切り替える（既定 OFF ＝ 前川＋フレネル開口積分）。
         //   焼く模型を決めるための比較用。BTM は稜線を**選ばず**複素で足すので、
         //   「開口」という量を持たない ── 90° の段差と閉扉の幻が、模型由来かどうかを切り分ける。
