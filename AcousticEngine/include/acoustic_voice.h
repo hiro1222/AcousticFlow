@@ -131,6 +131,11 @@ ACOUSTIC_API void AF_TailBusRender(AF_TailBusHandle bus, int frames, float* outL
 /* 直前ブロックの尾の RMS（左）。バスに預けた音源の rmsTail は 0 になるので、計器はこちら。 */
 ACOUSTIC_API float AF_TailBusRms(AF_TailBusHandle bus);
 ACOUSTIC_API int AF_TailBusHasIr(AF_TailBusHandle bus);
+/* 【オーディオスレッド】直近に Render したブロックの尾のモノラル（左右の平均）を out へ書く。
+ * 扉の定点用: 隣の部屋のバスの出力を、戸口に置いた音源（別の AF_Voice）の入力にする。
+ * Render と同じスレッドで、Render の後に呼ぶ。ホストは次のブロックで読めばよい
+ * （1 ブロックの遅れは尾の立ち上がり 25ms より短い）。書けた数を返す。 */
+ACOUSTIC_API int AF_TailBusLastMono(AF_TailBusHandle bus, float* out, int frames);
 
 /* この音源の尾を共有バスへ預ける。bus=NULL で自前の畳み込みに戻る（既定）。 */
 ACOUSTIC_API void AF_VoiceSetTailBus(AF_VoiceHandle voice, AF_TailBusHandle bus, int isOwner);

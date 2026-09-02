@@ -125,6 +125,11 @@ int AF_TailBusHasIr(AF_TailBusHandle bus) {
     return (b && b->hasIr()) ? 1 : 0;
 }
 
+int AF_TailBusLastMono(AF_TailBusHandle bus, float* out, int frames) {
+    af::dsp::TailBus* b = asBus(bus);
+    return b ? b->lastMono(out, frames) : 0;
+}
+
 void AF_VoiceSetTailBus(AF_VoiceHandle voice, AF_TailBusHandle bus, int isOwner) {
     if (af::dsp::VoiceRenderer* v = asVoice(voice))
         v->setTailBus(asBus(bus), isOwner != 0);

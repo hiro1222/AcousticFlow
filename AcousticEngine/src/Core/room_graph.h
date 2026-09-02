@@ -215,7 +215,8 @@ struct Room {
 //     ここに出るのは**戸口**（開口の器）であって、その開き具合ではない。
 //     開き具合は既存の回折・透過の経路が連続量として出しているので、そちらと組む。
 struct Aperture {
-    int   roomA = -1, roomB = -1;   // 繋いでいる部屋（roomA < roomB）
+    int   roomA = -1, roomB = -1;   // 繋いでいる部屋（roomA < roomB）。外の世界なら roomA=-1
+    bool  toOutside = false;        // 片側が「外の世界」か（Builder::setIncludeOutside が ON のときだけ出る）
     float area = 0.0f;              // 断面積(m2)
     Vec3  center{0, 0, 0};          // 断面の重心
     Vec3  normal{0, 0, 0};          // 面の向き（A→B が正）。面積で重み付けした平均
@@ -360,6 +361,14 @@ public:
         if (m >= 0.0f && m != seedRadius_) { seedRadius_ = m; needFull_ = true; }
     }
     float seedRadius() const { return seedRadius_; }
+    /// 部屋と「外の世界」の間の口も開口として出すか（既定 OFF）。
+    ///   洞窟の口・屋外へ開く戸口を「扉の定点」として使うために要る。
+    ///   ★OFF のままなら従来と同じ（外へ開く口は出ない）。ON にすると roomA=-1 の開口が増え、
+    ///     その部屋の Sabine の境界面積にも口が（吸音率 1 で）入る。
+    void setIncludeOutside(bool on) {
+        if (on != includeOutside_) { includeOutside_ = on; needFull_ = true; }
+    }
+    bool includeOutside() const { return includeOutside_; }
 
     // 距離の近似（1=3-4-5 の13近傍・既定 / 0=市街地距離の3近傍）。
     // 0 は 0.15m 以下の細かい格子でだけ使うこと（上の解説を参照）。
@@ -478,6 +487,8 @@ private:
     int   minVoxels_ = 16;
     int   brick_ = 16;
     float seedRadius_ = 0.6f;
+    bool  includeOutside_ = false;             // 外の世界との口を開口にするか
+    std::vector<std::uint8_t> outside_;        // ボクセルが「外の世界」か（-1 に均す前の印）
     bool  chamferFull_ = true;
     std::size_t maxVoxels_ = 4000000;
 
@@ -724,8 +735,11 @@ private:
 
         // 「外の世界」は競争のためだけに置いた種なので、ここで普通の「部屋なし」に均す。
         //   以降の利用側（開口の抽出・roomAtVoxel・重み）は負値を一律に扱えばよい。
+        //   ★ただし「外だった」印は別に残す。外へ開く口を開口として出すとき、
+        //     「小さすぎて捨てた部屋」（同じ -1）と区別が要る。
+        outside_.assign(n, 0);
         for (std::size_t i = 0; i < n; ++i)
-            if (R[i] == kOutsideSlot) R[i] = -1;
+            if (R[i] == kOutsideSlot) { outside_[i] = 1; R[i] = -1; }
 
         // 体積・重心・境界は塗り戻した後の姿で取り直す（種だけの体積は実際より小さい）。
         const std::size_t nr = res_.rooms.size();
@@ -807,7 +821,10 @@ private:
                             for (int b = 0; b < kNumBands; ++b)
                                 absA[u * kNumBands + static_cast<std::size_t>(b)] +=
                                     cellA * (ab ? ab[b] : 0.1f);
-                        } else if (R[j] >= 0 && R[j] != ra) {
+                        } else if ((R[j] >= 0 && R[j] != ra)
+                                   || (includeOutside_ && R[j] < 0
+                                       && outside_[static_cast<std::size_t>(j)])) {
+                            // 別部屋との境目、または（ON のとき）外の世界との境目＝開口。
                             area[u] += cellA;
                             openA[u] += cellA;
                             for (int b = 0; b < kNumBands; ++b)
@@ -822,9 +839,26 @@ private:
                         const int j = i + step[a];
                         if (V[j] == kSolid) continue;
                         const int rb = R[j];
-                        if (rb < 0 || rb == ra) continue;
+                        if (rb == ra) continue;
+                        // 外の世界との face は includeOutside_ のときだけ口にする。
+                        if (rb < 0 && !(includeOutside_ && outside_[static_cast<std::size_t>(j)]))
+                            continue;
                         faceIdx_.push_back(i);
                         faceAxis_.push_back(static_cast<std::uint8_t>(a));
+                    }
+                    // ★外の世界が**負の側**にある face。部屋どうしなら小さい側の部屋のボクセルが
+                    //   +方向を見れば必ず拾えるが、外の世界のボクセルはこのループに入らない
+                    //   （ra < 0 で飛ばす）ので、部屋側から −方向も見る。face の記録は
+                    //   「手前側＝外のボクセル j、軸 a」（R[j] < 0, R[j+step] = ra）。
+                    if (includeOutside_) {
+                        for (int a = 0; a < 3; ++a) {
+                            if (pos[a] <= 0) continue;
+                            const int j = i - step[a];
+                            if (V[j] == kSolid) continue;
+                            if (R[j] >= 0 || !outside_[static_cast<std::size_t>(j)]) continue;
+                            faceIdx_.push_back(j);
+                            faceAxis_.push_back(static_cast<std::uint8_t>(a));
+                        }
                     }
                 }
             }
@@ -911,6 +945,7 @@ private:
             const double cnt = area / cellArea;
             Aperture ap;
             ap.roomA = pa; ap.roomB = pb;
+            ap.toOutside = (pa < 0);          // 小さい側が -1 なら外の世界との口
             ap.area = static_cast<float>(area);
             ap.center = Vec3(g.origin.x + static_cast<float>(cx / cnt) * g.cell,
                              g.origin.y + static_cast<float>(cy / cnt) * g.cell,

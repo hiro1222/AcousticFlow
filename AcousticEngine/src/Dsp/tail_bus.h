@@ -124,6 +124,14 @@ public:
         }
         for (int i = 0; i < n; ++i) { outL[i] += scratchL_[static_cast<size_t>(i)];
                                      outR[i] += scratchR_[static_cast<size_t>(i)]; }
+        // ★扉の定点用に、このブロックの尾のモノラル（左右の平均）を取っておく。
+        //   隣の部屋のバスの出力を、戸口の位置に置いた音源の入力にするための取り出し口。
+        //   耳ごとのバランスは IR に焼き込まれているが、戸口から鳴らし直すときは
+        //   向きを鳴らす側が付け直すので、ここでは平均して消す。
+        if (mono_.size() < static_cast<size_t>(maxFrames_)) mono_.assign(static_cast<size_t>(maxFrames_), 0.0f);
+        for (int i = 0; i < n; ++i)
+            mono_[static_cast<size_t>(i)] = 0.5f * (scratchL_[static_cast<size_t>(i)] + scratchR_[static_cast<size_t>(i)]);
+        monoFrames_ = n;
         rms_ = 0.0f;
         for (int i = 0; i < n; ++i)
             rms_ += scratchL_[static_cast<size_t>(i)] * scratchL_[static_cast<size_t>(i)];
@@ -133,6 +141,15 @@ public:
 
     /// 直近ブロックの尾の RMS（左）。音源ごとの計器が使えなくなるので、ここで出す。
     float rms() const { return rms_; }
+    /// 直近に render したブロックの尾のモノラルを out へ書く（frames を超えない分）。書けた数を返す。
+    ///   ★render と同じオーディオスレッドから、render の**後**に呼ぶこと（ホストは次のブロックで読む）。
+    int lastMono(float* out, int frames) const {
+        if (!out || frames <= 0) return 0;
+        const int n = std::min(frames, monoFrames_);
+        for (int i = 0; i < n; ++i) out[i] = mono_[static_cast<size_t>(i)];
+        for (int i = n; i < frames; ++i) out[i] = 0.0f;
+        return n;
+    }
     int partitions() const { return const_cast<TailBus*>(this)->cur().totalPartitions(); }
 
 private:
@@ -153,6 +170,8 @@ private:
     std::vector<float> in_;
     std::vector<float> scratchL_;
     std::vector<float> scratchR_;
+    std::vector<float> mono_;       // 直近ブロックの尾（左右の平均）。扉の定点の入力用
+    int monoFrames_ = 0;
 };
 
 }  // namespace dsp

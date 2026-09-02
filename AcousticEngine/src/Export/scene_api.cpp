@@ -771,6 +771,31 @@ int AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* outCenter,
     return 1;
 }
 
+int AF_SceneGetPortalRooms(AF_SceneHandle scene, int id,
+                           int* outRoomA, int* outRoomB, int* outToOutside) {
+    Scene* s = asScene(scene);
+    if (!s || id < 0 || id >= s->portalCount()) return 0;
+    const auto& p = s->portal(id);
+    if (outRoomA) *outRoomA = p.roomA;
+    if (outRoomB) *outRoomB = p.roomB;
+    if (outToOutside) *outToOutside = p.toOutside ? 1 : 0;
+    return 1;
+}
+
+void AF_SceneSetOutsideApertures(AF_SceneHandle scene, int on) {
+    Scene* s = asScene(scene);
+    if (s) s->setOutsideApertures(on);
+}
+
+int AF_ScenePortalDiffuseCoupling(AF_SceneHandle scene, int id, float* out6) {
+    Scene* s = asScene(scene);
+    if (!s || !out6) return 0;
+    float g[6];
+    if (!s->portalDiffuseCoupling(id, g)) return 0;
+    for (int b = 0; b < 6; ++b) out6[b] = g[b];
+    return 1;
+}
+
 /* 【計測用】回折の可視判定のゲートを個別に切る。0 = 全部有効（本番）。 */
 /* 【(B)】稜線からポータルを生成してフレネル積分する。既定 0（従来の前川＋開口積分）。
  * 1 点で回折を表すのをやめる ── 隙間の幅も角の死角も、矩形の中で影が落ちることで

@@ -3359,6 +3359,315 @@ void diagnoseReverbSendWalk() {
 //   回折の周波数依存は切ってあるので、帯域ごとのゲインは平坦なはず。それでも音色が
 //   変わるなら、原因はフィルタではなく「直接音と反射の力関係」と「反射どうしの櫛」。
 //   どちらがどれだけ効いているかを分けて出す。
+// 洞窟の口の場面 ── 外に立っていて、中で鳴っている。
+//   S1「響きには向きがある」の基準測定。いまの尾は部屋ごとの 2ch バスで、リスナーの周囲から
+//   出る（向きは探針から作る左右の耳のバランスだけ）。ここでは位置ごとに、
+//     ・場そのものに向きがあるか（探針のエネルギーの平均方向と、口の方向とのずれ）
+//     ・いまの鳴らし方がそれをどれだけ捉えているか（左右バランス＝正面の口では 1.00 に潰れる）
+//     ・尾の量が口からの距離でどう変わるか（外にいるのに部屋の式で決まっていないか）
+//   を数字で残す。「扉の定点から鳴らす」を入れる前の**前**の値。
+void diagnoseCaveMouth() {
+    std::printf("\n[診断] 洞窟の口（外に立って中の音を聴く）── 扉の定点から鳴らす前の基準\n");
+    const float t = 0.15f, h = 4.0f, hw = 5.0f, depth = 8.0f, mouthW = 1.2f, mouthH = 2.4f;
+    AF_SceneHandle s = AF_SceneCreate();
+    const float liveA[6] = {0.02f, 0.02f, 0.03f, 0.04f, 0.05f, 0.07f};   // 響く岩
+    const float tr[6] = {0.000398f, 0.0001585f, 0.0000398f,
+                         0.00001f, 0.00000251f, 0.000001f};
+    const int mLive = AF_SceneAddMaterial(s, tr, liveA, nullptr, 6);
+    // 洞窟: x∈[-hw,hw], y∈[0,h], z∈[0,depth]。口は z=0 の壁、幅 mouthW・高さ mouthH。
+    const float zc = depth * 0.5f;
+    const float sideW = hw - mouthW * 0.5f;
+    AF_SceneAddInstanceBox(s, V(-(mouthW*0.5f + sideW*0.5f), h*0.5f, 0), V(sideW*0.5f, h*0.5f, t),
+                           V(1,0,0), V(0,1,0), mLive);
+    AF_SceneAddInstanceBox(s, V( (mouthW*0.5f + sideW*0.5f), h*0.5f, 0), V(sideW*0.5f, h*0.5f, t),
+                           V(1,0,0), V(0,1,0), mLive);
+    AF_SceneAddInstanceBox(s, V(0, (mouthH + h)*0.5f, 0), V(mouthW*0.5f, (h - mouthH)*0.5f, t),
+                           V(1,0,0), V(0,1,0), mLive);
+    AF_SceneAddInstanceBox(s, V(0, -t, zc),        V(hw + t, t, zc + t), V(1,0,0), V(0,1,0), mLive);
+    AF_SceneAddInstanceBox(s, V(0, h + t, zc),     V(hw + t, t, zc + t), V(1,0,0), V(0,1,0), mLive);
+    AF_SceneAddInstanceBox(s, V(-hw - t, h*0.5f, zc), V(t, h*0.5f, zc + t), V(1,0,0), V(0,1,0), mLive);
+    AF_SceneAddInstanceBox(s, V( hw + t, h*0.5f, zc), V(t, h*0.5f, zc + t), V(1,0,0), V(0,1,0), mLive);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f, depth + t), V(hw + t, h*0.5f, t), V(1,0,0), V(0,1,0), mLive);
+    // 外の地面（外で立つ場所。地面の反射は現実にもある）
+    AF_SceneAddInstanceBox(s, V(0, -t, -6.0f), V(14.0f, t, 6.0f), V(1,0,0), V(0,1,0), mLive);
+
+    const AF_Vector3 S = V(1.5f, 1.5f, 5.0f);           // 中の音源（口の正面から外す）
+    const AF_Vector3 mouth = V(0, mouthH * 0.5f, 0);    // 口の中心
+    struct Pos { const char* name; AF_Vector3 p; };
+    const Pos pos[] = {
+        {"口の正面 2m（外）",     V(0.0f, 1.6f, -2.0f)},
+        {"口の正面 6m（外）",     V(0.0f, 1.6f, -6.0f)},
+        {"斜め 45° 3m（外）",     V(2.1f, 1.6f, -2.1f)},
+        {"壁ぎわ・口は見えない",  V(4.0f, 1.6f, -0.5f)},
+        {"中・口の内側 2m",       V(0.0f, 1.6f,  2.0f)},
+        {"中・奥",                V(-2.0f, 1.6f, 6.0f)},
+    };
+    // 探針の方向（フィボナッチ球）
+    constexpr int kDirs = 64;
+    AF_Vector3 dirs[kDirs];
+    for (int i = 0; i < kDirs; ++i) {
+        const float y = 1.0f - 2.0f * (i + 0.5f) / kDirs;
+        const float r = std::sqrt(std::max(0.0f, 1.0f - y * y));
+        const float ph = 2.399963f * i;   // 黄金角
+        dirs[i] = V(r * std::cos(ph), y, r * std::sin(ph));
+    }
+    AF_SceneSetSource(s, 1, S);
+    AF_SceneSetListener(s, pos[0].p);
+    for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+    int nAuto = 0, nManual = 0;
+    AF_SceneGetPortalCounts(s, &nAuto, &nManual);
+    std::printf("      部屋 %d 個 / 自動ポータル %d 枚。音源(1.5,1.5,5.0) 固定、リスナーは口(0,%.1f,0)を向く\n",
+                AF_SceneRoomCount(s), nAuto, mouth.y);
+    std::printf("      %-22s 部屋  直接(dB)  尾wet   探針:指向性  口との角度  ±30°内  左右R/L\n", "位置");
+    for (const Pos& q : pos) {
+        const AF_Vector3 L = q.p;
+        AF_SceneSetListener(s, L);
+        AF_SceneSetSource(s, 1, S);
+        for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+        // 直接（透過⊕回折⊕反射の生存、広帯域）
+        const int idx = AF_SceneSourceIndex(s, 1);
+        float band[kBands] = {};
+        AF_SceneGetSourceOcclusion(s, idx, band);
+        double e2 = 0.0; for (int b = 0; b < kBands; ++b) e2 += band[b] * band[b];
+        const double directDb = 10.0 * std::log10(std::max(e2 / kBands, 1e-12));
+        // 尾の量（ホストと同じ wet = (総和 − 直接ピーク)/総和）
+        float echo[100 * kBands] = {};
+        const int bins = AF_SceneGetEchogramBands(s, -1, echo, 100);
+        double peak = 0.0, total = 0.0;
+        for (int i = 0; i < bins; ++i) {
+            double v = 0.0;
+            for (int b = 0; b < kBands; ++b) v += echo[i * kBands + b];
+            v /= kBands; total += v; if (v > peak) peak = v;
+        }
+        const double wet = (total > 1e-12) ? (total - peak) / total : 0.0;
+        // 探針（500Hz 帯）: 平均方向、口との角度、口から ±30° に入る割合、左右バランス
+        std::vector<float> en(static_cast<std::size_t>(kDirs) * kBands, 0.0f);
+        AF_SceneProbeDirectionalEnergy(s, L, dirs, kDirs, 8, en.data());
+        const int bb = 2;
+        double sum = 0.0, mx = 0.0, my = 0.0, mz = 0.0, cone = 0.0, sumL = 0.0, sumR = 0.0;
+        // リスナーは口を向く。右耳の軸 = up × forward
+        float fx = mouth.x - L.x, fy = 0.0f, fz = mouth.z - L.z;
+        { const float n = std::sqrt(fx*fx + fz*fz); if (n > 1e-4f) { fx /= n; fz /= n; } }
+        const float rx = fz, rz = -fx;   // right = (fz, 0, -fx)
+        float tx = mouth.x - L.x, ty = mouth.y - L.y, tz = mouth.z - L.z;
+        { const float n = std::sqrt(tx*tx + ty*ty + tz*tz); tx /= n; ty /= n; tz /= n; }
+        for (int i = 0; i < kDirs; ++i) {
+            const double e = en[i * kBands + bb];
+            if (e <= 0.0) continue;
+            sum += e; mx += e * dirs[i].x; my += e * dirs[i].y; mz += e * dirs[i].z;
+            const float cs = dirs[i].x * tx + dirs[i].y * ty + dirs[i].z * tz;
+            if (cs > 0.866f) cone += e;
+            const float c = dirs[i].x * rx + dirs[i].z * rz;
+            sumR += e * (0.5 + 0.5 * c);
+            sumL += e * (0.5 - 0.5 * c);
+        }
+        double directivity = 0.0, angDeg = 0.0, coneFrac = 0.0, rl = 1.0;
+        if (sum > 1e-12) {
+            mx /= sum; my /= sum; mz /= sum;
+            directivity = std::sqrt(mx*mx + my*my + mz*mz);
+            if (directivity > 1e-6) {
+                const double cs = (mx * tx + my * ty + mz * tz) / directivity;
+                angDeg = std::acos(std::max(-1.0, std::min(1.0, cs))) * 180.0 / 3.14159265;
+            }
+            coneFrac = cone / sum;
+            rl = (sumL > 1e-12) ? sumR / sumL : 1.0;
+        }
+        (void)fy;
+        std::printf("      %-22s %3d   %6.1f   %5.3f      %5.3f       %5.1f°   %5.1f%%   %5.2f\n",
+                    q.name, AF_SceneRoomAt(s, L), directDb, wet, directivity, angDeg,
+                    coneFrac * 100.0, rl);
+    }
+    std::printf("      読み方: 指向性 0=等方 / 1=一方向。口との角度が小さく ±30°内 が大きいほど"
+                "「場は口を指している」。\n"
+                "              いまの鳴らし方が使うのは 左右R/L だけなので、正面では 1.00 に潰れて向きが消える。\n");
+
+    // ── 扉の定点の部品: 外へ開く口を開口にし、拡散した響きが口を通る割合を測る ──
+    std::printf("      ── 外へ開く口を開口にする（AF_SceneSetOutsideApertures=1）──\n");
+    AF_SceneSetOutsideApertures(s, 1);
+    AF_SceneSetListener(s, pos[0].p);
+    AF_SceneSetSource(s, 1, S);
+    for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+    AF_SceneGetPortalCounts(s, &nAuto, &nManual);
+    std::printf("      部屋 %d 個 / 自動ポータル %d 枚\n", AF_SceneRoomCount(s), nAuto);
+    {
+        // 部屋の境界に口が（吸音率 1 で）数えられているか。0 のままなら外の world との face が拾えていない。
+        float vol = 0.0f, surf = 0.0f, open = 0.0f, ab[6] = {}, rt[6] = {};
+        AF_SceneRoomInfo(s, 0, &vol, nullptr, nullptr, nullptr);
+        AF_SceneRoomAcoustics(s, 0, &surf, &open, ab, rt);
+        int nx = 0, ny = 0, nz = 0; float cell = 0.0f;
+        AF_SceneRoomGridDims(s, &nx, &ny, &nz, &cell);
+        std::printf("      部屋0: V=%.0f m3 境界 %.1f m2（うち開口 %.2f m2）RT60(500Hz) %.2f s / 格子 %d×%d×%d セル %.2f m\n",
+                    vol, surf, open, rt[2], nx, ny, nz, cell);
+        const int nap = AF_SceneApertureCount(s);
+        std::printf("      部屋グラフの開口 %d 個\n", nap);
+        for (int i = 0; i < nap; ++i) {
+            float area = 0.0f; AF_Vector3 c, nrm; int ra = -1, rb = -1;
+            AF_SceneApertureInfo(s, i, &area, &c, &nrm, &ra, &rb);
+            std::printf("        開口%d 面積 %.2f m2 中心(%.2f,%.2f,%.2f) 法線(%.2f,%.2f,%.2f) 部屋 %d↔%d\n",
+                        i, area, c.x, c.y, c.z, nrm.x, nrm.y, nrm.z, ra, rb);
+        }
+    }
+    auto printPortals = [&](const char* label) {
+        const int np = nAuto + nManual;
+        for (int id = 0; id < np; ++id) {
+            AF_Vector3 c, u, v; float hu = 0, hv = 0;
+            if (!AF_SceneGetPortal(s, id, &c, &u, &v, &hu, &hv)) continue;
+            int ra = -1, rb = -1, out = 0;
+            AF_SceneGetPortalRooms(s, id, &ra, &rb, &out);
+            float g[6] = {};
+            AF_ScenePortalDiffuseCoupling(s, id, g);
+            std::printf("        %-14s 口%d 中心(%.2f,%.2f,%.2f) %.2f×%.2f m 部屋 %d↔%d%s"
+                        "  結合 125Hz %.3f / 1kHz %.3f / 4kHz %.3f\n",
+                        label, id, c.x, c.y, c.z, hu * 2, hv * 2, ra, rb, out ? "(外)" : "",
+                        g[0], g[3], g[5]);
+        }
+    };
+    printPortals("口が開いている");
+    // 口を板で塞ぐ（閉じた扉）。動かして「動く物」にし、部屋分割からは外す。
+    const float trDoor[6] = {0.0316f, 0.0178f, 0.0100f, 0.0056f, 0.0032f, 0.0018f};   // −15…−27 dB
+    const float absDoor[6] = {0.1f, 0.1f, 0.1f, 0.1f, 0.1f, 0.1f};
+    const int mDoor = AF_SceneAddMaterial(s, trDoor, absDoor, nullptr, 6);
+    const int door = AF_SceneAddInstanceBox(s, V(0, mouthH * 0.5f, 0), V(mouthW * 0.5f, mouthH * 0.5f, 0.02f),
+                                            V(1,0,0), V(0,1,0), mDoor);
+    AF_SceneUpdateInstance(s, door, V(0, mouthH * 0.5f, 0.001f), V(mouthW * 0.5f, mouthH * 0.5f, 0.02f),
+                           V(1,0,0), V(0,1,0));
+    for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+    AF_SceneGetPortalCounts(s, &nAuto, &nManual);
+    std::printf("      板で塞ぐ（閉扉、τ=%.3f/%.4f/%.4f）: 自動ポータル %d 枚\n",
+                trDoor[0], trDoor[3], trDoor[5], nAuto);
+    printPortals("閉扉");
+    // 45° 開く（右の縁を蝶番に、中へ）
+    {
+        const float c45 = 0.70710678f, s45 = 0.70710678f;
+        const AF_Vector3 ax = V(c45, 0, s45);                      // 板の横方向
+        const AF_Vector3 hinge = V(mouthW * 0.5f, mouthH * 0.5f, 0);
+        const AF_Vector3 center = V(hinge.x - ax.x * mouthW * 0.5f, hinge.y, hinge.z - ax.z * mouthW * 0.5f);
+        AF_SceneUpdateInstance(s, door, center, V(mouthW * 0.5f, mouthH * 0.5f, 0.02f), ax, V(0,1,0));
+        for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+        std::printf("      45° 開く（期待: 隙間 ∝ sin45 ≒ 0.7 が通り、残りは板の τ。全開の値との比で見る）\n");
+        printPortals("45°");
+        // 90°（全開、板は口の脇に垂直に立つ）
+        const AF_Vector3 ax90 = V(0, 0, 1);
+        const AF_Vector3 c90 = V(hinge.x, hinge.y, hinge.z - mouthW * 0.5f);
+        AF_SceneUpdateInstance(s, door, c90, V(mouthW * 0.5f, mouthH * 0.5f, 0.02f), ax90, V(0,1,0));
+        for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+        std::printf("      90° 開く（期待: 口が開いている時とほぼ同じ）\n");
+        printPortals("90°");
+        // 5°（隙間 ∝ sin5 ≒ 0.09）
+        const float c5 = std::cos(5.0f * 3.14159265f / 180.0f), s5 = std::sin(5.0f * 3.14159265f / 180.0f);
+        const AF_Vector3 ax5 = V(c5, 0, s5);
+        const AF_Vector3 cc5 = V(hinge.x - ax5.x * mouthW * 0.5f, hinge.y, hinge.z - ax5.z * mouthW * 0.5f);
+        AF_SceneUpdateInstance(s, door, cc5, V(mouthW * 0.5f, mouthH * 0.5f, 0.02f), ax5, V(0,1,0));
+        for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+        std::printf("      5° 開く（期待: 隙間 ∝ sin5 ≒ 0.09 が通る。閉扉の τ より上、45° より下）\n");
+        printPortals("5°");
+    }
+
+    // ── 扉の定点から鳴らす（配線の試作）: 現行の「部屋のバスを 2ch で足す」と比べる ──
+    //   現行: 洞窟の尾の IR を部屋のバスで畳み、リスナーへそのまま足す。向きは探針の
+    //         左右バランス（耳ごとの帯域ゲイン）を IR に焼くだけ。距離は知らない。
+    //   定点: 同じバスのモノラル出力を、口の位置に置いた音源（別のボイス）の入力にして、
+    //         口の方向へパンし、口からの距離で減らし、口の結合率を掛ける。
+    //   測るのは尾の左右比（dB）と、正面 2m を 0 dB とした尾のレベル。
+    std::printf("      ── 扉の定点から鳴らす（試作）: 尾の左右比と、口からの距離での落ち方 ──\n");
+    AF_SceneUpdateInstance(s, door, V(0, -50.0f, 0), V(mouthW * 0.5f, mouthH * 0.5f, 0.02f), V(1,0,0), V(0,1,0));
+    for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+    {
+        constexpr int kSr = 48000, kBlk = 512, kBlocks = 140;   // 1.5 秒
+        // 部屋の尾の形: 中で測ったエコグラム（形は部屋のもの）
+        std::vector<float> echo(200 * kBands, 0.0f);
+        {
+            const AF_Vector3 srcArr[1] = { S };
+            AF_SceneComputeEchogramBands(s, V(0, 1.6f, 4.0f), srcArr, 1, echo.data(), 200,
+                                         0.01f, 343.0f, 512, 12, 4.0f);
+        }
+        float coup[6] = {1, 1, 1, 1, 1, 1};
+        AF_ScenePortalDiffuseCoupling(s, 0, coup);
+        // 探針から耳ごとの帯域ゲインを作る（ホストと同じ式、強さ 1）。リスナーは +z（洞窟の壁）を向く。
+        auto earGains = [&](const AF_Vector3& L, float ear[12]) {
+            std::vector<float> en(static_cast<std::size_t>(kDirs) * kBands, 0.0f);
+            AF_SceneProbeDirectionalEnergy(s, L, dirs, kDirs, 8, en.data());
+            for (int b = 0; b < kBands; ++b) {
+                double sumL = 0.0, sumR = 0.0;
+                for (int i = 0; i < kDirs; ++i) {
+                    const double e = en[i * kBands + b];
+                    if (e <= 0.0) continue;
+                    const float c = dirs[i].x;   // 右耳の軸 = +x（+z を向いている）
+                    sumR += e * (0.5 + 0.5 * c);
+                    sumL += e * (0.5 - 0.5 * c);
+                }
+                const double mean = 0.5 * (sumL + sumR);
+                double gl = 1.0, gr = 1.0;
+                if (mean > 1e-9) {
+                    gl = std::min(2.0, std::max(0.25, sumL / mean));
+                    gr = std::min(2.0, std::max(0.25, sumR / mean));
+                }
+                ear[b] = static_cast<float>(gl); ear[6 + b] = static_cast<float>(gr);
+            }
+        };
+        std::printf("      %-22s  現行: 左右R/L(dB) レベル(dB) | 定点: 左右R/L(dB) レベル(dB)  口までの距離\n", "位置");
+        double refCur = -1.0, refNew = -1.0;
+        for (int pi = 0; pi < 4; ++pi) {   // 外の 4 点
+            const AF_Vector3 L = pos[pi].p;
+            float ear[12];
+            earGains(L, ear);
+            // 現行: 音源ボイス → 部屋のバス（IR に耳のゲインを焼く）→ 2ch
+            AF_VoiceConfig cfg{}; cfg.sampleRate = kSr; cfg.maxFrames = kBlk; cfg.tailSeconds = 2.0f;
+            AF_VoiceHandle src = AF_VoiceCreate(&cfg);
+            AF_TailBusHandle bus = AF_TailBusCreate(kSr, 2.0f, 64, 8192, kBlk);
+            AF_VoiceSetTailBus(src, bus, 1);
+            AF_VoiceSetHrtfEnabled(src, 0);
+            AF_VoiceTap st{}; st.gain6[0] = st.gain6[1] = st.gain6[2] = st.gain6[3] = st.gain6[4] = st.gain6[5] = 1.0f;
+            st.panL = st.panR = 0.7071f; st.gSpec = 1.0f;
+            AF_VoiceSetTaps(src, &st, 1);
+            AF_VoiceRebuildTail(src, echo.data(), 200, 10.0f, 25.0f, 8.0f, 30.0f, 0.0f, 0.6f,
+                                1.0f, 1.0f, ear, 12);
+            // 定点: 口に置いた音源ボイス。入力はバスのモノラル。
+            AF_VoiceConfig cfg2{}; cfg2.sampleRate = kSr; cfg2.maxFrames = kBlk; cfg2.tailSeconds = 0.1f;
+            AF_VoiceHandle pv = AF_VoiceCreate(&cfg2);
+            AF_VoiceSetHrtfEnabled(pv, 0);
+            const float dx = mouth.x - L.x, dy = mouth.y - L.y, dz = mouth.z - L.z;
+            const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const float att = 1.0f / std::max(dist, 1.0f);
+            const float xr = (dx / dist + 1.0f) * 0.5f;              // −1..+1 → 0..1（+x が右）
+            AF_VoiceTap pt{};
+            for (int b = 0; b < 6; ++b) pt.gain6[b] = coup[b] / coup[0] * att;   // 結合は開の値で正規化
+            pt.panL = std::sqrt(1.0f - xr); pt.panR = std::sqrt(xr); pt.gSpec = 1.0f;
+            pt.dirX = dx / dist; pt.dirY = dy / dist; pt.dirZ = dz / dist;
+            AF_VoiceSetTaps(pv, &pt, 1);
+            std::vector<float> in(kBlk, 0.0f), l(kBlk), r(kBlk), bl(kBlk), br(kBlk), mono(kBlk), pl(kBlk), pr(kBlk);
+            double eCurL = 0.0, eCurR = 0.0, eNewL = 0.0, eNewR = 0.0;
+            for (int blk = 0; blk < kBlocks; ++blk) {
+                std::fill(in.begin(), in.end(), 0.0f);
+                if (blk == 0) in[0] = 1.0f;                        // クリック 1 発
+                AF_VoiceRender(src, in.data(), kBlk, l.data(), r.data(), nullptr);
+                std::fill(bl.begin(), bl.end(), 0.0f); std::fill(br.begin(), br.end(), 0.0f);
+                AF_TailBusRender(bus, kBlk, bl.data(), br.data());
+                AF_TailBusLastMono(bus, mono.data(), kBlk);
+                AF_VoiceRender(pv, mono.data(), kBlk, pl.data(), pr.data(), nullptr);
+                for (int i = 0; i < kBlk; ++i) {
+                    eCurL += bl[i] * bl[i]; eCurR += br[i] * br[i];
+                    eNewL += pl[i] * pl[i]; eNewR += pr[i] * pr[i];
+                }
+            }
+            AF_VoiceDestroy(pv);
+            AF_VoiceSetTailBus(src, nullptr, 0);
+            AF_VoiceDestroy(src);
+            AF_TailBusDestroy(bus);
+            const double curTot = eCurL + eCurR, newTot = eNewL + eNewR;
+            if (refCur < 0.0) { refCur = curTot; refNew = newTot; }
+            const double curRL = 10.0 * std::log10(std::max(eCurR, 1e-20) / std::max(eCurL, 1e-20));
+            const double newRL = 10.0 * std::log10(std::max(eNewR, 1e-20) / std::max(eNewL, 1e-20));
+            std::printf("      %-22s     %+6.1f     %+6.1f    |    %+6.1f     %+6.1f      %.1f m\n",
+                        pos[pi].name, curRL, 10.0 * std::log10(std::max(curTot, 1e-20) / refCur),
+                        newRL, 10.0 * std::log10(std::max(newTot, 1e-20) / refNew), dist);
+        }
+        std::printf("      読み方: 定点は口の方向へ寄り（斜めや壁ぎわで左右比が大きく開く）、口から離れると 1/r で落ちる。\n"
+                    "              現行は左右比が探針の丸めで小さく、レベルは距離を知らない。\n");
+    }
+    AF_SceneDestroy(s);
+}
+
 void diagnosePillarTimbre() {
     std::printf("\n[診断] 直線上に柱があるだけで音色が変わる理由\n");
     const float h = 4.0f, t = 0.3f, hw = 5.0f, hd = 6.0f;
@@ -9837,6 +10146,7 @@ int main() {
     diagnoseNonDoorShapes();
     diagnosePillarTimbre();
     diagnoseReverbSendWalk();
+    diagnoseCaveMouth();
     diagnosePortalScope();
     diagnoseNonPlateBlocker();
     diagnoseApertureWidthCurve();

@@ -533,6 +533,23 @@ ACOUSTIC_API int  AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* ou
                                     AF_Vector3* outAxisU, AF_Vector3* outAxisV,
                                     float* outHalfU, float* outHalfV);
 
+/* ポータルが繋いでいる部屋（自動生成のときだけ入る。手置きは -1/-1）。
+ * outToOutside=1 なら片側が「外の世界」の口（洞窟の口・屋外へ開く戸口。roomA=-1）。 */
+ACOUSTIC_API int  AF_SceneGetPortalRooms(AF_SceneHandle scene, int id,
+                                         int* outRoomA, int* outRoomB, int* outToOutside);
+
+/* 外の世界へ開く口も開口（自動ポータル）にするか。既定 0。
+ * ★1 にしても回折・エコグラムの経路生成はその口を使わない（従来の数値を変えないため）。
+ *   使うのは「扉の定点」（隣の空間の響きを戸口の位置から鳴らす仕組み）だけ。
+ *   ON にすると、その部屋の Sabine の境界面積に口が吸音率 1 で入るので RT60 が少し短くなる。 */
+ACOUSTIC_API void AF_SceneSetOutsideApertures(AF_SceneHandle scene, int on);
+
+/* 【扉の定点】隣の空間の**拡散した響き**がこの口を通る割合（帯域別 0..1、6 要素）。
+ * 音源に依存しない。口の面に垂直な短い線分を 9×3 並べて透過を測り、面積で平均する。
+ *   開いている所 1.0 ／ 板（閉じた扉）に覆われた所 その材質の質量則
+ * ＝ τ_eff = τ_板·(覆われた割合) + (開いた割合)。戻り値 0 で範囲外。 */
+ACOUSTIC_API int  AF_ScenePortalDiffuseCoupling(AF_SceneHandle scene, int id, float* out6);
+
 /* ポータルの「支配が及ぶ距離」(m)。矩形と経路の距離がこれを超えたら、
  * 回折は一般の稜線探索に完全に戻る。あいだは滑らかに混ざる。
  *

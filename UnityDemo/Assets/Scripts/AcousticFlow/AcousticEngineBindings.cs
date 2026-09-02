@@ -573,6 +573,21 @@ namespace AcousticFlow
         public static extern float AF_TailBusRms(IntPtr bus);
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_TailBusHasIr(IntPtr bus);
+
+        // ── 扉の定点（隣の空間の響きを戸口の位置から鳴らす）──
+        // 直近に Render したブロックの尾のモノラル（左右の平均）。Render の後、同じオーディオスレッドで読む。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_TailBusLastMono(IntPtr bus, [Out] float[] outMono, int frames);
+        // ポータルが繋いでいる部屋。toOutside=1 なら片側が外の世界（洞窟の口・屋外へ開く戸口）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneGetPortalRooms(IntPtr scene, int id,
+                                                        out int roomA, out int roomB, out int toOutside);
+        // 外の世界へ開く口も自動ポータルにする（既定 0。回折の経路生成は使わず、扉の定点だけが使う）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetOutsideApertures(IntPtr scene, int on);
+        // 隣の空間の拡散した響きがこの口を通る割合（帯域別 6 要素、0..1）。音源に依存しない。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_ScenePortalDiffuseCoupling(IntPtr scene, int id, [Out] float[] out6);
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_VoiceSetTailBus(IntPtr voice, IntPtr bus, int isOwner);
         [DllImport(Dll, CallingConvention = Cc)]

@@ -266,7 +266,14 @@ int main(int argc, char** argv) {
                               fromSvg(kSrc[i].sx, kSrc[i].sy, 1.5f));
         }
         // 回折の二次音源は数フレームに 1 回しか更新されない（測定時の罠）。
-        for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        {   // AF_UPDATES=N で更新回数を変えられる（既定 4）
+            int nUpd = 4;
+            if (const char* u = std::getenv("AF_UPDATES")) nUpd = (std::atoi(u) > 0) ? std::atoi(u) : 1;
+            for (int k = 0; k < nUpd; ++k) {
+                if (std::getenv("AF_APDIAG")) std::fprintf(stderr, "### update %d\n", k);
+                AF_SceneUpdate(s, 1.0f / 60.0f);
+            }
+        }
 
         if (!csv) std::printf("── %s ──\n", p.name);
 
@@ -287,6 +294,7 @@ int main(int argc, char** argv) {
             //   両脇の音源だけ扉が効かない原因が、この分岐かどうかを確かめるために足した。
             if (std::getenv("AF_DIAG")) {
                 float d28[28] = {};
+                if (std::getenv("AF_APDIAG")) std::fprintf(stderr, "### diag src %d\n", i);
                 const int np = AF_SceneDebugDiffractionPath(
                     s, L, fromSvg(kSrc[i].sx, kSrc[i].sy, 1.5f), d28, 0);
                 std::printf("   [診断] %s 経路%d  フレネル=%s  面%d 有界%d 落%d  "

@@ -320,6 +320,9 @@ public:
     std::size_t roomMaxVoxels() const { return roomBuilder_.maxVoxels(); }
     void setRoomBrick(int voxels) { roomBuilder_.setBrick(voxels); }
     void setRoomSeedRadius(float m) { roomBuilder_.setSeedRadius(m); }
+    /// 外の世界へ開く口も開口（自動ポータル）にする。既定 OFF。扉の定点が使う。
+    void setOutsideApertures(int on) { roomBuilder_.setIncludeOutside(on != 0); }
+    int outsideApertures() const { return roomBuilder_.includeOutside() ? 1 : 0; }
     void setRoomChamferFull(bool on) { roomBuilder_.setChamferFull(on); }
 
     // 【回折を平坦にする】既定 ON。回折が持つ情報を「開口の方向」と「距離減衰」に限り、
@@ -1302,6 +1305,12 @@ public:
         // 矩形が「実在する穴」ではなく「積分範囲」であるという印。
         //   稜線から作った一時ポータルだけが立てる。帯域ごとに r1 で範囲を切る。
         bool fresnelSized = false;
+        // 繋いでいる部屋（自動生成のとき部屋グラフから写す。手置きは -1 のまま）。
+        int  roomA = -1, roomB = -1;
+        // 片側が「外の世界」の口（洞窟の口・屋外へ開く戸口）。
+        //   ★回折・エコグラムの経路生成では**使わない**（従来の数値を変えないため）。
+        //     「扉の定点」（隣の空間の響きをこの位置から鳴らす）だけが使う。
+        bool toOutside = false;
     };
 
     int addPortal(const Vec3& center, const Vec3& axisU, const Vec3& axisV,
@@ -1324,6 +1333,92 @@ public:
     }
     int portalCount() const { return static_cast<int>(portals_.size()); }
     void clearPortals() { portals_.clear(); }
+
+    // ── 扉の定点: 隣の空間の**拡散した響き**が、この口をどれだけ通るか（帯域別 0..1）──
+    //
+    //   直接経路の開口積分（portalOpenBands）はリスナーと音源を結ぶ線のまわりのフレネル窓で
+    //   測る量で、音源の位置に依存する。ここで要るのは音源に依存しない量 ──
+    //   部屋に溜まった拡散音場が口を抜ける割合 ── なので、**口の面に垂直な短い線分**を
+    //   矩形の上に並べて透過を測り、面積で平均する。
+    //     開いている所 … 1.0
+    //     板（閉じた扉）に覆われた所 … その材質の質量則 τ_b
+    //   ＝ 合成透過率の割合形 τ_eff = τ_板·(覆われた割合) + (開いた割合)。
+    //
+    //   ★測り方は**半球の見通し**（環境遮蔽）。面に垂直な線分で測る案は却下した:
+    //     斜めに立った板は「法線方向の投影」でしか覆いにならず、45° で 1−cos45=0.29 しか
+    //     開かない。拡散音場が抜けるのは板と枠の**隙間**（∝ sinθ、45° で 0.71）なので、
+    //     向きを積分しないと隙間が見えない。半球の見通しなら、隙間へ向かう向きは通り、
+    //     板へ向かう向きは板の τ になる。板が面から離れるほど遠くで当たるので、距離で
+    //     重みを落とせば（w = 1 − t/R）扉が回る間も連続に変わる。
+    //   両側の半球を掛ける: 外へ開く板は外側の半球を、内へ開く板は内側の半球を塞ぐ。
+    //   閉じた扉は標本点が板の中に入るので、その材質の τ をそのまま取る。
+    //   標本 5×3 × 半球 12 本 × 2 側 = 360 本。変化があった時だけ測ればよい量。
+    //   ⚠ 床・天井・廊下の向かいの壁も少し当たるので、全開でも 1.0 には届かない（0.8〜0.9）。
+    //     これは全ての口に同じ向きに掛かる偏りで、絶対値は耳で決める側に回す。
+    bool portalDiffuseCoupling(int id, float out6[kNumBands]) const {
+        for (int b = 0; b < kNumBands; ++b) out6[b] = 1.0f;
+        if (id < 0 || id >= static_cast<int>(portals_.size())) return false;
+        const Portal& pt = portals_[static_cast<std::size_t>(id)];
+        if (!pt.active) return false;
+        ensureBvh();
+        const Vec3 n = normalized(cross(pt.axisU, pt.axisV));
+        constexpr int kU = 5, kV = 3, kDirs = 12;
+        const float reach = std::min(std::max(2.0f * std::max(pt.halfU, pt.halfV), 0.5f), 4.0f);
+        constexpr float kGolden = 2.399963f;
+        // 標本点が実体の中にあるか（閉じた扉の板の中）。中なら τ をそのまま。
+        auto insideTau = [&](const Vec3& P, float tau[kNumBands]) -> bool {
+            bool inside = false;
+            for (int b = 0; b < kNumBands; ++b) tau[b] = 1.0f;
+            for (const Instance& inst : instances_) {
+                if (!inst.active) continue;
+                const Vec3 lp = obbToLocalPoint(P, inst.obb);
+                const Vec3& he = inst.obb.halfExtents;
+                if (std::fabs(lp.x) > he.x + 0.01f || std::fabs(lp.y) > he.y + 0.01f
+                    || std::fabs(lp.z) > he.z + 0.01f) continue;
+                const AcousticMaterial& m = materialOf(inst.materialId);
+                for (int b = 0; b < kNumBands; ++b) tau[b] = std::min(tau[b], m.transmission[b]);
+                inside = true;
+            }
+            return inside;
+        };
+        // 片側の半球の見通し（余弦重みの向き、当たった距離で重みを落とす）。
+        auto hemisphere = [&](const Vec3& P, const Vec3& axis, float ao[kNumBands]) {
+            double acc[kNumBands] = {0, 0, 0, 0, 0, 0};
+            for (int k = 0; k < kDirs; ++k) {
+                const float h = (k + 0.5f) / kDirs;
+                const float sn = std::sqrt(h), cs = std::sqrt(std::max(0.0f, 1.0f - h));
+                const float ph = kGolden * k;
+                const Vec3 d = axis * cs + pt.axisU * (std::cos(ph) * sn) + pt.axisV * (std::sin(ph) * sn);
+                const SceneHit hit = raycastClosest(P + d * 0.01f, d, reach);
+                if (!hit.hit) { for (int b = 0; b < kNumBands; ++b) acc[b] += 1.0; continue; }
+                const float w = std::max(0.0f, 1.0f - hit.t / reach);   // 遠い当たりは弱く
+                const AcousticMaterial& m = materialOf(hit.materialId);
+                for (int b = 0; b < kNumBands; ++b)
+                    acc[b] += (1.0f - w) * 1.0f + w * m.transmission[b];
+            }
+            for (int b = 0; b < kNumBands; ++b) ao[b] = static_cast<float>(acc[b] / kDirs);
+        };
+        double acc[kNumBands] = {0, 0, 0, 0, 0, 0};
+        for (int j = 0; j < kV; ++j) {
+            const float fv = -0.7f + 1.4f * j / (kV - 1);
+            for (int i = 0; i < kU; ++i) {
+                const float fu = -0.8f + 1.6f * i / (kU - 1);
+                const Vec3 P = pt.center + pt.axisU * (fu * pt.halfU) + pt.axisV * (fv * pt.halfV);
+                float tau[kNumBands];
+                if (insideTau(P, tau)) {
+                    for (int b = 0; b < kNumBands; ++b) acc[b] += tau[b];
+                    continue;
+                }
+                float aoP[kNumBands], aoM[kNumBands];
+                hemisphere(P, n, aoP);
+                hemisphere(P, Vec3(-n.x, -n.y, -n.z), aoM);
+                for (int b = 0; b < kNumBands; ++b) acc[b] += aoP[b] * aoM[b];
+            }
+        }
+        for (int b = 0; b < kNumBands; ++b)
+            out6[b] = static_cast<float>(acc[b] / (kU * kV));
+        return true;
+    }
 
     // ── ポータルの「支配の強さ」 ──
     //
@@ -1488,6 +1583,12 @@ public:
         };
         const rooms::Result& rr = roomGraph();
         for (const rooms::Aperture& ap : rr.apertures) {
+            if (apDiag())
+                std::fprintf(stderr, "    [autoportal] rooms %d<->%d out=%d area %.2f half %.3f x %.3f%s\n",
+                             ap.roomA, ap.roomB, ap.toOutside ? 1 : 0, ap.area, ap.halfU, ap.halfV,
+                             (ap.area < autoPortalMinArea_) ? " -> too small" :
+                             (ap.halfU <= 1e-3f || ap.halfV <= 1e-3f) ? " -> flat rect" :
+                             coveredByManual(ap) ? " -> covered by manual" : " -> portal");
             if (ap.area < autoPortalMinArea_) continue;
             if (ap.halfU <= 1e-3f || ap.halfV <= 1e-3f) continue;
             if (coveredByManual(ap)) continue;
@@ -1497,6 +1598,9 @@ public:
             p.axisV = ap.axisV;
             p.halfU = ap.halfU;
             p.halfV = ap.halfV;
+            p.roomA = ap.roomA;
+            p.roomB = ap.roomB;
+            p.toOutside = ap.toOutside;
             portals_.push_back(p);
             ++autoPortalCount_;
         }
@@ -1915,7 +2019,7 @@ public:
         if (dist < 1e-4f) return nullptr;
         const Vec3 dir = d * (1.0f / dist);
         for (const Portal& pt : portals_) {
-            if (!pt.active) continue;
+            if (!pt.active || pt.toOutside) continue;   // 外へ開く口は経路生成に使わない（扉の定点だけが使う）
             const Vec3 pn = normalized(cross(pt.axisU, pt.axisV));
             const float dn = dot(pn, dir);
             if (std::fabs(dn) < 1e-4f) continue;
@@ -1951,6 +2055,10 @@ public:
                               float outFrac[kNumBands],
                               const Vec3* atPoint = nullptr) const {
         for (int b = 0; b < kNumBands; ++b) outFrac[b] = 1.0f;
+        if (apDiag())
+            std::fprintf(stderr, "    [fres] L(%.2f %.2f %.2f) S(%.2f %.2f %.2f) at(%s)\n",
+                         listener.x, listener.y, listener.z, source.x, source.y, source.z,
+                         atPoint ? "point" : "line");
 
         Vec3 axis = source - listener;
         const float dist = length(axis);
@@ -2027,6 +2135,9 @@ public:
                 planeInst[slot] = i;
                 planeRank[slot] = rank;
                 planeNrm[slot] = nn;
+                if (apDiag())
+                    std::fprintf(stderr, "      [pick] slot %d inst %d tt %.3f rank %.3f nn(%.2f %.2f %.2f)\n",
+                                 slot, i, tt, rank, nn.x, nn.y, nn.z);
             }
         }
         if (nPlanes == 0) {
@@ -2052,6 +2163,9 @@ public:
         }
 
         const float directLen = std::max(length(source - listener), 1e-4f);
+        if (apDiag())
+            std::fprintf(stderr, "      [picked] nPlanes %d : %d %d %d %d\n", nPlanes,
+                         planeInst[0], planeInst[1], planeInst[2], planeInst[3]);
 
         for (int b = 0; b < kNumBands; ++b) outFrac[b] = 1.0f;
 
@@ -2401,6 +2515,7 @@ public:
         }
         openBegin[kRows] = static_cast<int>(openRow.size());
         if (area <= 1e-9) {                 // どこも開いていない
+            if (apDiag()) std::fprintf(stderr, "      [plane %d] inst %d area 0 -> all blocked\n", pl, planeInst[pl]);
             // ★ここを「開口が窓の外へ出たのかもしれない」と疑って、回折点が窓の外なら
             //   前川へ落とす、という手当てを試した。**外れ**。横へ外れた点でも f は
             //   0.0008 など**小さいが 0 ではない**ので、この分岐に入っていなかった。
@@ -2456,6 +2571,12 @@ public:
             // 両方の軸が開いている＝どちらへも広がれる＝半空間。前川に任せる。
             dbgUFrac_ = static_cast<float>(uFrac);
             dbgVFrac_ = static_cast<float>(vFrac);
+            if (apDiag()) {
+                const Vec3 he = instances_[static_cast<std::size_t>(planeInst[pl])].obb.halfExtents;
+                std::fprintf(stderr, "      [plane %d] inst %d c(%.2f %.2f %.2f) he(%.2f %.2f %.2f) area %.4f uFrac %.2f vFrac %.2f%s\n",
+                             pl, planeInst[pl], instances_[static_cast<std::size_t>(planeInst[pl])].obb.center.x, instances_[static_cast<std::size_t>(planeInst[pl])].obb.center.y, instances_[static_cast<std::size_t>(planeInst[pl])].obb.center.z, he.x, he.y, he.z, area, uFrac, vFrac,
+                             (uFrac > kBoundedPerimMax && vFrac > kBoundedPerimMax) ? "  -> half-space (Maekawa)" : "  -> bounded");
+            }
 
             // ★「直線そのものが面で塞がれているなら半空間ではない」という規則を試したが**却下**。
             //   閉扉の崖は 0.8m で直った（-17.4 → -36.2dB）が、**影境界に別の崖ができた**
@@ -2513,8 +2634,12 @@ public:
                              : 1.0f;
             outFrac[b] = std::min(outFrac[b], here);
         }
+        if (apDiag()) std::fprintf(stderr, "      [plane %d] here: 125 %.4f  4k %.4f\n", pl, outFrac[0], outFrac[5]);
         }   // 面のループ
         // 有界な開口が 1 つも無かった＝この経路に f は使えない。呼び出し側は前川に落ちる。
+        if (apDiag())
+            std::fprintf(stderr, "    [fres] -> bounded=%d planes=%d outFrac 125 %.4f 4k %.4f\n",
+                         anyBounded ? 1 : 0, nPlanes, outFrac[0], outFrac[5]);
         return anyBounded;
     }
 
@@ -2810,6 +2935,8 @@ public:
     void setUseBtm(int on) { useBtm_ = (on != 0); }
     void setDirectPenumbra(int on) { directPenumbraFresnel_ = (on != 0); }
     int directPenumbra() const { return directPenumbraFresnel_ ? 1 : 0; }
+    // 【診断】AF_APDIAG の有無は一度だけ読む（毎回 getenv すると回折の内側で効いてしまう）。
+    static bool apDiag() { static const bool on = std::getenv("AF_APDIAG") != nullptr; return on; }
     int useBtm() const { return useBtm_ ? 1 : 0; }
     /// 楔の開き角(rad)。既定 1.5π＝箱の凸稜線。薄い衝立なら 2π。
     void setBtmWedgeAngle(float rad) { btmWedgeAngle_ = (rad > 0.1f) ? rad : 4.712389f; }
@@ -3412,7 +3539,7 @@ public:
             int np2 = 0;
             for (const Portal& pt : portals_) {
                 if (np2 >= maxPaths) break;
-                if (!pt.active) continue;
+                if (!pt.active || pt.toOutside) continue;   // 外へ開く口は経路生成に使わない（扉の定点だけが使う）
                 float f[kNumBands]; Vec3 cp(0, 0, 0);
                 if (!portalCoupling(pt, listener, source, f, &cp)) continue;
                 // 低域加重の広帯域スカラ（他の経路と同じ畳み方）。
@@ -3473,7 +3600,7 @@ public:
         };
         auto coveredByPortal = [&](const Vec3& p) {
             for (const Portal& pt : portals_) {
-                if (!pt.active) continue;
+                if (!pt.active || pt.toOutside) continue;   // 外へ開く口は経路生成に使わない（扉の定点だけが使う）
                 // 開口点そのものが矩形の中／面の近くにある
                 const Vec3 n2 = normalized(cross(pt.axisU, pt.axisV));
                 const Vec3 d = p - pt.center;
@@ -3540,6 +3667,17 @@ public:
             // ★窓の中心に Pc（稜線由来の開口点）を渡してはいけない。Pc は跳ぶので
             //   （実測 3m）、窓ごと飛んで値が乱高下する。窓は測定の基準ではなく
             //   積分の範囲なので、**連続に動く点**（直線と平面の交点）に据える。
+            // ★2026-09-03 記録: 「窓を経路の脚ごと（L→重心、重心→S）に置く」を試して**却下**。
+            //   狙いは外開きの扉の段差。聴く人と戸口の間に立つ板の影が直線 L→S 上の戸口の窓を
+            //   丸ごと塞ぎ、1 次経路が f=0 で消える（外開き 1.5 m・42° で −37 dB＝透過だけ）。
+            //   一方 1 次が見つからない 44° では 2 次探索が板の縁経由の経路を見つけ、前川だけで
+            //   −12.7 dB。同じ場面で 1 次と 2 次が別の答えを持ち、探索の当たり外れが段になる。
+            //   脚ごとの窓でも直らなかった理由: 折れ点（重心）は**戸口の縁**なので L→折れ点の脚が
+            //   板を貫き、板の面の窓が塞がったまま。実際の音は板の縁で一度折れ、さらに戸口を通る
+            //   **2 回折れる経路**で、1 次の枠組みでは表せない。実測（外開き 1.5 m）: 最大段差
+            //   24.7 → 18.4 dB で −37 の台地は残り、影境界の隣接差が 0.562 に悪化（見通し側が直線の
+            //   窓のままなので境界で式が変わる）、メッシュ／箱の比が 0.00、フレーム +18%。
+            //   → 直すなら「2 次を 1 次の代替ではなく並走させ、脚ごとの開口を持たせる」形。
             float fres[kNumBands];
             bool haveFres = useFresnelAperture_
                           && apertureFresnelBands(listener, source, fres);
@@ -4342,7 +4480,7 @@ public:
         float difPortal[kNumBands] = {0, 0, 0, 0, 0, 0};
         if (!portals_.empty()) {
             for (const Portal& pt : portals_) {
-                if (!pt.active) continue;
+                if (!pt.active || pt.toOutside) continue;   // 外へ開く口は経路生成に使わない（扉の定点だけが使う）
                 const float w = portalGovern(pt, listener, source);
                 if (w <= 0.0f) continue;
                 float pf[kNumBands]; Vec3 cp(0, 0, 0);
@@ -4543,7 +4681,7 @@ public:
             float best[kNumBands] = {0, 0, 0, 0, 0, 0};
             float wMax = 0.0f;
             for (const Portal& pt : portals_) {
-                if (!pt.active) continue;
+                if (!pt.active || pt.toOutside) continue;   // 外へ開く口は経路生成に使わない（扉の定点だけが使う）
                 const float w = portalGovern(pt, listener, source);
                 if (w <= 0.0f) continue;
                 float f[kNumBands]; Vec3 cp(0, 0, 0);
@@ -6067,7 +6205,7 @@ private:
         //   閉じた開口の向こうの響き。レイ数は落としてよい ──
         //   要るのは尾の包絡であって細かい構造ではないので（本体の 1/4）。
         for (const Portal& pt : portals_) {
-            if (!pt.active) continue;
+            if (!pt.active || pt.toOutside) continue;   // 外へ開く口は経路生成に使わない（扉の定点だけが使う）
             addPortalEchogram(pt, echoRepPos_.data(), m,
                               echoAccum_.data(), results_.echogramBins,
                               cfg_.echogramBinSeconds, cfg_.speedOfSound,
