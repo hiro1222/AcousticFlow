@@ -407,40 +407,22 @@
       <div class="col" style="flex:1.35">
         <table>
           <tr><th style="width:24%">パターン</th><th class="n">音源1（左）</th><th class="n">音源2（正面）</th><th class="n">音源3（右・蝶番側）</th></tr>
-          <tr><td><strong>0°（閉）</strong></td><td class="n">−38.6</td><td class="n">−36.2</td><td class="n">−38.7</td></tr>
-          <tr><td>40°</td><td class="n">−4.5</td><td class="n">−14.4</td><td class="n">−19.4</td></tr>
-          <tr><td>80°</td><td class="n">−4.8</td><td class="n">0.0</td><td class="n">−16.9</td></tr>
-          <tr><td>160°</td><td class="n">−5.1</td><td class="n">0.0</td><td class="n">−5.1</td></tr>
-          <tr><td><strong>ドアなし</strong>（基準）</td><td class="n">−5.1</td><td class="n">0.0</td><td class="n">−5.1</td></tr>
+          <tr><td><strong>0°（閉）</strong></td><td class="n">−37.2</td><td class="n">−36.3</td><td class="n">−36.9</td></tr>
+          <tr><td>40°</td><td class="n">−4.1</td><td class="n">−5.0</td><td class="n">−19.0</td></tr>
+          <tr><td>80°</td><td class="n">−3.5</td><td class="n">−0.5</td><td class="n">−14.1</td></tr>
+          <tr><td>160°</td><td class="n">−3.7</td><td class="n">−0.1</td><td class="n">−2.8</td></tr>
+          <tr><td><strong>ドアなし</strong>（基準）</td><td class="n">−3.7</td><td class="n">−0.1</td><td class="n">−2.8</td></tr>
         </table>
-        <p class="tiny" style="margin-top:2mm">● 音源／▲ リスナー（戸口の正面・外側）。部屋 7.08 × 3.48 × 3.0 m ／ 戸口 1.40 m 幅 ／ 壁厚 0.16 m ／ 蝶番は右端・内開き。値は帯域別の生存ゲイン（透過⊕回折⊕反射）を dB にしたもの。<strong>この表は測定用の実行ファイル 1 本で再現できます。</strong></p>
-        <p class="tiny" style="margin-top:1.5mm">★見るのは <strong>いちばん下の「ドアなし」との差</strong>です。音源1・3 は斜めから覗く位置なので、扉が無くても<strong>戸口の縁（壁）</strong>に −5.1 dB 分だけ遮られます。<strong>扉の効果と、戸口そのものの効果は別物</strong>です。</p>
+        <p class="tiny" style="margin-top:2mm">● 音源／▲ リスナー（戸口の正面・外側）。部屋 7.08 × 3.48 × 3.0 m／戸口 1.40 m／壁厚 0.16 m／蝶番は右端・内開き。値は帯域別の生存ゲイン（透過⊕回折⊕反射）の dB で、測定用の実行ファイル 1 本で再現できます。★見るのは <strong>「ドアなし」との差</strong> ── 音源1・3 は斜めから覗くので、扉が無くても<strong>戸口の縁</strong>に 3 dB 前後遮られる。<strong>扉と戸口の効果は別物</strong>。</p>
       </div>
       <div class="col">
         <div class="call">
           <strong>① 開口が向いた側から順に入ってくる。</strong>
           蝶番は右なので、隙間はまず左から開きます。<strong>音源1 と 音源3 は左右対称＝距離が同じ</strong>なのに、入ってくる順が違う ── <strong>距離ではなく開口の向きが決めています。</strong>
+          <span class="tiny">★蝶番を左へ振ると鏡像（40°: −18.6 / −5.8 / <b>−3.4</b>）。開く側と蝶番側の差は <strong>15 dB</strong>。</span><br>
+          <strong>② 閉じているときは「こもる」だけで、位置が分からない</strong> ── 3 本とも −36〜−37 dB、<strong>低域−高域 +21〜23 dB</strong>。<strong>開けた瞬間に分かれる</strong>（p2 の答え合わせ）。
         </div>
-        <div class="call" style="margin-top:2.5mm">
-          <strong>★蝶番を左へ振ると、きれいに鏡像になります。</strong>
-          <table style="margin-top:1.5mm">
-            <tr><th>40°</th><th class="n">音源1</th><th class="n">音源2</th><th class="n">音源3</th></tr>
-            <tr><td>蝶番 右</td><td class="n"><strong>−4.5</strong></td><td class="n">−14.4</td><td class="n">−19.4</td></tr>
-            <tr><td>蝶番 左</td><td class="n">−18.8</td><td class="n">−14.0</td><td class="n"><strong>−4.5</strong></td></tr>
-          </table>
-          <span class="tiny">入る側だけが入れ替わり、中央の音源2 は <b>−14.4 / −14.0 とほぼ動かない</b>。開く側と蝶番側の差は <strong>15 dB</strong>。<strong>幾何がそのまま出ている</strong>ことの確認です。</span>
-        </div>
-        <div class="call" style="margin-top:2.5mm">
-          <strong>② 閉じているときは「こもる」だけで、位置が分からない。</strong>
-          3 本とも −36.2〜−38.7 dB とほぼ同じ値で、<strong>低域−高域は +21.3〜21.5 dB</strong>（扉板を透過してくる低域だけが残る）。<strong>開けた瞬間に分かれる</strong> ── これが p2 の「答え合わせ」です。
-        </div>
-        <p class="tiny" style="margin-top:2.5mm">★<strong>4 点だけでなく全域を 10° 刻み・境目は 1° 刻みで振って形を確かめました</strong>（音源3・広帯域 dB）。
-        閉 <b>−38.7</b> → 10° −26.4 → 20° −21.7 → 40° −19.4 → 60° −18.1 → <b>80° −16.9</b>
-        → 120° −15.6 → 140° −5.1 → 160° <b>−5.1</b> → ドアなし −5.1。<strong>閉から 120° までは単調に良くなり、蝶番側の音源は 120° を過ぎるまで塞がれたままです。</strong>
-        90° 付近は 1° 刻みでも滑らか（86〜94° で −16.8 → −16.5）。<br>
-        ⚠ ただし <strong>127°→128°→129° に崖があります</strong>（−15.1 → −8.0 → −5.5、<strong>2° で 9.6 dB</strong>）。
-        開いた板の縁が音源の見通し線を横切る瞬間で、<strong>直接経路の「遮られているか」が二値</strong>なので、板の縁に半影が無く一気に切り替わります。起きる事象は本物ですが、<strong>連続性に反するので未解決</strong>として p19 に挙げています。<br>
-        ★<strong>外開きにすると 60° で 3 本とも一気に開きます</strong> ── 板がリスナー側に立つからで、<strong>「どちらへ開くか」まで音が変わる</strong>ことの実測です。⚠ ただし 40° までは<strong>閉扉より暗い</strong>（脇の音源で −43.2）── 目の前に立った板を通る透過を今の模型が持っていないためで、これも p19 に挙げています。</p>
+        <p class="tiny" style="margin-top:2.5mm">★全域を 10° 刻み（境目は 1°）で振っても、<strong>蝶番側の音源は 120° を過ぎるまで塞がれたまま</strong>（80° −14.1 → 120° −12.4 → 140° −2.8）。板の縁を横切る 127〜136° も <strong>1° あたり最大 1.5 dB</strong> ── 半影を帯域別のフレネル環で見ているためで、この間は<strong>低域−高域が最大 12 dB＝低い音から先に届く</strong>。外開きは 44° で 3 本とも一気に開くが、38〜42° は閉扉より暗い（p19）。</p>
       </div>
 
     </div>
@@ -1053,9 +1035,9 @@
       <table>
         <tr><th style="width:42%">課題</th><th>いまの状態</th></tr>
         <tr><td><strong>構造を焼く実装がこれから</strong></td><td>尾は<b>焼かないと確定</b>（p3）。残るのは<b>静的な稜線</b>を焼いて探索の点滅を消すこと。費用ではなく品質のための作業</td></tr>
-        <tr><td><strong>音源数の上限</strong>／並列化の頭打ち</td><td>共有バスで 1 本あたりの費用が下がり、以前の実測（約 36 本）は当てはまらない。並列は<b>音源ごとに割れない処理</b>（カタログ・部屋の検出）が残り 4 コア 2.42 倍 → 8 コア 2.74 倍</td></tr>
-        <tr><td><strong>★開口積分に二値の分岐が残っている</strong></td><td>閉扉の「幻」（脇の音源が −6 dB で素通り）は窓が建物より大きく屋外側を開口に数えていたのが原因で、<b>影を音源側からも落として直した</b>（2026-09-02）。90° の段差も再現しない。だが<b>「有界か」の bool でフレネル積分と前川を切り替える分岐</b>と fail-open は残る。次にやること 1</td></tr>
-        <tr><td><strong>★扉の板の縁で崖</strong></td><td>内開きの蝶番側の音源が <b>127° −15.1 → 129° −5.5（2° で 9.6 dB）</b>：直接経路の遮蔽判定が二値。外開きは 40° で<b>閉扉より暗く</b> 60° で 39 dB 跳ぶ：板を通る透過を別の運び手として持っていない。<b>未解決</b></td></tr>
+        <tr><td><strong>音源数の上限</strong>／並列化の頭打ち</td><td>共有バスで 1 本あたりの費用が下がり、以前の実測（約 36 本）は当てはまらない。並列は<b>音源ごとに割れない処理</b>が残り 4 コア 2.42 倍 → 8 コア 2.74 倍</td></tr>
+        <tr><td><strong>★開口積分に二値の分岐が残っている</strong></td><td>閉扉の「幻」（脇の音源が −6 dB で素通り）は窓が建物より大きく屋外側を開口に数えていたのが原因。<b>影を音源側からも落として直した</b>（2026-09-02）。だが<b>「有界か」の bool でフレネル積分と前川を切り替える分岐</b>と fail-open は残る。次にやること 1</td></tr>
+        <tr><td><strong>★外開きの板が目の前に立つ</strong></td><td>内開きの縁の崖（2° で 9.6 dB）は<b>直接経路の半影を帯域別のフレネル環にして 1° あたり 1.5 dB に収めた</b>（p6）。外開きは残る：38〜42° で<b>閉扉より暗く</b>、44° で 38 dB 跳ぶ（板を通る透過を別の運び手として持たない）。<b>未解決</b></td></tr>
         <tr><td><strong>響く空間で尾が短い</strong>／位相／GPU</td><td>跳ね返り 24 回で打ち切るため吸音の小さい空間（α≦0.2）は減衰しきる前に切れる（256 回で RT60 0.70 → 0.93 s）。位相は扱わず、レイの段がフレームの約半分で規模が上がれば GPU が要る</td></tr>
       </table>
     </div>
