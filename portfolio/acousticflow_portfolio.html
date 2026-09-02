@@ -407,14 +407,14 @@
       <div class="col" style="flex:1.35">
         <table>
           <tr><th style="width:24%">パターン</th><th class="n">音源1（左）</th><th class="n">音源2（正面）</th><th class="n">音源3（右・蝶番側）</th></tr>
-          <tr><td><strong>0°（閉）</strong></td><td class="n">−36.9</td><td class="n">−36.3</td><td class="n">−37.0</td></tr>
-          <tr><td>40°</td><td class="n">−4.1</td><td class="n">−8.9</td><td class="n">−11.1</td></tr>
-          <tr><td>80°</td><td class="n">−4.3</td><td class="n">0.0</td><td class="n">−10.4</td></tr>
-          <tr><td>160°</td><td class="n">−4.4</td><td class="n">0.0</td><td class="n">−5.5</td></tr>
-          <tr><td><strong>ドアなし</strong>（基準）</td><td class="n">−4.4</td><td class="n">0.0</td><td class="n">−4.4</td></tr>
+          <tr><td><strong>0°（閉）</strong></td><td class="n">−38.6</td><td class="n">−36.2</td><td class="n">−38.7</td></tr>
+          <tr><td>40°</td><td class="n">−4.5</td><td class="n">−14.4</td><td class="n">−19.4</td></tr>
+          <tr><td>80°</td><td class="n">−4.8</td><td class="n">0.0</td><td class="n">−16.9</td></tr>
+          <tr><td>160°</td><td class="n">−5.1</td><td class="n">0.0</td><td class="n">−5.1</td></tr>
+          <tr><td><strong>ドアなし</strong>（基準）</td><td class="n">−5.1</td><td class="n">0.0</td><td class="n">−5.1</td></tr>
         </table>
         <p class="tiny" style="margin-top:2mm">● 音源／▲ リスナー（戸口の正面・外側）。部屋 7.08 × 3.48 × 3.0 m ／ 戸口 1.40 m 幅 ／ 壁厚 0.16 m ／ 蝶番は右端・内開き。値は帯域別の生存ゲイン（透過⊕回折⊕反射）を dB にしたもの。<strong>この表は測定用の実行ファイル 1 本で再現できます。</strong></p>
-        <p class="tiny" style="margin-top:1.5mm">★見るのは <strong>いちばん下の「ドアなし」との差</strong>です。音源1・3 は斜めから覗く位置なので、扉が無くても<strong>戸口の縁（壁）</strong>に −4.4 dB 分だけ遮られます。<strong>扉の効果と、戸口そのものの効果は別物</strong>です。</p>
+        <p class="tiny" style="margin-top:1.5mm">★見るのは <strong>いちばん下の「ドアなし」との差</strong>です。音源1・3 は斜めから覗く位置なので、扉が無くても<strong>戸口の縁（壁）</strong>に −5.1 dB 分だけ遮られます。<strong>扉の効果と、戸口そのものの効果は別物</strong>です。</p>
       </div>
       <div class="col">
         <div class="call">
@@ -425,22 +425,22 @@
           <strong>★蝶番を左へ振ると、きれいに鏡像になります。</strong>
           <table style="margin-top:1.5mm">
             <tr><th>40°</th><th class="n">音源1</th><th class="n">音源2</th><th class="n">音源3</th></tr>
-            <tr><td>蝶番 右</td><td class="n"><strong>−4.1</strong></td><td class="n">−8.9</td><td class="n">−11.1</td></tr>
-            <tr><td>蝶番 左</td><td class="n">−11.0</td><td class="n">−8.9</td><td class="n"><strong>−4.0</strong></td></tr>
+            <tr><td>蝶番 右</td><td class="n"><strong>−4.5</strong></td><td class="n">−14.4</td><td class="n">−19.4</td></tr>
+            <tr><td>蝶番 左</td><td class="n">−18.8</td><td class="n">−14.0</td><td class="n"><strong>−4.5</strong></td></tr>
           </table>
-          <span class="tiny">入る側だけが入れ替わり、中央の音源2 は <b>−8.9 のまま動かない</b>。<strong>幾何がそのまま出ている</strong>ことの確認です。</span>
+          <span class="tiny">入る側だけが入れ替わり、中央の音源2 は <b>−14.4 / −14.0 とほぼ動かない</b>。開く側と蝶番側の差は <strong>15 dB</strong>。<strong>幾何がそのまま出ている</strong>ことの確認です。</span>
         </div>
         <div class="call" style="margin-top:2.5mm">
           <strong>② 閉じているときは「こもる」だけで、位置が分からない。</strong>
-          3 本とも −36.3〜−37.0 dB とほぼ同じ値で、<strong>低域−高域は +21.3 dB</strong>（扉板を透過してくる低域だけが残る）。<strong>開けた瞬間に分かれる</strong> ── これが p2 の「答え合わせ」です。
+          3 本とも −36.2〜−38.7 dB とほぼ同じ値で、<strong>低域−高域は +21.3〜21.5 dB</strong>（扉板を透過してくる低域だけが残る）。<strong>開けた瞬間に分かれる</strong> ── これが p2 の「答え合わせ」です。
         </div>
         <p class="tiny" style="margin-top:2.5mm">★<strong>4 点だけでなく全域を 10° 刻み・境目は 1° 刻みで振って形を確かめました</strong>（音源3・広帯域 dB）。
-        閉 <b>−37.0</b> → 10° −14.0 → 20° −12.1 → 40° −11.1 → 60° −10.6 → <b>80° −10.4</b>
-        → 120° −11.1 → 140° −6.5 → 160° <b>−5.5</b> → ドアなし −4.4。<strong>閉から 80° までは素直に良くなります。</strong><br>
-        ⚠ ただし <strong>89°→90°→91° に段差があり、そこは信用できません</strong>（−10.2 → −17.3 → −12.7）。
-        <strong>1° で 7 dB 突出し、そのあと 2.5 dB 低い枝に移って 30° 以上戻らない</strong> ── 板が壁とちょうど直角になる退化した配置で分岐がぶれています。
-        <strong>連続性に反するのでこれはバグ</strong>で、未解決として p19 に挙げています。<strong>この表の角度は、その区間を避けて選んでいます。</strong><br>
-        ★<strong>外開きにすると 40° で 3 本とも一気に開きます</strong> ── 板が音源側ではなくリスナー側に立つからで、<strong>「どちらへ開くか」まで音が変わる</strong>ことの実測です。</p>
+        閉 <b>−38.7</b> → 10° −26.4 → 20° −21.7 → 40° −19.4 → 60° −18.1 → <b>80° −16.9</b>
+        → 120° −15.6 → 140° −5.1 → 160° <b>−5.1</b> → ドアなし −5.1。<strong>閉から 120° までは単調に良くなり、蝶番側の音源は 120° を過ぎるまで塞がれたままです。</strong>
+        90° 付近は 1° 刻みでも滑らか（86〜94° で −16.8 → −16.5）。<br>
+        ⚠ ただし <strong>127°→128°→129° に崖があります</strong>（−15.1 → −8.0 → −5.5、<strong>2° で 9.6 dB</strong>）。
+        開いた板の縁が音源の見通し線を横切る瞬間で、<strong>直接経路の「遮られているか」が二値</strong>なので、板の縁に半影が無く一気に切り替わります。起きる事象は本物ですが、<strong>連続性に反するので未解決</strong>として p19 に挙げています。<br>
+        ★<strong>外開きにすると 60° で 3 本とも一気に開きます</strong> ── 板がリスナー側に立つからで、<strong>「どちらへ開くか」まで音が変わる</strong>ことの実測です。⚠ ただし 40° までは<strong>閉扉より暗い</strong>（脇の音源で −43.2）── 目の前に立った板を通る透過を今の模型が持っていないためで、これも p19 に挙げています。</p>
       </div>
 
     </div>
@@ -1053,24 +1053,20 @@
       <table>
         <tr><th style="width:42%">課題</th><th>いまの状態</th></tr>
         <tr><td><strong>構造を焼く実装がこれから</strong></td><td>尾は<b>焼かないと確定</b>（p3）。残るのは<b>静的な稜線</b>を焼いて探索の点滅を消すこと。費用ではなく品質のための作業</td></tr>
-        <tr><td><strong>音源数の上限を測り直せていない</strong></td><td>共有バスで 1 本あたりの限界費用が下がったので、以前の実測（約 36 本）はもう当てはまらない</td></tr>
-        <tr><td>並列化が 4 コアで頭打ち</td><td>共有したレイの段（エコグラム・反射）は塊で割れるが、<b>音源ごとに割れない処理</b>（エッジカタログ・部屋の検出）が残る。4 コア 2.42 倍 → 8 コア 2.74 倍</td></tr>
-        <tr><td><strong>★閉じた扉の「幻」</strong></td><td>戸口の幅によっては、閉扉なのに <b>−11 dB・帯域がまっすぐ</b>という値が出る（正しくは −37 dB・低−高 +21 dB）。<b>幅 0.9/1.1/1.8 m で出て、1.4/2.2 m では出ない</b>という<b>非単調</b>な出方をする。部屋を 2.5 倍に広げても消えないので、原因は部屋ではなく<b>幅</b>。<b>未解決</b>。デバッグツールの型紙 4 が自動で拾える</td></tr>
-        <tr><td><strong>★扉が真横（90°）で不連続</strong></td><td>1° 刻みで振ると <b>89° −10.2 → 90° −17.3 → 91° −12.7</b>。<b>1° で 7 dB 突出し、そのあと 2.5 dB 低い枝へ移って 30° 以上戻らない</b>。さらに 90° の値は<b>同じプロセスで先に何を計算したかで −12.7 と −17.3 の間を揺れる</b>（単独 8 回では安定）。板が壁とちょうど直角になる退化した配置で分岐がぶれており、<b>初期化されていない値を読んでいる疑い</b>。<b>連続性が第一制約なので、これは最優先の未解決課題</b></td></tr>
-        <tr><td><strong>響く空間で尾が短い</strong></td><td>跳ね返りを 32 回で打ち切っているため、吸音の小さい空間（α≦0.2）は減衰しきる前に切れる。256 回にすると RT60 が 0.70 → 0.93 s</td></tr>
-        <tr><td>位相を扱わない</td><td>干渉・共鳴は表現できない。連続性を優先した結果の制約</td></tr>
-        <tr><td>GPU 未使用</td><td>レイの段がフレームの約半分を占める。規模が上がれば必要になる</td></tr>
+        <tr><td><strong>音源数の上限</strong>／並列化の頭打ち</td><td>共有バスで 1 本あたりの費用が下がり、以前の実測（約 36 本）は当てはまらない。並列は<b>音源ごとに割れない処理</b>（カタログ・部屋の検出）が残り 4 コア 2.42 倍 → 8 コア 2.74 倍</td></tr>
+        <tr><td><strong>★開口積分に二値の分岐が残っている</strong></td><td>閉扉の「幻」（脇の音源が −6 dB で素通り）は窓が建物より大きく屋外側を開口に数えていたのが原因で、<b>影を音源側からも落として直した</b>（2026-09-02）。90° の段差も再現しない。だが<b>「有界か」の bool でフレネル積分と前川を切り替える分岐</b>と fail-open は残る。次にやること 1</td></tr>
+        <tr><td><strong>★扉の板の縁で崖</strong></td><td>内開きの蝶番側の音源が <b>127° −15.1 → 129° −5.5（2° で 9.6 dB）</b>：直接経路の遮蔽判定が二値。外開きは 40° で<b>閉扉より暗く</b> 60° で 39 dB 跳ぶ：板を通る透過を別の運び手として持っていない。<b>未解決</b></td></tr>
+        <tr><td><strong>響く空間で尾が短い</strong>／位相／GPU</td><td>跳ね返り 24 回で打ち切るため吸音の小さい空間（α≦0.2）は減衰しきる前に切れる（256 回で RT60 0.70 → 0.93 s）。位相は扱わず、レイの段がフレームの約半分で規模が上がれば GPU が要る</td></tr>
       </table>
     </div>
     <div class="col">
       <h2>次にやること</h2>
       <table>
-        <tr><td class="n" style="width:8%">1</td><td><strong>扉が真横のときの不連続を直す</strong>（1° で 7 dB。連続性が第一制約なので、ここが最優先）</td></tr>
-        <tr><td class="n">2</td><td><strong>閉じた扉の「幻」を直す</strong>（開口積分の分岐。戸口の幅で出方が変わる）</td></tr>
-        <tr><td class="n">3</td><td><strong>静的な稜線を焼く</strong>（探索の点滅を構成から消す。動く物の稜線は実行時に合流）</td></tr>
-        <tr><td class="n">4</td><td>キャプチャの入力リプレイを Unity 側から回せるようにする</td></tr>
-        <tr><td class="n">5</td><td>音声スレッド 45 % をさらに下げる（段の振り分け）</td></tr>
-        <tr><td class="n">6</td><td>実証用ゲーム Bell / Door の完成（制作中）</td></tr>
+        <tr><td class="n" style="width:8%">1</td><td><strong>開口積分の二値の分岐をやめる</strong>（有界判定の bool を、縁の開き割合でフレネルと前川を連続に混ぜる形へ。fail-open は「影が無い」と「計算できなかった」を分ける）</td></tr>
+        <tr><td class="n">2</td><td><strong>扉を角度軸で焼く</strong>（自由度 1 なので 5° 刻み 33 点で足りる。実行時は補間だけ＝探索が無く跳べない。焼く前に各角度の値が信用できることを確かめる）</td></tr>
+        <tr><td class="n">3</td><td><strong>静的な稜線を焼く</strong>（探索の点滅を構成から消す。置物の稜線は実行時に合流、更新は部屋グラフで判定）</td></tr>
+        <tr><td class="n">4</td><td>音声スレッドの<strong>最悪ブロック</strong>を測れるようにする（いまはレベルしか出ていない。平均 45 % に意味は無い）</td></tr>
+        <tr><td class="n">5</td><td>実証用ゲーム Bell / Door の完成（制作中）</td></tr>
       </table>
       <div class="call" style="margin-top:4mm">
         <strong>この作品で身につけたこと</strong>
