@@ -2379,7 +2379,8 @@ MonoBehaviour:
   roomSeedRadius: 0.6
   autoPortals: 1
   workerThreads: 4
-  sharedTailBus: 0
+  sharedTailBus: 1
+  portalTail: 1
   autoPortalMinArea: 0.25
   portalGovernRange: 1
   enableEarlyReflections: 1

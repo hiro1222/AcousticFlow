@@ -1541,6 +1541,8 @@ namespace AcousticFlow
             }
             // B：全音源を 音楽 ↔ 足音SE(WalkSE_01) に切替。
             if (Input.GetKeyDown(KeyCode.B)) SwitchSourceSound();
+            // P：扉の定点 ON/OFF（聴き比べ用。sharedTailBus が ON のときだけ効く）。
+            if (Input.GetKeyDown(KeyCode.P)) portalTail = !portalTail;
             // M：Wwise音源を一括ミュート/復帰（IR畳み込みテストで楽曲を止めてクリックを聞く用）。
             //   ミュート=全ボイスStop、復帰=再Post（拍は頭出しに戻る）。IrConvolver(Unity)は無関係に鳴り続ける。
             if (Input.GetKeyDown(KeyCode.M))
@@ -2821,6 +2823,22 @@ namespace AcousticFlow
                                 + " / M:楽曲ミュート", style);
             GUILayout.Label($"音: {(_singleFootstep ? $"足音ループ・音源0のみ ({footstepEvent})" : (useFootstepSE ? $"足音SE・音源0のみ ({footstepEvent})" : "音楽ステム"))}  (B:足音切替{(enableFootstepToggleKey ? " / Enter:足音ループ" : "")})", style);
             GUILayout.Label($"音源配置: {(_stacked ? "重ね(1点)" : "展開")}", style);
+            {
+                // 扉の定点の状態。効いていない理由があればそれも出す（黙って効かないのがいちばん困る）。
+                float peak = 0f; int live = 0;
+                foreach (var kv in _portalEmitters)
+                {
+                    if (kv.Value == null) continue;
+                    if (kv.Value.feedGain > 0f) live++;
+                    if (kv.Value.rmsOut > peak) peak = kv.Value.rmsOut;
+                }
+                string why = !portalTail ? "" :
+                             !sharedTailBus ? "（sharedTailBus が OFF なので効いていません）" :
+                             !autoPortals ? "（autoPortals が OFF なので効いていません）" : "";
+                GUILayout.Label($"扉の定点(P): {(portalTail ? "ON" : "OFF")}{why}   定点 {_portalEmitters.Count} 本"
+                                + $"（鳴っている {live} 本、最大 {(peak > 1e-6f ? 20f * Mathf.Log10(peak) : -99f):F1} dB）"
+                                + $"  レベル {portalTailLevel:F2}", style);
+            }
             if (enableReverb)
             {
                 float wetP = _reverbWet * 100f;                 // 物理wet%（t/(1+t)）
