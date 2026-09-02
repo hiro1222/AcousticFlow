@@ -47,6 +47,20 @@ namespace AcousticFlow
 
         // 尾の形の index → バス。形が同じ音源は同じバスへ入る。
         private readonly Dictionary<int, System.IntPtr> _buses = new Dictionary<int, System.IntPtr>();
+        // 【扉の定点】バスごとの「直接に足す割合」＝リスナーのまわりでその部屋が占める割合 w。
+        //   部屋の中では 1（従来どおり）、外では 0（尾は戸口の PortalEmitter が (1−w) で運ぶ）。
+        //   主スレッドが書き、オーディオスレッドが読む。float の読み書きは原子的なので配列で持つ
+        //   （辞書はオーディオスレッドから触らない）。鍵は尾の形の index（音源の index）。
+        private readonly float[] _busWeight = new float[512];
+        public void SetBusWeight(int shapeIndex, float w)
+        {
+            if ((uint)shapeIndex < (uint)_busWeight.Length) _busWeight[shapeIndex] = Mathf.Clamp01(w);
+        }
+        /// その形のバスのハンドル（無ければ Zero）。**主スレッドからだけ呼ぶこと**（辞書を引く）。
+        public System.IntPtr BusHandle(int shapeIndex)
+        {
+            return _buses.TryGetValue(shapeIndex, out var b) ? b : System.IntPtr.Zero;
+        }
         private float[] _l, _r;
         private int _sampleRate = 48000;
         private float _tailSeconds = 1f;
@@ -68,6 +82,7 @@ namespace AcousticFlow
         private void Awake()
         {
             _sampleRate = AudioSettings.outputSampleRate;
+            for (int i = 0; i < _busWeight.Length; i++) _busWeight[i] = 1f;   // 既定は従来どおり全部足す
         }
 
         private void OnDisable()
@@ -77,6 +92,9 @@ namespace AcousticFlow
             //   音源側はまだバスを掴んでいる可能性がある。掴んでいる側を先に外させる。
             foreach (var v in FindObjectsByType<VoiceConvolver>(FindObjectsSortMode.None))
                 v.DetachTailBus();
+            // 扉の定点もバスのモノラルを読んでいるので、先に離す。
+            foreach (var e in FindObjectsByType<PortalEmitter>(FindObjectsSortMode.None))
+                e.Detach();
             foreach (var kv in _buses)
                 if (kv.Value != System.IntPtr.Zero)
                     Native.AF_TailBusDestroy(kv.Value);
@@ -98,17 +116,20 @@ namespace AcousticFlow
                 System.Array.Clear(_l, 0, frames);
                 System.Array.Clear(_r, 0, frames);
                 Native.AF_TailBusRender(kv.Value, frames, _l, _r);
+                // 直接に足す割合 w（既定 1）。バスの中に残るモノラルは薄めない（定点が別に読む）。
+                float w = ((uint)kv.Key < (uint)_busWeight.Length) ? _busWeight[kv.Key] : 1f;
+                if (w <= 0f) continue;
                 if (channels >= 2)
                 {
                     for (int i = 0; i < frames; i++)
                     {
-                        data[i * channels] += _l[i];
-                        data[i * channels + 1] += _r[i];
+                        data[i * channels] += _l[i] * w;
+                        data[i * channels + 1] += _r[i] * w;
                     }
                 }
                 else
                 {
-                    for (int i = 0; i < frames; i++) data[i * channels] += 0.5f * (_l[i] + _r[i]);
+                    for (int i = 0; i < frames; i++) data[i * channels] += 0.5f * (_l[i] + _r[i]) * w;
                 }
             }
         }

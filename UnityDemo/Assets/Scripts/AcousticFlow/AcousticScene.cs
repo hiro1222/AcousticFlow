@@ -834,6 +834,43 @@ namespace AcousticFlow
             catch (System.Exception) { return false; }
         }
 
+        // ── 扉の定点（隣の空間の響きを戸口の位置から鳴らす）──
+
+        /// ポータルが繋いでいる部屋。toOutside なら片側が外の世界（洞窟の口・屋外へ開く戸口、roomA=-1）。
+        public bool GetPortalRooms(int id, out int roomA, out int roomB, out bool toOutside)
+        {
+            roomA = -1; roomB = -1; toOutside = false;
+            if (_handle == IntPtr.Zero) return false;
+            try
+            {
+                int o;
+                if (Native.AF_SceneGetPortalRooms(_handle, id, out roomA, out roomB, out o) == 0) return false;
+                toOutside = (o != 0);
+                return true;
+            }
+            catch (System.Exception) { return false; }
+        }
+
+        /// 外の世界へ開く口も自動ポータルにする（既定 OFF）。回折の経路生成は使わず、扉の定点だけが使う。
+        /// 中で値の変化を見ているので毎フレーム押してよい。
+        private int _outsideApertures = -1;
+        public void SetOutsideApertures(bool on)
+        {
+            if (_handle == IntPtr.Zero) return;
+            int v = on ? 1 : 0;
+            if (v == _outsideApertures) return;
+            _outsideApertures = v;
+            try { Native.AF_SceneSetOutsideApertures(_handle, v); } catch (System.Exception) { }
+        }
+
+        /// 隣の空間の拡散した響きがこの口を通る割合（帯域別 6 要素、0..1）。音源に依存しない。
+        public bool PortalDiffuseCoupling(int id, float[] out6)
+        {
+            if (_handle == IntPtr.Zero || out6 == null || out6.Length < 6) return false;
+            try { return Native.AF_ScenePortalDiffuseCoupling(_handle, id, out6) != 0; }
+            catch (System.Exception) { return false; }
+        }
+
         // 部屋が 2 つ以上あるのにポータルが 1 枚も無い状態を **1 度だけ** 警告する。
         //
         //   ★これが C1 のいちばんの動機。ポータルが無いと §4.3 のフレネル帯域積分が

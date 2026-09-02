@@ -289,6 +289,20 @@ namespace AcousticFlow
                  + "⚠ 尾の形は部屋ごとに共有済み（段階①）。その形の index をバスの鍵にします。"
                  + "違う部屋を同じバスへ入れると、片方の部屋の響きがもう片方に付きます。")]
         public bool sharedTailBus = false;
+        [Header("扉の定点（隣の空間の響きを戸口の位置から鳴らす）")]
+        [Tooltip("ON: 隣の部屋（洞窟の中など）の尾は、その部屋のバスをそのまま足すのではなく、"
+                 + "戸口の位置に置いた定点から HRTF で鳴らす。口の結合率（閉じた扉なら板の透過）と"
+                 + "口からの距離で減る。部屋の中では従来どおり。\n\n"
+                 + "★sharedTailBus が ON のときだけ効く（バスのモノラルを使うため）。\n"
+                 + "★外へ開く口（洞窟の口）も自動ポータルになる。回折の経路には使わないので他の音は変わらない。\n"
+                 + "★戻せる切り替え。OFF で従来どおり。")]
+        public bool portalTail = false;
+        [Tooltip("定点の全体レベル（1.0 で戸口の真ん中でバスの直接の足し込みと同じ大きさ）。")]
+        [Range(0f, 4f)] public float portalTailLevel = 1f;
+        [Tooltip("口の結合率（半球の見通し、360 本）を測り直す間隔（フレーム）。扉が回っている間の追従。")]
+        [Range(1, 30)] public int portalTailCouplingEveryFrames = 5;
+        [Tooltip("定点のボイスが使う HRTF（StreamingAssets 内のファイル名）。無ければ合成。")]
+        public string portalTailHrtfFile = "kemar.afhr";
         [Tooltip("これ未満の断面積(m2)の開口はポータルにしない。\n"
                  + "格子の量子化ノイズ（セル 1〜2 個の隙間）でありもしない戸口が並ぶのを防ぐ。")]
         [Range(0f, 4f)] public float autoPortalMinArea = 0.25f;
@@ -1615,6 +1629,8 @@ namespace AcousticFlow
             _scene.SetAutoPortalMinArea(autoPortalMinArea);
             _scene.SetPortalGovernRange(portalGovernRange);
             _scene.SetAutoPortals(autoPortals);
+            // 【扉の定点】外へ開く口（洞窟の口）も自動ポータルにする。定点が使うときだけ。
+            _scene.SetOutsideApertures(portalTail && sharedTailBus && autoPortals);
             // 音源ごとの段を何コアで回すか。中で値の変化を見ているので毎フレーム押してよい。
             _scene.SetWorkerThreads(workerThreads);
             _scene.Update(Time.deltaTime);
@@ -1806,6 +1822,7 @@ namespace AcousticFlow
                     //   先に比を確定させる（旧: wet を出してから比を出していた）。
                     UpdateReverbTargetRatio();
                     UpdateReverbFromEchogram();
+                    UpdatePortalTail();
                     // Reverb Monitor 窓へ。
                     LatestEchogram = _echogram;
                     EchogramBins = _echogram.Length;
@@ -2054,6 +2071,10 @@ namespace AcousticFlow
             //     代表が入れ替わって尾の形が乗り換わり、段差になるため。）
             ts.TailShapeIndex = _scene.GetTailShapeIndex(idx);
             if (ts.TailShapeIndex < 0) ts.TailShapeIndex = idx;
+            // 【扉の定点】この音源が部屋の代表なら「尾の形の index → 部屋番号」を控える。
+            //   バスの鍵は形の index なので、定点が「どの部屋のバスか」を引くのに要る。
+            if (ts.TailShapeIndex == idx && _srcPos != null && si < _srcPos.Length)
+                _shapeRoom[idx] = _scene.RoomAt(_srcPos[si]);
 
             // 回折の開口は直接タップの決定に要る（下記）ので先に取る。
             int df = _scene.GetDiffractionSources(idx, _tapDiffPos, _tapDiffGain);
@@ -2446,6 +2467,106 @@ namespace AcousticFlow
             if (!_audioReady) return;
             AcousticEngine.SetRTPCValue("ReverbWet", _reverbWet * 100f * reverbWetScale);
             AcousticEngine.SetRTPCValue("ReverbDecay", _reverbDecay);
+        }
+
+        // ── 扉の定点（PortalEmitter）の管理 ──────────────────────────────────────
+        //   部屋ごとのバスの「直接に足す割合 w」と、口ごとの定点の (1−w)・結合率・距離・遮蔽・向きを
+        //   入れ直す。エコグラムの更新と同じ周期で呼ばれる（毎フレームではない）。
+        //   ★部屋番号で切り替えず「まわりの何割がどの部屋か」で混ぜる（UpdateReverbTargetRatio と同じ理由）。
+        private readonly Dictionary<int, int> _shapeRoom = new Dictionary<int, int>();   // 形の index → 部屋
+        private readonly Dictionary<long, PortalEmitter> _portalEmitters = new Dictionary<long, PortalEmitter>();
+        private TailBusRenderer _portalHost;
+        private readonly int[] _ptRooms = new int[8];
+        private readonly float[] _ptW = new float[8];
+        private readonly float[] _ptTrans = new float[AcousticEngine.NumBands];
+        private readonly float[] _ptGain = new float[AcousticEngine.NumBands];
+        private int _ptFrame;
+
+        private float PortalRoomWeight(int room, int n, float outsideW)
+        {
+            if (room < 0) return outsideW;
+            for (int i = 0; i < n; i++) if (_ptRooms[i] == room) return _ptW[i];
+            return 0f;
+        }
+
+        private void UpdatePortalTail()
+        {
+            bool on = portalTail && sharedTailBus && autoPortals && _audioReady
+                      && _scene != null && _scene.IsValid && listener != null;
+            if (_portalHost == null) _portalHost = FindFirstObjectByType<TailBusRenderer>();
+            if (!on || _portalHost == null)
+            {
+                // 切ったら従来どおり: バスは全部足し、定点は黙る。
+                foreach (var kv in _shapeRoom) _portalHost?.SetBusWeight(kv.Key, 1f);
+                foreach (var kv in _portalEmitters) if (kv.Value != null) kv.Value.feedGain = 0f;
+                return;
+            }
+            _ptFrame++;
+            // リスナーのまわりの部屋の占め方。外の世界の分 = 1 − 合計。
+            int n = _scene.GetRoomWeights(listener.position, roomBlendRadius, _ptRooms, _ptW);
+            float sum = 0f;
+            for (int i = 0; i < n; i++) sum += _ptW[i];
+            float outsideW = Mathf.Clamp01(1f - sum);
+            // バスごとの直接の足し込み w。
+            foreach (var kv in _shapeRoom)
+                _portalHost.SetBusWeight(kv.Key, PortalRoomWeight(kv.Value, n, outsideW));
+            // 口ごとの定点。
+            _scene.GetPortalCounts(out int nAuto, out int nManual);
+            int total = nAuto + nManual;
+            Vector3 lp = listener.position;
+            var alive = new HashSet<long>();
+            for (int id = 0; id < total; id++)
+            {
+                if (!_scene.GetPortal(id, out Vector3 c, out Vector3 u, out Vector3 v, out float hu, out float hv)) continue;
+                if (!_scene.GetPortalRooms(id, out int ra, out int rb, out bool toOutside)) continue;
+                Vector3 nrm = Vector3.Cross(u, v).normalized;
+                float side = Mathf.Sign(Vector3.Dot(lp - c, nrm));
+                if (side == 0f) side = 1f;
+                // 口に面した部屋それぞれについて、その部屋の尾をこの口から鳴らす定点を持つ。
+                for (int k = 0; k < 2; k++)
+                {
+                    int room = (k == 0) ? ra : rb;
+                    if (room < 0) continue;                      // 外の世界には尾のバスが無い
+                    int shape = -1;
+                    foreach (var kv in _shapeRoom) if (kv.Value == room) { shape = kv.Key; break; }
+                    if (shape < 0) continue;                     // その部屋に音源が無い＝尾が無い
+                    long key = ((long)id << 32) | (uint)room;
+                    alive.Add(key);
+                    if (!_portalEmitters.TryGetValue(key, out PortalEmitter em) || em == null)
+                    {
+                        var go = new GameObject($"AF_PortalEmitter_p{id}_r{room}");
+                        go.transform.SetParent(transform, false);
+                        em = go.AddComponent<PortalEmitter>();
+                        em.portalId = id; em.room = room;
+                        em.Init(portalTailHrtfFile);
+                        _portalEmitters[key] = em;
+                    }
+                    em.busShape = shape;
+                    em.busHandle = _portalHost.BusHandle(shape);
+                    // 定点は口の面からリスナー側へ少し出す（閉じた板の中に置かない）。
+                    em.transform.position = c + nrm * (side * 0.15f);
+                    // (1 − その部屋の占め方) × 全体レベル。部屋の中では 0、外では 1。
+                    float w = PortalRoomWeight(room, n, outsideW);
+                    em.feedGain = (1f - w) * portalTailLevel;
+                    // 口の結合率は周期を落として測る（半球の見通し 360 本）。
+                    if ((_ptFrame % Mathf.Max(1, portalTailCouplingEveryFrames)) == 0 || em.coupling6[0] <= 0f)
+                        _scene.PortalDiffuseCoupling(id, em.coupling6);
+                    // 距離減衰（口の 1 m 以内は頭打ち＝戸口の真ん中でバスと同じ大きさ）と、口→リスナーの遮蔽。
+                    Vector3 ep = em.transform.position;
+                    float dist = Vector3.Distance(lp, ep);
+                    float att = 1f / Mathf.Max(dist, 1f);
+                    float occ;
+                    if (!_scene.ComputeSoftOcclusion(lp, ep, _ptTrans, out occ))
+                        for (int b = 0; b < _ptTrans.Length; b++) _ptTrans[b] = 1f;
+                    for (int b = 0; b < _ptGain.Length; b++)
+                        _ptGain[b] = em.coupling6[Mathf.Min(b, 5)] * att * _ptTrans[b];
+                    Vector3 dirLocal = listener.InverseTransformDirection((ep - lp).normalized);
+                    em.SetTap(_ptGain, dirLocal, 57f);
+                }
+            }
+            // 消えた口の定点は黙らせる。
+            foreach (var kv in _portalEmitters)
+                if (kv.Value != null && !alive.Contains(kv.Key)) kv.Value.feedGain = 0f;
         }
 
         // 尾の絶対レベルの土台＝残響/直接エネルギーの物理目標比 (r/r_c)² を出す。
