@@ -4714,6 +4714,24 @@ public:
         }
     }
 
+    // ★反射レイの打ち切り（2026-09-03 方針 2「エネルギー量が一定を下回るまでの反射経路はとる」）。
+    //   次のバウンスが寄与し得る上限 = max_b carry[b] × min(1, (refDist/totalLen)²)。
+    //   これが床を割ったら、以降は何を足しても生存に効かないので止める。
+    //   床 1e-2 = エネルギーで −20 dB（基準距離の自由音場の直接音比）。レイの寄与は本数で平均するので、
+    //   切った分の総和もこの床を超えない。−30 dB にすると 15 m の部屋では距離で止まらず（190 m 要る）、
+    //   結局 maxBounces まで走って費用だけ増える（実測: 5 部屋 8 音源で 1 フレーム 8.4 → 11.1 ms）。
+    //   maxBounces（cfg.reflectionBounces）は「安全の上限」に格下げ（既定 6）。3 固定だったときは
+    //   コンクリ（反射率 0.95）で 3 回後も carry 0.86 を運んだまま捨てていた。
+    static constexpr float kReflectionEnergyFloor = 1e-2f;
+    static bool reflectionRayExhausted(const float* carry, float refDist, float totalLen) {
+        float cmax = 0.0f;
+        for (int b = 0; b < kNumBands; ++b) cmax = std::max(cmax, carry[b]);
+        float atten = refDist / std::max(totalLen, 1e-3f);
+        atten *= atten;
+        if (atten > 1.0f) atten = 1.0f;
+        return cmax * atten < kReflectionEnergyFloor;
+    }
+
     // 【役割2(Phase 5)：反射込み遮蔽】リスナー起点で numRays 本のレイを撒き、壁で反射
     // させながら各バウンス点から音源へ next-event でつなぐ。直接(透過⊕回折)＋反射で回り込む
     // 成分を帯域別に積み、遮蔽量(0..1)を返す。反射経路があるので壁裏でも 1.0 に張り付かない。
@@ -4759,6 +4777,7 @@ public:
                         reflected[b] += carry[b] * refl * seg[b] * atten;
                         carry[b] *= refl;
                     }
+                    if (reflectionRayExhausted(carry, refDist, totalLen)) break;  // 運ぶエネルギーで打ち切り
                     d = scatteredDir(d, hit.normal, scatteringMean(mat), rng);
                     o = q;
                 }
@@ -4913,6 +4932,7 @@ public:
                             acc[j * kNumBands + b] += carry[b] * refl[b] * seg[b] * atten;
                     }
                     for (int b = 0; b < kNumBands; ++b) carry[b] *= refl[b];  // 継続レイの減衰
+                    if (reflectionRayExhausted(carry, maxRef, totalLen)) break;   // 運ぶエネルギーで打ち切り（最遠の音源基準）
                     d = scatteredDir(d, hit.normal, scatteringMean(mat), rng);
                     o = q;
                 }
@@ -5572,7 +5592,7 @@ public:
 
         // 役割1
         int reflectionRays = 256;
-        int reflectionBounces = 3;
+        int reflectionBounces = 6;   // 安全の上限。実際は運ぶエネルギーで先に止まる（reflectionRayExhausted）
         float directWeight = 1.0f;
         bool useReflections = true;
         bool useEdgeCatalog = true;

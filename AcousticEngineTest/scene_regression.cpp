@@ -9528,6 +9528,21 @@ void testRoomSegmentation() {
             // 低−高（符号つき）。正なら低域の方が通っている。
             auto tiltLoHi = [&](bool pillar, const float* absorb) {
                 AF_SceneHandle s = build(pillar, absorb);
+                // ★反射レイは切る（useReflections=0）。この検査が縛るのは**直接経路の半影**が帯域で幅を変えること。
+                //   2026-09-03 に反射レイを「運ぶエネルギーが床を割るまで」走らせるようにしたら、
+                //   吸わない壁（noAbsorb）の箱では反射が影を埋め切って 低−高 0.0 dB になった。
+                //   それは無損失の箱の正しい極限で、半影の主張とは別物。反射込みの影は上の 3 ケース表で見る。
+                AF_UpdateConfig cfg = {};
+                cfg.role1EveryN = 1; cfg.role2EveryN = 1; cfg.earlyEveryN = 1;
+                cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 3;
+                cfg.reflectionRays = 256; cfg.reflectionBounces = 6;
+                cfg.directWeight = 1.0f; cfg.useReflections = 0;
+                cfg.useEdgeCatalog = 1; cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+                cfg.enableReverb = 0; cfg.echogramBins = 100; cfg.echogramBinSeconds = 0.01f;
+                cfg.echogramRays = 128; cfg.echogramBounces = 8; cfg.speedOfSound = 343.0f;
+                cfg.enableEarlyReflections = 0; cfg.earlyTaps = 4; cfg.earlyRays = 64; cfg.earlyBounces = 2;
+                cfg.enableDiffractionSources = 0; cfg.diffSources = 1;
+                AF_SceneSetUpdateConfig(s, &cfg);
                 AF_SceneSetListener(s, V(0, 1.6f, -3.5f));
                 AF_SceneSetSource(s, 1, V(0, 1.6f, 3.5f));
                 for (int i = 0; i < 6; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);

@@ -71,8 +71,8 @@ namespace AcousticFlow
         [Range(0.02f, 0.6f)] public float directionSmoothTime = 0.18f;
         [Tooltip("反射計算のリスナーレイ本数（共有＝音源数非依存。例 256〜1024）。")]
         public int reflectionRays = 256;
-        [Tooltip("反射の最大回数（例 2〜3）。")]
-        public int reflectionBounces = 3;
+        [Tooltip("反射の安全上限回数。実際はレイが運ぶエネルギーが床（−20 dB）を割った所で先に止まる（エンジンの reflectionRayExhausted）。")]
+        public int reflectionBounces = 6;
 
         [Header("残響 (Phase6)")]
         [Tooltip("ON: エコグラムから RT60/wet を算出し、尾の IR と部屋のバスに渡す。")]
