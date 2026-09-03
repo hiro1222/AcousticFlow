@@ -4040,6 +4040,123 @@ void testHrtfLeftRight() {
     }
 }
 
+// Test_SwingDoor をそのまま再現して、音源を左右へ振る（2026-09-03 の報告の再現）。
+//   報告: 「閉扉で音源を x=-3.5 にすると右から聞こえる」「x=-3.6 で急に音が開ける」。
+//   場面（.unity から実寸で写した）:
+//     部屋 14.8×14.8×3.4 の箱。z=0 に仕切り（Partition_L x∈[-7,-0.5] / R x∈[0.5,7]、厚み 0.2）。
+//     戸口は x∈[-0.5,0.5] の幅 1.0 m。扉は蝶番 x=-0.5、幅 1.0、厚み 0.06。
+//     リスナー (0,1.6,-3)。音源は z=+3 で x を振る。
+//   見る量: 生存 dB／到来方位（真との差）／回折の本数・開口率・フレネル可否。
+void diagnoseSwingDoorSourceSweep() {
+    std::printf("\n[診断] Test_SwingDoor の再現: 閉扉で音源を左右へ振る\n");
+    const float halfW = 7.4f, wallT = 0.2f, roomH = 3.4f;
+    const float doorHalf = 0.5f;
+    auto build = [&](float doorDeg, bool withDoor) -> AF_SceneHandle {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        auto box = [&](AF_Vector3 c, AF_Vector3 he) {
+            AF_SceneAddInstanceBox(s, c, he, V(1,0,0), V(0,1,0), mat);
+        };
+        // 外周（Wall_W/E/N/S、床、天井）
+        box(V(-7.2f, 1.5f, 0), V(0.2f, 1.5f, 7.0f));
+        box(V( 7.2f, 1.5f, 0), V(0.2f, 1.5f, 7.0f));
+        box(V(0, 1.5f,  7.2f), V(7.0f, 1.5f, 0.2f));
+        box(V(0, 1.5f, -7.2f), V(7.0f, 1.5f, 0.2f));
+        box(V(0, -0.2f, 0), V(halfW, 0.2f, halfW));
+        box(V(0,  3.2f, 0), V(halfW, 0.2f, halfW));
+        // 仕切り（戸口の左右）
+        box(V(-3.75f, 1.5f, 0), V(3.25f, 1.5f, wallT * 0.5f));
+        box(V( 3.75f, 1.5f, 0), V(3.25f, 1.5f, wallT * 0.5f));
+        if (withDoor) {
+            // 蝶番 x=-0.5、幅 1.0。閉じている時は戸口をちょうど塞ぐ。
+            const int d = AF_SceneAddInstanceBox(s, V(0, 1.5f, 0), V(doorHalf, 1.5f, 0.03f),
+                                                 V(1,0,0), V(0,1,0), mat);
+            const float th = doorDeg * 3.14159265f / 180.0f;
+            const float c = std::cos(th), sn = std::sin(th);
+            AF_SceneUpdateInstance(s, d, V(-0.5f + doorHalf * c, 1.5f, doorHalf * sn),
+                                   V(doorHalf, 1.5f, 0.03f), V(c, 0, sn), V(0,1,0));
+        }
+        AF_UpdateConfig cfg{};
+        cfg.role1EveryN = 1;   cfg.role2EveryN = 1;   cfg.earlyEveryN = 1;
+        cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 1;
+        cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+        cfg.directWeight = 1.0f;  cfg.useReflections = 1;
+        cfg.useEdgeCatalog = 1;   cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+        cfg.enableReverb = 1;     cfg.echogramBins = 100;  cfg.echogramBinSeconds = 0.01f;
+        cfg.echogramRays = 512;   cfg.echogramBounces = 24;
+        cfg.speedOfSound = 343.0f; cfg.distanceRef = 1.5f;
+        cfg.enableEarlyReflections = 1; cfg.earlyTaps = 4;
+        cfg.earlyRays = 512; cfg.earlyBounces = 2;
+        cfg.enableDiffractionSources = 1; cfg.diffSources = 3;
+        AF_SceneSetUpdateConfig(s, &cfg);
+        return s;
+    };
+    const AF_Vector3 L = V(0, 1.6f, -3.0f);
+    auto azOf = [](float dx, float dz) { return std::atan2(dx, dz) * 180.0f / 3.14159265f; };
+    auto sweep = [&](float doorDeg, bool withDoor, const char* label, float x0, float x1, float step) {
+        AF_SceneHandle s = build(doorDeg, withDoor);
+        std::printf("      ── %s ──\n", label);
+        std::printf("        音源x   生存(dB)  真の方位  到来方位   差     回折  開口率  フレネル\n");
+        float prevDb = 0.0f; bool have = false;
+        float maxJump = 0.0f, jumpAt = 0.0f;
+        for (float x = x0; x <= x1 + 1e-4f; x += step) {
+            const AF_Vector3 S = V(x, 1.6f, 3.0f);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetSource(s, 1, S);
+            for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+            const int idx = AF_SceneSourceIndex(s, 1);
+            float b6[kBands] = {};
+            AF_SceneGetSourceOcclusion(s, idx, b6);
+            double e2 = 0.0; for (int b = 0; b < kBands; ++b) e2 += b6[b] * b6[b];
+            const float db = static_cast<float>(10.0 * std::log10(std::max(e2 / kBands, 1e-12)));
+            float ad[3] = {0, 0, 1};
+            AF_SceneGetSourceArrivalDir(s, idx, ad);
+            const float trueAz = azOf(x - L.x, 3.0f - L.z);
+            const float arrAz = azOf(ad[0], ad[2]);
+            float d28[28] = {};
+            const int np = AF_SceneDebugDiffractionPath(s, L, S, d28, 0);
+            // ★ホストが実際に読むのは**キャッシュ側**（AF_SceneUpdate が書いた物）。
+            //   早期反射は像源としてワールドに置かれ、Unity が 3D で定位する ──
+            //   鏡像は反対側に出ることがあるので、閉扉で直接音が −35 dB まで落ちると
+            //   ここが定位を持っていく。方位と強さを並べる。
+            AF_Vector3 dp[4]; float dg[4] = {};
+            const int nds = AF_SceneGetDiffractionSources(s, idx, dp, dg, 4);
+            AF_Vector3 ep[8]; float eg[8 * kBands] = {};
+            const int ne = AF_SceneGetEarlyReflections(s, idx, ep, eg, 8);
+            char er[160]; int q = 0; er[0] = 0;
+            float erAzTop = 0.0f, erTop = -1.0f;
+            for (int k = 0; k < ne; ++k) {
+                float sum = 0.0f;
+                for (int b = 0; b < kBands; ++b) sum += eg[k * kBands + b];
+                sum /= kBands;
+                const float az = azOf(ep[k].x - L.x, ep[k].z - L.z);
+                if (sum > erTop) { erTop = sum; erAzTop = az; }
+                { const float dxr = ep[k].x - L.x, dyr = ep[k].y - L.y, dzr = ep[k].z - L.z;
+                    const float dr = std::sqrt(dxr*dxr + dyr*dyr + dzr*dzr);
+                    if (q < 96) q += std::snprintf(er + q, sizeof(er) - q, " %+.0f°/%.1fm", az, dr); }
+            }
+            if (have) {
+                const float j = std::fabs(db - prevDb);
+                if (j > maxJump) { maxJump = j; jumpAt = x; }
+            }
+            prevDb = db; have = true;
+            const bool flip = (std::fabs(trueAz) > 5.0f) && (trueAz * arrAz < 0.0f) && (std::fabs(arrAz) > 5.0f);
+            const bool erFlip = (ne > 0) && (std::fabs(trueAz) > 5.0f) && (trueAz * erAzTop < 0.0f)
+                                && (std::fabs(erAzTop) > 5.0f);
+            std::printf("        %+5.2f  %7.1f   %+6.1f°  %+6.1f°  %+6.1f°   %d本  %.4f  %s | 回折源%d 反射%d本%s%s%s\n",
+                        x, db, trueAz, arrAz, trueAz - arrAz, np, d28[1],
+                        (d28[18] > 0.5f) ? "はい" : "いいえ", nds, ne, er,
+                        flip ? "  ★到来が反転" : "", erFlip ? "  ★最強の反射が反対側" : "");
+        }
+        std::printf("        最大の跳び %.1f dB（x=%+.2f 付近、刻み %.2f m）\n", maxJump, jumpAt, step);
+        AF_SceneDestroy(s);
+    };
+    sweep(0.0f, true, "閉扉・音源を x=-5 → +5（0.5 m 刻み）", -5.0f, 5.0f, 0.5f);
+    sweep(0.0f, true, "閉扉・報告の境目まわり x=-3.9 → -3.1（0.1 m 刻み）", -3.9f, -3.1f, 0.1f);
+    sweep(90.0f, true, "90° 開・x=-5 → +5（0.5 m 刻み）", -5.0f, 5.0f, 0.5f);
+    std::printf("      読み方: 到来方位の符号が真と逆なら反転。生存 dB の跳びが「急に開ける」。\n");
+}
+
 void diagnoseClosedDoorLocalization() {
     std::printf("\n[診断] 閉じた扉ごしの定位（真の方位 vs 到来方位。壁の奥の反転の切り分け）\n");
     const float roomW = 7.08f, roomD = 3.48f, roomH = 3.0f, wall = 0.16f;
@@ -10612,6 +10729,7 @@ int main() {
     diagnoseWalkContinuity();
     testHrtfLeftRight();
     diagnoseClosedDoorLocalization();
+    diagnoseSwingDoorSourceSweep();
     diagnosePortalScope();
     diagnoseNonPlateBlocker();
     diagnoseApertureWidthCurve();
