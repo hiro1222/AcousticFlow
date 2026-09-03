@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -118,6 +119,21 @@ int renderCorridor(const char* outPath, bool earCues, bool useClick, bool noTail
     }
     const AF_Vector3 S = V(bEnd - 2.0f, 1.6f, 0.0f);
     AF_SceneSetSource(s, 1, S);
+    // 更新の設定はエンジンの既定と同じ値を明示する（聴き比べ用に早期反射の模型だけ環境変数で切り替える）。
+    {
+        AF_UpdateConfig cfg{};
+        cfg.role1EveryN = 1; cfg.role2EveryN = 4; cfg.earlyEveryN = 3; cfg.diffSrcEveryN = 2; cfg.catalogEveryN = 3;
+        cfg.reflectionRays = 256; cfg.reflectionBounces = 6; cfg.directWeight = 1.0f; cfg.useReflections = 1;
+        cfg.useEdgeCatalog = 1; cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+        cfg.enableReverb = 1; cfg.echogramBins = 100; cfg.echogramBinSeconds = 0.01f;
+        cfg.echogramRays = 512; cfg.echogramBounces = 24; cfg.speedOfSound = 343.0f; cfg.distanceRef = 0.0f;
+        cfg.enableEarlyReflections = 1; cfg.earlyTaps = 48; cfg.earlyRays = 512; cfg.earlyBounces = 2;
+        cfg.enableDiffractionSources = 1; cfg.diffSources = 3;
+        // 早期反射の模型（既定 1 = 面の線）。AF_EARLY_MODEL=0 で旧の像源レイ（聴き比べ用）。
+        cfg.earlyModel = 1; cfg.earlyFaceSubTaps = 5; cfg.echogramSkipFirstOrder = 1;
+        if (const char* em = std::getenv("AF_EARLY_MODEL")) cfg.earlyModel = std::atoi(em);
+        AF_SceneSetUpdateConfig(s, &cfg);
+    }
     AF_SceneSetApertureSpread(s, 3);
     // onemodel: 回折の減衰を前川だけに任せる（フレネル積分 f を重ねて掛けない）。
     AF_SceneSetDiffractionSingleModel(s, oneModel ? 1 : 0);
@@ -191,7 +207,7 @@ int renderCorridor(const char* outPath, bool earCues, bool useClick, bool noTail
         AF_SceneUpdate(s, static_cast<float>(n) / kSampleRate);
         const int idx = AF_SceneSourceIndex(s, 1);
 
-        AF_VoiceTap taps[16] = {};
+        AF_VoiceTap taps[64] = {};
         int nTaps = 0;
         float trans[6] = {};
         float occFrac = 0.0f;
@@ -241,10 +257,10 @@ int renderCorridor(const char* outPath, bool earCues, bool useClick, bool noTail
         }
 
         // ★早期反射。ここに方向エネルギーの大半がある。
-        AF_Vector3 ep[16];
-        float eg6[16 * 6];
-        const int ne = (idx >= 0) ? AF_SceneGetEarlyReflections(s, idx, ep, eg6, 16) : 0;
-        for (int i = 0; i < ne && nTaps < 16; ++i) {
+        AF_Vector3 ep[48];
+        float eg6[48 * 6];
+        const int ne = (idx >= 0) ? AF_SceneGetEarlyReflections(s, idx, ep, eg6, 48) : 0;
+        for (int i = 0; i < ne && nTaps < 56; ++i) {
             const float dx = ep[i].x - L.x, dy = ep[i].y - L.y, dz = ep[i].z - L.z;
             const float plen = std::sqrt(dx * dx + dy * dy + dz * dz);
             const float at = 4.0f / std::max(plen, 4.0f);
@@ -401,6 +417,21 @@ int main(int argc, char** argv) {
     std::printf("  音源 x = %.1f （0=戸口に正対 / -2=外れた位置）\n", srcX);
     AF_SceneSetListener(s, L);
     AF_SceneSetSource(s, 1, S);
+    // 更新の設定はエンジンの既定と同じ値を明示する（聴き比べ用に早期反射の模型だけ環境変数で切り替える）。
+    {
+        AF_UpdateConfig cfg{};
+        cfg.role1EveryN = 1; cfg.role2EveryN = 4; cfg.earlyEveryN = 3; cfg.diffSrcEveryN = 2; cfg.catalogEveryN = 3;
+        cfg.reflectionRays = 256; cfg.reflectionBounces = 6; cfg.directWeight = 1.0f; cfg.useReflections = 1;
+        cfg.useEdgeCatalog = 1; cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+        cfg.enableReverb = 1; cfg.echogramBins = 100; cfg.echogramBinSeconds = 0.01f;
+        cfg.echogramRays = 512; cfg.echogramBounces = 24; cfg.speedOfSound = 343.0f; cfg.distanceRef = 0.0f;
+        cfg.enableEarlyReflections = 1; cfg.earlyTaps = 48; cfg.earlyRays = 512; cfg.earlyBounces = 2;
+        cfg.enableDiffractionSources = 1; cfg.diffSources = 3;
+        // 早期反射の模型（既定 1 = 面の線）。AF_EARLY_MODEL=0 で旧の像源レイ（聴き比べ用）。
+        cfg.earlyModel = 1; cfg.earlyFaceSubTaps = 5; cfg.echogramSkipFirstOrder = 1;
+        if (const char* em = std::getenv("AF_EARLY_MODEL")) cfg.earlyModel = std::atoi(em);
+        AF_SceneSetUpdateConfig(s, &cfg);
+    }
     // 開口を「面」として鳴らす（ホイヘンス）。点1つだと戸口がピンポイントに聞こえる。
     AF_SceneSetApertureSpread(s, 3);
     // 戸口をポータルとして置く（x∈[-0.6,0.6], y∈[0,2.4], z=0）。
