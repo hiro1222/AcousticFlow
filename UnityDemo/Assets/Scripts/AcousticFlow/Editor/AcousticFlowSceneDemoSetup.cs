@@ -54,7 +54,6 @@ namespace AcousticFlow.EditorTools
             demo.listener = listener.transform;
             demo.source = vocal;
             demo.extraSources = new[] { guitar, piano, bass, drums, other };
-            demo.sourceEvents = new[] { "Vocal", "Guitar", "Piano", "Bass", "Drums", "Other" };
             demo.autoCollectBoxColliders = true;              // 床/天井/壁/衝立を自動収集
             demo.occluderMaterial = AcousticMaterialPreset.Concrete;
             demo.firstPersonCamera = true;                    // WASD で歩き回る一人称

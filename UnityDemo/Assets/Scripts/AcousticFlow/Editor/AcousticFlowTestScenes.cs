@@ -315,11 +315,6 @@ namespace AcousticFlow.EditorTools
         //   両側とも閉じた部屋なので、戸口は C1 の自動生成で出る（板の表: 屋内⇄屋内 は
         //   自動生成される）。手置きすると広さを変えるたびに追従させる必要が出るので、
         //   ここでは自動に任せる。**屋外に面した開口が無いシーンだから成立する**。
-        //
-        // ★Enter を SceneDemo から譲ってもらっている
-        //   AcousticFlowSceneDemo は Enter を「音源0のみ足音ループ」に使っている。
-        //   このシーンだけ enableFootstepToggleKey を OFF にする（既定は ON のままなので
-        //   他のシーンの効き方は変わらない）。
         [MenuItem("AcousticFlow/Test Scenes/Room Compare (広さと隣室の比較)")]
         public static void RoomCompareScene()
         {
@@ -345,7 +340,6 @@ namespace AcousticFlow.EditorTools
             lab.source = srcs[0];
 
             var demo = Object.FindFirstObjectByType<AcousticFlowSceneDemo>();
-            if (demo != null) demo.enableFootstepToggleKey = false;   // Enter を台へ譲る
 
             // ★扉だけ弱い材質にする。現実の部屋で音が漏れるのは壁ではなく扉。
             //   壁を一様に弱くすると、どこから漏れているか分からなくなる（Test_SwingDoor と同じ理由）。
@@ -819,7 +813,6 @@ namespace AcousticFlow.EditorTools
             var extra = new Transform[positions.Length - 1];
             for (int i = 1; i < positions.Length; i++) extra[i - 1] = srcs[i];
             demo.extraSources = extra;
-            demo.sourceEvents = names;
             demo.autoCollectBoxColliders = true;
             demo.occluderMaterial = material;
             demo.firstPersonCamera = true;
@@ -869,7 +862,6 @@ namespace AcousticFlow.EditorTools
             var extra = new Transform[events.Length - 1];
             for (int i = 1; i < events.Length; i++) extra[i - 1] = srcs[i];
             demo.extraSources = extra;
-            demo.sourceEvents = events;
             demo.autoCollectBoxColliders = true;
             demo.occluderMaterial = material;
             demo.firstPersonCamera = true;

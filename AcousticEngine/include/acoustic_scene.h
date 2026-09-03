@@ -1,18 +1,34 @@
-/* acoustic_scene.h ── 新アーキ(2026-07) Phase 1：Scene ベースの幾何/音響クエリ C API
+/* acoustic_scene.h ── Scene ベースの幾何/音響クエリ C API
  *
- * 旧 acoustic_engine.h の AddBox/IsOccluded/ComputeOcclusion 系（スカラ遮蔽・箱コーナー回折）
- * を置き換える、インスタンス方式 Scene のための新しい C 窓口。
  *   - 幾何 = インスタンス（geomId + OBB transform + materialId）
  *   - 出力 = 6帯域（1スカラに潰さない）
- * Wwise 音声のライフサイクル（Init/LoadBank/PostEvent/RTPC 等）は acoustic_engine.h の
- * 既存 ABI を引き続き使う（音声バックエンドは新アーキでも再利用）。
+ *
+ * ★2026-09-03: 旧 acoustic_engine.h（AddBox/IsOccluded 系と Wwise 風の再生 API）を削除した。
+ *   DLL 側は既定でスタブ Adapter だったので、あの再生 API は何も鳴らしていなかった。
+ *   ここが C の唯一の窓口になったので、エクスポートのマクロと AF_Vector3 もここで定義する。
  *
  * ハンドルは Scene 実体への不透明ポインタ。C# 側は IntPtr。
  */
 #ifndef ACOUSTIC_SCENE_H
 #define ACOUSTIC_SCENE_H
 
-#include "acoustic_engine.h"  /* AF_Vector3 / ACOUSTIC_API を共有 */
+/* DLL ビルド側（ACOUSTICENGINE_EXPORTS）でだけ dllexport。利用側は dllimport。 */
+#ifdef _WIN32
+  #ifdef ACOUSTICENGINE_EXPORTS
+    #define ACOUSTIC_API __declspec(dllexport)
+  #else
+    #define ACOUSTIC_API __declspec(dllimport)
+  #endif
+#else
+  #define ACOUSTIC_API   /* 非 Windows では不要 */
+#endif
+
+/* 3 次元ベクトル。C# 側の AFVector3（float×3, blittable）と並びを揃える。 */
+typedef struct AF_Vector3 {
+    float x;
+    float y;
+    float z;
+} AF_Vector3;
 
 #ifdef __cplusplus
 extern "C" {

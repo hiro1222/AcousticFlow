@@ -4,8 +4,8 @@
  *
  *   メニュー: AcousticFlow > Output Monitor で開く。
  *
- * 値の出どころ: AcousticFlowDemo が毎フレーム AcousticEngine.GetOutputLevels で
- *   マスターバスの L/R RMS（線形）を取り、リングバッファ
+ * 値の出どころ: AcousticFlowDemo が毎フレーム AudioListener.GetOutputData で
+ *   Unity 出力の L/R RMS（線形）を取り、リングバッファ
  *   AcousticFlowSceneDemo.OutHistoryL/R に積んでいる（OutHistoryHead が最古位置）。
  *   左右の振幅が時間で動く＝音の鳴り・定位の偏りが波形として見える。
  *   ※ Windows Sonic の「前」のバス値なので HRTF の頭部回り込みは映らない。
