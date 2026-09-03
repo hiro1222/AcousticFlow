@@ -988,6 +988,28 @@ ACOUSTIC_API int AF_SceneFaceBakeFaceCount(AF_SceneHandle scene);
 /* 音響的に動く物（扉・門・車両）のタグ。焼く層に入れず、最初から実行時の遮蔽として扱う。焼き済みなら焼き直す。 */
 ACOUSTIC_API void AF_SceneSetInstanceDynamic(AF_SceneHandle scene, int instanceId, int dynamic);
 
+/* ── 外の走査器・別の作り手のための口（2026-09-03、GPU 化の下ごしらえ）──
+ *   BVH（インスタンスの broad-phase）を平らな配列で書き出す。節は AABB / leftFirst / count。
+ *   count > 0 が葉で、order[leftFirst .. leftFirst+count) のインスタンス添字を指す（走査の規則は DLL 内と同じ）。
+ *   メッシュの三角形はまだ出さない（箱の OBB だけ）。 */
+typedef struct AF_BvhNode { float minX, minY, minZ, maxX, maxY, maxZ; int leftFirst; int count; } AF_BvhNode;
+typedef struct AF_InstanceDesc {
+    AF_Vector3 center, halfExtents, axisX, axisY, axisZ;
+    int materialId, geomId, active, moved, dynamicTag;
+} AF_InstanceDesc;
+ACOUSTIC_API int AF_SceneBvhNodeCount(AF_SceneHandle scene);
+ACOUSTIC_API int AF_SceneBvhOrderCount(AF_SceneHandle scene);
+/* 戻り値は書いた節の数。outNodes/outOrder は NULL 可（数だけ知りたいとき）。 */
+ACOUSTIC_API int AF_SceneExportBvh(AF_SceneHandle scene, AF_BvhNode* outNodes, int maxNodes,
+                                   int* outOrder, int maxOrder);
+ACOUSTIC_API int AF_SceneGetInstance(AF_SceneHandle scene, int instanceId, AF_InstanceDesc* out);
+/* 面の焼きの入れ物をバイト列で出し入れする（ファイル保存／別の作り手の結果の受け取り）。
+ *   Bytes は 0 なら焼きが無い。Export は書いたバイト数（cap が足りなければ 0）。
+ *   Import は 1=OK。版・大きさ・インスタンス数が合わなければ 0（焼いたときと実体の並びが違う）。 */
+ACOUSTIC_API int AF_SceneFaceBakeBytes(AF_SceneHandle scene);
+ACOUSTIC_API int AF_SceneFaceBakeExport(AF_SceneHandle scene, void* out, int cap);
+ACOUSTIC_API int AF_SceneFaceBakeImport(AF_SceneHandle scene, const void* data, int size);
+
 /* 回折二次音源。位置とゲインを書き、本数を返す。 */
 ACOUSTIC_API int AF_SceneGetDiffractionSources(AF_SceneHandle scene, int index,
                                                AF_Vector3* outPos, float* outGain, int maxSrc);

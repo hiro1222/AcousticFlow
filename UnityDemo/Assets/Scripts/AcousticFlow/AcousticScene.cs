@@ -438,6 +438,42 @@ namespace AcousticFlow
             catch (EntryPointNotFoundException) { }
         }
 
+        // 面の焼きをバイト列で出し入れする（ファイル保存／別の作り手の結果）。古い DLL なら null / false。
+        public byte[] FaceBakeExport()
+        {
+            if (_handle == IntPtr.Zero) return null;
+            try
+            {
+                int n = Native.AF_SceneFaceBakeBytes(_handle);
+                if (n <= 0) return null;
+                var buf = new byte[n];
+                return Native.AF_SceneFaceBakeExport(_handle, buf, n) == n ? buf : null;
+            }
+            catch (EntryPointNotFoundException) { return null; }
+        }
+        public bool FaceBakeImport(byte[] data)
+        {
+            if (_handle == IntPtr.Zero || data == null || data.Length == 0) return false;
+            try { return Native.AF_SceneFaceBakeImport(_handle, data, data.Length) == 1; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+        // BVH の書き出し（GPU の走査器へ渡す用）。戻り値は節の数。配列は呼び手が確保する。
+        public int BvhNodeCount() { if (_handle == IntPtr.Zero) return 0; try { return Native.AF_SceneBvhNodeCount(_handle); } catch (EntryPointNotFoundException) { return 0; } }
+        public int BvhOrderCount() { if (_handle == IntPtr.Zero) return 0; try { return Native.AF_SceneBvhOrderCount(_handle); } catch (EntryPointNotFoundException) { return 0; } }
+        public int ExportBvh(AFBvhNode[] nodes, int[] order)
+        {
+            if (_handle == IntPtr.Zero || nodes == null || order == null) return 0;
+            try { return Native.AF_SceneExportBvh(_handle, nodes, nodes.Length, order, order.Length); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+        public bool GetInstanceDesc(int instanceId, out AFInstanceDesc desc)
+        {
+            desc = default;
+            if (_handle == IntPtr.Zero) return false;
+            try { return Native.AF_SceneGetInstance(_handle, instanceId, out desc) == 1; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+
         // 回折二次音源。位置とゲインを受け、本数を返す。
         public int GetDiffractionSources(int index, Vector3[] outPos, float[] outGain)
         {

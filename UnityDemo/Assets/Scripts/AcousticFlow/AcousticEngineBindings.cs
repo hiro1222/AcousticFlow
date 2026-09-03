@@ -10,8 +10,19 @@ namespace AcousticFlow
 {
     // C 側 AF_Vector3 (float x,y,z) と同じメモリ配置にする。
     // Sequential = 宣言順にそのまま並べる（C 構造体と一致）。
+    // BVH の節（C 側 AF_BvhNode と同じ並び）。GPU の compute shader へ渡すための物。
     [StructLayout(LayoutKind.Sequential)]
-    internal struct AFVector3
+    public struct AFBvhNode { public float minX, minY, minZ, maxX, maxY, maxZ; public int leftFirst, count; }
+    // インスタンスの記述（C 側 AF_InstanceDesc と同じ並び）。
+    [StructLayout(LayoutKind.Sequential)]
+    public struct AFInstanceDesc
+    {
+        public AFVector3 center, halfExtents, axisX, axisY, axisZ;
+        public int materialId, geomId, active, moved, dynamicTag;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct AFVector3
     {
         public float x;
         public float y;
@@ -236,6 +247,22 @@ namespace AcousticFlow
         // 音響的に動く物のタグ（焼く層に入れない）。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneSetInstanceDynamic(IntPtr scene, int instanceId, int dynamic);
+
+        // 外の作り手のための口（GPU 化の下ごしらえ）: BVH の書き出しと、面の焼きの出し入れ。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneBvhNodeCount(IntPtr scene);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneBvhOrderCount(IntPtr scene);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneExportBvh(IntPtr scene, [Out] AFBvhNode[] outNodes, int maxNodes, [Out] int[] outOrder, int maxOrder);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneGetInstance(IntPtr scene, int instanceId, out AFInstanceDesc outDesc);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneFaceBakeBytes(IntPtr scene);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneFaceBakeExport(IntPtr scene, [Out] byte[] outBytes, int cap);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneFaceBakeImport(IntPtr scene, [In] byte[] data, int size);
 
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneGetDiffractionSources(

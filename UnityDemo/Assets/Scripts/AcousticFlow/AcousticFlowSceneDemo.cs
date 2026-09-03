@@ -330,6 +330,9 @@ namespace AcousticFlow
         [Tooltip("音響的に動く物（扉・門・車両）。この配下のコライダは焼く層に入れず、最初から実行時の遮蔽として扱う。"
                  + "SwingDoor が付いた物と Rigidbody 付きは自動で動く物になる。タグを忘れても、動いた瞬間に焼き直す（1 回だけ重い）。")]
         public Transform[] dynamicOccluders;
+        [Tooltip("面の焼きのファイル（StreamingAssets からの相対パス。空なら毎回メモリの中で焼く）。"
+                 + "ファイルがあれば読んで焼きを飛ばす。無ければ焼いてから（エディタでだけ）書き出す。実体の並びが違えば読まずに焼き直す。")]
+        public string bakeFile = "";
         [Tooltip("像源レイ模型（earlyReflectModel=0）のときの反射タップ数。面の線では使わない（面数 × 下位タップ数、上限 48）。")]
         [Range(1, 8)] public int earlyReflectTaps = 4;
         [Tooltip("早期反射抽出のレイ本数（音源ごと）。多いほど角度分解能が上がり、"
@@ -984,11 +987,36 @@ namespace AcousticFlow
                 if (d) { _scene.SetInstanceDynamic(o.instanceId, true); dyn++; }
             }
             _bakeDynamic = dyn;
+            // ファイルがあれば読む（焼く層の「制作時に焼く」の最小形）。
+            string bakePath = string.IsNullOrEmpty(bakeFile) ? null : System.IO.Path.Combine(Application.streamingAssetsPath, bakeFile);
+            if (bakePath != null && System.IO.File.Exists(bakePath))
+            {
+                var swf = System.Diagnostics.Stopwatch.StartNew();
+                if (_scene.FaceBakeImport(System.IO.File.ReadAllBytes(bakePath)))
+                {
+                    _bakeFaces = _scene.FaceBakeFaceCount();
+                    _bakeCells = -1;   // ファイル由来（セル数は表示しない）
+                    _bakeMs = (float)swf.Elapsed.TotalMilliseconds;
+                    Debug.Log($"[AcousticFlowScene] 面の焼きをファイルから読んだ: {bakeFile} / 面 {_bakeFaces} / {_bakeMs:F0} ms");
+                    return;
+                }
+                Debug.LogWarning($"[AcousticFlowScene] 焼きのファイルが今の実体と合わないので焼き直します: {bakeFile}");
+            }
             var sw = System.Diagnostics.Stopwatch.StartNew();
             _bakeCells = _scene.BakeStaticFaces(bakeCellSize, Mathf.Clamp(earlyFaceSubTaps, 1, 8));
             _bakeFaces = _scene.FaceBakeFaceCount();
             _bakeMs = (float)sw.Elapsed.TotalMilliseconds;
             Debug.Log($"[AcousticFlowScene] 面の焼き: 面 {_bakeFaces} / セル {_bakeCells} / {_bakeMs:F0} ms ／ 動く物 {_bakeDynamic}");
+            if (bakePath != null && Application.isEditor)
+            {
+                var bytes = _scene.FaceBakeExport();
+                if (bytes != null)
+                {
+                    System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(bakePath));
+                    System.IO.File.WriteAllBytes(bakePath, bytes);
+                    Debug.Log($"[AcousticFlowScene] 面の焼きを書き出した: {bakeFile} ({bytes.Length} バイト)");
+                }
+            }
         }
 
         private void CollectPortals()

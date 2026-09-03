@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <vector>
 
@@ -5664,6 +5665,121 @@ public:
     }
     void clearFaceBake() { faceBake_ = FaceBake{}; }
     int faceBakeFaceCount() const { return faceBake_.valid ? static_cast<int>(faceBake_.faces.size()) : 0; }
+
+    // ── 外の走査器・別の作り手のための口（2026-09-03、GPU 化の下ごしらえ）────────────
+    //   BVH（インスタンスの broad-phase）を平らな配列で書き出す。GPU の compute shader などが同じ木を
+    //   走査できるようにするため。走査の規則は computeTransmission と同じ:
+    //     節 = AABB / leftFirst / count。count > 0 が葉で、order[leftFirst .. leftFirst+count) のインスタンス添字を指す。
+    //   ★答えの規則は 1 本のまま（作り手が替わるだけ）。外で作った結果は faceBakeImport で同じ入れ物へ入れる。
+    struct BvhExportNode { float minX, minY, minZ, maxX, maxY, maxZ; int leftFirst, count; };
+    int bvhNodeCount() const { ensureBvh(); return static_cast<int>(bvhNodes_.size()); }
+    int bvhOrderCount() const { ensureBvh(); return static_cast<int>(bvhOrder_.size()); }
+    int exportBvh(BvhExportNode* outNodes, int maxNodes, int* outOrder, int maxOrder) const {
+        ensureBvh();
+        const int n = std::min(maxNodes, static_cast<int>(bvhNodes_.size()));
+        for (int i = 0; i < n && outNodes; ++i) {
+            const BvhNode& b = bvhNodes_[static_cast<std::size_t>(i)];
+            BvhExportNode& o = outNodes[i];
+            o.minX = b.bounds.min.x; o.minY = b.bounds.min.y; o.minZ = b.bounds.min.z;
+            o.maxX = b.bounds.max.x; o.maxY = b.bounds.max.y; o.maxZ = b.bounds.max.z;
+            o.leftFirst = b.leftFirst; o.count = b.count;
+        }
+        const int m = std::min(maxOrder, static_cast<int>(bvhOrder_.size()));
+        for (int i = 0; i < m && outOrder; ++i) outOrder[i] = bvhOrder_[static_cast<std::size_t>(i)];
+        return n;
+    }
+    bool getInstanceDesc(int id, Obb& obb, int& materialId, int& geomId,
+                         bool& active, bool& moved, bool& dynamicTag) const {
+        if (!validInstance(id)) return false;
+        const Instance& in = instances_[static_cast<std::size_t>(id)];
+        obb = in.obb; materialId = in.materialId; geomId = in.geomId;
+        active = in.active; moved = in.moved; dynamicTag = in.dynamicTag;
+        return true;
+    }
+
+    // 面の焼きの入れ物を、そのままのバイト列で出し入れする。
+    //   用途: ファイル保存（エディタの「焼く」ボタン）と、GPU 等の別の作り手が作った表の受け取り。
+    //   形式（版 1）: ヘッダ → 面[faceCount] → inBake[instanceCount] → cellValid[cellCount] → vis[cellCount*faceCount*K*6]
+    //   ★実体の並びが焼いたときと違えば受け取らない（面が指す instanceId が別物になるため）。
+    struct FaceBakeBlobHeader { int magic, version; float cell, ox, oy, oz; int nx, ny, nz, K, faceCount, instanceCount, cellCount; };
+    struct FaceBakeBlobFace { int instanceId, materialId, room; float c[3], nrm[3], aL[3], aS[3]; float hL, hS; };
+    static constexpr int kFaceBakeMagic = 0x31424641;   // 'AFB1'
+    int faceBakeBytes() const {
+        if (!faceBake_.valid) return 0;
+        const FaceBake& b = faceBake_;
+        return static_cast<int>(sizeof(FaceBakeBlobHeader) + b.faces.size() * sizeof(FaceBakeBlobFace)
+                                + b.inBake.size() + b.cellValid.size() + b.vis.size() * sizeof(float));
+    }
+    int faceBakeExport(void* out, int cap) const {
+        const int need = faceBakeBytes();
+        if (need <= 0 || !out || cap < need) return 0;
+        const FaceBake& b = faceBake_;
+        std::uint8_t* p = static_cast<std::uint8_t*>(out);
+        FaceBakeBlobHeader h{};
+        h.magic = kFaceBakeMagic; h.version = 1; h.cell = b.cell;
+        h.ox = b.origin.x; h.oy = b.origin.y; h.oz = b.origin.z;
+        h.nx = b.nx; h.ny = b.ny; h.nz = b.nz; h.K = b.K;
+        h.faceCount = static_cast<int>(b.faces.size());
+        h.instanceCount = static_cast<int>(b.inBake.size());
+        h.cellCount = static_cast<int>(b.cellValid.size());
+        std::memcpy(p, &h, sizeof h); p += sizeof h;
+        for (const ReflFace& f : b.faces) {
+            FaceBakeBlobFace bf{};
+            bf.instanceId = f.instanceId; bf.materialId = f.materialId; bf.room = f.room;
+            bf.c[0] = f.c.x; bf.c[1] = f.c.y; bf.c[2] = f.c.z;
+            bf.nrm[0] = f.nrm.x; bf.nrm[1] = f.nrm.y; bf.nrm[2] = f.nrm.z;
+            bf.aL[0] = f.aL.x; bf.aL[1] = f.aL.y; bf.aL[2] = f.aL.z;
+            bf.aS[0] = f.aS.x; bf.aS[1] = f.aS.y; bf.aS[2] = f.aS.z;
+            bf.hL = f.hL; bf.hS = f.hS;
+            std::memcpy(p, &bf, sizeof bf); p += sizeof bf;
+        }
+        if (!b.inBake.empty()) { std::memcpy(p, b.inBake.data(), b.inBake.size()); p += b.inBake.size(); }
+        if (!b.cellValid.empty()) { std::memcpy(p, b.cellValid.data(), b.cellValid.size()); p += b.cellValid.size(); }
+        if (!b.vis.empty()) { std::memcpy(p, b.vis.data(), b.vis.size() * sizeof(float)); }
+        return need;
+    }
+    bool faceBakeImport(const void* data, int size) {
+        if (!data || size < static_cast<int>(sizeof(FaceBakeBlobHeader))) return false;
+        FaceBakeBlobHeader h;
+        std::memcpy(&h, data, sizeof h);
+        if (h.magic != kFaceBakeMagic || h.version != 1) return false;
+        if (h.K < 1 || h.K > kFaceSubTapsMax || h.nx <= 0 || h.ny <= 0 || h.nz <= 0 || h.faceCount < 0) return false;
+        if (h.cellCount != h.nx * h.ny * h.nz) return false;
+        if (h.instanceCount != static_cast<int>(instances_.size())) return false;
+        const std::size_t visN = static_cast<std::size_t>(h.cellCount) * static_cast<std::size_t>(h.faceCount)
+                               * static_cast<std::size_t>(h.K) * kNumBands;
+        const std::size_t need = sizeof h + static_cast<std::size_t>(h.faceCount) * sizeof(FaceBakeBlobFace)
+                               + static_cast<std::size_t>(h.instanceCount) + static_cast<std::size_t>(h.cellCount)
+                               + visN * sizeof(float);
+        if (static_cast<std::size_t>(size) != need) return false;
+        FaceBake b;
+        b.cell = h.cell; b.origin = Vec3(h.ox, h.oy, h.oz);
+        b.nx = h.nx; b.ny = h.ny; b.nz = h.nz; b.K = h.K;
+        const std::uint8_t* p = static_cast<const std::uint8_t*>(data) + sizeof h;
+        b.faces.resize(static_cast<std::size_t>(h.faceCount));
+        for (int i = 0; i < h.faceCount; ++i) {
+            FaceBakeBlobFace bf;
+            std::memcpy(&bf, p, sizeof bf); p += sizeof bf;
+            ReflFace& f = b.faces[static_cast<std::size_t>(i)];
+            f.instanceId = bf.instanceId; f.materialId = bf.materialId; f.room = bf.room;
+            f.c = Vec3(bf.c[0], bf.c[1], bf.c[2]);
+            f.nrm = Vec3(bf.nrm[0], bf.nrm[1], bf.nrm[2]);
+            f.aL = Vec3(bf.aL[0], bf.aL[1], bf.aL[2]);
+            f.aS = Vec3(bf.aS[0], bf.aS[1], bf.aS[2]);
+            f.hL = bf.hL; f.hS = bf.hS;
+        }
+        b.inBake.assign(p, p + h.instanceCount); p += h.instanceCount;
+        b.cellValid.assign(p, p + h.cellCount); p += h.cellCount;
+        b.vis.resize(visN);
+        if (visN) std::memcpy(b.vis.data(), p, visN * sizeof(float));
+        bool any = false;
+        for (std::uint8_t v : b.cellValid) if (v) { any = true; break; }
+        b.valid = (h.faceCount > 0 && any);
+        faceBake_ = std::move(b);
+        faceBakeStale_ = false;
+        return true;
+    }
+
 
     // 焼いた見通しを p のまわり 8 セルで三線形に補間する。部屋の外のセルは重みから外す。
     // 有効なセルが無ければ false（呼び手は生で解く）。

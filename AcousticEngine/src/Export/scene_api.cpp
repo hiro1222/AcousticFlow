@@ -603,6 +603,51 @@ void AF_SceneSetInstanceDynamic(AF_SceneHandle scene, int instanceId, int dynami
     if (s) s->setInstanceDynamic(instanceId, dynamic != 0);
 }
 
+int AF_SceneBvhNodeCount(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    return s ? s->bvhNodeCount() : 0;
+}
+
+int AF_SceneBvhOrderCount(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    return s ? s->bvhOrderCount() : 0;
+}
+
+int AF_SceneExportBvh(AF_SceneHandle scene, AF_BvhNode* outNodes, int maxNodes, int* outOrder, int maxOrder) {
+    Scene* s = asScene(scene);
+    if (!s) return 0;
+    static_assert(sizeof(AF_BvhNode) == sizeof(Scene::BvhExportNode), "AF_BvhNode と BvhExportNode の並びを揃えること");
+    return s->exportBvh(reinterpret_cast<Scene::BvhExportNode*>(outNodes), outNodes ? maxNodes : 0,
+                        outOrder, outOrder ? maxOrder : 0);
+}
+
+int AF_SceneGetInstance(AF_SceneHandle scene, int instanceId, AF_InstanceDesc* out) {
+    Scene* s = asScene(scene);
+    if (!s || !out) return 0;
+    Obb obb; int mat = 0, geom = -1; bool active = false, moved = false, dyn = false;
+    if (!s->getInstanceDesc(instanceId, obb, mat, geom, active, moved, dyn)) return 0;
+    out->center = fromVec3(obb.center); out->halfExtents = fromVec3(obb.halfExtents);
+    out->axisX = fromVec3(obb.axisX); out->axisY = fromVec3(obb.axisY); out->axisZ = fromVec3(obb.axisZ);
+    out->materialId = mat; out->geomId = geom;
+    out->active = active ? 1 : 0; out->moved = moved ? 1 : 0; out->dynamicTag = dyn ? 1 : 0;
+    return 1;
+}
+
+int AF_SceneFaceBakeBytes(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    return s ? s->faceBakeBytes() : 0;
+}
+
+int AF_SceneFaceBakeExport(AF_SceneHandle scene, void* out, int cap) {
+    Scene* s = asScene(scene);
+    return s ? s->faceBakeExport(out, cap) : 0;
+}
+
+int AF_SceneFaceBakeImport(AF_SceneHandle scene, const void* data, int size) {
+    Scene* s = asScene(scene);
+    return (s && s->faceBakeImport(data, size)) ? 1 : 0;
+}
+
 int AF_SceneGetDiffractionSources(AF_SceneHandle scene, int index,
                                   AF_Vector3* outPos, float* outGain, int maxSrc) {
     Scene* s = asScene(scene);

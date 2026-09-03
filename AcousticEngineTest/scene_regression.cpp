@@ -4370,6 +4370,51 @@ void testFaceReflections() {
             }
         }
     }
+    // 9) 外の作り手のための口: BVH の書き出しと、焼きの出し入れ（GPU 化の下ごしらえ）。
+    {
+        AF_SceneHandle s = boxRoom(4.0f, 1.5f, 3.0f, tr, ab, sc);
+        AF_UpdateConfig c = cfgFor(1, 5, 0);
+        AF_SceneSetUpdateConfig(s, &c);
+        // BVH: 節 > 0、葉の数の和 = 実体数、葉が指す添字が有効。
+        const int nn = AF_SceneBvhNodeCount(s), no = AF_SceneBvhOrderCount(s);
+        std::vector<AF_BvhNode> nodes(static_cast<size_t>(std::max(1, nn)));
+        std::vector<int> order(static_cast<size_t>(std::max(1, no)));
+        const int got = AF_SceneExportBvh(s, nodes.data(), nn, order.data(), no);
+        int leafSum = 0; bool idxOk = true;
+        for (int i = 0; i < got; ++i) if (nodes[static_cast<size_t>(i)].count > 0) leafSum += nodes[static_cast<size_t>(i)].count;
+        for (int i = 0; i < no; ++i) idxOk = idxOk && order[static_cast<size_t>(i)] >= 0 && order[static_cast<size_t>(i)] < AF_SceneInstanceCount(s);
+        bool rootOk = got > 0;
+        if (got > 0) {   // 根は全実体の箱を包む
+            for (int i = 0; i < AF_SceneInstanceCount(s); ++i) {
+                AF_InstanceDesc d{};
+                if (!AF_SceneGetInstance(s, i, &d)) { rootOk = false; break; }
+                rootOk = rootOk && d.center.x - d.halfExtents.x >= nodes[0].minX - 1e-3f
+                                && d.center.x + d.halfExtents.x <= nodes[0].maxX + 1e-3f;
+            }
+        }
+        std::snprintf(buf, sizeof(buf), "(節 %d / 葉の和 %d / 実体 %d)", got, leafSum, AF_SceneInstanceCount(s));
+        check("[口] BVH が書き出せる（葉の和 = 実体数、添字が有効、根が全部を包む）",
+              got == nn && nn > 0 && leafSum == AF_SceneInstanceCount(s) && idxOk && rootOk, buf);
+        // 焼きの往復: 出して消して入れたら、タップがビット一致で戻る。
+        AF_SceneBakeStaticFaces(s, 1.0f, 5);
+        const int n1 = taps(s, L, S, pos, g);
+        std::vector<float> g1(g, g + n1 * kBands);
+        const int bytes = AF_SceneFaceBakeBytes(s);
+        std::vector<unsigned char> blob(static_cast<size_t>(std::max(1, bytes)));
+        const int wrote = AF_SceneFaceBakeExport(s, blob.data(), bytes);
+        AF_SceneClearFaceBake(s);
+        const int facesCleared = AF_SceneFaceBakeFaceCount(s);
+        const int badImport = AF_SceneFaceBakeImport(s, blob.data(), bytes - 1);
+        const int imp = AF_SceneFaceBakeImport(s, blob.data(), bytes);
+        const int n2 = taps(s, L, S, pos, g);
+        bool same = (n1 == n2);
+        for (int k = 0; same && k < n2 * kBands; ++k) same = (g[k] == g1[static_cast<size_t>(k)]);
+        std::snprintf(buf, sizeof(buf), "(%d バイト / 面 %d → 消して %d → 入れて %d / タップ %d 本)",
+                      wrote, 6, facesCleared, AF_SceneFaceBakeFaceCount(s), n2);
+        check("[口] 焼きを出して消して入れ直すと、タップがビット一致で戻る", wrote == bytes && bytes > 0 && facesCleared == 0 && imp == 1 && same, buf);
+        check("[口] 大きさの合わない焼きは受け取らない", badImport == 0);
+        AF_SceneDestroy(s);
+    }
 }
 
 void diagnoseSwingDoorSourceSweep() {
