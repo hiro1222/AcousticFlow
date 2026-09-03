@@ -5057,7 +5057,8 @@ public:
                               float* outBins, int numBins, float binSeconds, float speedOfSound,
                               int numRays, int maxBounces, float distanceRef,
                               int rayBegin = -1, int rayCount = -1, bool clearFirst = true,
-                              bool useTiers = false, bool skipFirstOrder = false) const {
+                              bool useTiers = false, bool skipFirstOrder = false,
+                              const std::vector<int>* const* renderedKeys = nullptr) const {
         using namespace scene_detail;
         if (!outBins || numBins <= 0 || !sources || count <= 0) return;
         if (clearFirst)
@@ -5159,7 +5160,19 @@ public:
                         for (int b = 0; b < kNumBands; ++b) e[b] = carry[b] * refl[b] * seg[b];
                         // 広がり損失は「音源→反射点」の区間にだけ掛ける（総経路長ではない）。
                         // 1 次反射（bounce 0）は早期反射のタップが鳴らす。二重に積まない（skipFirstOrder）。
-                        if (!(skipFirstOrder && bounce == 0)) addBinTo(bins, j, pathLen, e, inv * spreadEnergy(srcLeg));
+                        // 1 次反射（bounce 0）: 線として鳴らした面だけ尾から外す（二重に積まない）。鳴らさなかった面
+                        //   （予算から漏れた弱い面）の 1 次は尾に残る ＝ 弱い面は拡散へ折り込まれる。renderedKeys が
+                        //   無ければ（旧の像源レイ模型）bounce 0 を全部外す。
+                        bool skipHit = false;
+                        if (skipFirstOrder && bounce == 0) {
+                            skipHit = true;
+                            if (renderedKeys && renderedKeys[j]) {
+                                const int key = faceKeyOfHit(hit);
+                                const std::vector<int>& rk = *renderedKeys[j];
+                                skipHit = (key >= 0) && (std::find(rk.begin(), rk.end(), key) != rk.end());
+                            }
+                        }
+                        if (!skipHit) addBinTo(bins, j, pathLen, e, inv * spreadEnergy(srcLeg));
                     }
                     for (int b = 0; b < kNumBands; ++b) carry[b] *= refl[b];
                     d = scatteredDir(d, hit.normal, scatteringMean(mat), rng);
@@ -5497,6 +5510,7 @@ public:
         Vec3 c, nrm, aL, aS;   // 中心・法線・線の向き（長い軸）・短い軸
         float hL = 0.0f, hS = 0.0f;
         int room = -1;         // 面の表側の部屋（焼くときに roomAt で決める。-1 = 部屋の外）
+        int key = -1;          // instanceId*6 + 軸*2 + 向き。尾のエコグラムが「線として鳴らした面」を見分けるのに使う
     };
 
     // インスタンスの 6 面のうち、線にする資格のある面（面積 ≥ kFaceMinArea）を fn に渡す。
@@ -5521,9 +5535,24 @@ public:
                 f.aS = uLong ? axes[iv] : axes[iu];
                 f.hL = uLong ? hu : hv;
                 f.hS = uLong ? hv : hu;
+                f.key = instanceId * 6 + k * 2 + (sign > 0 ? 1 : 0);
                 fn(f);
             }
         }
+    }
+
+    // レイの当たりから面の鍵（instanceId*6 + 軸*2 + 向き）を引く。箱以外（メッシュ）は -1。
+    int faceKeyOfHit(const SceneHit& hit) const {
+        if (hit.instanceId < 0 || hit.instanceId >= static_cast<int>(instances_.size())) return -1;
+        const Instance& inst = instances_[static_cast<std::size_t>(hit.instanceId)];
+        if (inst.geomId != -1) return -1;
+        const Vec3 axes[3] = {inst.obb.axisX, inst.obb.axisY, inst.obb.axisZ};
+        int k = 0; float best = -1.0f, sgn = 1.0f;
+        for (int a = 0; a < 3; ++a) {
+            const float d = dot(hit.normal, axes[a]);
+            if (std::fabs(d) > best) { best = std::fabs(d); k = a; sgn = d; }
+        }
+        return hit.instanceId * 6 + k * 2 + (sgn > 0.0f ? 1 : 0);
     }
 
     // 相手 to のまわり半径 r の円盤に 9 標本（中心 1、円周 4、半径 r/2 の対角 4）を 4 回対称に置き、
@@ -5831,21 +5860,43 @@ public:
                     [&](const Vec3& a, const Vec3& p, float* g) { dynamicBlock(a, p, g); }, out6);
     }
 
+    // ── 面の線の並べ方（LOD）と予算 ───────────────────────────────────────────
+    //   並べ方は距離ではなく「面が張る角」で選ぶ。同じ式で下位タップの並びが違うだけなので、切り替わりで音量は跳ばない
+    //   （各面の重みの和は常に 1）。遠い壁は自然に点に潰れ、壁ぎわは両軸に広がる。
+    //     長軸の張る角 < kLodPointDeg   → 1 本（点）
+    //     短軸の張る角 ≥ kLodSurfaceDeg → 面（長軸 K × 短軸 kLodRows）
+    //     （面にするのは壁だけ。床・天井は線のまま）
+    //     それ以外                      → 線（長軸 K）
+    //   予算は面ごと丸ごと（e/len² の大きい順に、上限に収まる面だけ線として鳴らす）。漏れた面はタップにしない。
+    //   その面の 1 次のエネルギーは尾のエコグラムに残る（bounce 0 を外すのは「線として鳴らした面」だけ）。
+    //   ＝ 強い面は線、弱い面は拡散へ。距離のスイッチではなくエネルギー順の連続な規則。
+    //   費用の LOD: 面の中心で見て refl × (直接距離/経路長)² が kFaceEnergyFloor（−30 dB）を割る面は、
+    //   見通しの円盤（18 本）を撃つ前に落とす。遠い部屋の壁は τ 越しなので自然にここで消える。
+    static constexpr float kLodPointDeg = 10.0f;
+    static constexpr float kLodSurfaceDeg = 100.0f;
+    static constexpr int   kLodRows = 3;
+    static constexpr float kFaceEnergyFloor = 1e-3f;
+
     void computeFaceReflections(const Vec3& listener, const Vec3* sources, int count,
                                 Vec3* outImagePos, float* outGain, int* outCount,
-                                int maxTaps, int subTaps) const {
+                                int maxTaps, int subTaps, std::vector<int>* outKeys = nullptr) const {
         using namespace scene_detail;
         if (!sources || count <= 0 || !outImagePos || !outGain || !outCount) return;
-        for (int j = 0; j < count; ++j) outCount[j] = 0;
+        for (int j = 0; j < count; ++j) { outCount[j] = 0; if (outKeys) outKeys[j].clear(); }
         if (maxTaps <= 0 || instanceCount() == 0) return;
-        const int K = std::max(1, std::min(subTaps, kFaceSubTapsMax));
+        // 予算が線 1 本ぶんも無いとき（旧の既定 earlyTaps=4 など）は、線を予算に合わせて短くする（無音にはしない）。
+        const int K = std::max(1, std::min(std::min(subTaps, kFaceSubTapsMax), maxTaps));
         const float kC = 343.0f;
         const float kF[kNumBands] = {125.0f, 250.0f, 500.0f, 1000.0f, 2000.0f, 4000.0f};
+        const float kRad2Deg = 57.29578f;
 
         struct Cand { Vec3 dir; float len; float g[kNumBands]; float key; };
+        struct Seg { int faceKey; int start; int n; float score; };
         static thread_local std::vector<std::vector<Cand>> cands;
+        static thread_local std::vector<std::vector<Seg>> segs;
         cands.resize(static_cast<std::size_t>(count));
-        for (int j = 0; j < count; ++j) cands[static_cast<std::size_t>(j)].clear();
+        segs.resize(static_cast<std::size_t>(count));
+        for (int j = 0; j < count; ++j) { cands[static_cast<std::size_t>(j)].clear(); segs[static_cast<std::size_t>(j)].clear(); }
         ensureBvh();
         const FaceBake& bk = faceBake_;
         const bool useBake = bk.valid && bk.K == K;
@@ -5861,16 +5912,40 @@ public:
         auto processFace = [&](const ReflFace& f, int bakedIdx) {
             const float dl = dot(listener - f.c, f.nrm);
             if (dl <= 0.05f) return;                                // リスナーが裏側
-            if (length(listener - f.c) > kFaceMaxDist) return;
+            const float dc = length(listener - f.c);
+            if (dc > kFaceMaxDist) return;
             const AcousticMaterial& mat = materialOf(f.materialId);
             float refl[kNumBands];
-            for (int b = 0; b < kNumBands; ++b)
+            float reflMax = 0.0f;
+            for (int b = 0; b < kNumBands; ++b) {
                 refl[b] = clamp01(1.0f - mat.absorption[b] - mat.transmission[b]);
-            const float pitch = 2.0f * f.hL / static_cast<float>(K);
+                reflMax = std::max(reflMax, refl[b]);
+            }
+            if (reflMax <= 0.0f) return;
+            // 並べ方（LOD）: 面が張る角で決める。
+            const float thetaL = 2.0f * std::atan(f.hL / std::max(dc, 0.1f)) * kRad2Deg;
+            const float thetaS = 2.0f * std::atan(f.hS / std::max(dc, 0.1f)) * kRad2Deg;
+            const int KL = (thetaL < kLodPointDeg) ? 1 : K;
+            // 面（両軸）にするのは壁だけ。床・天井は足元で必ず 100° を超えるが、上下の広がりは耳に効かず
+            //   （ITD/ILD は水平）、予算を食うだけ（箱部屋で床＋天井 30 本になり壁が落ちた）。
+            const bool wall = std::fabs(f.nrm.y) < 0.5f;
+            // 面（両軸）にするのは「短軸（壁の高さ）の張る角」が大きいとき。長軸だけだと 8 m の壁は 3 m 離れても
+            //   100° を超えて面になり、箱部屋の予算 48 を溢れて弱い面が落ちた（柱あり > 柱なし の逆転で捕まえた）。
+            //   高さ 3 m の壁なら 1.3 m 以内 ＝ 壁ぎわ。
+            const int M  = (wall && thetaS >= kLodSurfaceDeg)
+                           ? std::max(1, std::min(kLodRows, maxTaps / std::max(1, KL))) : 1;
+            const float pitchL = 2.0f * f.hL / static_cast<float>(KL);
+            const float pitchS = 2.0f * f.hS / static_cast<float>(M);
             for (int j = 0; j < count; ++j) {
                 const Vec3& S = sources[j];
                 const float ds = dot(S - f.c, f.nrm);
                 if (ds <= 0.05f) continue;                          // 音源が裏側
+                // 費用の LOD: この面が寄与し得る上限（refl × 距離比²）が床を割るなら、見通しを撃つ前に落とす。
+                {
+                    const float dDirect = std::max(length(S - listener), 1e-3f);
+                    const float lenMin = std::max(dc + length(S - f.c), 1e-3f);
+                    if (reflMax * (dDirect * dDirect) / (lenMin * lenMin) < kFaceEnergyFloor) continue;
+                }
                 const Vec3 img = S - f.nrm * (2.0f * ds);           // 像源
                 const Vec3 P = listener + (img - listener) * (dl / (dl + ds));   // 鏡面点
                 const float pL = dot(P - f.c, f.aL), pS = dot(P - f.c, f.aS);
@@ -5883,48 +5958,56 @@ public:
                     const float rF = std::sqrt(std::max((kC / kF[b]) * a1 * a2 / (a1 + a2), 1e-6f));
                     specW[b] = clamp01(1.0f - over / rF);
                 }
-                // 線上の鏡面点。端の半ピッチ内へクランプして、三角核の和が常に 1 になるようにする。
-                const float sp = std::max(-f.hL + 0.5f * pitch, std::min(f.hL - 0.5f * pitch, pL));
-                const float sS = std::max(-f.hS, std::min(f.hS, pS));  // 線の高さ
-                for (int i = 0; i < K; ++i) {
-                    const float si = -f.hL + pitch * (static_cast<float>(i) + 0.5f);
-                    const float lobe = std::max(0.0f, 1.0f - std::fabs(si - sp) / pitch);
-                    const Vec3 Pi = f.c + f.aL * si + f.aS * sS;
-                    const Vec3 q = Pi + f.nrm * 0.02f;               // 自己ヒット防止に浮かせる
-                    float vL[kNumBands], vS[kNumBands];
-                    // 脚ごとに「焼き × 動いた物」か「生」かを選ぶ。
-                    bool okL = false, okS = false;
-                    if (bakedIdx >= 0 && f.room >= 0) {
-                        float b6[kNumBands], d6[kNumBands];
-                        if (listenerRoom == f.room && bakedVisAt(listener, bakedIdx, i, b6)) {
-                            dynamicBlockDisc(q, listener, kFaceDiscRadius, d6);
-                            for (int b = 0; b < kNumBands; ++b) vL[b] = b6[b] * d6[b];
-                            okL = true;
+                // 鏡面点を、端の半ピッチ内へクランプ（三角核の和が常に 1）。
+                const float spL = std::max(-f.hL + 0.5f * pitchL, std::min(f.hL - 0.5f * pitchL, pL));
+                const float spS = (M > 1) ? std::max(-f.hS + 0.5f * pitchS, std::min(f.hS - 0.5f * pitchS, pS))
+                                          : std::max(-f.hS, std::min(f.hS, pS));
+                std::vector<Cand>& cv = cands[static_cast<std::size_t>(j)];
+                Seg seg; seg.faceKey = f.key; seg.start = static_cast<int>(cv.size()); seg.n = 0; seg.score = 0.0f;
+                for (int r = 0; r < M; ++r) {
+                    const float sS = (M > 1) ? (-f.hS + pitchS * (static_cast<float>(r) + 0.5f)) : spS;
+                    const float lobeS = (M > 1) ? std::max(0.0f, 1.0f - std::fabs(sS - spS) / pitchS) : 1.0f;
+                    for (int i = 0; i < KL; ++i) {
+                        const float si = -f.hL + pitchL * (static_cast<float>(i) + 0.5f);
+                        const float lobeL = std::max(0.0f, 1.0f - std::fabs(si - spL) / pitchL);
+                        const Vec3 Pi = f.c + f.aL * si + f.aS * sS;
+                        const Vec3 q = Pi + f.nrm * 0.02f;               // 自己ヒット防止に浮かせる
+                        float vL[kNumBands], vS[kNumBands];
+                        // 脚ごとに「焼き × 動いた物」か「生」かを選ぶ。
+                        bool okL = false, okS = false;
+                        if (bakedIdx >= 0 && f.room >= 0) {
+                            float b6[kNumBands], d6[kNumBands];
+                            if (listenerRoom == f.room && bakedVisAt(listener, bakedIdx, i, b6)) {
+                                dynamicBlockDisc(q, listener, kFaceDiscRadius, d6);
+                                for (int b = 0; b < kNumBands; ++b) vL[b] = b6[b] * d6[b];
+                                okL = true;
+                            }
+                            if (srcRoom[static_cast<std::size_t>(j)] == f.room && bakedVisAt(S, bakedIdx, i, b6)) {
+                                dynamicBlockDisc(q, S, kFaceDiscRadius, d6);
+                                for (int b = 0; b < kNumBands; ++b) vS[b] = b6[b] * d6[b];
+                                okS = true;
+                            }
                         }
-                        if (srcRoom[static_cast<std::size_t>(j)] == f.room && bakedVisAt(S, bakedIdx, i, b6)) {
-                            dynamicBlockDisc(q, S, kFaceDiscRadius, d6);
-                            for (int b = 0; b < kNumBands; ++b) vS[b] = b6[b] * d6[b];
-                            okS = true;
+                        // 生: 見通しは半影つき（相手のまわり半径 0.4 m の円盤に 9 標本）。1 本のレイだと、扉の縁が
+                        //   線を越える瞬間に下位タップが二値で跳ぶ（実測: 10 度刻みで 5.1 dB → 円盤で 2.5 dB）。
+                        if (!okL) softTransmissionDisc(q, listener, kFaceDiscRadius, vL);
+                        if (!okS) softTransmissionDisc(q, S, kFaceDiscRadius, vS);
+                        Cand cd;
+                        const float l1 = length(Pi - listener), l2 = length(S - Pi);
+                        cd.len = l1 + l2;
+                        cd.dir = (l1 > 1e-4f) ? (Pi - listener) * (1.0f / l1) : f.nrm;
+                        float e = 0.0f;
+                        for (int b = 0; b < kNumBands; ++b) {
+                            const float s = clamp01(mat.scattering[b]);
+                            const float w = (1.0f - s) * specW[b] * lobeL * lobeS + s / static_cast<float>(KL * M);
+                            cd.g[b] = refl[b] * w * vL[b] * vS[b];
+                            e += cd.g[b];
                         }
+                        cd.key = e / (cd.len * cd.len);   // 1/r² 込みの強さ
+                        if (e > 1e-7f) { cv.push_back(cd); ++seg.n; seg.score += cd.key; }
                     }
-                    // 生: 見通しは半影つき（相手のまわり半径 0.4 m の円盤に 9 標本）。1 本のレイだと、扉の縁が
-                    //   線を越える瞬間に下位タップが二値で跳ぶ（実測: 10 度刻みで 5.1 dB → 円盤で 2.5 dB）。
-                    if (!okL) softTransmissionDisc(q, listener, kFaceDiscRadius, vL);
-                    if (!okS) softTransmissionDisc(q, S, kFaceDiscRadius, vS);
-                    Cand cd;
-                    const float l1 = length(Pi - listener), l2 = length(S - Pi);
-                    cd.len = l1 + l2;
-                    cd.dir = (l1 > 1e-4f) ? (Pi - listener) * (1.0f / l1) : f.nrm;
-                    float e = 0.0f;
-                    for (int b = 0; b < kNumBands; ++b) {
-                        const float s = clamp01(mat.scattering[b]);
-                        const float w = (1.0f - s) * specW[b] * lobe + s / static_cast<float>(K);
-                        cd.g[b] = refl[b] * w * vL[b] * vS[b];
-                        e += cd.g[b];
-                    }
-                    cd.key = e / (cd.len * cd.len);   // 上限で切るときの順（1/r² 込みの強さ）
-                    if (e > 1e-7f) cands[static_cast<std::size_t>(j)].push_back(cd);
                 }
+                if (seg.n > 0) segs[static_cast<std::size_t>(j)].push_back(seg);
             }
         };
 
@@ -5949,18 +6032,24 @@ public:
                 forEachReflFace(static_cast<int>(id), instances_[id], [&](const ReflFace& f) { processFace(f, -1); });
         }
 
+        // 予算: 面ごと丸ごと、強い順に上限へ収まる面だけ鳴らす。漏れた面の 1 次は尾に残る（鍵を返さない）。
         for (int j = 0; j < count; ++j) {
             std::vector<Cand>& cv = cands[static_cast<std::size_t>(j)];
-            if (static_cast<int>(cv.size()) > maxTaps)
-                std::partial_sort(cv.begin(), cv.begin() + maxTaps, cv.end(),
-                                  [](const Cand& a, const Cand& b) { return a.key > b.key; });
-            const int n = std::min(maxTaps, static_cast<int>(cv.size()));
+            std::vector<Seg>& sv = segs[static_cast<std::size_t>(j)];
+            std::sort(sv.begin(), sv.end(), [](const Seg& a, const Seg& b) { return a.score > b.score; });
+            int n = 0;
             Vec3* pos = outImagePos + static_cast<std::size_t>(j) * maxTaps;
             float* gain = outGain + static_cast<std::size_t>(j) * maxTaps * kNumBands;
-            for (int t = 0; t < n; ++t) {
-                pos[t] = listener + cv[t].dir * cv[t].len;
-                // 内部はエネルギー、タップのゲインは振幅で返す（material.h の単位規約）。
-                for (int b = 0; b < kNumBands; ++b) gain[t * kNumBands + b] = std::sqrt(cv[t].g[b]);
+            for (const Seg& sg : sv) {
+                if (n + sg.n > maxTaps) continue;                   // 収まらない面は落とす（尾に残る）
+                for (int t = 0; t < sg.n; ++t) {
+                    const Cand& cd = cv[static_cast<std::size_t>(sg.start + t)];
+                    pos[n] = listener + cd.dir * cd.len;
+                    // 内部はエネルギー、タップのゲインは振幅で返す（material.h の単位規約）。
+                    for (int b = 0; b < kNumBands; ++b) gain[n * kNumBands + b] = std::sqrt(cd.g[b]);
+                    ++n;
+                }
+                if (outKeys) outKeys[j].push_back(sg.faceKey);
             }
             outCount[j] = n;
         }
@@ -6417,6 +6506,7 @@ private:
         std::vector<Vec3> earlyPos;    // [count*earlyCap]
         std::vector<float> earlyGain;  // [count*earlyCap*6]
         std::vector<int> earlyCount;   // [count]
+        std::vector<std::vector<int>> earlyFaceKeys;   // [count] 線として鳴らした面の鍵（尾から 1 次を外す面）
 
         int diffCap = 0;
         std::vector<Vec3> diffPos;     // [count*diffCap]
@@ -6441,6 +6531,7 @@ private:
             earlyPos.assign(static_cast<size_t>(n) * eCap, Vec3(0, 0, 0));
             earlyGain.assign(static_cast<size_t>(n) * eCap * kNumBands, 0.0f);
             earlyCount.assign(static_cast<size_t>(n), 0);
+            earlyFaceKeys.assign(static_cast<size_t>(n), std::vector<int>());
             diffPos.assign(static_cast<size_t>(n) * dCap, Vec3(0, 0, 0));
             diffGain.assign(static_cast<size_t>(n) * dCap, 0.0f);
             diffCount.assign(static_cast<size_t>(n), 0);
@@ -6493,7 +6584,7 @@ private:
         earlyIdx_.clear();
         for (int i = 0; i < n; ++i) {
             if (tierIs_(i, TierExact)) earlyIdx_.push_back(i);
-            else results_.earlyCount[static_cast<size_t>(i)] = 0;
+            else { results_.earlyCount[static_cast<size_t>(i)] = 0; results_.earlyFaceKeys[static_cast<size_t>(i)].clear(); }
         }
         const int m = static_cast<int>(earlyIdx_.size());
         if (m <= 0) return;
@@ -6506,9 +6597,10 @@ private:
 
         if (cfg_.earlyModel == 1) {
             // 面ごとの線音源（レイを撃たない。面の数 × 下位タップ数 × 透過 2 本）。
+            earlyKeysBuf_.assign(static_cast<std::size_t>(m), std::vector<int>());
             computeFaceReflections(listenerPos_, earlySrc_.data(), m,
                                    earlyPosBuf_.data(), earlyGainBuf_.data(),
-                                   earlyCntBuf_.data(), cap, cfg_.earlyFaceSubTaps);
+                                   earlyCntBuf_.data(), cap, cfg_.earlyFaceSubTaps, earlyKeysBuf_.data());
         } else {
             computeEarlyReflectionsMulti(listenerPos_, earlySrc_.data(), m,
                                          earlyPosBuf_.data(), earlyGainBuf_.data(),
@@ -6528,6 +6620,8 @@ private:
                         earlyGainBuf_[(src + t) * kNumBands + b];
             }
             results_.earlyCount[static_cast<size_t>(i)] = got;
+            results_.earlyFaceKeys[static_cast<size_t>(i)] =
+                (cfg_.earlyModel == 1 && k < static_cast<int>(earlyKeysBuf_.size())) ? earlyKeysBuf_[static_cast<std::size_t>(k)] : std::vector<int>();
         }
     }
 
@@ -6766,11 +6860,20 @@ private:
         const std::size_t need = static_cast<std::size_t>(results_.echogramBins) * kNumBands
                                * static_cast<std::size_t>(m);
         if (echoAccum_.size() != need) { echoAccum_.assign(need, 0.0f); }
+        // 線として鳴らした面の鍵（代表の音源ごと）。旧模型（earlyModel=0）なら null ＝ bounce 0 を全部外す。
+        echoKeys_.assign(static_cast<std::size_t>(m), nullptr);
+        if (cfg_.earlyModel == 1)
+            for (int kk = 0; kk < m; ++kk) {
+                const int idx = echoRepIdx_[static_cast<std::size_t>(kk)];
+                if (idx >= 0 && idx < static_cast<int>(results_.earlyFaceKeys.size()))
+                    echoKeys_[static_cast<std::size_t>(kk)] = &results_.earlyFaceKeys[static_cast<std::size_t>(idx)];
+            }
         computeEchogramBands(listenerPos_, echoRepPos_.data(), m,
                              echoAccum_.data(), results_.echogramBins,
                              cfg_.echogramBinSeconds, cfg_.speedOfSound,
                              cfg_.echogramRays, cfg_.echogramBounces, cfg_.distanceRef,
-                             begin, chunk, first, /*useTiers=*/true, cfg_.echogramSkipFirstOrder);
+                             begin, chunk, first, /*useTiers=*/true, cfg_.echogramSkipFirstOrder,
+                             echoKeys_.empty() ? nullptr : echoKeys_.data());
         echoRaySlice_ = last ? 0 : (echoRaySlice_ + 1);
         if (!last) return;      // まだ 1 周していない。前回の結果を保ったまま帰る
         echoPrimed_ = true;
@@ -7114,6 +7217,8 @@ private:
     std::vector<Vec3> earlyPosBuf_;
     std::vector<float> earlyGainBuf_;
     std::vector<int> earlyCntBuf_;
+    std::vector<std::vector<int>> earlyKeysBuf_;          // 線として鳴らした面の鍵（音源ごと）
+    std::vector<const std::vector<int>*> echoKeys_;      // エコグラムへ渡す（代表の音源ごと）
 
     // ── 段の解決 ───────────────────────────────────────────────────
     // 音源ごとの固定の段に、自動バーチャルの判定を重ねて「今フレーム実際に使う段」を作る。

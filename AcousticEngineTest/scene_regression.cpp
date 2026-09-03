@@ -4415,6 +4415,55 @@ void testFaceReflections() {
         check("[口] 大きさの合わない焼きは受け取らない", badImport == 0);
         AF_SceneDestroy(s);
     }
+    // 10) LOD と予算: 張る角で 1 本／線／面を選ぶ。予算から漏れた面の 1 次は尾に残る。
+    {
+        // 10a) 大きな箱（20 x 3 x 6）。西の壁ぎわ 0.4 m → 面 5x3 = 15 本。東の壁（19.8 m 先、半幅 3 → 17°）→ 線 5 本。
+        //      1.2 m 角の板（14.7 m 先 → 4.7°）→ 1 本。床・天井・南北（張る角 89〜91°）→ 線 5 本ずつ。合計 41 本。
+        {
+            AF_SceneHandle s = boxRoom(10.0f, 1.5f, 3.0f, tr, ab, sc);
+            const int m = AF_SceneAddMaterial(s, tr, ab, sc, 6);
+            AF_SceneAddInstanceBox(s, V(5.0f, 1.5f, 0.0f), V(0.03f, 0.6f, 0.6f), V(1,0,0), V(0,1,0), m);   // 小さな板
+            AF_UpdateConfig c = cfgFor(1, 5, 0);
+            AF_SceneSetUpdateConfig(s, &c);
+            const AF_Vector3 Lw = V(-9.6f, 1.6f, 0.0f), Sw = V(-8.0f, 1.6f, 0.5f);
+            const int n = taps(s, Lw, Sw, pos, g);
+            int west = 0, east = 0;
+            for (int t = 0; t < n; ++t) {
+                const float dx = pos[t].x - Lw.x, dy = pos[t].y - Lw.y, dz = pos[t].z - Lw.z;
+                const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (len < 1e-4f) continue;
+                if (dx / len < 0.0f) ++west;                 // 西向き＝壁ぎわの面
+                if (dx / len > 0.95f) ++east;                // ほぼ真東＝東の壁の線と板
+            }
+            std::snprintf(buf, sizeof(buf), "(全 %d 本 / 西 %d / 真東 %d)", n, west, east);
+            check("[LOD] 壁ぎわは面 15 本、遠い板は 1 本、合計 41 本", n == 41 && west == 15, buf);
+            AF_SceneDestroy(s);
+        }
+        // 10b) 予算: 上限が小さいと面ごと丸ごと落ち、落ちた面の 1 次は尾に残る。
+        //      尾の総和は「全部線」< 「一部線」< 「1 次を外さない」。
+        {
+            double tail[3] = {0, 0, 0}; int nTaps[3] = {0, 0, 0};
+            for (int k = 0; k < 3; ++k) {
+                AF_SceneHandle s = boxRoom(4.0f, 1.5f, 3.0f, tr, ab, sc);
+                AF_UpdateConfig c = cfgFor(1, 5, 1);
+                c.earlyTaps = (k == 1) ? 12 : 48;                  // 12 本 = 面 2 枚ぶんしか入らない
+                c.echogramSkipFirstOrder = (k == 2) ? 0 : 1;
+                AF_SceneSetUpdateConfig(s, &c);
+                AF_SceneSetListener(s, L); AF_SceneSetSource(s, 1, S);
+                for (int i = 0; i < 8; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+                const int idx = AF_SceneSourceIndex(s, 1);
+                nTaps[k] = AF_SceneGetEarlyReflections(s, idx, pos, g, 48);
+                float bins[60 * kBands];
+                const int nb = AF_SceneGetEchogramBands(s, idx, bins, 60);
+                for (int i = 0; i < nb * kBands; ++i) tail[k] += bins[i];
+                AF_SceneDestroy(s);
+            }
+            std::snprintf(buf, sizeof(buf), "(タップ 48:%d 本 / 12:%d 本、尾 全部線 %.3f < 一部線 %.3f < 外さない %.3f)",
+                          nTaps[0], nTaps[1], tail[0], tail[1], tail[2]);
+            check("[予算] 上限 12 なら面 2 枚（10 本）だけ線になり、残りの面の 1 次は尾に残る",
+                  nTaps[0] == 30 && nTaps[1] == 10 && tail[0] < tail[1] && tail[1] < tail[2], buf);
+        }
+    }
 }
 
 void diagnoseSwingDoorSourceSweep() {
