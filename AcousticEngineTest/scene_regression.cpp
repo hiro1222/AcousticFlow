@@ -4135,6 +4135,20 @@ void diagnoseSwingDoorSourceSweep() {
                     const float dr = std::sqrt(dxr*dxr + dyr*dyr + dzr*dzr);
                     if (q < 96) q += std::snprintf(er + q, sizeof(er) - q, " %+.0f°/%.1fm", az, dr); }
             }
+            // ★尾／直接の比。ホスト（UpdateReverbTargetRatio）と同じ式で出す:
+            //   rc = 0.057√(V/RT60)、t = (r/rc)²、知覚圧縮 t^exponent（場面の値 0.5）。
+            //   尾の絶対レベルは tailGain = 自由音場の直接 × √t、直接タップは 自由音場 × 生存、
+            //   さらに尾には tailSrcLevel(=生存) が掛かるので、**尾/直接 = √t**（生存が約分される）。
+            //   ＝ 遮蔽が深いほど、聞こえている物のほとんどが尾になる。
+            const float vol = AF_SceneRoomVolumeAt(s, L, 2.0f);
+            float rt6[kBands] = {};
+            AF_SceneRt60At(s, L, 2.0f, rt6, kBands);
+            const float rt = std::max(0.05f, rt6[2]);
+            const float rc = 0.057f * std::sqrt(std::max(vol, 1.0f) / rt);
+            const float rr = std::sqrt((x - L.x) * (x - L.x) + (3.0f - L.z) * (3.0f - L.z));
+            const float traw = (rr * rr) / std::max(rc * rc, 1e-4f);
+            const float tcmp = std::pow(traw, 0.5f);                 // 場面の reverbRatioExponent
+            const float tailOverDirect = 10.0f * std::log10(std::max(tcmp, 1e-12f));
             if (have) {
                 const float j = std::fabs(db - prevDb);
                 if (j > maxJump) { maxJump = j; jumpAt = x; }
@@ -4143,9 +4157,9 @@ void diagnoseSwingDoorSourceSweep() {
             const bool flip = (std::fabs(trueAz) > 5.0f) && (trueAz * arrAz < 0.0f) && (std::fabs(arrAz) > 5.0f);
             const bool erFlip = (ne > 0) && (std::fabs(trueAz) > 5.0f) && (trueAz * erAzTop < 0.0f)
                                 && (std::fabs(erAzTop) > 5.0f);
-            std::printf("        %+5.2f  %7.1f   %+6.1f°  %+6.1f°  %+6.1f°   %d本  %.4f  %s | 回折源%d 反射%d本%s%s%s\n",
+            std::printf("        %+5.2f  %7.1f   %+6.1f°  %+6.1f°  %+6.1f°   %d本  %.4f  %s | 尾/直接 %+5.1f dB | 回折源%d 反射%d本%s%s%s\n",
                         x, db, trueAz, arrAz, trueAz - arrAz, np, d28[1],
-                        (d28[18] > 0.5f) ? "はい" : "いいえ", nds, ne, er,
+                        (d28[18] > 0.5f) ? "はい" : "いいえ", tailOverDirect, nds, ne, er,
                         flip ? "  ★到来が反転" : "", erFlip ? "  ★最強の反射が反対側" : "");
         }
         std::printf("        最大の跳び %.1f dB（x=%+.2f 付近、刻み %.2f m）\n", maxJump, jumpAt, step);

@@ -1543,6 +1543,16 @@ namespace AcousticFlow
             if (Input.GetKeyDown(KeyCode.B)) SwitchSourceSound();
             // P：扉の定点 ON/OFF（聴き比べ用。sharedTailBus が ON のときだけ効く）。
             if (Input.GetKeyDown(KeyCode.P)) portalTail = !portalTail;
+            // 1〜4：成分のソロ（直接音／反射／回折／後期尾）。
+            //   ★「何が定位を持っているか」を耳で切り分けるための口。仕組み（IrConvolver.Solo）は
+            //     前からあったのに**キーが無く、実行中に切り替えられなかった**。
+            //     2026-09-03「閉扉で壁の奥の定位が反転する」を追うときに、F（早期反射のエミッタ）だけでは
+            //     足りず、尾と回折を個別に落とせないと切り分けられないと分かって足した。
+            //   ⚠ F と 3 は別物。F はワールドに置く**像源エミッタ**、3 は畳み込み器の中の回折タップ。
+            if (Input.GetKeyDown(KeyCode.Alpha1)) IrConvolver.Solo.PassDirect = !IrConvolver.Solo.PassDirect;
+            if (Input.GetKeyDown(KeyCode.Alpha2)) IrConvolver.Solo.PassReflect = !IrConvolver.Solo.PassReflect;
+            if (Input.GetKeyDown(KeyCode.Alpha3)) IrConvolver.Solo.PassDiffract = !IrConvolver.Solo.PassDiffract;
+            if (Input.GetKeyDown(KeyCode.Alpha4)) IrConvolver.Solo.PassTail = !IrConvolver.Solo.PassTail;
             // M：Wwise音源を一括ミュート/復帰（IR畳み込みテストで楽曲を止めてクリックを聞く用）。
             //   ミュート=全ボイスStop、復帰=再Post（拍は頭出しに戻る）。IrConvolver(Unity)は無関係に鳴り続ける。
             if (Input.GetKeyDown(KeyCode.M))
@@ -2831,6 +2841,11 @@ namespace AcousticFlow
                                 + " / M:楽曲ミュート", style);
             GUILayout.Label($"音: {(_singleFootstep ? $"足音ループ・音源0のみ ({footstepEvent})" : (useFootstepSE ? $"足音SE・音源0のみ ({footstepEvent})" : "音楽ステム"))}  (B:足音切替{(enableFootstepToggleKey ? " / Enter:足音ループ" : "")})", style);
             GUILayout.Label($"音源配置: {(_stacked ? "重ね(1点)" : "展開")}", style);
+            GUILayout.Label($"成分ソロ: 1直接 {(IrConvolver.Solo.PassDirect ? "ON " : "OFF")}"
+                            + $" / 2反射 {(IrConvolver.Solo.PassReflect ? "ON " : "OFF")}"
+                            + $" / 3回折 {(IrConvolver.Solo.PassDiffract ? "ON " : "OFF")}"
+                            + $" / 4尾 {(IrConvolver.Solo.PassTail ? "ON " : "OFF")}"
+                            + $"   (F=像源エミッタ {(enableEarlyReflections ? "ON" : "OFF")})", style);
             {
                 // 扉の定点の状態。効いていない理由があればそれも出す（黙って効かないのがいちばん困る）。
                 float peak = 0f; int live = 0;
