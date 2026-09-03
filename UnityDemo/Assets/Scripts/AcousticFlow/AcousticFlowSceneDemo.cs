@@ -315,8 +315,9 @@ namespace AcousticFlow
                  + "実測: 戸口の正面から横へ 0.1m 刻みで歩いて最大隣接差 1.77dB（崖なし）。")]
         [Range(0.2f, 4f)] public float portalGovernRange = 1.0f;
 
-        [Tooltip("ON: 各音源の主要な初期反射を像源として抽出し、IR の反射タップ(R)として畳み込む。F キー切替。")]
-        public bool enableEarlyReflections = true;
+        [Tooltip("ON: 各音源の主要な初期反射を像源として抽出し、IR の反射タップ(R)として畳み込む。F キー切替。\n"
+                 + "★2026-09-03 の方針で既定 OFF: 反射レイ（役割1の生存）は残し、可聴の反射音（像源）は捨てて残響へ資源を回す。")]
+        public bool enableEarlyReflections = false;
         [Tooltip("音源あたりの最大反射タップ数（＝像源＝仮想ボイス数）。多いほど密だがボイスを食う（例 3〜6）。"
                  + "総仮想ボイス数 = 音源数 × これ。")]
         [Range(1, 8)] public int earlyReflectTaps = 4;
