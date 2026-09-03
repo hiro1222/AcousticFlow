@@ -8228,3 +8228,20 @@ DLL は変えていません。
 
 ⚠ Unity 上ではまだ聴いていません。型検査は通っています。聴いて変なら `portalTail` を OFF に戻してください。
 DLL は更新済み（新しい口が 4 つ増えただけで、既定の音は同じ）。
+
+---
+
+# 【サウンド→ゲームシステム】消した: Wwise 風の再生経路（音は AudioSource → 畳み込み器だけになった）
+
+DLL は既定でスタブ Adapter だったので、あの経路（PostEvent / RTPC / 像源エミッタ / 回折エミッタ）は何も鳴らしていませんでした。
+道が 2 本あると「聞こえているのはどちらの音か」が切り分けられないので、2026-09-03 に全部消しました（71b5581）。
+
+## そちらに関わること
+- `AcousticFlowSceneDemo.sourceEvents` は**もう何も読みません**。`BellGameStages.cs:777` が書き込んでいるので型だけ残してあります
+  （HideInInspector）。都合のよいときにその 1 行を消してください。消したら私が型ごと消します。
+- 音源（`source` / `extraSources`）の Transform に **AudioSource（clip 付き）** が要ります。無い音源は幾何計算だけになります。
+  `spatialBlend` は起動時に 0 へ固定します（空間化は畳み込み器が担うので、Unity の 3D 減衰と二重に掛けない）。
+- キー: B = 全音源のクリップを `altClip` に差し替え / M = 音源の一括ミュート / Enter の足音ループは廃止（Enter を使っていた
+  RoomCompareLab 向けの `enableFootstepToggleKey` も消えました）。H は畳み込み器の HRTF に届くようになりました。
+- 早期反射の像源（IR の R タップ）は既定 OFF にしました（75eeee0、F キーで戻せます）。反射レイの生存はそのままです。
+- DLL は AF_* の口が変わっていないので、古い DLL のままでも新しい C# は動きます（Unity を閉じたときに配り直します）。

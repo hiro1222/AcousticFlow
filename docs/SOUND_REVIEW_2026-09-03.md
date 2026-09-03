@@ -127,3 +127,17 @@
 - **Unity を閉じてから `tools/dev.ps1 deploy`**（Plugins の DLL が 03:27 の版のまま）。
 - 直近のコミット: cb2d640 半影 / 22b3197 資料 / e1a3020 定点の部品 / 472fcdf 定点のホスト配線 / 40e8976 P キーと HUD / d23312d 扉のドラッグ / bd5d44e 歩行の走査と空間版 / c04f01b 古い DLL の逃げ道。自レーンに未コミットは無い。
 - 記憶（memory）: `door-sound-phase-plan.md` に手順と設計、`keep-model-changes-revertible.md` に戻せる形の約束、`portfolio-core-spatial-awareness.md` に三層。
+
+## 5. 追記（同日夜）: Wwise 撤去と、反射・回折の方針
+
+- **Wwise 風の再生経路を全部消した**（71b5581）。DLL は既定でスタブ Adapter だったので、あの経路は何も鳴らしていなかった。
+  音は各音源の AudioSource（spatialBlend 0）→ IrConvolver / VoiceConvolver の畳み込みだけ。
+  §1.4 の「ホスト側のリスク」のうち、二重経路の混乱はこれで消えた。
+  - 消えたもの: acoustic_engine.h（公開口 40）、acoustic_api.cpp、Adapter/、acoustic_world、source_directivity、
+    AcousticEngineTest/main.cpp、C# の DllImport 39 本、デモの PostEvent/RTPC/像源・回折エミッタ/足音ループ。19 ファイル −3,611 行。
+  - 残したもの: `sourceEvents`（BellGame の編集スクリプトが書くため型だけ）。
+  - 回帰 355/355、C# 型検査エラーなし。DLL は AF_* の口が変わっていないので、古い DLL でも新しい C# は動く。
+- **方針 2（ユーザー確定）**: 「エネルギー量が一定を下回るまでの反射経路はとるけど、反響音の計算は捨てていい」。
+  - 早期反射の像源（IR の R タップ）は既定 OFF（75eeee0、F キーで戻せる）。
+  - 役割1 の反射レイ（生存）は残す。回数は固定 3 回ではなく、運ぶエネルギーが床を割るまで（次項）。
+  - 回折はポータルが主。エッジ探索は精度の上積みに留める。浮いた資源は残響へ。
