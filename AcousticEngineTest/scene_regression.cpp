@@ -3927,6 +3927,209 @@ void diagnoseWalkContinuity() {
     useRefl = true;
 }
 
+// 閉じた扉ごしの定位 ── 「壁の奥の音源が左右反転して聞こえる」の切り分け（2026-09-03 の報告）。
+//   ホストは遮蔽が深いほど**エンジンの到来方向**へ寄せる（AcousticFlowSceneDemo の steer）。
+//   閉扉では steer≈1 なので、聞こえる向きは AF_SceneGetSourceArrivalDir がそのまま決める。
+//   ここでは資料の部屋で、真の方位と到来方位を扉の開閉ごとに並べる。
+//     方位は世界系（+x が右、+z が奥）。atan2(x, z) の度。左の音源は負、右の音源は正。
+//   符号が逆なら反転。0 付近なら「戸口へ寄っている」だけで反転ではない。
+// HRTF の左右 ── 「右から来る音は右耳が大きい」。検査が 1 つも無かった所。
+//   閉扉では聞こえる向きを HRTF が単独で決める（開いていると回折の二次音源や早期反射の
+//   実体（Unity の AudioSource）が正しい位置から鳴るので、HRTF の誤りが隠れる）。
+//   ★リスナー座標系の規約: +x = 右 / +y = 上 / +z = 前（Unity の InverseTransformDirection と同じ）。
+void testHrtfLeftRight() {
+    std::printf("\n[HRTF] 左右の向き（+x=右 / +z=前）\n");
+    constexpr int kSr = 48000, kBlk = 512;
+    struct Dir { const char* name; float x, y, z; int expect; };   // expect: +1=右が大きい / -1=左 / 0=同じ
+    const Dir dirs[5] = {
+        { "右 (+x)",  1, 0,  0, +1 },
+        { "左 (-x)", -1, 0,  0, -1 },
+        { "前 (+z)",  0, 0,  1,  0 },
+        { "後 (-z)",  0, 0, -1,  0 },
+        { "右後ろ",   0.707f, 0, -0.707f, +1 },
+    };
+    auto check1 = [&](AF_HrtfHandle h, const char* label) {
+        if (!h) { std::printf("      %s: 読めない\n", label); return; }
+        for (const Dir& d : dirs) {
+            AF_VoiceConfig cfg{}; cfg.sampleRate = kSr; cfg.maxFrames = kBlk; cfg.tailSeconds = 0.05f;
+            AF_VoiceHandle v = AF_VoiceCreate(&cfg);
+            AF_VoiceSetHrtf(v, h);
+            AF_VoiceSetHrtfEnabled(v, 1);
+            AF_VoiceSetTailLevel(v, 0.0f);
+            AF_VoiceTap t{};
+            for (int b = 0; b < kBands; ++b) t.gain6[b] = 1.0f;
+            t.panL = t.panR = 0.7071f; t.gSpec = 1.0f;
+            AF_VoiceSetTaps(v, &t, 1);
+            AF_VoiceSetDirection(v, V(d.x, d.y, d.z), 57.0f);
+            std::vector<float> in(kBlk, 0.0f), l(kBlk), r(kBlk);
+            double eL = 0.0, eR = 0.0;
+            for (int blk = 0; blk < 24; ++blk) {          // 0.26 秒。タップのクロスフェード 30ms を越える
+                std::fill(in.begin(), in.end(), 0.0f);
+                if (blk == 8) in[0] = 1.0f;               // 落ち着いてからクリック 1 発
+                AF_VoiceRender(v, in.data(), kBlk, l.data(), r.data(), nullptr);
+                if (blk < 8) continue;
+                for (int i = 0; i < kBlk; ++i) { eL += l[i] * l[i]; eR += r[i] * r[i]; }
+            }
+            AF_VoiceDestroy(v);
+            const double rl = 10.0 * std::log10(std::max(eR, 1e-20) / std::max(eL, 1e-20));
+            char buf2[96];
+            std::snprintf(buf2, sizeof(buf2), "%s %s: 右−左 %+.1f dB", label, d.name, rl);
+            if (d.expect > 0)      check(buf2, rl > 1.0, "（右が大きいはず）");
+            else if (d.expect < 0) check(buf2, rl < -1.0, "（左が大きいはず）");
+            else                   check(buf2, std::fabs(rl) < 1.5, "（左右がほぼ同じはず）");
+        }
+    };
+    // ── 2 本目以降のタップ（HRTF を通らない「軽量な両耳化」＝ ITD ＋ 帯域別 ILD）──
+    //   閉じた扉ごしでは直接音タップが材質の透過まで落ち、**回折タップ**が実エネルギーを運ぶ。
+    //   回折タップは 1 本だけ HRTF バスへ載り、残りはこの軽量経路で鳴る。
+    //   ここが逆だと「扉を閉めた時だけ左右が入れ替わる」という出方をする。
+    auto check2 = [&](AF_HrtfHandle h, const char* label, bool viaHrtfBus) {
+        if (!h) return;
+        for (const Dir& d : dirs) {
+            AF_VoiceConfig cfg{}; cfg.sampleRate = kSr; cfg.maxFrames = kBlk; cfg.tailSeconds = 0.05f;
+            AF_VoiceHandle v = AF_VoiceCreate(&cfg);
+            AF_VoiceSetHrtf(v, h);
+            AF_VoiceSetHrtfEnabled(v, 1);
+            AF_VoiceSetTailLevel(v, 0.0f);
+            AF_VoiceSetEarCues(v, 1);
+            AF_VoiceTap t[2] = {};
+            // index 0 = 直接音。閉扉のつもりで黙らせる（方向の手がかりを 2 本目だけにする）。
+            t[0].panL = t[0].panR = 0.7071f; t[0].gSpec = 1.0f;
+            for (int b = 0; b < kBands; ++b) t[1].gain6[b] = 1.0f;
+            t[1].gSpec = 1.0f;
+            t[1].dirX = d.x; t[1].dirY = d.y; t[1].dirZ = d.z;
+            // 等パワーパンも同時に入れる（ホストと同じ。軽量経路が効けばこちらは使われない）。
+            const float xr = (d.x + 1.0f) * 0.5f;
+            t[1].panL = std::sqrt(1.0f - xr); t[1].panR = std::sqrt(xr);
+            t[1].hrtfWeight = viaHrtfBus ? 1.0f : 0.0f;
+            AF_VoiceSetTaps(v, t, 2);
+            AF_VoiceSetDirection(v, V(0, 0, 1), 57.0f);          // 直接音は正面（黙っている）
+            if (viaHrtfBus) AF_VoiceSetDiffractionDirection(v, V(d.x, d.y, d.z), 57.0f);
+            std::vector<float> in(kBlk, 0.0f), l(kBlk), r(kBlk);
+            double eL = 0.0, eR = 0.0;
+            for (int blk = 0; blk < 24; ++blk) {
+                std::fill(in.begin(), in.end(), 0.0f);
+                if (blk == 8) in[0] = 1.0f;
+                AF_VoiceRender(v, in.data(), kBlk, l.data(), r.data(), nullptr);
+                if (blk < 8) continue;
+                for (int i = 0; i < kBlk; ++i) { eL += l[i] * l[i]; eR += r[i] * r[i]; }
+            }
+            AF_VoiceDestroy(v);
+            const double rl = 10.0 * std::log10(std::max(eR, 1e-20) / std::max(eL, 1e-20));
+            char buf2[112];
+            std::snprintf(buf2, sizeof(buf2), "%s %s: 右−左 %+.1f dB", label, d.name, rl);
+            if (d.expect > 0)      check(buf2, rl > 1.0, "（右が大きいはず）");
+            else if (d.expect < 0) check(buf2, rl < -1.0, "（左が大きいはず）");
+            else                   check(buf2, std::fabs(rl) < 1.5, "（左右がほぼ同じはず）");
+        }
+    };
+    AF_HrtfHandle syn = AF_HrtfCreateSynthetic(kSr);
+    check1(syn, "合成");
+    AF_HrtfDestroy(syn);
+    AF_HrtfHandle km = AF_HrtfLoadFile("UnityDemo/Assets/StreamingAssets/kemar.afhr");
+    if (!km) km = AF_HrtfLoadFile("../UnityDemo/Assets/StreamingAssets/kemar.afhr");
+    if (km) {
+        std::printf("      実測 HRTF: %d 方向\n", AF_HrtfDirectionCount(km));
+        check1(km, "実測");
+        std::printf("      ── 2 本目のタップ（閉扉で実エネルギーを運ぶ経路）──\n");
+        check2(km, "実測・軽量両耳", false);
+        check2(km, "実測・回折HRTFバス", true);
+        AF_HrtfDestroy(km);
+    } else {
+        std::printf("      ⚠ kemar.afhr が見つからないので実測 HRTF は試していない\n");
+    }
+}
+
+void diagnoseClosedDoorLocalization() {
+    std::printf("\n[診断] 閉じた扉ごしの定位（真の方位 vs 到来方位。壁の奥の反転の切り分け）\n");
+    const float roomW = 7.08f, roomD = 3.48f, roomH = 3.0f, wall = 0.16f;
+    const float doorW = 1.40f, doorH = 2.0f, doorT = 0.08f;
+    const float gapCx = 3.54f;
+    const float gapL = gapCx - doorW * 0.5f, gapR = gapCx + doorW * 0.5f;
+    const float hw = wall * 0.5f, cy = roomH * 0.5f, zf = roomD + hw;
+    const AF_Vector3 L = V(gapCx, 1.6f, roomD + wall + 0.5f);
+    const AF_Vector3 src[3] = { V((306.0f-146.0f)/100.0f, 1.5f, (432.0f-196.0f)/100.0f),
+                                V((500.0f-146.0f)/100.0f, 1.5f, (320.0f-196.0f)/100.0f),
+                                V((694.0f-146.0f)/100.0f, 1.5f, (432.0f-196.0f)/100.0f) };
+    const char* sname[3] = { "音源1(左)", "音源2(中)", "音源3(右)" };
+    auto azOf = [&](float dx, float dz) {
+        return std::atan2(dx, dz) * 180.0f / 3.14159265f;
+    };
+    auto run = [&](float deg, bool hasDoor, const char* label) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        auto box = [&](AF_Vector3 c, AF_Vector3 he) {
+            AF_SceneAddInstanceBox(s, c, he, V(1,0,0), V(0,1,0), mat);
+        };
+        box(V(-hw, cy, roomD*0.5f), V(hw, cy, roomD*0.5f + wall));
+        box(V(roomW + hw, cy, roomD*0.5f), V(hw, cy, roomD*0.5f + wall));
+        box(V(roomW*0.5f, cy, -hw), V(roomW*0.5f + wall, cy, hw));
+        box(V(roomW*0.5f, roomH + hw, roomD*0.5f), V(roomW*0.5f + wall, hw, roomD*0.5f + wall));
+        box(V(roomW*0.5f, -hw, roomD*0.5f), V(roomW*0.5f + wall, hw, roomD*0.5f + wall));
+        box(V(gapL*0.5f, cy, zf), V(gapL*0.5f, cy, hw));
+        box(V((gapR + roomW)*0.5f, cy, zf), V((roomW - gapR)*0.5f, cy, hw));
+        box(V(gapCx, (doorH + roomH)*0.5f, zf), V(doorW*0.5f, (roomH - doorH)*0.5f, hw));
+        if (hasDoor) {
+            const int doorId = AF_SceneAddInstanceBox(s, V(gapCx, doorH*0.5f, zf),
+                V(doorW*0.5f, doorH*0.5f, doorT*0.5f), V(1,0,0), V(0,1,0), mat);
+            const float th = deg * 3.14159265f / 180.0f;
+            const float c = std::cos(th), sn = std::sin(th);
+            const float rx = gapCx - gapR;
+            const float sgn = (rx < 0.0f) ? 1.0f : -1.0f;
+            AF_SceneUpdateInstance(s, doorId, V(gapR + rx*c, doorH*0.5f, zf - std::fabs(rx)*sn),
+                V(doorW*0.5f, doorH*0.5f, doorT*0.5f), V(c, 0, sgn*sn), V(0,1,0));
+        }
+        AF_UpdateConfig cfg{};
+        cfg.role1EveryN = 1;   cfg.role2EveryN = 1;   cfg.earlyEveryN = 1;
+        cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 1;
+        cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+        cfg.directWeight = 1.0f;  cfg.useReflections = 1;
+        cfg.useEdgeCatalog = 1;   cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+        cfg.enableReverb = 1;     cfg.echogramBins = 100;  cfg.echogramBinSeconds = 0.01f;
+        cfg.echogramRays = 512;   cfg.echogramBounces = 24;
+        cfg.speedOfSound = 343.0f; cfg.distanceRef = 1.5f;
+        cfg.enableEarlyReflections = 1; cfg.earlyTaps = 4;
+        cfg.earlyRays = 512; cfg.earlyBounces = 2;
+        cfg.enableDiffractionSources = 1; cfg.diffSources = 3;
+        AF_SceneSetUpdateConfig(s, &cfg);
+        AF_SceneSetListener(s, L);
+        for (int i = 0; i < 3; ++i) AF_SceneSetSource(s, (unsigned long long)(i + 1), src[i]);
+        for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        std::printf("      ── %s ──\n", label);
+        std::printf("        %-10s 真の方位  到来方位   差    生存(dB)  漏れ点の方位  回折の開口の方位\n", "音源");
+        for (int i = 0; i < 3; ++i) {
+            const int idx = AF_SceneSourceIndex(s, (unsigned long long)(i + 1));
+            const float trueAz = azOf(src[i].x - L.x, src[i].z - L.z);
+            float ad[3] = {0, 0, 1};
+            AF_SceneGetSourceArrivalDir(s, idx, ad);
+            const float arrAz = azOf(ad[0], ad[2]);
+            float b6[kBands] = {};
+            AF_SceneGetSourceOcclusion(s, idx, b6);
+            double e2 = 0.0; for (int b = 0; b < kBands; ++b) e2 += b6[b] * b6[b];
+            const double db = 10.0 * std::log10(std::max(e2 / kBands, 1e-12));
+            AF_Vector3 lp{};
+            AF_SceneMeasureLeakPoint(s, L, src[i], &lp);
+            const float leakAz = azOf(lp.x - L.x, lp.z - L.z);
+            AF_Vector3 dpos[4]; float dgain[4] = {}; float dband[4 * kBands] = {};
+            const int nd = AF_SceneComputeDiffractionSourceBands(s, L, src[i], dpos, dgain, dband, 4);
+            char apStr[32] = "なし";
+            if (nd > 0) std::snprintf(apStr, sizeof(apStr), "%+6.1f°(%d本)", azOf(dpos[0].x - L.x, dpos[0].z - L.z), nd);
+            float dsq = trueAz - arrAz; if (dsq > 180.0f) dsq -= 360.0f; if (dsq < -180.0f) dsq += 360.0f;
+            const bool flipped = (std::fabs(trueAz) > 8.0f) && (trueAz * arrAz < 0.0f)
+                                 && (std::fabs(arrAz) > 8.0f);
+            std::printf("        %-10s %+6.1f°  %+6.1f°  %+6.1f°  %6.1f   %+6.1f°       %s%s\n",
+                        sname[i], trueAz, arrAz, dsq, db, leakAz, apStr,
+                        flipped ? "   ★左右が反転" : "");
+        }
+        AF_SceneDestroy(s);
+    };
+    run(0.0f, true, "閉扉（0°）");
+    run(40.0f, true, "40° 開");
+    run(0.0f, false, "ドアなし（基準）");
+    std::printf("      読み方: 到来方位が 0° 付近なら「戸口へ寄っている」＝正しい（壁の奥は戸口から漏れる）。\n"
+                "              符号が真と逆で絶対値が大きいなら反転。ホストは遮蔽が深いほどこの向きへ寄せる。\n");
+}
+
 void diagnosePillarTimbre() {
     std::printf("\n[診断] 直線上に柱があるだけで音色が変わる理由\n");
     const float h = 4.0f, t = 0.3f, hw = 5.0f, hd = 6.0f;
@@ -10407,6 +10610,8 @@ int main() {
     diagnoseReverbSendWalk();
     diagnoseCaveMouth();
     diagnoseWalkContinuity();
+    testHrtfLeftRight();
+    diagnoseClosedDoorLocalization();
     diagnosePortalScope();
     diagnoseNonPlateBlocker();
     diagnoseApertureWidthCurve();
