@@ -31,7 +31,7 @@ if (-not (Test-Path $cmake)) { $cmake = "cmake" }
 $bin = Join-Path $root "build\bin\Release"
 
 function Build([string[]]$targets) {
-  if (-not $targets -or $targets.Count -eq 0) { $targets = @("AcousticEngine", "SceneRegressionTest", "AfPatternTable") }
+  if (-not $targets -or $targets.Count -eq 0) { $targets = @("AcousticEngine", "SceneRegressionTest", "AfPatternTable", "AfDspBench") }
   $args = @("--build", "build", "--config", "Release")
   foreach ($t in $targets) { $args += @("--target", $t) }
   & $cmake @args 2>&1 | Where-Object { $_ -match 'error|warning C4|->' }

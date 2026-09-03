@@ -50,3 +50,8 @@ target_link_libraries(AfPatternTable PRIVATE AcousticEngine)
 #     走査の答えを 2 つ持たせないため。
 add_executable(AfCapScan afcap_scan.cpp)
 target_link_libraries(AfCapScan PRIVATE AcousticEngine)
+
+# 畳み込み側（AF_Voice / AF_TailBus）だけの費用を測る。幾何は呼ばない。
+#   「IR が畳み込みまで持っているから CPU が厳しい」を数字で確かめるための道具（2026-09-03）。
+add_executable(AfDspBench dsp_bench.cpp)
+target_link_libraries(AfDspBench PRIVATE AcousticEngine)
