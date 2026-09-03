@@ -315,11 +315,15 @@ namespace AcousticFlow
                  + "実測: 戸口の正面から横へ 0.1m 刻みで歩いて最大隣接差 1.77dB（崖なし）。")]
         [Range(0.2f, 4f)] public float portalGovernRange = 1.0f;
 
-        [Tooltip("ON: 各音源の主要な初期反射を像源として抽出し、IR の反射タップ(R)として畳み込む。F キー切替。\n"
-                 + "★2026-09-03 の方針で既定 OFF: 反射レイ（役割1の生存）は残し、可聴の反射音（像源）は捨てて残響へ資源を回す。")]
-        public bool enableEarlyReflections = false;
-        [Tooltip("音源あたりの最大反射タップ数（＝像源＝仮想ボイス数）。多いほど密だがボイスを食う（例 3〜6）。"
-                 + "総仮想ボイス数 = 音源数 × これ。")]
+        [Tooltip("ON: 各音源の早期反射を IR の反射タップ(R)として畳み込む。F キー切替。"
+                 + "模型は earlyReflectModel で選ぶ（既定は面の線）。尾のエコグラムからは 1 次反射を外して二重に鳴らさない。")]
+        public bool enableEarlyReflections = true;
+        [Tooltip("早期反射の模型。0 = 像源をレイで拾う（旧。像が見えた/消えたの二値でタップが跳ぶ）"
+                 + "1 = 面ごとの線音源（2026-09-03 決定。鏡面点にピークを持つ下位タップの線。低域は点、高域は面いっぱいに広がる）")]
+        [Range(0, 1)] public int earlyReflectModel = 1;
+        [Tooltip("面 1 枚あたりの下位タップ数（面の線の分割数）。3〜5。")]
+        [Range(1, 8)] public int earlyFaceSubTaps = 5;
+        [Tooltip("像源レイ模型（earlyReflectModel=0）のときの反射タップ数。面の線では使わない（面数 × 下位タップ数、上限 48）。")]
         [Range(1, 8)] public int earlyReflectTaps = 4;
         [Tooltip("早期反射抽出のレイ本数（音源ごと）。多いほど角度分解能が上がり、"
                  + "リスナー移動でタップの入れ替わりがカクつきにくい。総コスト = 音源数 × これ。"
@@ -734,8 +738,8 @@ namespace AcousticFlow
         private int _tapUpdateEveryFrames = 3;
         private int _tapCountdown = 1;
         // タップ本体は音源ごとに SourceTaps が持つ（_taps / Status.Taps）。
-        private Vector3[] _tapErPos = new Vector3[8];  // 早期反射 像源バッファ(主音源のタップ計算用)
-        private float[] _tapErGain = new float[8 * 6];
+        private Vector3[] _tapErPos = new Vector3[48];  // 早期反射 像源バッファ（面の線: 面 ~10 枚 × 5 本）
+        private float[] _tapErGain = new float[48 * 6];
         private Vector3[] _tapDiffPos = new Vector3[8];
         private float[] _tapDiffGain = new float[8];
 
@@ -938,6 +942,9 @@ namespace AcousticFlow
                 earlyTaps = Mathf.Max(Mathf.Max(1, earlyReflectTaps), _tapErPos.Length),
                 earlyRays = earlyReflectRays,
                 earlyBounces = earlyReflectBounces,
+                earlyModel = earlyReflectModel,
+                earlyFaceSubTaps = Mathf.Clamp(earlyFaceSubTaps, 1, 8),
+                echogramSkipFirstOrder = enableEarlyReflections ? 1 : 0,
                 enableDiffractionSources = enableDiffractionSources ? 1 : 0,
                 diffSources = Mathf.Max(Mathf.Max(1, diffractionSourceCount), _tapDiffPos.Length),
             };
@@ -1829,7 +1836,7 @@ namespace AcousticFlow
 
             // 反射タップ（像源位置から経路長→遅延、6帯域ゲイン×空気吸収）。
             int er = _scene.GetEarlyReflections(idx, _tapErPos, _tapErGain);
-            for (int t = 0; t < er && n < SourceTaps.MaxTaps; t++)
+            for (int t = 0; t < er && n < SourceTaps.MaxTaps - 8; t++)   // 回折タップの枠（8）を残す。面の線は最大 48 本
             {
                 float pl = Vector3.Distance(lp, _tapErPos[t]);  // 全経路長
                 float rel = (pl - directDist) * toMs;
@@ -2445,7 +2452,7 @@ namespace AcousticFlow
                             + $" / 2反射 {(IrConvolver.Solo.PassReflect ? "ON " : "OFF")}"
                             + $" / 3回折 {(IrConvolver.Solo.PassDiffract ? "ON " : "OFF")}"
                             + $" / 4尾 {(IrConvolver.Solo.PassTail ? "ON " : "OFF")}"
-                            + $"   (F=反射の像源 {(enableEarlyReflections ? "ON" : "OFF")})", style);
+                            + $"   (F=早期反射 {(enableEarlyReflections ? "ON" : "OFF")}・模型 {(earlyReflectModel == 1 ? "面の線" : "像源レイ")})", style);
             {
                 // 扉の定点の状態。効いていない理由があればそれも出す（黙って効かないのがいちばん困る）。
                 float peak = 0f; int live = 0;
@@ -2498,7 +2505,7 @@ namespace AcousticFlow
                 : "主音源の回折: なし", style);
             if (showDiffractionCandidates)
                 GUILayout.Label($"回折候補(主音源): {_diffCandCount} 本合成 (水色=最短) (C)", style);
-            GUILayout.Label($"早期反射(IR の R タップ): {(enableEarlyReflections ? "ON" : "OFF")} (F)   "
+            GUILayout.Label($"早期反射(IR の R タップ・{(earlyReflectModel == 1 ? "面の線" : "像源レイ")}): {(enableEarlyReflections ? "ON" : "OFF")} (F)   "
                             + $"回折二次音源(IR の F タップ): {(enableDiffractionSources ? "ON" : "OFF")} (V)", style);
             // 扉の開き角。音を判断する前提なので数字でも出す（見た目だけだと追えない）。
             if (_swingDoors == null)

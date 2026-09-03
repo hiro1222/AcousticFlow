@@ -4047,6 +4047,215 @@ void testHrtfLeftRight() {
 //     戸口は x∈[-0.5,0.5] の幅 1.0 m。扉は蝶番 x=-0.5、幅 1.0、厚み 0.06。
 //     リスナー (0,1.6,-3)。音源は z=+3 で x を振る。
 //   見る量: 生存 dB／到来方位（真との差）／回折の本数・開口率・フレネル可否。
+// ---------------------------------------------------------------- 早期反射（面の線）
+// 2026-09-03: ISM の像源を「反射面ごとの線音源」に縮約する模型（earlyModel=1）。
+//   絶対値ではなく性質で縛る: 本数／エネルギー保存／連続性／幅／閉扉の減り／尾との二重防止。
+namespace facerefl {
+AF_UpdateConfig cfgFor(int model, int subTaps, int reverb) {
+    AF_UpdateConfig c{};
+    c.role1EveryN = 1; c.role2EveryN = 1; c.earlyEveryN = 1; c.diffSrcEveryN = 1; c.catalogEveryN = 1;
+    c.reflectionRays = 128; c.reflectionBounces = 3; c.directWeight = 1.0f; c.useReflections = 1;
+    c.useEdgeCatalog = 0; c.edgeCatalogRes = 8; c.edgeCatalogMaxDist = 40.0f;
+    c.enableReverb = reverb; c.echogramBins = 60; c.echogramBinSeconds = 0.01f;
+    c.echogramRays = 256; c.echogramBounces = 8; c.speedOfSound = 343.0f; c.distanceRef = 1.5f;
+    c.enableEarlyReflections = 1; c.earlyTaps = 48; c.earlyRays = 512; c.earlyBounces = 1;
+    c.enableDiffractionSources = 0; c.diffSources = 1;
+    c.earlyModel = model; c.earlyFaceSubTaps = subTaps; c.echogramSkipFirstOrder = 0;
+    return c;
+}
+// 箱部屋 2hw x 2hh x 2hd（壁 6 枚、厚み 0.2）。床の上面が y=0。材質は 6 帯域の配列で渡す。
+AF_SceneHandle boxRoom(float hw, float hh, float hd, const float* tr, const float* ab, const float* sc) {
+    AF_SceneHandle s = AF_SceneCreate();
+    const int m = AF_SceneAddMaterial(s, tr, ab, sc, 6);
+    const float t = 0.1f;
+    auto box = [&](AF_Vector3 c, AF_Vector3 he) { AF_SceneAddInstanceBox(s, c, he, V(1,0,0), V(0,1,0), m); };
+    box(V(-hw - t, hh, 0), V(t, hh, hd));          // 西
+    box(V( hw + t, hh, 0), V(t, hh, hd));          // 東
+    box(V(0, hh,  hd + t), V(hw, hh, t));          // 北
+    box(V(0, hh, -hd - t), V(hw, hh, t));          // 南
+    box(V(0, -t, 0), V(hw, t, hd));                // 床
+    box(V(0, 2.0f * hh + t, 0), V(hw, t, hd));     // 天井
+    return s;
+}
+int taps(AF_SceneHandle s, AF_Vector3 L, AF_Vector3 S, AF_Vector3* pos, float* g) {
+    AF_SceneSetListener(s, L);
+    AF_SceneSetSource(s, 1, S);
+    for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+    const int idx = AF_SceneSourceIndex(s, 1);
+    return (idx >= 0) ? AF_SceneGetEarlyReflections(s, idx, pos, g, 48) : 0;
+}
+// 壁 1 枚だけ（幅の検査用。どのタップも同じ面の物なので、張る角がそのまま幅）。
+AF_SceneHandle singleWall(const float* tr, const float* ab, const float* sc) {
+    AF_SceneHandle s = AF_SceneCreate();
+    const int m = AF_SceneAddMaterial(s, tr, ab, sc, 6);
+    AF_SceneAddInstanceBox(s, V(-4.1f, 1.5f, 0), V(0.1f, 1.5f, 3.0f), V(1,0,0), V(0,1,0), m);
+    return s;
+}
+double energy(const float* g, int n, int b) {
+    double e = 0.0;
+    for (int t = 0; t < n; ++t) e += static_cast<double>(g[t * kBands + b]) * g[t * kBands + b];
+    return e;
+}
+double energyAll(const float* g, int n) { double e = 0.0; for (int b = 0; b < kBands; ++b) e += energy(g, n, b); return e; }
+double dB(double e) { return 10.0 * std::log10(std::max(e, 1e-12)); }
+}  // namespace facerefl
+
+void testFaceReflections() {
+    using namespace facerefl;
+    std::printf("\n[早期反射・面] ISM の像源を面ごとの線音源に縮約する（earlyModel=1）\n");
+    float tr[6], ab[6], sc[6];
+    AF_MaterialPresetBands(0, tr, ab, sc);
+    const AF_Vector3 L = V(-1.0f, 1.6f, -1.0f), S = V(1.5f, 1.6f, 1.2f);
+    AF_Vector3 pos[48]; float g[48 * kBands];
+    char buf[200];
+
+    // 1) 本数とエネルギー保存（箱部屋 8x3x6。この配置では鏡面点が 6 面とも面の内側）。
+    {
+        AF_SceneHandle s = boxRoom(4.0f, 1.5f, 3.0f, tr, ab, sc);
+        AF_UpdateConfig c = cfgFor(1, 5, 0);
+        AF_SceneSetUpdateConfig(s, &c);
+        const int n = taps(s, L, S, pos, g);
+        std::snprintf(buf, sizeof(buf), "(%d 本)", n);
+        check("[面] 6 面 x 5 本のタップが出る", n == 30, buf);
+        double worst = 0.0;
+        for (int b = 0; b < kBands; ++b) {
+            const double refl = std::max(0.0, 1.0 - static_cast<double>(ab[b]) - tr[b]);
+            const double e = energy(g, n, b);
+            worst = std::max(worst, std::fabs(e - 6.0 * refl) / std::max(6.0 * refl, 1e-9));
+        }
+        std::snprintf(buf, sizeof(buf), "(最大相対誤差 %.4f)", worst);
+        check("[面] タップのエネルギー和 = 6 面の反射率の和（1/r はホストが掛ける規約）", worst < 2e-3, buf);
+        AF_SceneDestroy(s);
+    }
+    // 2) 連続性: 音源を 2 cm ずつ動かして総エネルギーの跳びを見る（面 vs 像源レイ）。
+    {
+        double maxStep[2] = {0.0, 0.0};
+        for (int model = 0; model < 2; ++model) {
+            AF_SceneHandle s = boxRoom(4.0f, 1.5f, 3.0f, tr, ab, sc);
+            AF_UpdateConfig c = cfgFor(model, 5, 0);
+            AF_SceneSetUpdateConfig(s, &c);
+            double prev = -1.0;
+            for (float x = -2.0f; x <= 2.0f + 1e-4f; x += 0.02f) {
+                const int n = taps(s, L, V(x, 1.6f, 1.2f), pos, g);
+                const double e = energyAll(g, n);
+                if (prev > 0.0 && e > 0.0) maxStep[model] = std::max(maxStep[model], std::fabs(dB(e) - dB(prev)));
+                prev = e;
+            }
+            AF_SceneDestroy(s);
+        }
+        std::snprintf(buf, sizeof(buf), "(面 %.2f dB / 像源レイ %.2f dB)", maxStep[1], maxStep[0]);
+        check("[面] 音源を 2 cm 動かしたときの総エネルギーの跳びが 0.5 dB 未満", maxStep[1] < 0.5, buf);
+    }
+    // 3) 幅: 西の壁の 5 本が張る方位角は、壁に近いほど広い。
+    {
+        auto span = [&](float lx) {
+            AF_SceneHandle s = singleWall(tr, ab, sc);
+            AF_UpdateConfig c = cfgFor(1, 5, 0);
+            AF_SceneSetUpdateConfig(s, &c);
+            const AF_Vector3 Lp = V(lx, 1.6f, -1.0f);
+            const int n = taps(s, Lp, S, pos, g);
+            float lo = 999.0f, hi = -999.0f;
+            for (int t = 0; t < n; ++t) {
+                const float dx = pos[t].x - Lp.x, dz = pos[t].z - Lp.z;
+                const float az = std::atan2(dz, -dx) * 180.0f / 3.14159265f;
+                lo = std::min(lo, az); hi = std::max(hi, az);
+            }
+            AF_SceneDestroy(s);
+            return hi - lo;
+        };
+        const float nearSpan = span(-3.7f), farSpan = span(-1.0f);
+        std::snprintf(buf, sizeof(buf), "(壁から 0.3 m: %.0f 度 / 3 m: %.0f 度)", nearSpan, farSpan);
+        check("[面] 壁に近いほど線が張る角が広い（幅が出る）", nearSpan > farSpan, buf);
+    }
+    // 4) 鏡面だけ（scattering=0）なら、面ごとに鏡面点を挟む 2 本しか鳴らない。
+    {
+        const float sc0[6] = {0, 0, 0, 0, 0, 0};
+        AF_SceneHandle s = boxRoom(4.0f, 1.5f, 3.0f, tr, ab, sc0);
+        AF_UpdateConfig c = cfgFor(1, 5, 0);
+        AF_SceneSetUpdateConfig(s, &c);
+        const int n = taps(s, L, S, pos, g);
+        int live = 0;
+        for (int t = 0; t < n; ++t) {
+            float e = 0.0f;
+            for (int b = 0; b < kBands; ++b) e += g[t * kBands + b];
+            if (e > 1e-6f) ++live;
+        }
+        std::snprintf(buf, sizeof(buf), "(鳴る本数 %d / 全 %d)", live, n);
+        check("[面] 散乱 0 なら鳴るのは面ごとに鏡面点を挟む 2 本まで", live >= 6 && live <= 12, buf);
+        AF_SceneDestroy(s);
+    }
+    // 5) 閉じた扉: 隣室の面は透過ぶんしか鳴らない（開けると増える）。Test_SwingDoor と同じ形。
+    {
+        auto door = [&](float deg) {
+            AF_SceneHandle s = boxRoom(7.4f, 1.5f, 7.4f, tr, ab, sc);
+            const int m = AF_SceneAddMaterial(s, tr, ab, sc, 6);
+            AF_SceneAddInstanceBox(s, V(-3.75f, 1.5f, 0), V(3.25f, 1.5f, 0.1f), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V( 3.75f, 1.5f, 0), V(3.25f, 1.5f, 0.1f), V(1,0,0), V(0,1,0), m);
+            const float th = deg * 3.14159265f / 180.0f, cs = std::cos(th), sn = std::sin(th);
+            AF_SceneAddInstanceBox(s, V(-0.5f + 0.5f * cs, 1.5f, 0.5f * sn), V(0.5f, 1.5f, 0.03f),
+                                   V(cs, 0, sn), V(0,1,0), m);
+            AF_UpdateConfig c = cfgFor(1, 5, 0);
+            AF_SceneSetUpdateConfig(s, &c);
+            const int n = taps(s, V(0, 1.6f, -3.0f), V(0, 1.6f, 3.0f), pos, g);
+            const double e = energyAll(g, n);
+            AF_SceneDestroy(s);
+            return e;
+        };
+        std::printf("      扉の角度 → 早期反射の総エネルギー（リスナー z=-3、音源 z=+3、閉扉の向こう）\n");
+        double prev = -1.0, maxStep = 0.0, eClosed = 0.0, eOpen = 0.0;
+        for (int deg = 0; deg <= 90; deg += 10) {
+            const double e = door(static_cast<float>(deg));
+            if (deg == 0) eClosed = e;
+            if (deg == 90) eOpen = e;
+            std::printf("        %3d 度  %7.1f dB\n", deg, dB(e));
+            if (prev > 0.0 && e > 0.0) maxStep = std::max(maxStep, std::fabs(dB(e) - dB(prev)));
+            prev = e;
+        }
+        std::snprintf(buf, sizeof(buf), "(閉 %.1f dB / 開 %.1f dB)", dB(eClosed), dB(eOpen));
+        check("[面] 閉扉では隣室の面の早期反射が開扉より小さい", eClosed < 0.5 * eOpen, buf);
+        std::snprintf(buf, sizeof(buf), "(10 度刻みの最大段差 %.2f dB)", maxStep);
+        check("[面] 扉を 10 度ずつ開いても総エネルギーが 3 dB 以上は跳ばない", maxStep < 3.0, buf);
+    }
+    // 6) 尾との二重防止: 1 次反射を外した尾は総和が減る（ゼロにはならない）。
+    {
+        double e[2] = {0.0, 0.0};
+        for (int skip = 0; skip < 2; ++skip) {
+            AF_SceneHandle s = boxRoom(4.0f, 1.5f, 3.0f, tr, ab, sc);
+            AF_UpdateConfig c = cfgFor(1, 5, 1);
+            c.echogramSkipFirstOrder = skip;
+            AF_SceneSetUpdateConfig(s, &c);
+            AF_SceneSetListener(s, L); AF_SceneSetSource(s, 1, S);
+            for (int k = 0; k < 8; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+            float bins[60 * kBands];
+            const int nb = AF_SceneGetEchogramBands(s, AF_SceneSourceIndex(s, 1), bins, 60);
+            for (int k = 0; k < nb * kBands; ++k) e[skip] += bins[k];
+            AF_SceneDestroy(s);
+        }
+        std::snprintf(buf, sizeof(buf), "(1 次込み %.3f / 1 次なし %.3f)", e[0], e[1]);
+        check("[尾] echogramSkipFirstOrder で尾から 1 次反射が抜ける", e[1] < e[0] && e[1] > 0.0, buf);
+    }
+    // 7) 費用: 扉のある部屋（箱 9 個）で 1 音源、模型ごとの 1 更新あたりの時間（役割1 込み、earlyEveryN=1）。
+    {
+        for (int model = 0; model < 2; ++model) {
+            AF_SceneHandle s = boxRoom(7.4f, 1.5f, 7.4f, tr, ab, sc);
+            const int m = AF_SceneAddMaterial(s, tr, ab, sc, 6);
+            AF_SceneAddInstanceBox(s, V(-3.75f, 1.5f, 0), V(3.25f, 1.5f, 0.1f), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V( 3.75f, 1.5f, 0), V(3.25f, 1.5f, 0.1f), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, 1.5f, 0), V(0.5f, 1.5f, 0.03f), V(1,0,0), V(0,1,0), m);
+            AF_UpdateConfig c = cfgFor(model, 5, 0);
+            AF_SceneSetUpdateConfig(s, &c);
+            AF_SceneSetListener(s, V(0, 1.6f, -3.0f)); AF_SceneSetSource(s, 1, V(0, 1.6f, 3.0f));
+            for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            for (int k = 0; k < 200; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+            const double us = std::chrono::duration<double, std::micro>(
+                std::chrono::high_resolution_clock::now() - t0).count() / 200.0;
+            std::printf("      費用: %s  1 更新 %.0f us（役割1 込み・音源 1・箱 9 個）\n", model ? "面の線" : "像源レイ", us);
+            AF_SceneDestroy(s);
+        }
+    }
+}
+
 void diagnoseSwingDoorSourceSweep() {
     std::printf("\n[診断] Test_SwingDoor の再現: 閉扉で音源を左右へ振る\n");
     const float halfW = 7.4f, wallT = 0.2f, roomH = 3.4f;
@@ -10758,6 +10967,7 @@ int main() {
     diagnoseWalkContinuity();
     testHrtfLeftRight();
     diagnoseClosedDoorLocalization();
+    testFaceReflections();
     diagnoseSwingDoorSourceSweep();
     diagnosePortalScope();
     diagnoseNonPlateBlocker();

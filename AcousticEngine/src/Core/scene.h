@@ -5040,7 +5040,7 @@ public:
                               float* outBins, int numBins, float binSeconds, float speedOfSound,
                               int numRays, int maxBounces, float distanceRef,
                               int rayBegin = -1, int rayCount = -1, bool clearFirst = true,
-                              bool useTiers = false) const {
+                              bool useTiers = false, bool skipFirstOrder = false) const {
         using namespace scene_detail;
         if (!outBins || numBins <= 0 || !sources || count <= 0) return;
         if (clearFirst)
@@ -5141,7 +5141,8 @@ public:
                         float e[kNumBands];
                         for (int b = 0; b < kNumBands; ++b) e[b] = carry[b] * refl[b] * seg[b];
                         // 広がり損失は「音源→反射点」の区間にだけ掛ける（総経路長ではない）。
-                        addBinTo(bins, j, pathLen, e, inv * spreadEnergy(srcLeg));
+                        // 1 次反射（bounce 0）は早期反射のタップが鳴らす。二重に積まない（skipFirstOrder）。
+                        if (!(skipFirstOrder && bounce == 0)) addBinTo(bins, j, pathLen, e, inv * spreadEnergy(srcLeg));
                     }
                     for (int b = 0; b < kNumBands; ++b) carry[b] *= refl[b];
                     d = scatteredDir(d, hit.normal, scatteringMean(mat), rng);
@@ -5443,6 +5444,164 @@ public:
         }
     }
 
+    // ★★ 早期反射（面の線）：ISM の像源を「反射面ごとの線音源」に縮約する ★★
+    //
+    //   2026-09-03 に決めた早期反射の描き方（docs/EARLY_REFLECTION_FACES.md）。
+    //   像源をレイで拾う旧版（computeEarlyReflectionsMulti）は「像が見えた／消えた」の二値で鳴り、
+    //   扉の縁や歩行でタップが跳んでいた（実測 +1.97/−3.26 dB）。ここでは面 1 枚を
+    //   「鏡面点にピークを持つ K 本の下位タップの線」として返す。点が消えないので跳ばない。
+    //
+    //   面   : 箱インスタンスの 6 面のうち、面積 ≥ kFaceMinArea、リスナーと音源が表側、中心が kFaceMaxDist 以内。
+    //   線   : 面の長い軸に沿い、鏡面点の短軸座標（面内にクランプ）を通る。K 等分の中点に下位タップ。
+    //   重み : e_ib = refl_b × { (1−s_b)·specW_b·lobe_i + s_b / K } × vis_ib
+    //     refl_b  = 1 − α_b − τ_b（反射率。役割1・エコグラムと同じ規約）
+    //     s_b     = 材質の scattering。低域で小さく高域で大きい ＝ 低域は壁の向こうの点、高域は面いっぱいの広がり
+    //     lobe_i  = 鏡面点を挟む 2 本に線形に割る三角核（和は 1。鏡面点が動いても連続）
+    //     specW_b = 鏡面点が面の外へ出た距離を、その帯域のフレネル半径 √(λ·a·b/(a+b)) で割って 1→0 に落とす
+    //               （直接経路の半影と同じ考え。縁で消えるのではなく、帯域ごとに溶ける）
+    //     vis_ib  = 下位タップ→リスナー と 下位タップ→音源 の透過（閉じた扉の向こうの面は τ ぶんだけ鳴る）
+    //   出力 : 位置は「リスナー + 方向 × 経路長」（像源と同じ規約。ホストのタップ組み立ては触らずに済む）。
+    //          ゲインは振幅（√エネルギー）。1/r と空気吸収はホストが経路長から掛ける。
+    //   捨てたもの: 2 次以上の像、メッシュのインスタンス（箱だけ）、曲面。
+    //   検算: 鏡面点が全部の面の内側なら、タップのエネルギー和 = Σ_面 refl_b（scene_regression [早期反射・面]）。
+    // 面の下位タップの見通し（半影つき）。相手 to のまわり半径 r の円盤に 9 標本（中心 1、円周 4、半径 r/2 の対角 4）を
+    // 4 回対称に置き、透過エネルギーの平均を返す。直接経路の半影（computeDirectSoft の帯域別フレネル環）とは別物:
+    //   あちらは波の広がり（低域ほど広い窓）を表す。ここで欲しいのは「扉の縁が線を横切る瞬間に二値で跳ばない」だけ
+    //   なので、帯域によらない固定半径の円盤でよい。フレネル環を使うと、部屋の中の壁ぎわで低域の標本が壁を踏み、
+    //   空いた箱部屋でも 125 Hz が 54% 落ちた（回帰 [面] エネルギー保存で捕まえた）。
+    void softTransmissionDisc(const Vec3& from, const Vec3& to, float radius, float out6[kNumBands]) const {
+        using namespace scene_detail;
+        Vec3 dir = to - from;
+        const float dist = length(dir);
+        for (int b = 0; b < kNumBands; ++b) out6[b] = 0.0f;
+        if (dist < 1e-4f) { for (int b = 0; b < kNumBands; ++b) out6[b] = 1.0f; return; }
+        dir = dir * (1.0f / dist);
+        const Vec3 t = (std::fabs(dir.x) > 0.9f) ? Vec3(0, 1, 0) : Vec3(1, 0, 0);
+        const Vec3 u = normalized(cross(dir, t));
+        const Vec3 v = cross(dir, u);
+        static const float ox[9] = {0, 1, -1, 0, 0, 0.707f, -0.707f, 0.707f, -0.707f};
+        static const float oy[9] = {0, 0, 0, 1, -1, 0.707f, 0.707f, -0.707f, -0.707f};
+        static const float sc[9] = {0, 1, 1, 1, 1, 0.5f, 0.5f, 0.5f, 0.5f};
+        for (int k = 0; k < 9; ++k) {
+            const Vec3 p = to + (u * ox[k] + v * oy[k]) * (radius * sc[k]);
+            float g[kNumBands];
+            computeTransmission(from, p, g);
+            for (int b = 0; b < kNumBands; ++b) out6[b] += g[b];
+        }
+        for (int b = 0; b < kNumBands; ++b) out6[b] *= (1.0f / 9.0f);
+    }
+
+    static constexpr float kFaceMinArea = 1.0f;    // 波長より小さい面は幾何が立たない（1 m² ≒ 340 Hz の波長角）
+    static constexpr float kFaceMaxDist = 30.0f;   // 面の中心がこれより遠ければ見ない
+    static constexpr int   kFaceSubTapsMax = 8;
+
+    void computeFaceReflections(const Vec3& listener, const Vec3* sources, int count,
+                                Vec3* outImagePos, float* outGain, int* outCount,
+                                int maxTaps, int subTaps) const {
+        using namespace scene_detail;
+        if (!sources || count <= 0 || !outImagePos || !outGain || !outCount) return;
+        for (int j = 0; j < count; ++j) outCount[j] = 0;
+        if (maxTaps <= 0 || instanceCount() == 0) return;
+        const int K = std::max(1, std::min(subTaps, kFaceSubTapsMax));
+        const float kC = 343.0f;
+        const float kF[kNumBands] = {125.0f, 250.0f, 500.0f, 1000.0f, 2000.0f, 4000.0f};
+
+        struct Cand { Vec3 dir; float len; float g[kNumBands]; float key; };
+        static thread_local std::vector<std::vector<Cand>> cands;
+        cands.resize(static_cast<std::size_t>(count));
+        for (int j = 0; j < count; ++j) cands[static_cast<std::size_t>(j)].clear();
+        ensureBvh();
+
+        for (const Instance& inst : instances_) {
+            if (!inst.active || inst.geomId != -1) continue;
+            const Obb& o = inst.obb;
+            const AcousticMaterial& mat = materialOf(inst.materialId);
+            float refl[kNumBands];
+            for (int b = 0; b < kNumBands; ++b)
+                refl[b] = clamp01(1.0f - mat.absorption[b] - mat.transmission[b]);
+            const Vec3 axes[3] = {o.axisX, o.axisY, o.axisZ};
+            const float half[3] = {o.halfExtents.x, o.halfExtents.y, o.halfExtents.z};
+            for (int k = 0; k < 3; ++k) {
+                const int iu = (k + 1) % 3, iv = (k + 2) % 3;
+                const float hu = half[iu], hv = half[iv];
+                if (4.0f * hu * hv < kFaceMinArea) continue;
+                for (int sign = -1; sign <= 1; sign += 2) {
+                    const Vec3 nrm = axes[k] * static_cast<float>(sign);
+                    const Vec3 c = o.center + nrm * half[k];
+                    const float dl = dot(listener - c, nrm);
+                    if (dl <= 0.05f) continue;                          // リスナーが裏側
+                    if (length(listener - c) > kFaceMaxDist) continue;
+                    const bool uLong = (hu >= hv);
+                    const Vec3 aL = uLong ? axes[iu] : axes[iv];        // 線の向き（長い軸）
+                    const Vec3 aS = uLong ? axes[iv] : axes[iu];
+                    const float hL = uLong ? hu : hv;
+                    const float hS = uLong ? hv : hu;
+                    const float pitch = 2.0f * hL / static_cast<float>(K);
+                    for (int j = 0; j < count; ++j) {
+                        const Vec3& S = sources[j];
+                        const float ds = dot(S - c, nrm);
+                        if (ds <= 0.05f) continue;                      // 音源が裏側
+                        const Vec3 img = S - nrm * (2.0f * ds);         // 像源
+                        // 鏡面点: リスナー→像源の線が面の平面を貫く所。
+                        const Vec3 P = listener + (img - listener) * (dl / (dl + ds));
+                        const float pL = dot(P - c, aL), pS = dot(P - c, aS);
+                        const float over = std::max(std::fabs(pL) - hL, std::fabs(pS) - hS);
+                        const float a1 = std::max(length(P - listener), 1e-3f);
+                        const float a2 = std::max(length(S - P), 1e-3f);
+                        float specW[kNumBands];
+                        for (int b = 0; b < kNumBands; ++b) {
+                            if (over <= 0.0f) { specW[b] = 1.0f; continue; }
+                            const float rF = std::sqrt(std::max((kC / kF[b]) * a1 * a2 / (a1 + a2), 1e-6f));
+                            specW[b] = clamp01(1.0f - over / rF);
+                        }
+                        // 線上の鏡面点。端の半ピッチ内へクランプして、三角核の和が常に 1 になるようにする。
+                        const float sp = std::max(-hL + 0.5f * pitch, std::min(hL - 0.5f * pitch, pL));
+                        const float sS = std::max(-hS, std::min(hS, pS));  // 線の高さ
+                        for (int i = 0; i < K; ++i) {
+                            const float si = -hL + pitch * (static_cast<float>(i) + 0.5f);
+                            const float lobe = std::max(0.0f, 1.0f - std::fabs(si - sp) / pitch);
+                            const Vec3 Pi = c + aL * si + aS * sS;
+                            const Vec3 q = Pi + nrm * 0.02f;             // 自己ヒット防止に浮かせる
+                            float vL[kNumBands], vS[kNumBands];
+                            // 見通しは半影つき（相手のまわり半径 0.4 m の円盤に 9 標本）。1 本のレイだと、扉の縁が線を越える瞬間に
+                            //   下位タップが二値で跳ぶ（実測: 10 度刻みで 5.1 dB → 円盤で 2.3 dB）。
+                            softTransmissionDisc(q, listener, 0.4f, vL);
+                            softTransmissionDisc(q, S, 0.4f, vS);
+                            Cand cd;
+                            const float l1 = length(Pi - listener), l2 = length(S - Pi);
+                            cd.len = l1 + l2;
+                            cd.dir = (l1 > 1e-4f) ? (Pi - listener) * (1.0f / l1) : nrm;
+                            float e = 0.0f;
+                            for (int b = 0; b < kNumBands; ++b) {
+                                const float s = clamp01(mat.scattering[b]);
+                                const float w = (1.0f - s) * specW[b] * lobe + s / static_cast<float>(K);
+                                cd.g[b] = refl[b] * w * vL[b] * vS[b];
+                                e += cd.g[b];
+                            }
+                            cd.key = e / (cd.len * cd.len);   // 上限で切るときの順（1/r² 込みの強さ）
+                            if (e > 1e-7f) cands[static_cast<std::size_t>(j)].push_back(cd);
+                        }
+                    }
+                }
+            }
+        }
+        for (int j = 0; j < count; ++j) {
+            std::vector<Cand>& cv = cands[static_cast<std::size_t>(j)];
+            if (static_cast<int>(cv.size()) > maxTaps)
+                std::partial_sort(cv.begin(), cv.begin() + maxTaps, cv.end(),
+                                  [](const Cand& a, const Cand& b) { return a.key > b.key; });
+            const int n = std::min(maxTaps, static_cast<int>(cv.size()));
+            Vec3* pos = outImagePos + static_cast<std::size_t>(j) * maxTaps;
+            float* gain = outGain + static_cast<std::size_t>(j) * maxTaps * kNumBands;
+            for (int t = 0; t < n; ++t) {
+                pos[t] = listener + cv[t].dir * cv[t].len;
+                // 内部はエネルギー、タップのゲインは振幅で返す（material.h の単位規約）。
+                for (int b = 0; b < kNumBands; ++b) gain[t * kNumBands + b] = std::sqrt(cv[t].g[b]);
+            }
+            outCount[j] = n;
+        }
+    }
+
     // 【可視化】origin から dir 方向へ鏡面反射で maxBounces 回まで追い、通過点を outPoints に書く。
     //   outPoints[0]=origin、以降=反射点、最後=終端（開放空間での到達点 or 最終反射点）。
     //   返り値=書き込んだ点数。反響経路(reflection path)を Unity で線描画するための土台。
@@ -5617,6 +5776,13 @@ public:
         int earlyBounces = 2;
         bool enableDiffractionSources = true;
         int diffSources = 3;
+        // 2026-09-03 早期反射の模型。0 = 像源をレイで拾う（旧）／1 = 面ごとの線音源（既定）。
+        //   旧版は像が見えた／消えたの二値でタップが跳ぶ。採用が固まったら 0 側を消す。
+        int earlyModel = 1;
+        int earlyFaceSubTaps = 5;      // 面 1 枚あたりの下位タップ数（線の分割数）
+        // 尾のエコグラムから 1 次反射を外す（早期反射のタップと二重に鳴らさない）。
+        //   ホストは enableEarlyReflections と同じ値を渡す。
+        bool echogramSkipFirstOrder = false;
     };
 
     // 段の**位相**をずらすことは試したが、測ったら効かなかった（最悪 18.65 → 19.35ms）。
@@ -5969,10 +6135,17 @@ private:
         for (int k = 0; k < m; ++k)
             earlySrc_[static_cast<size_t>(k)] = srcScratch_[static_cast<size_t>(earlyIdx_[k])];
 
-        computeEarlyReflectionsMulti(listenerPos_, earlySrc_.data(), m,
-                                     earlyPosBuf_.data(), earlyGainBuf_.data(),
-                                     earlyCntBuf_.data(), cap,
-                                     cfg_.earlyRays, cfg_.earlyBounces);
+        if (cfg_.earlyModel == 1) {
+            // 面ごとの線音源（レイを撃たない。面の数 × 下位タップ数 × 透過 2 本）。
+            computeFaceReflections(listenerPos_, earlySrc_.data(), m,
+                                   earlyPosBuf_.data(), earlyGainBuf_.data(),
+                                   earlyCntBuf_.data(), cap, cfg_.earlyFaceSubTaps);
+        } else {
+            computeEarlyReflectionsMulti(listenerPos_, earlySrc_.data(), m,
+                                         earlyPosBuf_.data(), earlyGainBuf_.data(),
+                                         earlyCntBuf_.data(), cap,
+                                         cfg_.earlyRays, cfg_.earlyBounces);
+        }
 
         for (int k = 0; k < m; ++k) {
             const int i = earlyIdx_[k];
@@ -6228,7 +6401,7 @@ private:
                              echoAccum_.data(), results_.echogramBins,
                              cfg_.echogramBinSeconds, cfg_.speedOfSound,
                              cfg_.echogramRays, cfg_.echogramBounces, cfg_.distanceRef,
-                             begin, chunk, first, /*useTiers=*/true);
+                             begin, chunk, first, /*useTiers=*/true, cfg_.echogramSkipFirstOrder);
         echoRaySlice_ = last ? 0 : (echoRaySlice_ + 1);
         if (!last) return;      // まだ 1 周していない。前回の結果を保ったまま帰る
         echoPrimed_ = true;

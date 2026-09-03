@@ -542,6 +542,9 @@ void AF_SceneSetUpdateConfig(AF_SceneHandle scene, const AF_UpdateConfig* cfg) {
     c.earlyBounces = cfg->earlyBounces;
     c.enableDiffractionSources = cfg->enableDiffractionSources != 0;
     c.diffSources = cfg->diffSources;
+    c.earlyModel = cfg->earlyModel;
+    c.earlyFaceSubTaps = cfg->earlyFaceSubTaps;
+    c.echogramSkipFirstOrder = cfg->echogramSkipFirstOrder != 0;
     s->setUpdateConfig(c);
 }
 

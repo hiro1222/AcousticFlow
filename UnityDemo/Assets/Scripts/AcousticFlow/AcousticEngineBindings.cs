@@ -50,6 +50,10 @@ namespace AcousticFlow
         // 役割2: 早期反射 / 回折二次音源
         public int enableEarlyReflections, earlyTaps, earlyRays, earlyBounces;
         public int enableDiffractionSources, diffSources;
+
+        // 2026-09-03 早期反射の模型。0 = 像源をレイで拾う（旧）／1 = 面ごとの線音源（既定）。
+        //   earlyFaceSubTaps = 面 1 枚あたりの下位タップ数。echogramSkipFirstOrder = 尾から 1 次反射を外す（二重防止）。
+        public int earlyModel, earlyFaceSubTaps, echogramSkipFirstOrder;
     }
 
     internal static class Native
@@ -568,7 +572,7 @@ namespace AcousticFlow
         //   DLL だけ古いまま C# を更新すると、AF_VoiceTap の長さが食い違って
         //   マーシャラが別の刻み幅で書き込む（44→48 バイトになった）。例外も出ずに
         //   タップの中身が化けるので、原因に辿り着けない。ここで止める。
-        public const int ExpectedAbiVersion = 5;
+        public const int ExpectedAbiVersion = 6;
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_AbiVersion();
 

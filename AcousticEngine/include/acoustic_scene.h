@@ -946,6 +946,13 @@ typedef struct AF_UpdateConfig {
     int   earlyBounces;
     int   enableDiffractionSources; /* 0/1 */
     int   diffSources;
+
+    /* 2026-09-03 早期反射の模型。0 = 像源をレイで拾う（旧）／1 = 面ごとの線音源（既定）。
+     * earlyFaceSubTaps = 面 1 枚あたりの下位タップ数（1..8）。
+     * echogramSkipFirstOrder = 1 で尾のエコグラムから 1 次反射を外す（早期反射のタップと二重に鳴らさない）。 */
+    int   earlyModel;
+    int   earlyFaceSubTaps;
+    int   echogramSkipFirstOrder;
 } AF_UpdateConfig;
 
 /* 設定を渡す（変わったときだけでよい）。 */
