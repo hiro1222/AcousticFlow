@@ -21,6 +21,9 @@ af::dsp::HrtfSet* asHrtf(AF_HrtfHandle h) { return static_cast<af::dsp::HrtfSet*
 af::dsp::VoiceRenderer* asVoice(AF_VoiceHandle h) {
     return static_cast<af::dsp::VoiceRenderer*>(h);
 }
+af::dsp::DirectionBus* asDirBus(AF_DirectionBusHandle h) {
+    return static_cast<af::dsp::DirectionBus*>(h);
+}
 
 // タップ詰め替え用の一時領域。制御スレッドからしか触らないので静的で足りる。
 //   毎回 vector を作らないのは、setTaps が毎フレーム呼ばれうるため。
@@ -133,6 +136,45 @@ int AF_TailBusLastMono(AF_TailBusHandle bus, float* out, int frames) {
 void AF_VoiceSetTailBus(AF_VoiceHandle voice, AF_TailBusHandle bus, int isOwner) {
     if (af::dsp::VoiceRenderer* v = asVoice(voice))
         v->setTailBus(asBus(bus), isOwner != 0);
+}
+
+AF_DirectionBusHandle AF_DirectionBusCreate(int sampleRate, int lanes, int maxFrames) {
+    return new (std::nothrow) af::dsp::DirectionBus(orDefault(sampleRate, 48000), orDefault(lanes, 8),
+                                                    orDefault(maxFrames, 1024));
+}
+
+AF_DirectionBusHandle AF_DirectionBusCreateEx(int sampleRate, int lanes, int maxFrames, int firstBlock, int capBlock) {
+    return new (std::nothrow) af::dsp::DirectionBus(orDefault(sampleRate, 48000), orDefault(lanes, 8),
+                                                    orDefault(maxFrames, 1024), orDefault(firstBlock, 128), orDefault(capBlock, 1024));
+}
+
+void AF_DirectionBusDestroy(AF_DirectionBusHandle bus) { delete asDirBus(bus); }
+
+void AF_DirectionBusSetHrtf(AF_DirectionBusHandle bus, AF_HrtfHandle hrtf, float headCircumferenceCm) {
+    if (af::dsp::DirectionBus* b = asDirBus(bus)) b->setHrtfSet(asHrtf(hrtf), orDefault(headCircumferenceCm, 57.0f));
+}
+
+int AF_DirectionBusHasHrtf(AF_DirectionBusHandle bus) {
+    af::dsp::DirectionBus* b = asDirBus(bus);
+    return (b && b->hasHrtf()) ? 1 : 0;
+}
+
+int AF_DirectionBusLanes(AF_DirectionBusHandle bus) {
+    af::dsp::DirectionBus* b = asDirBus(bus);
+    return b ? b->lanes() : 0;
+}
+
+void AF_DirectionBusRender(AF_DirectionBusHandle bus, int frames, float* outL, float* outR) {
+    if (af::dsp::DirectionBus* b = asDirBus(bus)) b->render(frames, outL, outR);
+}
+
+float AF_DirectionBusRms(AF_DirectionBusHandle bus) {
+    af::dsp::DirectionBus* b = asDirBus(bus);
+    return b ? b->rms() : 0.0f;
+}
+
+void AF_VoiceSetDirectionBus(AF_VoiceHandle voice, AF_DirectionBusHandle bus) {
+    if (af::dsp::VoiceRenderer* v = asVoice(voice)) v->setDirectionBus(asDirBus(bus));
 }
 
 void AF_VoiceSetTaps(AF_VoiceHandle voice, const AF_VoiceTap* taps, int count) {

@@ -31,6 +31,7 @@
 #include "nonuniform_convolver.h"
 #include "reverb_tail_ir.h"
 #include "tail_bus.h"
+#include "direction_bus.h"
 
 namespace af {
 namespace dsp {
@@ -147,23 +148,36 @@ public:
     ///     タップは元から「小数遅延＋6帯域ゲイン」なので、耳ごとに 2 組持てば
     ///     畳み込みを増やさずに ITD と ILD が載る。
     void setTaps(const EarlyReflectConv::Tap* taps, int count) {
-        if (!taps || count <= 0 || !earCues_ || !hrtfSet_ || !hrtfSet_->hasEarBands()) {
-            early_.setTaps(taps, count);
-            return;
-        }
+        if (!taps || count <= 0) { early_.setTaps(taps, count); return; }
         tapScratch_.assign(taps, taps + count);
+        const bool cues = earCues_ && hrtfSet_ && hrtfSet_->hasEarBands();
+        const int lanes = dirBus_ ? dirBus_->lanes() : 0;
+        const int busLatency = dirBus_ ? dirBus_->latency() : 0;
         for (int i = 1; i < count; ++i) {           // index 0 は直接音＝フル HRTF が担当
             EarlyReflectConv::Tap& d = tapScratch_[static_cast<std::size_t>(i)];
             if (!d.dirValid || d.hrtfWeight > 0.0f) continue;   // 方向なし／HRTF バス行き
+            if (lanes > 0) {
+                // 方向バス行き: 隣り合う 2 レーンへ等パワー。バスの固有遅延（firstBlock）ぶんタップを早める。
+                DirectionBus::laneWeights(d.dir, lanes, d.lane, d.laneW);
+                d.laneUse = true;
+                d.delaySamples = std::max(0, d.delaySamples - busLatency);
+                // ITD はタップ自身の物を持つ（方向 × 耳の行へ別々に送る。ILD とスペクトルは行の HRIR が担当）。
+                if (hrtfSet_ && hrtfSet_->isValid()) {
+                    const int idx = hrtfSet_->nearestIndex(d.dir);
+                    if (idx >= 0) {
+                        const float samp = hrtfSet_->itdSecondsScaled(idx, headCm_) * static_cast<float>(sampleRate_);
+                        d.earDelay[0] = (samp < 0.0f) ? -samp : 0.0f;   // 右が先 → 左耳が遅れる
+                        d.earDelay[1] = (samp > 0.0f) ? samp : 0.0f;    // 左が先 → 右耳が遅れる
+                    }
+                }
+                continue;
+            }
+            if (!cues) continue;
             const int idx = hrtfSet_->nearestIndex(d.dir);
             if (idx < 0) continue;
             const float* gl = hrtfSet_->earBandGains(idx, 0);
             const float* gr = hrtfSet_->earBandGains(idx, 1);
             if (!gl || !gr) continue;
-            // ITD は「音源が右なら右耳が先＝負」の規約（hrtf_set.h）。
-            //   遅延は**遅れて届く側**に足す。右が先なら遅れるのは**左耳**。
-            //   ★ここを逆にすると、右から来る音の左耳が先に鳴る＝像が左へ行く。
-            //     実測で右60°の ITD が +479us（本来 -479us）になって気づいた。
             const float itd = hrtfSet_->itdSecondsScaled(idx, headCm_);
             const float samp = itd * static_cast<float>(sampleRate_);
             d.earDelay[0] = (samp < 0.0f) ? -samp : 0.0f;   // 右が先 → 左耳が遅れる
@@ -283,6 +297,16 @@ public:
     }
     const TailBus* tailBus() const { return tailBus_; }
 
+    /// 反射・回折のタップを方向バスへ預ける。bus=NULL で自前の両耳化（軽量両耳化／パン）に戻る。
+    ///   ★次の setTaps から効く（レーンの割り当てはタップを受け取るときに決める）。
+    void setDirectionBus(DirectionBus* bus) {
+        dirBus_ = bus;
+        laneStride_ = maxFrames_ + EarlyReflectConv::kLaneItdMax;
+        if (bus) laneBuf_.assign(static_cast<std::size_t>(bus->rows()) * laneStride_, 0.0f);
+        laneCarry_ = 0;
+    }
+    const DirectionBus* directionBus() const { return dirBus_; }
+
     /// クロスフェードの長さ(ms)。0 で即差し替え（旧挙動）。
     void setTailCrossfadeMs(float ms) {
         tailXfadeLen_ = std::max(0, static_cast<int>(ms * 0.001f * sampleRate_));
@@ -395,13 +419,30 @@ private:
         if (hrtfActive) hrtf_.beginBlock();
         if (difActive) hrtfDif_.beginBlock();
         early_.beginBlock();
+        // 方向バスがあれば、このチャンクぶんのレーンの箱を 0 にしておく（[レーン][maxFrames]）。
+        const int rows = dirBus_ ? dirBus_->rows() : 0;   // 方向 × 2 耳
+        float* laneOut = nullptr;
+        if (rows > 0) {
+            // 行は maxFrames + kLaneItdMax。前のチャンクで末尾の余裕へ書かれた ITD ぶんを頭へ持ち越してから、残りを 0 にする。
+            if (laneBuf_.size() < static_cast<std::size_t>(rows) * laneStride_)
+                laneBuf_.assign(static_cast<std::size_t>(rows) * laneStride_, 0.0f);
+            const int carry = EarlyReflectConv::kLaneItdMax;
+            for (int k = 0; k < rows; ++k) {
+                float* row = laneBuf_.data() + static_cast<std::size_t>(k) * laneStride_;
+                if (laneCarry_ > 0) std::copy(row + laneCarry_, row + laneCarry_ + carry, row);
+                else std::fill(row, row + carry, 0.0f);
+                std::fill(row + carry, row + n + carry, 0.0f);
+            }
+            laneOut = laneBuf_.data();
+        }
 
         for (int f = 0; f < n; ++f) {
             const float dry = input[f];
 
             float l, r, scatSendL, scatSendR, directMono, difMono;
             early_.processSample(dry, hrtfActive, l, r,
-                                 scatSendL, scatSendR, directMono, difMono);
+                                 scatSendL, scatSendR, directMono, difMono,
+                                 laneOut ? laneOut + f : nullptr, laneStride_);
 
             // 直接音を HRTF で両耳化して足す（パンの代わり）。
             float dirL = 0.0f, dirR = 0.0f;
@@ -448,6 +489,18 @@ private:
             outL[f] = l;
             outR[f] = r;
         }
+        // 方向バスへ送る。outputGain_ はここで掛ける（尾のバスと同じ理由: リスナー側で足されるので、
+        //   最後の l *= outputGain_ を通らない）。計器には両耳ぶんとして足しておく（実際の両耳化はバス側）。
+        if (laneOut) {
+            float e = 0.0f;
+            for (int k = 0; k < rows; ++k) {
+                const float* v = laneOut + static_cast<std::size_t>(k) * laneStride_;
+                for (int i = 0; i < n; ++i) e += v[i] * v[i];
+            }
+            m.rmsEarly += e * outputGain_ * outputGain_;
+            dirBus_->add(laneOut, n, laneStride_, outputGain_, dstOffset);
+            laneCarry_ = n;   // 末尾の余裕（[n, n+kLaneItdMax)）は次のチャンクの頭へ
+        }
     }
 
     Config cfg_;
@@ -465,6 +518,10 @@ private:
     // 共有バス。null なら自前で畳む（既定＝これまでどおり）。
     //   バスを差すと、この音源は尾を**送るだけ**になり、畳み込みは 1 回に集約される。
     TailBus* tailBus_ = nullptr;
+    DirectionBus* dirBus_ = nullptr;   // 反射・回折タップの行き先（リスナーに 1 組、全音源で共有）
+    std::vector<float> laneBuf_;       // [行][maxFrames + kLaneItdMax] このチャンクの送り（末尾は ITD の持ち越し）
+    int laneStride_ = 0;
+    int laneCarry_ = 0;                 // 前のチャンクの長さ（持ち越しの読み出し位置）
     bool tailBusOwner_ = false;    // この音源が IR をバスへ入れる係か（部屋の代表）
     NonUniformConvolver tailConvA_;
     NonUniformConvolver tailConvB_;

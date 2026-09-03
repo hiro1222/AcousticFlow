@@ -92,6 +92,27 @@ namespace AcousticFlow
         }
 
         /// 共有バスから外して自前の畳み込みに戻す。バスを壊す前に必ず呼ぶこと。
+        // ── 方向バス ──
+        //   反射・回折のタップをリスナーのレーンへ預ける。ホストのバスは実行時に生える（Start で付く）ので、
+        //   付くまで毎フレーム試す。付いた後の SetTaps からレーン行きになる。
+        private IntPtr _dirBus = IntPtr.Zero;
+        private void AttachDirectionBus()
+        {
+            var host = TailBusHost;
+            if (host == null || !host.enableDirectionBus || _voice == IntPtr.Zero) return;
+            var bus = host.GetOrCreateDirectionBus(_tailBusFrames);
+            if (bus == IntPtr.Zero) return;
+            if (Native.AF_DirectionBusHasHrtf(bus) == 0 && _hrtf != IntPtr.Zero)
+                Native.AF_DirectionBusSetHrtf(bus, _hrtf, headCircumferenceCm);
+            _dirBus = bus;
+            Native.AF_VoiceSetDirectionBus(_voice, bus);
+        }
+        public void DetachDirectionBus()
+        {
+            if (_voice != IntPtr.Zero && _dirBus != IntPtr.Zero) Native.AF_VoiceSetDirectionBus(_voice, IntPtr.Zero);
+            _dirBus = IntPtr.Zero;
+        }
+
         public void DetachTailBus()
         {
             if (_voice != IntPtr.Zero && _tailBus != IntPtr.Zero)
@@ -207,6 +228,7 @@ namespace AcousticFlow
 
         private void OnDestroy()
         {
+            DetachDirectionBus();
             _ready = false;
             if (_voice != IntPtr.Zero) { Native.AF_VoiceDestroy(_voice); _voice = IntPtr.Zero; }
             if (_hrtf != IntPtr.Zero) { Native.AF_HrtfDestroy(_hrtf); _hrtf = IntPtr.Zero; }
@@ -222,6 +244,7 @@ namespace AcousticFlow
         // メインスレッド：タップと尾をエンジンへ渡す。
         private void Update()
         {
+            if (_dirBus == IntPtr.Zero) AttachDirectionBus();
             if (!_ready) return;
             var ts = MyTaps();
             if (ts == null) return;

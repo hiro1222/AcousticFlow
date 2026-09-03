@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "acoustic_scene.h"   // AF_Vector3
@@ -63,10 +64,13 @@ std::vector<float> echogram(int bins, float rt60) {
 struct Bench { double voiceMs = 0.0; double busMs = 0.0; };
 
 // voices 本を bus（無しも可）に預けて kSeconds ぶん回し、ボイス側とバス側の時間を分けて測る。
-Bench run(int voices, bool ownTail, bool useBus, AF_HrtfHandle hrtf, int nR, int nF) {
+Bench run(int voices, bool ownTail, bool useBus, AF_HrtfHandle hrtf, int nR, int nF, int dirLanes = 0) {
     AF_VoiceConfig cfg{};
     cfg.sampleRate = kRate; cfg.maxFrames = kBlock; cfg.tailSeconds = 1.0f;
     AF_TailBusHandle bus = useBus ? AF_TailBusCreate(kRate, 1.0f, 64, 8192, kBlock) : nullptr;
+    const int firstBlock = std::getenv("AF_DIRBUS_FIRST") ? std::atoi(std::getenv("AF_DIRBUS_FIRST")) : 128;
+    AF_DirectionBusHandle dbus = (dirLanes > 0) ? AF_DirectionBusCreateEx(kRate, dirLanes, kBlock, firstBlock, 1024) : nullptr;
+    if (dbus) AF_DirectionBusSetHrtf(dbus, hrtf, 57.0f);
     const std::vector<AF_VoiceTap> taps = makeTaps(nR, nF);
     const std::vector<float> eg = echogram(100, 1.0f);
     std::vector<AF_VoiceHandle> vs;
@@ -75,6 +79,7 @@ Bench run(int voices, bool ownTail, bool useBus, AF_HrtfHandle hrtf, int nR, int
         AF_VoiceSetHrtf(v, hrtf);
         AF_VoiceSetHrtfEnabled(v, 1);
         AF_VoiceSetDirection(v, AF_Vector3{0.3f, 0.0f, 0.95f}, 57.0f);
+        if (dbus) AF_VoiceSetDirectionBus(v, dbus);   // 次の SetTaps から効くので、先に付ける
         AF_VoiceSetTaps(v, taps.data(), static_cast<int>(taps.size()));
         if (useBus) AF_VoiceSetTailBus(v, bus, (i == 0) ? 1 : 0);
         if (ownTail || (useBus && i == 0))
@@ -101,6 +106,7 @@ Bench run(int voices, bool ownTail, bool useBus, AF_HrtfHandle hrtf, int nR, int
             std::fill(mr.begin(), mr.end(), 0.0f);
             AF_TailBusRender(bus, kBlock, ml.data(), mr.data());
         }
+        if (dbus) AF_DirectionBusRender(dbus, kBlock, ml.data(), mr.data());
         const auto t2 = clk::now();
         b.voiceMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
         b.busMs += std::chrono::duration<double, std::milli>(t2 - t1).count();
@@ -108,6 +114,7 @@ Bench run(int voices, bool ownTail, bool useBus, AF_HrtfHandle hrtf, int nR, int
     if (!vs.empty()) std::printf("      （尾のパーティション %d）\n", AF_VoiceTailPartitions(vs[0]));
     for (AF_VoiceHandle v : vs) AF_VoiceDestroy(v);
     if (bus) AF_TailBusDestroy(bus);
+    if (dbus) AF_DirectionBusDestroy(dbus);
     return b;
 }
 
@@ -130,6 +137,9 @@ int main() {
     show("1本: 直接+R48+F7, 自前の尾 1.0 s",       run(1, true,  false, hrtf, 48, 7), 1);
     show("1本: 直接+R48+F7, 共有バスの尾 1.0 s",    run(1, false, true,  hrtf, 48, 7), 1);
     show("6本: 直接+R48+F7, 共有バス 1 本",         run(6, false, true,  hrtf, 48, 7), 6);
+    show("1本: 直接+R48+F7, 方向バス 8 本",         run(1, false, true,  hrtf, 48, 7, 8), 1);
+    show("6本: 直接+R48+F7, 共有バス + 方向バス 8",  run(6, false, true,  hrtf, 48, 7, 8), 6);
+    show("6本: 直接+R48+F7, 共有バス + 方向バス 12", run(6, false, true,  hrtf, 48, 7, 12), 6);
     AF_HrtfDestroy(hrtf);
     return 0;
 }

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include <string>
 
 #include <algorithm>
 
@@ -2256,6 +2257,178 @@ void testVoiceRenderer() {
 
 }  // namespace
 
+// ---------------------------------------------------------------- 方向バス
+// 2026-09-04: 反射・回折のタップをリスナー座標で固定した N 本のレーンへ振って、レーンごとに固定の HRIR で畳む。
+//   物差し: 1 本ずつその方向の HRIR で畳んだ基準と、8 レーン／12 レーンで、両耳相関（IACC）と ILD を比べる。
+namespace dirbus {
+double iacc(const std::vector<float>& L, const std::vector<float>& R, int maxLag) {
+    double el = 0.0, er = 0.0;
+    for (std::size_t i = 0; i < L.size(); ++i) { el += L[i] * L[i]; er += R[i] * R[i]; }
+    if (el <= 0.0 || er <= 0.0) return 0.0;
+    double best = 0.0;
+    for (int lag = -maxLag; lag <= maxLag; ++lag) {
+        double s = 0.0;
+        for (std::size_t i = 0; i < L.size(); ++i) {
+            const long j = static_cast<long>(i) + lag;
+            if (j < 0 || j >= static_cast<long>(R.size())) continue;
+            s += L[i] * R[static_cast<std::size_t>(j)];
+        }
+        best = std::max(best, std::fabs(s));
+    }
+    return best / std::sqrt(el * er);
+}
+double ildDb(const std::vector<float>& L, const std::vector<float>& R) {
+    double el = 0.0, er = 0.0;
+    for (std::size_t i = 0; i < L.size(); ++i) { el += L[i] * L[i]; er += R[i] * R[i]; }
+    return 10.0 * std::log10(std::max(er, 1e-12) / std::max(el, 1e-12));
+}
+struct Ring { std::vector<float> az; std::vector<int> delay; };
+// 基準: タップごとに、その方向の HRIR（ITD 込み）で畳む。
+void renderReference(const af::dsp::HrtfSet& set, const std::vector<float>& x, const Ring& ring, int sr,
+                     std::vector<float>& L, std::vector<float>& R) {
+    const int N = static_cast<int>(x.size());
+    L.assign(static_cast<std::size_t>(N), 0.0f); R.assign(static_cast<std::size_t>(N), 0.0f);
+    const int irLen = set.irLength();
+    for (std::size_t t = 0; t < ring.az.size(); ++t) {
+        const float az = ring.az[t] * 3.14159265f / 180.0f;
+        const float dir[3] = { std::sin(az), 0.0f, std::cos(az) };
+        const int idx = set.nearestIndex(dir);
+        const float itd = set.itdSecondsScaled(idx, 57.0f);
+        const int dL = (itd < 0.0f) ? static_cast<int>(std::lround(-itd * sr)) : 0;
+        const int dR = (itd > 0.0f) ? static_cast<int>(std::lround( itd * sr)) : 0;
+        const float* hl = set.hrir(idx, 0);
+        const float* hr = set.hrir(idx, 1);
+        const int d0 = ring.delay[t];
+        for (int i = 0; i < N; ++i) {
+            const int src = i - d0;
+            if (src < 0) continue;
+            const float v = x[static_cast<std::size_t>(src)];
+            if (v == 0.0f) continue;
+            for (int k = 0; k < irLen; ++k) {
+                const int jl = i + k + dL, jr = i + k + dR;
+                if (jl < N) L[static_cast<std::size_t>(jl)] += v * hl[k];
+                if (jr < N) R[static_cast<std::size_t>(jr)] += v * hr[k];
+            }
+        }
+    }
+}
+// レーン: タップを 2 方向へ等パワーで振り、耳ごとに自分の ITD で遅らせて 方向×耳 の行へ送り、バスで畳む。
+void renderLanes(const af::dsp::HrtfSet& set, const std::vector<float>& x, const Ring& ring, int sr, int lanes,
+                 std::vector<float>& L, std::vector<float>& R) {
+    using af::dsp::DirectionBus;
+    const int N = static_cast<int>(x.size());
+    const int B = 512;
+    DirectionBus bus(sr, lanes, B);
+    bus.setHrtfSet(&set, 57.0f);
+    const int lat = bus.latency();
+    L.assign(static_cast<std::size_t>(N), 0.0f); R.assign(static_cast<std::size_t>(N), 0.0f);
+    std::vector<int> ln(ring.az.size() * 2); std::vector<float> w(ring.az.size() * 2);
+    std::vector<int> earD(ring.az.size() * 2);
+    for (std::size_t t = 0; t < ring.az.size(); ++t) {
+        const float az = ring.az[t] * 3.14159265f / 180.0f;
+        const float dir[3] = { std::sin(az), 0.0f, std::cos(az) };
+        DirectionBus::laneWeights(dir, lanes, &ln[t * 2], &w[t * 2]);
+        const int idx = set.nearestIndex(dir);
+        const float itd = set.itdSecondsScaled(idx, 57.0f);
+        earD[t * 2 + 0] = (itd < 0.0f) ? static_cast<int>(std::lround(-itd * sr)) : 0;
+        earD[t * 2 + 1] = (itd > 0.0f) ? static_cast<int>(std::lround( itd * sr)) : 0;
+    }
+    const int rows = bus.rows();
+    std::vector<float> lane(static_cast<std::size_t>(rows) * B);
+    std::vector<float> oL(B), oR(B);
+    for (int pos = 0; pos < N; pos += B) {
+        const int n = std::min(B, N - pos);
+        std::fill(lane.begin(), lane.end(), 0.0f);
+        for (std::size_t t = 0; t < ring.az.size(); ++t) {
+            for (int e = 0; e < 2; ++e) {
+                const int d0 = std::max(0, ring.delay[t] - lat) + earD[t * 2 + e];
+                for (int i = 0; i < n; ++i) {
+                    const int src = pos + i - d0;
+                    if (src < 0) continue;
+                    const float v = x[static_cast<std::size_t>(src)];
+                    lane[static_cast<std::size_t>(ln[t * 2] * 2 + e) * B + i]     += v * w[t * 2];
+                    lane[static_cast<std::size_t>(ln[t * 2 + 1] * 2 + e) * B + i] += v * w[t * 2 + 1];
+                }
+            }
+        }
+        bus.add(lane.data(), n, B, 1.0f, 0);
+        std::fill(oL.begin(), oL.end(), 0.0f); std::fill(oR.begin(), oR.end(), 0.0f);
+        bus.render(n, oL.data(), oR.data());
+        for (int i = 0; i < n; ++i) { L[static_cast<std::size_t>(pos + i)] = oL[i]; R[static_cast<std::size_t>(pos + i)] = oR[i]; }
+    }
+}
+}  // namespace dirbus
+
+void testDirectionBus() {
+    using af::dsp::DirectionBus;
+    std::printf("\n[方向バス] レーンへの振り分けと、両耳の物差し（IACC / ILD）\n");
+    char buf[200];
+    // 1) 重み: レーンの真上は 1 本 100%、間は等パワー（w0² + w1² = 1）。
+    {
+        int ln[2]; float w[2];
+        const float front[3] = {0, 0, 1}; DirectionBus::laneWeights(front, 8, ln, w);
+        check("正面はレーン 0 に 100%", ln[0] == 0 && std::fabs(w[0] - 1.0f) < 1e-5f && w[1] < 1e-5f);
+        const float right[3] = {1, 0, 0}; DirectionBus::laneWeights(right, 8, ln, w);
+        check("真右（90°）は 8 レーンならレーン 2 に 100%", ln[0] == 2 && std::fabs(w[0] - 1.0f) < 1e-5f);
+        bool ok = true; float worst = 0.0f;
+        for (int a = 0; a < 360; ++a) {
+            const float az = a * 3.14159265f / 180.0f;
+            const float d[3] = { std::sin(az), 0.0f, std::cos(az) };
+            DirectionBus::laneWeights(d, 8, ln, w);
+            const float e = w[0] * w[0] + w[1] * w[1];
+            worst = std::max(worst, std::fabs(e - 1.0f));
+            ok = ok && ln[0] >= 0 && ln[0] < 8 && ln[1] == (ln[0] + 1) % 8;
+        }
+        std::snprintf(buf, sizeof(buf), "(w0²+w1² の 1 からのずれ 最大 %.2e)", worst);
+        check("全方位で等パワー（隣り合う 2 レーン）", ok && worst < 1e-5f, buf);
+    }
+    // 2) インパルス: 方向 2（右 90°）の右の行へ入れたら右にだけ出て、固有遅延の後にピークが立つ。
+    {
+        af::dsp::HrtfSet set = af::dsp::HrtfSet::createSynthetic(48000);
+        DirectionBus bus(48000, 8, 512);
+        bus.setHrtfSet(&set, 57.0f);
+        check("HRIR を焼けた", bus.hasHrtf());
+        auto energy = [](const std::vector<float>& v) { double e = 0; for (float s : v) e += s * s; return e; };
+        auto peakAt = [](const std::vector<float>& v) { int p = 0; for (std::size_t i = 1; i < v.size(); ++i) if (std::fabs(v[i]) > std::fabs(v[static_cast<std::size_t>(p)])) p = static_cast<int>(i); return p; };
+        std::vector<float> in(static_cast<std::size_t>(bus.rows()) * 512, 0.0f);
+        in[static_cast<std::size_t>(2 * 2 + 1) * 512] = 1.0f;     // 方向 2、右耳の行
+        std::vector<float> L(1024, 0.0f), R(1024, 0.0f);
+        bus.add(in.data(), 512, 512, 1.0f, 0); bus.render(512, L.data(), R.data());
+        std::fill(in.begin(), in.end(), 0.0f);
+        bus.add(in.data(), 512, 512, 1.0f, 0); bus.render(512, L.data() + 512, R.data() + 512);
+        std::snprintf(buf, sizeof(buf), "(左 %.2e / 右 %.2e、右のピーク %d サンプル、固有遅延 %d)", energy(L), energy(R), peakAt(R), bus.latency());
+        check("右の行に入れると右耳にだけ出る（ピークは固有遅延の後）", energy(L) < 1e-9 && energy(R) > 1e-4 && peakAt(R) >= bus.latency(), buf);
+    }
+    // 3) 物差し: 右半分の環（0°〜180°、30° 刻み、7 本）と、レーンの真ん中の 1 本（22.5°）。
+    {
+        const int sr = 48000, N = sr;   // 1 秒
+        af::dsp::HrtfSet set = af::dsp::HrtfSet::createSynthetic(sr);
+        std::vector<float> x(static_cast<std::size_t>(N));
+        unsigned rs = 2463534242u;
+        for (int i = 0; i < N; ++i) { rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5; x[static_cast<std::size_t>(i)] = static_cast<int>(rs) * (0.5f / 2147483648.0f); }
+        struct Case { const char* name; dirbus::Ring ring; float iaccTol, ildTol; };
+        std::vector<Case> cases;
+        { dirbus::Ring r; for (int k = 0; k <= 7; ++k) { r.az.push_back(25.0f * k); r.delay.push_back(200 + 37 * k); } cases.push_back({"右半分の環 8 本（25° 刻み）", r, 0.10f, 2.0f}); }
+        { dirbus::Ring r; r.az.push_back(22.5f); r.delay.push_back(200); cases.push_back({"レーンの真ん中 1 本（22.5°）", r, 0.15f, 3.0f}); }
+        { dirbus::Ring r; for (int k = 0; k < 14; ++k) { r.az.push_back(25.0f * k); r.delay.push_back(200 + 37 * k); } cases.push_back({"全周の環 14 本（25° 刻み）", r, 0.10f, 2.0f}); }
+        std::printf("      %-32s  %8s %8s %8s   %8s %8s %8s\n", "配置", "IACC基準", "IACC 8", "IACC 12", "ILD基準", "ILD 8", "ILD 12");
+        for (const Case& c : cases) {
+            std::vector<float> L0, R0, L8, R8, L12, R12;
+            dirbus::renderReference(set, x, c.ring, sr, L0, R0);
+            dirbus::renderLanes(set, x, c.ring, sr, 8, L8, R8);
+            dirbus::renderLanes(set, x, c.ring, sr, 12, L12, R12);
+            const int lag = sr / 1000;   // ±1 ms
+            const double i0 = dirbus::iacc(L0, R0, lag), i8 = dirbus::iacc(L8, R8, lag), i12 = dirbus::iacc(L12, R12, lag);
+            const double d0 = dirbus::ildDb(L0, R0), d8 = dirbus::ildDb(L8, R8), d12 = dirbus::ildDb(L12, R12);
+            std::printf("      %-32s  %8.3f %8.3f %8.3f   %+7.1f %+7.1f %+7.1f dB\n", c.name, i0, i8, i12, d0, d8, d12);
+            std::snprintf(buf, sizeof(buf), "(IACC 基準 %.3f / 8 レーン %.3f、ILD 基準 %+.1f / 8 レーン %+.1f dB)", i0, i8, d0, d8);
+            std::string nm = std::string("[物差し] ") + c.name + ": 8 レーンが基準と両耳相関・ILD で近い";
+            check(nm.c_str(), std::fabs(i8 - i0) < c.iaccTol && std::fabs(d8 - d0) < c.ildTol, buf);
+        }
+    }
+}
+
+
 int main() {
     std::printf("=== DSP 数値回帰テスト（段4: C++ 移行）===\n");
     testFft();
@@ -2271,6 +2444,7 @@ int main() {
     diagnoseDspCost();
     testDiffractionHrtf();
     testTapEarCues();
+    testDirectionBus();
     testTailCalibration();
     testVoiceTailBus();
     testVoiceRenderer();

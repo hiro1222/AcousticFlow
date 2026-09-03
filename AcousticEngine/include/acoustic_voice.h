@@ -140,6 +140,26 @@ ACOUSTIC_API int AF_TailBusLastMono(AF_TailBusHandle bus, float* out, int frames
 /* この音源の尾を共有バスへ預ける。bus=NULL で自前の畳み込みに戻る（既定）。 */
 ACOUSTIC_API void AF_VoiceSetTailBus(AF_VoiceHandle voice, AF_TailBusHandle bus, int isOwner);
 
+/* ── 方向バス（2026-09-04）──
+ *   反射・回折のタップを 1 本ずつ両耳化せず、リスナー座標で固定した N 本のレーン（水平の環）へ隣り合う
+ *   2 本の等パワーで振り、レーンごとに固定の HRIR で畳む。費用が O(タップ) → O(レーン) になり音源数に依らない。
+ *   使い方は尾のバスと同じ: 音源は Render の中で送り、AudioListener のフィルタが Render を 1 回呼んで足す。
+ *   lanes は 4〜16（8 = 45° 刻みが出発点、12 が反射の上限）。 */
+typedef void* AF_DirectionBusHandle;
+ACOUSTIC_API AF_DirectionBusHandle AF_DirectionBusCreate(int sampleRate, int lanes, int maxFrames);
+/* 分割の最小ブロック（＝固有遅延）と最大ブロックを指定する版。既定は Create（64 / 1024）。 */
+ACOUSTIC_API AF_DirectionBusHandle AF_DirectionBusCreateEx(int sampleRate, int lanes, int maxFrames, int firstBlock, int capBlock);
+ACOUSTIC_API void AF_DirectionBusDestroy(AF_DirectionBusHandle bus);
+/* レーンごとの固定 HRIR を焼く。hrtf は呼び手が生存を保証する。 */
+ACOUSTIC_API void AF_DirectionBusSetHrtf(AF_DirectionBusHandle bus, AF_HrtfHandle hrtf, float headCircumferenceCm);
+ACOUSTIC_API int  AF_DirectionBusHasHrtf(AF_DirectionBusHandle bus);
+ACOUSTIC_API int  AF_DirectionBusLanes(AF_DirectionBusHandle bus);
+/* 溜まった送りをレーンごとに畳んで outL/outR へ**足す**。音源が送っていないブロックでも呼ぶこと。 */
+ACOUSTIC_API void AF_DirectionBusRender(AF_DirectionBusHandle bus, int frames, float* outL, float* outR);
+ACOUSTIC_API float AF_DirectionBusRms(AF_DirectionBusHandle bus);
+/* この音源の反射・回折タップを方向バスへ預ける。bus=NULL で自前の両耳化に戻る（既定）。次の SetTaps から効く。 */
+ACOUSTIC_API void AF_VoiceSetDirectionBus(AF_VoiceHandle voice, AF_DirectionBusHandle bus);
+
 /* タップ集合を差し替える。切替は次のブロックからクロスフェードして行われる。 */
 ACOUSTIC_API void AF_VoiceSetTaps(AF_VoiceHandle voice, const AF_VoiceTap* taps, int count);
 

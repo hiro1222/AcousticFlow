@@ -290,6 +290,11 @@ namespace AcousticFlow
                  + "⚠ 尾の形は部屋ごとに共有済み（段階①）。その形の index をバスの鍵にします。"
                  + "違う部屋を同じバスへ入れると、片方の部屋の響きがもう片方に付きます。")]
         public bool sharedTailBus = false;
+        [Tooltip("方向バス: 反射・回折のタップをリスナー座標で固定した N 方向へ振り、方向×耳の固定 HRIR で畳む（全音源で共有）。"
+                 + "音声スレッドの費用が O(タップ) → O(方向) になり音源数に依らない。ITD はタップごと。OFF で従来の軽量両耳化（A/B 用）。")]
+        public bool directionBus = true;
+        [Tooltip("方向バスの本数（水平の環）。8 = 45° 刻み（費用 3.4%）。12 = 30°（5.4%）。両耳相関は 8 で基準と 0.02 以内。")]
+        [Range(4, 16)] public int directionLanes = 8;
         [Header("扉の定点（隣の空間の響きを戸口の位置から鳴らす）")]
         [Tooltip("ON: 隣の部屋（洞窟の中など）の尾は、その部屋のバスをそのまま足すのではなく、"
                  + "戸口の位置に置いた定点から HRTF で鳴らす。口の結合率（閉じた扉なら板の透過）と"
@@ -798,8 +803,10 @@ namespace AcousticFlow
                 if (lis != null)
                 {
                     var host = lis.GetComponent<TailBusRenderer>();
-                    if (host == null && sharedTailBus) host = lis.gameObject.AddComponent<TailBusRenderer>();
+                    // ★尾の共有バスを使わなくても付ける。方向バス（反射・回折タップの束ね）もこの部品が持つため。
+                    if (host == null) host = lis.gameObject.AddComponent<TailBusRenderer>();
                     if (host != null) host.enableSharedTail = sharedTailBus;
+                    if (host != null) { host.enableDirectionBus = directionBus; host.directionLanes = directionLanes; }
                 }
                 else if (sharedTailBus)
                 {
@@ -2572,6 +2579,11 @@ namespace AcousticFlow
                 GUILayout.Label($"回折候補(主音源): {_diffCandCount} 本合成 (水色=最短) (C)", style);
             GUILayout.Label($"早期反射(IR の R タップ・{(earlyReflectModel == 1 ? "面の線" : "像源レイ")}): {(enableEarlyReflections ? "ON" : "OFF")} (F)   "
                             + $"回折二次音源(IR の F タップ): {(enableDiffractionSources ? "ON" : "OFF")} (V)", style);
+            {
+                var tb = _portalHost != null ? _portalHost : FindFirstObjectByType<TailBusRenderer>();
+                if (tb != null)
+                    GUILayout.Label($"方向バス: {(tb.enableDirectionBus && tb.DirectionBusHandle != System.IntPtr.Zero ? $"{tb.directionLanes} 方向 × 2 耳（RMS {20f * Mathf.Log10(Mathf.Max(tb.DirectionBusRms, 1e-6f)):F1} dB）" : "OFF（タップごとの両耳化）")}", style);
+            }
             GUILayout.Label($"焼き(面の見通し): {(bakeStaticFaces ? $"面 {_bakeFaces} / セル {_bakeCells} / {_bakeMs:F0} ms ／ 動く物 {_bakeDynamic}" : "OFF（生で解く）")}", style);
             // 扉の開き角。音を判断する前提なので数字でも出す（見た目だけだと追えない）。
             if (_swingDoors == null)

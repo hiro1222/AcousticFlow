@@ -545,6 +545,24 @@ namespace AcousticFlow
         public static extern int AF_ScenePortalDiffuseCoupling(IntPtr scene, int id, [Out] float[] out6);
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_VoiceSetTailBus(IntPtr voice, IntPtr bus, int isOwner);
+
+        // ── 方向バス（2026-09-04）: 反射・回折タップをリスナー座標で固定したレーンへ振り、レーンごとに固定の HRIR で畳む ──
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern IntPtr AF_DirectionBusCreate(int sampleRate, int lanes, int maxFrames);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_DirectionBusDestroy(IntPtr bus);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_DirectionBusSetHrtf(IntPtr bus, IntPtr hrtf, float headCircumferenceCm);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_DirectionBusHasHrtf(IntPtr bus);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_DirectionBusLanes(IntPtr bus);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_DirectionBusRender(IntPtr bus, int frames, [In, Out] float[] outL, [In, Out] float[] outR);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern float AF_DirectionBusRms(IntPtr bus);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetDirectionBus(IntPtr voice, IntPtr bus);
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneSetAutoPortalMinArea(IntPtr scene, float m2);
         [DllImport(Dll, CallingConvention = Cc)]

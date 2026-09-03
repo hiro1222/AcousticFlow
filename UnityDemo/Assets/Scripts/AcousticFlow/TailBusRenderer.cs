@@ -45,6 +45,25 @@ namespace AcousticFlow
                  + "ふくらみます（音源側で +1.97dB が 0.35 秒続くのを実測済み）。")]
         [Range(0f, 200f)] public float crossfadeMs = 60f;
 
+        [Tooltip("方向バス: 反射・回折のタップを 1 本ずつ両耳化せず、リスナー座標で固定した N 本のレーンへ振って"
+                 + "レーンごとに固定の HRIR で畳む。費用が O(タップ) → O(レーン) になり、音源数に依らない。\n"
+                 + "OFF で従来（タップごとの軽量両耳化）。音は変わるので A/B 用に残す。")]
+        public bool enableDirectionBus = true;
+        [Tooltip("レーンの本数（水平の環）。8 = 45° 刻みが出発点、12 = 30° が反射の上限。16 以上は聞き分けられない所に払う。")]
+        [Range(4, 16)] public int directionLanes = 8;
+        private System.IntPtr _dirBus = System.IntPtr.Zero;
+        public System.IntPtr DirectionBusHandle => _dirBus;
+        public float DirectionBusRms => (_dirBus != System.IntPtr.Zero) ? Native.AF_DirectionBusRms(_dirBus) : 0f;
+
+        public System.IntPtr GetOrCreateDirectionBus(int maxFrames)
+        {
+            if (!enableDirectionBus) return System.IntPtr.Zero;
+            if (_dirBus != System.IntPtr.Zero) return _dirBus;
+            try { _dirBus = Native.AF_DirectionBusCreate(_sampleRate, directionLanes, Mathf.Max(maxFrames, 2048)); }
+            catch (System.EntryPointNotFoundException) { _dirBus = System.IntPtr.Zero; }
+            return _dirBus;
+        }
+
         // 尾の形の index → バス。形が同じ音源は同じバスへ入る。
         private readonly Dictionary<int, System.IntPtr> _buses = new Dictionary<int, System.IntPtr>();
         // 【扉の定点】バスごとの「直接に足す割合」＝リスナーのまわりでその部屋が占める割合 w。
@@ -91,7 +110,10 @@ namespace AcousticFlow
             //   OnDisable の時点で Unity はこの GameObject のフィルタを止めているが、
             //   音源側はまだバスを掴んでいる可能性がある。掴んでいる側を先に外させる。
             foreach (var v in FindObjectsByType<VoiceConvolver>(FindObjectsSortMode.None))
+            {
                 v.DetachTailBus();
+                v.DetachDirectionBus();
+            }
             // 扉の定点もバスのモノラルを読んでいるので、先に離す。
             foreach (var e in FindObjectsByType<PortalEmitter>(FindObjectsSortMode.None))
                 e.Detach();
@@ -99,6 +121,7 @@ namespace AcousticFlow
                 if (kv.Value != System.IntPtr.Zero)
                     Native.AF_TailBusDestroy(kv.Value);
             _buses.Clear();
+            if (_dirBus != System.IntPtr.Zero) { Native.AF_DirectionBusDestroy(_dirBus); _dirBus = System.IntPtr.Zero; }
         }
 
         // ★全音源のミックス後に呼ばれる。ここで各バスを 1 回ずつ畳んで足す。
@@ -106,7 +129,7 @@ namespace AcousticFlow
         //     次に送りが来たときに尾が飛ぶ（無音を入れて進めるのが正しい）。
         private void OnAudioFilterRead(float[] data, int channels)
         {
-            if (_buses.Count == 0 || channels < 1) return;
+            if ((_buses.Count == 0 && _dirBus == System.IntPtr.Zero) || channels < 1) return;
             int frames = data.Length / channels;
             if (_l == null || _l.Length < frames) { _l = new float[frames]; _r = new float[frames]; }
 
@@ -130,6 +153,26 @@ namespace AcousticFlow
                 else
                 {
                     for (int i = 0; i < frames; i++) data[i * channels] += 0.5f * (_l[i] + _r[i]) * w;
+                }
+            }
+
+            // 方向バス（全音源の反射・回折タップ）。尾のバスの後に 1 回。
+            if (_dirBus != System.IntPtr.Zero)
+            {
+                System.Array.Clear(_l, 0, frames);
+                System.Array.Clear(_r, 0, frames);
+                Native.AF_DirectionBusRender(_dirBus, frames, _l, _r);
+                if (channels >= 2)
+                {
+                    for (int i = 0; i < frames; i++)
+                    {
+                        data[i * channels] += _l[i];
+                        data[i * channels + 1] += _r[i];
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < frames; i++) data[i * channels] += 0.5f * (_l[i] + _r[i]);
                 }
             }
         }

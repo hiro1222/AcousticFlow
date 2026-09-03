@@ -53,6 +53,8 @@ namespace dsp {
 class EarlyReflectConv {
 public:
     static constexpr int kNumBands = 6;
+    // 方向バスへ書くときの ITD の上限（サンプル）。1 ms ≒ 48 本。行の末尾にこのぶんの余裕を持つ。
+    static constexpr int kLaneItdMax = 64;
 
     // 1 タップ。audio thread で毎サンプル sqrt を呼ばないよう、構築時に畳んである。
     struct Tap {
@@ -89,6 +91,12 @@ public:
         // 上の 3 つは VoiceRenderer が HRTF セットから埋める。
         float dir[3] = {0.0f, 0.0f, 1.0f};
         bool  dirValid = false;
+        // ── 方向バス（DirectionBus）行き ──
+        //   隣り合う 2 レーンへ等パワーで振る。laneUse のタップは軽量両耳化もパンも通さず、レーンへ送るだけ。
+        //   VoiceRenderer::setTaps がバスの本数から決める。バスが無ければ false のまま。
+        bool  laneUse = false;
+        int   lane[2] = {-1, -1};
+        float laneW[2] = {0.0f, 0.0f};
     };
 
     /// maxDelaySamples : 履歴リングの長さの目安（早期↔後期の境目ぶん）
@@ -196,7 +204,8 @@ public:
     void processSample(float x, bool hrtfActive,
                        float& outL, float& outR,
                        float& outDiffuseL, float& outDiffuseR, float& outDirect,
-                       float& outHrtfMono) {
+                       float& outHrtfMono,
+                       float* outLanes = nullptr, int laneStride = 1) {
         // 6 帯域に分ける。低域を抜き取った残りを次へ送るので、足すと元に戻る。
         const int wp = writePos_ & ringMask_;
         float rest = x;
@@ -257,6 +266,36 @@ public:
             //   畳み込みは増えず、リングをもう一度読むぶんで済む。
             //   ★index 0（直接音）と HRTF バスに載せたタップはここを通さない。
             //     あちらはフル HRTF が担当なので、二重に方向を付けることになる。
+            // ── 方向バス行き ──
+            //   バスが付いているとき（outLanes != null）、方向のあるタップは隣り合う 2 方向へ等パワーで送る。
+            //   ★ITD はタップ自身の物（earDelay）を「書き先の位置」で付ける。リングは 1 回しか読まない。
+            //     耳ごとに読み直す書き方は、行が 16 本に散る書き込みと合わせて 1 音源 9% → 14% に増えた（実測）。
+            //     遅い耳の行へは f + earDelay の位置に書く（呼び手は行の末尾に kLaneItdMax の余裕を持ち、次の
+            //     チャンクへ持ち越す）。ILD とスペクトルは行の固定 HRIR が担当。
+            //   from/to で方向が違えば from は (1−t)、to は t で両方へ送る（境をまたいでも連続）。HRTF バス行きは従来どおり。
+            if (outLanes && k != 0 && (a.laneUse || b.laneUse)) {
+                bool onHrtfBus = false;
+                if (hrtfActive) { const float hw = a.hrtfW + (b.hrtfW - a.hrtfW) * t; onHrtfBus = hw > 0.0f; }
+                if (!onHrtfBus) {
+                    int off[2];
+                    for (int e = 0; e < 2; ++e) {
+                        const float ed = a.earDelay[e] + (b.earDelay[e] - a.earDelay[e]) * t;
+                        int o = static_cast<int>(ed + 0.5f);
+                        off[e] = (o < 0) ? 0 : (o > kLaneItdMax ? kLaneItdMax : o);
+                    }
+                    if (a.laneUse && t < 1.0f)
+                        for (int q = 0; q < 2; ++q)
+                            if (a.lane[q] >= 0)
+                                for (int e = 0; e < 2; ++e)
+                                    outLanes[(a.lane[q] * 2 + e) * laneStride + off[e]] += sp * a.laneW[q] * (1.0f - t);
+                    if (b.laneUse)
+                        for (int q = 0; q < 2; ++q)
+                            if (b.lane[q] >= 0)
+                                for (int e = 0; e < 2; ++e)
+                                    outLanes[(b.lane[q] * 2 + e) * laneStride + off[e]] += sp * b.laneW[q] * t;
+                    continue;
+                }
+            }
             if (a.earUse && k != 0) {
                 bool skipPan = true;
                 if (hrtfActive) {
@@ -378,6 +417,9 @@ private:
         bool  earUse = false;
         float earDelay[2] = {0.0f, 0.0f};
         float earGain[2][kNumBands] = {{1,1,1,1,1,1}, {1,1,1,1,1,1}};
+        bool  laneUse = false;
+        int   lane[2] = {-1, -1};
+        float laneW[2] = {0.0f, 0.0f};
 
         static RtTap from(const Tap& t) {
             RtTap r;
@@ -387,6 +429,8 @@ private:
             r.gSpec = t.gSpec; r.gDiff = t.gDiff;
             r.hrtfW = t.hrtfWeight;
             r.earUse = t.earUse;
+            r.laneUse = t.laneUse;
+            for (int e = 0; e < 2; ++e) { r.lane[e] = t.lane[e]; r.laneW[e] = t.laneW[e]; }
             for (int e = 0; e < 2; ++e) {
                 r.earDelay[e] = t.earDelay[e];
                 for (int b = 0; b < kNumBands; ++b) r.earGain[e][b] = t.earGain[e][b];
@@ -419,6 +463,13 @@ private:
             a.gSpec += (b.gSpec - a.gSpec) * t;
             a.gDiff += (b.gDiff - a.gDiff) * t;
             a.hrtfW += (b.hrtfW - a.hrtfW) * t;
+            // レーンが同じなら重みを補間、違えば to の側へ乗り換える（途中の写しは稀なので近似でよい）。
+            if (a.laneUse && b.laneUse && a.lane[0] == b.lane[0] && a.lane[1] == b.lane[1]) {
+                for (int e = 0; e < 2; ++e) a.laneW[e] += (b.laneW[e] - a.laneW[e]) * t;
+            } else if (b.laneUse) {
+                a.laneUse = true;
+                for (int e = 0; e < 2; ++e) { a.lane[e] = b.lane[e]; a.laneW[e] = b.laneW[e] * t; }
+            }
             for (int e = 0; e < 2; ++e) {
                 a.earDelay[e] += (b.earDelay[e] - a.earDelay[e]) * t;
                 for (int k = 0; k < kNumBands; ++k)
