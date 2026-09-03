@@ -223,6 +223,20 @@ namespace AcousticFlow
         public static extern int AF_SceneGetEarlyReflections(
             IntPtr scene, int index, [In, Out] AFVector3[] outPos, [Out] float[] outGain6, int maxTaps);
 
+        // 焼く層: 静的な面のリストとセルごとの見通し。戻り値は焼いたセル数。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneBakeStaticFaces(IntPtr scene, float cellSize, int subTaps);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneClearFaceBake(IntPtr scene);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneFaceBakeFaceCount(IntPtr scene);
+
+        // 音響的に動く物のタグ（焼く層に入れない）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetInstanceDynamic(IntPtr scene, int instanceId, int dynamic);
+
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneGetDiffractionSources(
             IntPtr scene, int index, [In, Out] AFVector3[] outPos, [Out] float[] outGain, int maxSrc);

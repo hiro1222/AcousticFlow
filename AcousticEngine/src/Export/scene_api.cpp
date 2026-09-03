@@ -583,6 +583,26 @@ int AF_SceneGetEarlyReflections(AF_SceneHandle scene, int index,
     return n;
 }
 
+int AF_SceneBakeStaticFaces(AF_SceneHandle scene, float cellSize, int subTaps) {
+    Scene* s = asScene(scene);
+    return s ? s->bakeStaticFaces(cellSize, subTaps) : 0;
+}
+
+void AF_SceneClearFaceBake(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    if (s) s->clearFaceBake();
+}
+
+int AF_SceneFaceBakeFaceCount(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    return s ? s->faceBakeFaceCount() : 0;
+}
+
+void AF_SceneSetInstanceDynamic(AF_SceneHandle scene, int instanceId, int dynamic) {
+    Scene* s = asScene(scene);
+    if (s) s->setInstanceDynamic(instanceId, dynamic != 0);
+}
+
 int AF_SceneGetDiffractionSources(AF_SceneHandle scene, int index,
                                   AF_Vector3* outPos, float* outGain, int maxSrc) {
     Scene* s = asScene(scene);

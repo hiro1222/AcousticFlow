@@ -979,6 +979,15 @@ ACOUSTIC_API void AF_SceneGetSourceArrivalDir(AF_SceneHandle scene, int index, f
 ACOUSTIC_API int AF_SceneGetEarlyReflections(AF_SceneHandle scene, int index,
                                              AF_Vector3* outPos, float* outGain6, int maxTaps);
 
+/* 焼く層（2026-09-03、3 層構造の第 1 段）: 静的な面のリストとセルごとの見通しを焼く。
+ *   戻り値は焼いたセル数（0 なら焼けていない＝部屋グラフが無い／面が無い）。
+ *   実行時は 焼いた見通し × 動いた物の遮蔽 × 今の位置と重み で面の線を出す。呼ばなければ生で解く。 */
+ACOUSTIC_API int AF_SceneBakeStaticFaces(AF_SceneHandle scene, float cellSize, int subTaps);
+ACOUSTIC_API void AF_SceneClearFaceBake(AF_SceneHandle scene);
+ACOUSTIC_API int AF_SceneFaceBakeFaceCount(AF_SceneHandle scene);
+/* 音響的に動く物（扉・門・車両）のタグ。焼く層に入れず、最初から実行時の遮蔽として扱う。焼き済みなら焼き直す。 */
+ACOUSTIC_API void AF_SceneSetInstanceDynamic(AF_SceneHandle scene, int instanceId, int dynamic);
+
 /* 回折二次音源。位置とゲインを書き、本数を返す。 */
 ACOUSTIC_API int AF_SceneGetDiffractionSources(AF_SceneHandle scene, int index,
                                                AF_Vector3* outPos, float* outGain, int maxSrc);

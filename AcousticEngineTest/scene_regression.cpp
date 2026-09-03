@@ -4254,6 +4254,122 @@ void testFaceReflections() {
             AF_SceneDestroy(s);
         }
     }
+    // 8) 焼く層: 静的な面の見通しを焼き、実行時は 焼いた見通し × 動いた物の遮蔽。生で解いた物と一致すること。
+    {
+        auto total = [&](AF_SceneHandle s, AF_Vector3 Lp, AF_Vector3 Sp) {
+            const int n = taps(s, Lp, Sp, pos, g);
+            return energyAll(g, n);
+        };
+        // 8a) 静的な箱部屋: 焼き vs 生。
+        {
+            AF_SceneHandle s = boxRoom(4.0f, 1.5f, 3.0f, tr, ab, sc);
+            AF_UpdateConfig c = cfgFor(1, 5, 0);
+            AF_SceneSetUpdateConfig(s, &c);
+            const double eLive = total(s, L, S);
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            const int cells = AF_SceneBakeStaticFaces(s, 1.0f, 5);
+            const double bakeMs = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            const int faces = AF_SceneFaceBakeFaceCount(s);
+            const double eBake = total(s, L, S);
+            std::snprintf(buf, sizeof(buf), "(セル %d / 面 %d / %.0f ms)", cells, faces, bakeMs);
+            check("[焼き] 箱部屋で焼ける（セル > 0、面 6）", cells > 0 && faces == 6, buf);
+            std::snprintf(buf, sizeof(buf), "(生 %.2f dB / 焼き %.2f dB)", dB(eLive), dB(eBake));
+            check("[焼き] 焼いた見通しの答えが生と 0.5 dB 以内", std::fabs(dB(eLive) - dB(eBake)) < 0.5, buf);
+            AF_SceneDestroy(s);
+        }
+        // 8b) 静的な柱: 焼きも生も柱を見る（東の壁の線が柱に隠れる）。
+        {
+            double e[3] = {0, 0, 0};   // 0: 柱なし生 / 1: 柱あり生 / 2: 柱あり焼き
+            for (int k = 0; k < 3; ++k) {
+                AF_SceneHandle s = boxRoom(4.0f, 1.5f, 3.0f, tr, ab, sc);
+                if (k >= 1) {
+                    // 柱は吸い切る材質（反射率 0）。柱の面が鳴って総和が増えないように、遮蔽だけを見る。
+                    const float opq[6] = {0, 0, 0, 0, 0, 0}, ab1[6] = {1, 1, 1, 1, 1, 1};
+                    const int m = AF_SceneAddMaterial(s, opq, ab1, opq, 6);
+                    AF_SceneAddInstanceBox(s, V(2.0f, 1.5f, 0.0f), V(0.3f, 1.5f, 0.3f), V(1,0,0), V(0,1,0), m);
+                }
+                AF_UpdateConfig c = cfgFor(1, 5, 0);
+                AF_SceneSetUpdateConfig(s, &c);
+                if (k == 2) AF_SceneBakeStaticFaces(s, 1.0f, 5);
+                e[k] = total(s, V(-1.0f, 1.6f, 0.0f), V(0.5f, 1.6f, 0.0f));
+                AF_SceneDestroy(s);
+            }
+            std::snprintf(buf, sizeof(buf), "(柱なし %.2f / 柱あり生 %.2f / 柱あり焼き %.2f dB)", dB(e[0]), dB(e[1]), dB(e[2]));
+            check("[焼き] 静的な柱の遮蔽が焼きにも入る（生と 1 dB 以内、柱なしより小さい）",
+                  std::fabs(dB(e[1]) - dB(e[2])) < 1.0 && e[2] < e[0], buf);
+        }
+        // 8c) 焼いた後に扉が動く: 閉扉で焼き → 90° へ動かす → 生の 90° と比べる。
+        {
+            auto doorScene = [&](float deg, int* outDoorId) {
+                AF_SceneHandle s = boxRoom(7.4f, 1.5f, 7.4f, tr, ab, sc);
+                const int m = AF_SceneAddMaterial(s, tr, ab, sc, 6);
+                AF_SceneAddInstanceBox(s, V(-3.75f, 1.5f, 0), V(3.25f, 1.5f, 0.1f), V(1,0,0), V(0,1,0), m);
+                AF_SceneAddInstanceBox(s, V( 3.75f, 1.5f, 0), V(3.25f, 1.5f, 0.1f), V(1,0,0), V(0,1,0), m);
+                const float th = deg * 3.14159265f / 180.0f, cs = std::cos(th), sn = std::sin(th);
+                const int d = AF_SceneAddInstanceBox(s, V(-0.5f + 0.5f * cs, 1.5f, 0.5f * sn), V(0.5f, 1.5f, 0.03f),
+                                                     V(cs, 0, sn), V(0,1,0), m);
+                if (outDoorId) *outDoorId = d;
+                AF_UpdateConfig c = cfgFor(1, 5, 0);
+                AF_SceneSetUpdateConfig(s, &c);
+                return s;
+            };
+            const AF_Vector3 Ld = V(0, 1.6f, -3.0f), Sd = V(0, 1.6f, 3.0f);
+            int doorId = -1;
+            AF_SceneHandle sb = doorScene(0.0f, &doorId);
+            AF_SceneSetInstanceDynamic(sb, doorId, 1);   // 扉は「音響的に動く物」。焼きに入れない
+            const double eLiveClosed = total(sb, Ld, Sd);
+            AF_SceneBakeStaticFaces(sb, 1.0f, 5);
+            const double eBakeClosed = total(sb, Ld, Sd);
+            // 扉を 90° へ（moved になり、焼きから外れて生で扱われる）。
+            const float th = 90.0f * 3.14159265f / 180.0f, cs = std::cos(th), sn = std::sin(th);
+            AF_SceneUpdateInstance(sb, doorId, V(-0.5f + 0.5f * cs, 1.5f, 0.5f * sn), V(0.5f, 1.5f, 0.03f),
+                                   V(cs, 0, sn), V(0,1,0));
+            const double eBakeOpen = total(sb, Ld, Sd);
+            AF_SceneDestroy(sb);
+            AF_SceneHandle so = doorScene(90.0f, nullptr);
+            const double eLiveOpen = total(so, Ld, Sd);
+            AF_SceneDestroy(so);
+            std::snprintf(buf, sizeof(buf), "(閉: 生 %.2f / 焼き %.2f dB)", dB(eLiveClosed), dB(eBakeClosed));
+            check("[焼き] 閉扉で焼いた答えが生と 0.5 dB 以内", std::fabs(dB(eLiveClosed) - dB(eBakeClosed)) < 0.5, buf);
+            std::snprintf(buf, sizeof(buf), "(90°: 焼いた後に動かす %.2f / 生 %.2f dB)", dB(eBakeOpen), dB(eLiveOpen));
+            check("[焼き] 焼いた後に扉を開けても生と 1 dB 以内（動いた物は実行時に拾う）",
+                  std::fabs(dB(eBakeOpen) - dB(eLiveOpen)) < 1.0, buf);
+            // 8e) タグを付け忘れた場合: 静的として焼いた扉が動く → 焼きが stale になり、次の更新で扉を除いて焼き直す。
+            {
+                int d2 = -1;
+                AF_SceneHandle s2 = doorScene(0.0f, &d2);
+                AF_SceneBakeStaticFaces(s2, 1.0f, 5);            // 扉は静的として焼かれる
+                AF_SceneUpdateInstance(s2, d2, V(-0.5f + 0.5f * cs, 1.5f, 0.5f * sn), V(0.5f, 1.5f, 0.03f),
+                                       V(cs, 0, sn), V(0,1,0));  // → moved、焼きは stale
+                const double eStale = total(s2, Ld, Sd);          // 更新の中で焼き直される
+                const int facesAfter = AF_SceneFaceBakeFaceCount(s2);
+                AF_SceneDestroy(s2);
+                std::snprintf(buf, sizeof(buf), "(焼き直し後 %.2f / 生 %.2f dB、面 %d)", dB(eStale), dB(eLiveOpen), facesAfter);
+                check("[焼き] タグ無しで焼いた扉が動いても、焼き直しで生と 1 dB 以内", std::fabs(dB(eStale) - dB(eLiveOpen)) < 1.0, buf);
+            }
+        }
+        // 8d) 費用: 焼きあり／なし の 1 更新。同じ部屋に居るとき（焼きが効く形）。役割1・カタログ・尾は止めて面の線だけを測る。
+        {
+            for (int bake = 0; bake < 2; ++bake) {
+                AF_SceneHandle s = boxRoom(4.0f, 1.5f, 3.0f, tr, ab, sc);
+                const int m = AF_SceneAddMaterial(s, tr, ab, sc, 6);
+                AF_SceneAddInstanceBox(s, V(2.0f, 1.5f, 0.0f), V(0.3f, 1.5f, 0.3f), V(1,0,0), V(0,1,0), m);   // 柱
+                AF_UpdateConfig c = cfgFor(1, 5, 0);
+                c.role1EveryN = 100000; c.catalogEveryN = 100000; c.useEdgeCatalog = 0; c.useReflections = 0;
+                AF_SceneSetUpdateConfig(s, &c);
+                AF_SceneSetListener(s, V(-1.0f, 1.6f, -1.0f)); AF_SceneSetSource(s, 1, V(1.5f, 1.6f, 1.2f));
+                if (bake) AF_SceneBakeStaticFaces(s, 1.0f, 5);
+                for (int k = 0; k < 4; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+                const auto t0 = std::chrono::high_resolution_clock::now();
+                for (int k = 0; k < 200; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+                const double us = std::chrono::duration<double, std::micro>(
+                    std::chrono::high_resolution_clock::now() - t0).count() / 200.0;
+                std::printf("      費用: 面の線 %s  1 更新 %.0f us（面の線だけ・音源 1・箱 7 個・同じ部屋）\n", bake ? "焼きあり" : "焼きなし", us);
+                AF_SceneDestroy(s);
+            }
+        }
+    }
 }
 
 void diagnoseSwingDoorSourceSweep() {

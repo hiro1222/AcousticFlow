@@ -413,6 +413,31 @@ namespace AcousticFlow
             return n;
         }
 
+        // 焼く層（第 1 段）: 静的な面のリストとセルごとの見通しを焼く。戻り値は焼いたセル数。古い DLL なら 0。
+        public int BakeStaticFaces(float cellSize, int subTaps)
+        {
+            if (_handle == IntPtr.Zero) return 0;
+            try { return Native.AF_SceneBakeStaticFaces(_handle, cellSize, subTaps); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+        public void ClearFaceBake()
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneClearFaceBake(_handle); } catch (EntryPointNotFoundException) { }
+        }
+        public int FaceBakeFaceCount()
+        {
+            if (_handle == IntPtr.Zero) return 0;
+            try { return Native.AF_SceneFaceBakeFaceCount(_handle); } catch (EntryPointNotFoundException) { return 0; }
+        }
+        // 音響的に動く物（扉など）のタグ。焼く層に入れず、実行時の遮蔽として扱う。古い DLL なら無視。
+        public void SetInstanceDynamic(int instanceId, bool dynamic)
+        {
+            if (_handle == IntPtr.Zero || instanceId < 0) return;
+            try { Native.AF_SceneSetInstanceDynamic(_handle, instanceId, dynamic ? 1 : 0); }
+            catch (EntryPointNotFoundException) { }
+        }
+
         // 回折二次音源。位置とゲインを受け、本数を返す。
         public int GetDiffractionSources(int index, Vector3[] outPos, float[] outGain)
         {

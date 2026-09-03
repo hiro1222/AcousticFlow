@@ -66,3 +66,8 @@ s_b はハイシェルフ 2 パラメータで近似せず、材質の帯域別 
 - Test_SwingDoor で耳で聴く（F で ON/OFF、`earlyReflectModel` で新旧）。
 - 左右相関の測定（HRTF 試験に足す）。足りなければ全通過のデコリレーション。
 - 採用が固まったら `earlyModel = 0` 側（`computeEarlyReflectionsMulti`）を消す。
+
+## 焼く層（同日追記）
+見通し vis を「静的な面 × 1 m セル」で焼き、実行時は 焼いた見通し（8 セルの三線形補間）× 動いた物の遮蔽 × 今の位置と重み。
+規則は「焼くのは部屋の中の見通しだけ、口をまたぐ脚は生」。詳細と数字は docs/BAKE_RUNTIME_LAYERS.md。
+`AF_SceneBakeStaticFaces` を呼ばなければ今までどおり全部生（同じ式なので答えは同じ）。

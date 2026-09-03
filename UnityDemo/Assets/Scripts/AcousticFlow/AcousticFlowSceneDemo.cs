@@ -323,6 +323,13 @@ namespace AcousticFlow
         [Range(0, 1)] public int earlyReflectModel = 1;
         [Tooltip("面 1 枚あたりの下位タップ数（面の線の分割数）。3〜5。")]
         [Range(1, 8)] public int earlyFaceSubTaps = 5;
+        [Tooltip("ON: 起動時に静的な面のリストとセルごとの見通しを焼く（3 層構造の焼く層）。実行時は 焼いた見通し × 動いた物の遮蔽。OFF なら毎回生で解く（A/B 用。答えは同じ）。")]
+        public bool bakeStaticFaces = true;
+        [Tooltip("焼くセルの一辺(m)。小さいほど正確で重い。1 m で 15 m 角の部屋 675 セル。")]
+        [Range(0.5f, 2f)] public float bakeCellSize = 1f;
+        [Tooltip("音響的に動く物（扉・門・車両）。この配下のコライダは焼く層に入れず、最初から実行時の遮蔽として扱う。"
+                 + "SwingDoor が付いた物と Rigidbody 付きは自動で動く物になる。タグを忘れても、動いた瞬間に焼き直す（1 回だけ重い）。")]
+        public Transform[] dynamicOccluders;
         [Tooltip("像源レイ模型（earlyReflectModel=0）のときの反射タップ数。面の線では使わない（面数 × 下位タップ数、上限 48）。")]
         [Range(1, 8)] public int earlyReflectTaps = 4;
         [Tooltip("早期反射抽出のレイ本数（音源ごと）。多いほど角度分解能が上がり、"
@@ -774,6 +781,7 @@ namespace AcousticFlow
             CollectOccluders();
             RegisterInstances();
             CollectPortals();
+            BakeStaticFaces();
             SetupCamera();
             // DSP 経路（C# の IrConvolver ⇔ C++ の VoiceConvolver）。両方シーンに載せて片方だけ enabled にする。
             //   実機の HUD で「音声なし」と出ていたのがその証拠（_audioReady == false）。
@@ -954,6 +962,35 @@ namespace AcousticFlow
         // シーンに置かれた AcousticPortal を集めてエンジンへ登録する。
         //   ホストが持つのは**トポロジだけ**（ここが開口である、という事実）。
         //   開き具合は渡さない ── エンジンが毎フレーム実形状から測る。
+        // 焼く層（第 1 段）: 静的な面の見通しを焼く。幾何が揃った後（RegisterInstances / CollectPortals の後）に呼ぶ。
+        //   焼くのは構造で、答えではない。動いた物は moved で焼きから外れ、実行時に生で扱われる。
+        private int _bakeCells, _bakeFaces;
+        private float _bakeMs;
+        private int _bakeDynamic;
+        private void BakeStaticFaces()
+        {
+            if (_scene == null || !_scene.IsValid) return;
+            if (!bakeStaticFaces) { _scene.ClearFaceBake(); _bakeCells = 0; _bakeFaces = 0; _bakeMs = 0f; return; }
+            // 動く物のタグ（焼く前に付ける）。
+            int dyn = 0;
+            for (int i = 0; i < _occluders.Count; i++)
+            {
+                var o = _occluders[i];
+                if (o.col == null || o.instanceId < 0) continue;
+                bool d = o.col.GetComponentInParent<SwingDoor>() != null || o.col.attachedRigidbody != null;
+                if (!d && dynamicOccluders != null)
+                    foreach (var t in dynamicOccluders)
+                        if (t != null && o.col.transform.IsChildOf(t)) { d = true; break; }
+                if (d) { _scene.SetInstanceDynamic(o.instanceId, true); dyn++; }
+            }
+            _bakeDynamic = dyn;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            _bakeCells = _scene.BakeStaticFaces(bakeCellSize, Mathf.Clamp(earlyFaceSubTaps, 1, 8));
+            _bakeFaces = _scene.FaceBakeFaceCount();
+            _bakeMs = (float)sw.Elapsed.TotalMilliseconds;
+            Debug.Log($"[AcousticFlowScene] 面の焼き: 面 {_bakeFaces} / セル {_bakeCells} / {_bakeMs:F0} ms ／ 動く物 {_bakeDynamic}");
+        }
+
         private void CollectPortals()
         {
             _portals.Clear();
@@ -2507,6 +2544,7 @@ namespace AcousticFlow
                 GUILayout.Label($"回折候補(主音源): {_diffCandCount} 本合成 (水色=最短) (C)", style);
             GUILayout.Label($"早期反射(IR の R タップ・{(earlyReflectModel == 1 ? "面の線" : "像源レイ")}): {(enableEarlyReflections ? "ON" : "OFF")} (F)   "
                             + $"回折二次音源(IR の F タップ): {(enableDiffractionSources ? "ON" : "OFF")} (V)", style);
+            GUILayout.Label($"焼き(面の見通し): {(bakeStaticFaces ? $"面 {_bakeFaces} / セル {_bakeCells} / {_bakeMs:F0} ms ／ 動く物 {_bakeDynamic}" : "OFF（生で解く）")}", style);
             // 扉の開き角。音を判断する前提なので数字でも出す（見た目だけだと追えない）。
             if (_swingDoors == null)
                 _swingDoors = FindObjectsByType<SwingDoor>(
