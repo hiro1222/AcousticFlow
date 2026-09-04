@@ -7966,6 +7966,140 @@ void testAsyncUpdate() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 【探り】既知の不具合の現状を数字で採る（AF_ONLY=issues でだけ走る。合否は付けない）
+//   docs/SOUND_REVIEW_2026-09-04.md §2.3 の #5 #6 #7 #12。直す前に「いまどうか」を測る物差し。
+// ─────────────────────────────────────────────────────────────────────
+void probeKnownIssues() {
+    std::printf("\n[探り] 既知の不具合の現状\n");
+    const float h = 3.0f, t = 0.3f;
+    // 部屋 8 × 8 × 3 m、+z の壁に幅 doorW の戸口（外へ開く。外には何も無い）
+    auto buildRoomWithDoor = [&](float doorW, float seed) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        const float hw = 4.0f, hd = 4.0f;
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        if (doorW > 0.0f) {
+            const float side = (2.0f * hw - doorW) * 0.5f;            // 戸口の左右の壁
+            AF_SceneAddInstanceBox(s, V(-(doorW*0.5f + side*0.5f), h*0.5f, hd+t), V(side*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V( (doorW*0.5f + side*0.5f), h*0.5f, hd+t), V(side*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, (2.1f + h) * 0.5f, hd+t), V(doorW*0.5f, (h - 2.1f) * 0.5f, t), V(1,0,0), V(0,1,0), m);   // まぐさ（戸口の高さ 2.1）
+        } else {
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        }
+        if (seed > 0.0f) AF_SceneSetRoomSeedRadius(s, seed);
+        AF_SceneSetAutoPortals(s, 1);
+        AF_SceneSetListener(s, V(0, 1.6f, 0));
+        AF_SceneSetSource(s, 1, V(-2.0f, 1.6f, -2.0f));
+        return s;
+    };
+    char note[240]; (void)note;
+
+    // #5 V/RT60 の混ぜ（RoomWeights）: 外へ開く戸口を中→外へ歩く。0.1 m 刻みで V と RT60(1k) と空間版の重みの段差
+    {
+        AF_SceneHandle s = buildRoomWithDoor(1.2f, 0.8f);   // 種 0.8: 既定 0.6 だと 1.2 m の戸口で部屋が 0 個になる（#7）
+        for (int k = 0; k < 8; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        std::printf("      #5 外へ開く戸口（幅 1.2 m）を中 z=0 → 外 z=8 へ歩く（0.1 m 刻み、混ぜ半径 2.0 m、種 0.8）\n");
+        std::printf("           z      部屋  V(m3)   RT60 1k   空間版の重み(部屋0)\n");
+        float prevV = -1.0f, prevRt = -1.0f, prevW = -1.0f; float maxDv = 0.0f, maxDrt = 0.0f, maxDw = 0.0f; float atV = 0, atRt = 0, atW = 0;
+        for (int i = 0; i <= 80; ++i) {
+            const float z = 0.1f * i;
+            const AF_Vector3 p = V(0, 1.6f, z);
+            const float vol = AF_SceneRoomVolumeAt(s, p, 2.0f);
+            float rt[kBands] = {}; AF_SceneRt60At(s, p, 2.0f, rt, kBands);
+            int rooms[4]; float w[4]; const int nw = AF_SceneRoomShareAt(s, p, 2.0f, rooms, w, 4);
+            float w0 = 0.0f; for (int k = 0; k < nw; ++k) if (rooms[k] == 0) w0 = w[k];
+            const int room = AF_SceneRoomAt(s, p);
+            if (i % 5 == 0 || (prevV >= 0 && std::fabs(vol - prevV) > 10.0f))
+                std::printf("         %5.1f   %3d   %6.1f   %6.2f    %5.3f\n", z, room, vol, rt[3], w0);
+            if (prevV >= 0) {
+                if (std::fabs(vol - prevV) > maxDv) { maxDv = std::fabs(vol - prevV); atV = z; }
+                if (std::fabs(rt[3] - prevRt) > maxDrt) { maxDrt = std::fabs(rt[3] - prevRt); atRt = z; }
+                if (std::fabs(w0 - prevW) > maxDw) { maxDw = std::fabs(w0 - prevW); atW = z; }
+            }
+            prevV = vol; prevRt = rt[3]; prevW = w0;
+        }
+        std::printf("        → 1 歩(0.1 m)の最大段差: V %.1f m3 @ z=%.1f ／ RT60 %.2f s @ z=%.1f ／ 空間版の重み %.3f @ z=%.1f\n", maxDv, atV, maxDrt, atRt, maxDw, atW);
+        AF_SceneDestroy(s);
+    }
+    // #6 エコグラムの跳ね返り 24 回: 尾が何 ms で切れるか（閉じた部屋、1 kHz、ピーク比 −60 dB を割る最後のビン）
+    {
+        for (int bounces : {24, 96}) {
+            AF_SceneHandle s = buildRoomWithDoor(0.0f, 0.0f);
+            AF_UpdateConfig cfg{};
+            cfg.role1EveryN = 1; cfg.role2EveryN = 1; cfg.earlyEveryN = 1; cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 1;
+            cfg.reflectionRays = 256; cfg.reflectionBounces = 6; cfg.directWeight = 1.0f; cfg.useReflections = 1;
+            cfg.useEdgeCatalog = 1; cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+            cfg.enableReverb = 1; cfg.echogramBins = 100; cfg.echogramBinSeconds = 0.01f; cfg.echogramRays = 512; cfg.echogramBounces = bounces;
+            cfg.speedOfSound = 343.0f; cfg.distanceRef = 1.5f;
+            cfg.enableEarlyReflections = 1; cfg.earlyTaps = 48; cfg.earlyRays = 512; cfg.earlyBounces = 2;
+            cfg.enableDiffractionSources = 1; cfg.diffSources = 3; cfg.earlyModel = 1; cfg.earlyFaceSubTaps = 5;
+            AF_SceneSetUpdateConfig(s, &cfg);
+            for (int k = 0; k < 12; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+            float bins[100 * kBands] = {};
+            const int nb = AF_SceneGetEchogramBands(s, AF_SceneSourceIndex(s, 1), bins, 100);
+            float peak = 0.0f; for (int i = 0; i < nb; ++i) peak = std::max(peak, bins[i * kBands + 3]);
+            int last = -1; for (int i = 0; i < nb; ++i) if (bins[i * kBands + 3] > peak * 1e-6f) last = i;
+            int last40 = -1; for (int i = 0; i < nb; ++i) if (bins[i * kBands + 3] > peak * 1e-4f) last40 = i;
+            float rt[kBands] = {}; AF_SceneRt60At(s, V(0, 1.6f, 0), 2.0f, rt, kBands);
+            std::printf("      #6 跳ね返り %3d 回: 尾(1 kHz)が −60 dB を割る最後のビン %d (= %d ms) ／ −40 dB %d ms ／ RT60(1k) %.2f s ／ 8×8×3 m 無吸収\n",
+                        bounces, last, last * 10, last40 * 10, rt[3]);
+            AF_SceneDestroy(s);
+        }
+    }
+    // #7 種の半径と戸口幅: 半径 0.6 / 0.8 / 1.0、戸口 1.0 / 1.4 / 2.0 m で部屋の数
+    {
+        std::printf("      #7 部屋の数（行: 種の半径、列: 戸口幅 1.0 / 1.4 / 2.0 m、外へ開く。期待は 1）\n");
+        for (float seed : {0.6f, 0.8f, 1.0f}) {
+            std::printf("         種 %.1f m:", seed);
+            for (float dw : {1.0f, 1.4f, 2.0f}) {
+                AF_SceneHandle s = buildRoomWithDoor(dw, seed);
+                for (int k = 0; k < 2; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+                const int n = AF_SceneRoomCount(s);
+                const int at = AF_SceneRoomAt(s, V(0, 1.6f, 0));
+                std::printf("   %d 部屋(中央は %d)", n, at);
+                AF_SceneDestroy(s);
+            }
+            std::printf("\n");
+        }
+    }
+    // #12 保持の探りの周期: 20 本、厳密 4・簡易 2。衝立の裏の遠い音源が保持のとき、衝立を消してから生存が戻るまでのフレーム
+    {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        const float hw = 9.0f, hd = 9.0f, H = 4.0f;
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, H+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, H*0.5f, 0), V(t, H*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, H*0.5f, 0), V(t, H*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, H*0.5f, -hd-t), V(hw+t, H*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, H*0.5f,  hd+t), V(hw+t, H*0.5f, t), V(1,0,0), V(0,1,0), m);
+        const int screen = AF_SceneAddInstanceBox(s, V(6.0f, H*0.5f, 0), V(0.3f, H*0.5f, 3.0f), V(1,0,0), V(0,1,0), m);
+        AF_SceneSetListener(s, V(-8.0f, 1.6f, 0));
+        const int N = 20;
+        for (int i = 0; i < N; ++i) AF_SceneSetSource(s, static_cast<unsigned long long>(1 + i), V(-6.5f + i * 0.75f, 1.6f, (i % 2) ? 0.5f : -0.5f));   // 最後の数本は衝立の裏（x > 6）
+        AF_SceneSetTierBudget(s, 4, 2);
+        for (int k = 0; k < 180; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        int held = 0; for (int i = 0; i < N; ++i) if (AF_SceneGetSourceTierEffective(s, AF_SceneSourceIndex(s, 1 + i)) == 3) ++held;
+        const int idx = AF_SceneSourceIndex(s, N);
+        float b0[kBands] = {}; AF_SceneGetSourceOcclusion(s, idx, b0);
+        AF_SceneSetInstanceActive(s, screen, 0);                       // 衝立が消える（扉が開く代わり）
+        int frames = -1;
+        for (int k = 0; k < 240; ++k) {
+            AF_SceneUpdate(s, 1.0f / 60.0f);
+            float b[kBands] = {}; AF_SceneGetSourceOcclusion(s, idx, b);
+            if (b[5] > 0.9f) { frames = k + 1; break; }
+        }
+        std::printf("      #12 20 本・厳密 4・簡易 2 → 保持 %d 本。衝立の裏の音源(段 %d, 生存 4k %.3f)が、衝立が消えてから生存 >0.9 に戻るまで %d フレーム（探り 1 本/フレーム）\n",
+                    held, AF_SceneGetSourceTierEffective(s, idx), b0[5], frames);
+        AF_SceneDestroy(s);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 【調整支援】「この地点でこう聞こえてほしい」に合わせるための土台
 //
 //   道具の流れ:
@@ -11514,6 +11648,7 @@ int main() {
     if (const char* only = std::getenv("AF_ONLY")) {
         if (std::strcmp(only, "async") == 0) testAsyncUpdate();
         else if (std::strcmp(only, "tier") == 0) testTierBudget();
+        else if (std::strcmp(only, "issues") == 0) probeKnownIssues();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }
