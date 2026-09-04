@@ -826,6 +826,41 @@ namespace AcousticFlow
             catch (System.Exception) { return -1; }
         }
 
+        // ── 更新の非同期化（主スレッドの上限）──
+        //   ON: Update は解かずに帰り（数 µs）、DLL のワーカースレッドが解く。設定は待ち行列で次の着手に効き、
+        //   結果（遮蔽・タップ・尾・段）は 1 フレーム前の入力に対する写しから返る。幾何の問い合わせは解く段と並走する。
+        //   ⚠ Dispose（AF_SceneDestroy）は仕事を待ってから畳む。OnDisable で必ず Dispose すること。
+        public void SetAsync(bool on)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneSetAsync(_handle, on ? 1 : 0); }
+            catch (System.Exception) { }   // 古い DLL: 同期のまま
+        }
+        public bool IsAsync
+        {
+            get
+            {
+                if (_handle == IntPtr.Zero) return false;
+                try { return Native.AF_SceneIsAsync(_handle) != 0; }
+                catch (System.Exception) { return false; }
+            }
+        }
+        /// 走っている仕事を待ち、答えを写す（「このフレームの答えが要る」とき。毎フレーム呼ぶと同期と同じ費用になる）。
+        public void AsyncWait()
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneAsyncWait(_handle); }
+            catch (System.Exception) { }
+        }
+        /// 統計: ワーカーの計算時間(ms)、写しの古さ(フレーム)、追いつかず投げられなかったフレーム数、待ち行列の長さ。
+        public void GetUpdateStats(out float computeMs, out int lagFrames, out int skippedFrames, out int queued)
+        {
+            computeMs = 0f; lagFrames = 0; skippedFrames = 0; queued = 0;
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneGetUpdateStats(_handle, out computeMs, out lagFrames, out skippedFrames, out queued); }
+            catch (System.Exception) { }
+        }
+
         // ── キャプチャ（サウンドデバッグツール）──────────────────────
         //   起動時に CaptureBegin を呼んだら、あとは何もしなくてよい（Update の中で溜まる）。
         //   「いま変だった」と思ったら CaptureMark。前後が揃うと Status が 2 になる。

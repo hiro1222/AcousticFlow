@@ -16,12 +16,14 @@
 #include "Core/aabb.h"
 #include "Core/material.h"
 #include "Core/scene.h"
+#include "Core/scene_async.h"   // 更新の非同期化（待ち行列・写し・共有ロック）
 #include "Core/vec3.h"
 
 using acoustic::AcousticMaterial;
 using acoustic::kNumBands;
 using acoustic::Obb;
 using acoustic::Scene;
+using acoustic::SceneBox;
 using acoustic::SceneHit;
 using acoustic::Vec3;
 
@@ -31,7 +33,16 @@ inline Vec3 toVec3(const AF_Vector3& v) { return Vec3(v.x, v.y, v.z); }
 
 inline AF_Vector3 fromVec3(const Vec3& v) { return AF_Vector3{ v.x, v.y, v.z }; }
 
-inline Scene* asScene(AF_SceneHandle h) { return static_cast<Scene*>(h); }
+// ── 口の分類（docs/ASYNC_UPDATE.md）──
+//   asBox       … 箱（Scene ＋ 非同期の仕組み）
+//   SyncGuard   … 稀な同期の口（構築・焼き・書き出し・キャプチャ操作）。仕事を待ち、待ち行列を反映してから排他で入る
+//   ReadGuard   … 幾何の問い合わせ。共有ロック（解く段と並走、作り直しの段とは待ち合う）
+//   post        … 設定。非同期なら待ち行列へ（着手のとき順に適用）、同期なら即時
+//   snapshot    … 結果のゲッタ。非同期なら写し、同期なら Scene 自身
+//   同期モードでは全部が素通しで、従来と同じ。
+inline SceneBox* asBox(AF_SceneHandle h) { return static_cast<SceneBox*>(h); }
+using SyncGuard = SceneBox::SyncGuard;
+using ReadGuard = SceneBox::ReadGuard;
 
 // 半サイズと right/up から OBB を作る。right/up が退化していれば軸並行にフォールバック。
 Obb makeObb(const AF_Vector3& center, const AF_Vector3& half,
@@ -64,9 +75,9 @@ AcousticMaterial makeMaterial(const float* transmission, const float* absorption
 
 extern "C" {
 
-AF_SceneHandle AF_SceneCreate(void) { return new (std::nothrow) Scene(); }
+AF_SceneHandle AF_SceneCreate(void) { return new (std::nothrow) SceneBox(); }
 
-void AF_SceneDestroy(AF_SceneHandle scene) { delete asScene(scene); }
+void AF_SceneDestroy(AF_SceneHandle scene) { delete asBox(scene); }   // 仕事を待ってから畳む
 
 int AF_MaterialPresetBands(int preset, float* outTransmission,
                            float* outAbsorption, float* outScattering) {
@@ -89,7 +100,7 @@ int AF_MaterialPresetBands(int preset, float* outTransmission,
 int AF_SceneAddMaterial(AF_SceneHandle scene,
                         const float* transmission, const float* absorption,
                         const float* scattering, int numBands) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return -1;
     return s->addMaterial(makeMaterial(transmission, absorption, scattering, numBands));
 }
@@ -97,7 +108,7 @@ int AF_SceneAddMaterial(AF_SceneHandle scene,
 int AF_SceneGetMaterial(AF_SceneHandle scene, int materialId,
                         float* outTransmission, float* outAbsorption,
                         float* outScattering, int count) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || count <= 0) return 0;
     if (materialId < 0 || materialId >= s->materialCount()) return 0;
     const AcousticMaterial& m = s->materialAt(materialId);
@@ -113,44 +124,51 @@ int AF_SceneGetMaterial(AF_SceneHandle scene, int materialId,
 int AF_SceneSetMaterial(AF_SceneHandle scene, int materialId,
                         const float* transmission, const float* absorption,
                         const float* scattering, int numBands) {
-    Scene* s = asScene(scene);
-    if (!s) return 0;
-    return s->setMaterial(materialId,
-                          makeMaterial(transmission, absorption, scattering, numBands)) ? 1 : 0;
+    SceneBox* b = asBox(scene);
+    if (!b) return 0;
+    const AcousticMaterial m = makeMaterial(transmission, absorption, scattering, numBands);
+    if (!b->async()) return b->scene.setMaterial(materialId, m) ? 1 : 0;
+    b->post([materialId, m](Scene& s) { s.setMaterial(materialId, m); });
+    return (materialId >= 0 && materialId < b->scene.materialCount()) ? 1 : 0;   // 非同期: 範囲だけ答える
 }
 
 int AF_SceneSetInstanceMaterial(AF_SceneHandle scene, int instanceId, int materialId) {
-    Scene* s = asScene(scene);
-    if (!s) return 0;
-    return s->setInstanceMaterial(instanceId, materialId) ? 1 : 0;
+    SceneBox* b = asBox(scene);
+    if (!b) return 0;
+    if (!b->async()) return b->scene.setInstanceMaterial(instanceId, materialId) ? 1 : 0;
+    b->post([instanceId, materialId](Scene& s) { s.setInstanceMaterial(instanceId, materialId); });
+    return (instanceId >= 0 && instanceId < b->scene.instanceCount()
+            && materialId >= 0 && materialId < b->scene.materialCount()) ? 1 : 0;
 }
 
 int AF_SceneGetInstanceMaterial(AF_SceneHandle scene, int instanceId) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? s->instanceMaterial(instanceId) : -1;
 }
 
 int AF_SceneAddInstanceBox(AF_SceneHandle scene,
                            AF_Vector3 center, AF_Vector3 halfExtents,
                            AF_Vector3 right, AF_Vector3 up, int materialId) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return -1;
     return s->addInstance(makeObb(center, halfExtents, right, up), materialId);
 }
 
 void AF_SceneSetApertureOpen(AF_SceneHandle scene, float ref, float power,
                              float radius, int samples) {
-    Scene* s = asScene(scene);
-    if (!s) return;
-    s->setApertureOpenRef(ref);
-    s->setApertureOpenPower(power);
-    s->setApertureOpenRadius(radius);
-    s->setApertureOpenSamples(samples);
+    SceneBox* b = asBox(scene);
+    if (!b) return;
+    b->post([ref, power, radius, samples](Scene& s) {
+        s.setApertureOpenRef(ref);
+        s.setApertureOpenPower(power);
+        s.setApertureOpenRadius(radius);
+        s.setApertureOpenSamples(samples);
+    });
 }
 
 void AF_SceneGetApertureOpen(AF_SceneHandle scene, float* outRef, float* outPower,
                              float* outRadius, int* outSamples) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (outRef)     *outRef     = s ? s->apertureOpenRef() : 0.0f;
     if (outPower)   *outPower   = s ? s->apertureOpenPower() : 0.0f;
     if (outRadius)  *outRadius  = s ? s->apertureOpenRadius() : 0.0f;
@@ -158,7 +176,7 @@ void AF_SceneGetApertureOpen(AF_SceneHandle scene, float* outRef, float* outPowe
 }
 
 float AF_SceneMeasureSlitWidth(AF_SceneHandle scene, AF_Vector3 listener, AF_Vector3 source) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0.0f;
     const Vec3 l = toVec3(listener), src = toVec3(source);
     Scene::DiffractionPath paths[4];
@@ -169,7 +187,7 @@ float AF_SceneMeasureSlitWidth(AF_SceneHandle scene, AF_Vector3 listener, AF_Vec
 
 float AF_SceneMeasureApertureOpenness(AF_SceneHandle scene, AF_Vector3 listener,
                                       AF_Vector3 source) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0.0f;
     // 最有力の開口での開口率を返す。開口点はホストからは取れない（二次音源が返すのは
     // 定位用に投影し直した位置）ので、ここで探索してから測る。
@@ -182,7 +200,7 @@ float AF_SceneMeasureApertureOpenness(AF_SceneHandle scene, AF_Vector3 listener,
 
 void AF_SceneMeasureLeakPoint(AF_SceneHandle scene, AF_Vector3 listener,
                               AF_Vector3 source, AF_Vector3* outPoint) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outPoint) return;
     float t[kNumBands]; float frac = 0.0f; Vec3 p = toVec3(source);
     s->computeSoftOcclusion(toVec3(listener), toVec3(source), t, frac, 32, 0.9f, &p);
@@ -192,7 +210,7 @@ void AF_SceneMeasureLeakPoint(AF_SceneHandle scene, AF_Vector3 listener,
 int AF_SceneComputeSoftOcclusion(AF_SceneHandle scene,
                                  AF_Vector3 listener, AF_Vector3 source,
                                  float* outTrans, int count, float* outOccFrac) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outTrans || count <= 0) return 0;
     float t[kNumBands];
     float frac = 0.0f;
@@ -207,7 +225,7 @@ int AF_SceneComputeDiffractionKirchhoff(AF_SceneHandle scene,
                                         AF_Vector3 listener, AF_Vector3 source,
                                         float* outGains, int count,
                                         AF_Vector3* outAperture, float* outPathLength) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outGains || count <= 0) return 0;
     float gain[kNumBands];
     Vec3 ap; float pl = 0.0f;
@@ -222,7 +240,7 @@ int AF_SceneComputeDiffractionKirchhoff(AF_SceneHandle scene,
 void AF_SceneProbeDirectionalEnergy(AF_SceneHandle scene, AF_Vector3 origin,
                                     const AF_Vector3* dirs, int dirCount,
                                     int maxBounces, float* outEnergy) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !dirs || !outEnergy || dirCount <= 0) return;
     std::vector<Vec3> d(static_cast<size_t>(dirCount));
     for (int i = 0; i < dirCount; ++i) d[static_cast<size_t>(i)] = toVec3(dirs[i]);
@@ -233,7 +251,7 @@ int AF_SceneAddMesh(AF_SceneHandle scene,
                     const float* verticesXYZ, int vertexCount,
                     const int* indices, int indexCount,
                     AF_Vector3* outLocalCenter, AF_Vector3* outLocalHalfExtents) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return -1;
     Vec3 c, h;
     const int id = s->addMesh(verticesXYZ, vertexCount, indices, indexCount, &c, &h);
@@ -244,13 +262,13 @@ int AF_SceneAddMesh(AF_SceneHandle scene,
 }
 
 int AF_SceneGetMeshEdgeCount(AF_SceneHandle scene, int geomId) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return -1;
     return s->meshEdgeCount(geomId);
 }
 
 void AF_SceneRemoveMesh(AF_SceneHandle scene, int geomId) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return;
     s->removeMesh(geomId);
 }
@@ -258,7 +276,7 @@ void AF_SceneRemoveMesh(AF_SceneHandle scene, int geomId) {
 int AF_SceneAddInstanceMesh(AF_SceneHandle scene, int geomId,
                             AF_Vector3 center, AF_Vector3 halfExtents,
                             AF_Vector3 right, AF_Vector3 up, int materialId) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return -1;
     return s->addInstance(makeObb(center, halfExtents, right, up), materialId, geomId);
 }
@@ -266,26 +284,26 @@ int AF_SceneAddInstanceMesh(AF_SceneHandle scene, int geomId,
 void AF_SceneUpdateInstance(AF_SceneHandle scene, int instanceId,
                             AF_Vector3 center, AF_Vector3 halfExtents,
                             AF_Vector3 right, AF_Vector3 up) {
-    Scene* s = asScene(scene);
-    if (!s) return;
-    s->updateInstanceTransform(instanceId, makeObb(center, halfExtents, right, up));
+    SceneBox* b = asBox(scene);
+    if (!b) return;
+    const Obb o = makeObb(center, halfExtents, right, up);
+    b->post([instanceId, o](Scene& s) { s.updateInstanceTransform(instanceId, o); });
 }
 
 void AF_SceneSetInstanceActive(AF_SceneHandle scene, int instanceId, int active) {
-    Scene* s = asScene(scene);
-    if (!s) return;
-    s->setInstanceActive(instanceId, active != 0);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([instanceId, active](Scene& s) { s.setInstanceActive(instanceId, active != 0); });
 }
 
 void AF_SceneClearInstances(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (s) s->clearInstances();
 }
 
 int AF_SceneComputeTransmissionBands(AF_SceneHandle scene,
                                      AF_Vector3 from, AF_Vector3 to,
                                      float* outGains, int count) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outGains || count <= 0) return 0;
     float gain[kNumBands];
     s->computeTransmission(toVec3(from), toVec3(to), gain);
@@ -296,14 +314,14 @@ int AF_SceneComputeTransmissionBands(AF_SceneHandle scene,
 }
 
 int AF_SceneIsOccluded(AF_SceneHandle scene, AF_Vector3 from, AF_Vector3 to) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0;
     return s->isOccluded(toVec3(from), toVec3(to)) ? 1 : 0;
 }
 
 float AF_SceneRaycast(AF_SceneHandle scene, AF_Vector3 origin, AF_Vector3 dir,
                       float maxDist) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return -1.0f;
     const SceneHit hit = s->raycastClosest(toVec3(origin), toVec3(dir), maxDist);
     return hit.hit ? hit.t : -1.0f;
@@ -312,7 +330,7 @@ float AF_SceneRaycast(AF_SceneHandle scene, AF_Vector3 origin, AF_Vector3 dir,
 int AF_SceneComputeDiffractionBands(AF_SceneHandle scene,
                                     AF_Vector3 from, AF_Vector3 to,
                                     float* outGains, int count) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outGains || count <= 0) return 0;
     float gain[kNumBands];
     s->computeDiffraction(toVec3(from), toVec3(to), gain);
@@ -324,7 +342,7 @@ int AF_SceneComputeDiffractionBands(AF_SceneHandle scene,
 int AF_SceneComputeDiffractionBandsUtd(AF_SceneHandle scene,
                                        AF_Vector3 from, AF_Vector3 to,
                                        float* outGains, int count) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outGains || count <= 0) return 0;
     const Vec3 f = toVec3(from), t = toVec3(to);
     float gain[kNumBands];
@@ -336,7 +354,7 @@ int AF_SceneComputeDiffractionBandsUtd(AF_SceneHandle scene,
 
 float AF_SceneDiffractionPath(AF_SceneHandle scene, AF_Vector3 from, AF_Vector3 to,
                               AF_Vector3* outMidPoint) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return -1.0f;
     Vec3 p{0.0f, 0.0f, 0.0f};
     const float delta = s->diffractionDetour(toVec3(from), toVec3(to), p);
@@ -350,7 +368,7 @@ float AF_SceneDiffractionPath(AF_SceneHandle scene, AF_Vector3 from, AF_Vector3 
 
 int AF_SceneDiffractionCandidates(AF_SceneHandle scene, AF_Vector3 from, AF_Vector3 to,
                                   AF_Vector3* outPoints, float* outDeltas, int maxCount) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outPoints || !outDeltas || maxCount <= 0) return 0;
     std::vector<Vec3> pts(static_cast<size_t>(maxCount));
     const int n = s->diffractionCandidates(toVec3(from), toVec3(to), pts.data(), outDeltas, maxCount);
@@ -364,7 +382,7 @@ int AF_SceneDiffractionCandidates(AF_SceneHandle scene, AF_Vector3 from, AF_Vect
 
 int AF_SceneComputeDiffractionSources(AF_SceneHandle scene, AF_Vector3 listener, AF_Vector3 source,
                                       AF_Vector3* outPos, float* outGain, int maxN) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outPos || !outGain || maxN <= 0) return 0;
     std::vector<Vec3> pos(static_cast<size_t>(maxN));
     const int n = s->computeDiffractionSources(toVec3(listener), toVec3(source),
@@ -379,7 +397,7 @@ int AF_SceneComputeDiffractionSources(AF_SceneHandle scene, AF_Vector3 listener,
 
 float AF_SceneOcclusionReflected(AF_SceneHandle scene, AF_Vector3 source, AF_Vector3 listener,
                                  float* outBands6, int numRays, int maxBounces) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0.0f;
     return s->occlusionReflected(toVec3(source), toVec3(listener), outBands6, numRays, maxBounces);
 }
@@ -388,7 +406,7 @@ void AF_SceneOcclusionReflectedMulti(AF_SceneHandle scene, AF_Vector3 listener,
                                      const AF_Vector3* sources, int count,
                                      float* outOcc, float* outBands, float* outDir,
                                      float directWeight, int numRays, int maxBounces) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !sources || count <= 0) return;
     // 境界の AF_Vector3 配列を Core の Vec3 へ詰め替える。
     std::vector<Vec3> src(static_cast<size_t>(count));
@@ -402,7 +420,7 @@ void AF_SceneComputeEchogram(AF_SceneHandle scene, AF_Vector3 listener,
                              float* outBins, int numBins,
                              float binSeconds, float speedOfSound,
                              int numRays, int maxBounces) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !sources || count <= 0) return;
     std::vector<Vec3> src(static_cast<size_t>(count));
     for (int i = 0; i < count; ++i) src[i] = toVec3(sources[i]);
@@ -415,7 +433,7 @@ void AF_SceneComputeEchogramBands(AF_SceneHandle scene, AF_Vector3 listener,
                                   float* outBins, int numBins,
                                   float binSeconds, float speedOfSound,
                                   int numRays, int maxBounces, float distanceRef) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !sources || count <= 0 || !outBins || numBins <= 0) return;
     std::vector<Vec3> src(static_cast<size_t>(count));
     for (int i = 0; i < count; ++i) src[i] = toVec3(sources[i]);
@@ -435,7 +453,7 @@ void AF_SceneComputeEchogramBands(AF_SceneHandle scene, AF_Vector3 listener,
 int AF_SceneTraceReflectionPath(AF_SceneHandle scene, AF_Vector3 origin, AF_Vector3 dir,
                                 float maxDist, int maxBounces,
                                 AF_Vector3* outPoints, int maxPoints) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outPoints || maxPoints < 2) return 0;
     std::vector<Vec3> buf(static_cast<size_t>(maxPoints));
     const int n = s->traceReflectionPath(toVec3(origin), toVec3(dir), maxDist, maxBounces,
@@ -449,24 +467,24 @@ int AF_SceneTraceReflectionPath(AF_SceneHandle scene, AF_Vector3 origin, AF_Vect
 }
 
 void AF_SceneBuildEdgeCatalog(AF_SceneHandle scene, AF_Vector3 listener, int res, float maxDist) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (s) s->buildEdgeCatalog(toVec3(listener), res, maxDist);
 }
 
 int AF_SceneEdgeCatalogCount(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? s->edgeCatalogCount() : 0;
 }
 
 void AF_SceneClearEdgeCatalog(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (s) s->clearEdgeCatalog();
 }
 
 int AF_SceneComputeEarlyReflections(AF_SceneHandle scene, AF_Vector3 listener, AF_Vector3 source,
                                     AF_Vector3* outImagePos, float* outGain,
                                     int maxTaps, int numRays, int maxBounces) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outImagePos || !outGain || maxTaps <= 0) return 0;
     std::vector<Vec3> pos(static_cast<size_t>(maxTaps));
     const int n = s->computeEarlyReflections(toVec3(listener), toVec3(source),
@@ -480,42 +498,44 @@ int AF_SceneComputeEarlyReflections(AF_SceneHandle scene, AF_Vector3 listener, A
 }
 
 int AF_SceneInstanceCount(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? s->instanceCount() : 0;
 }
 
 // --- リスナー / 音源の保持（段1）---
 
 void AF_SceneSetListener(AF_SceneHandle scene, AF_Vector3 pos) {
-    Scene* s = asScene(scene);
-    if (s) s->setListener(toVec3(pos));
+    SceneBox* b = asBox(scene);
+    if (b) { const Vec3 p = toVec3(pos); b->post([p](Scene& s) { s.setListener(p); }); }
 }
 
 void AF_SceneSetSource(AF_SceneHandle scene, unsigned long long id, AF_Vector3 pos) {
-    Scene* s = asScene(scene);
-    if (s) s->setSource(id, toVec3(pos));
+    SceneBox* b = asBox(scene);
+    if (b) { const Vec3 p = toVec3(pos); b->post([id, p](Scene& s) { s.setSource(id, p); }); }
 }
 
 void AF_SceneRemoveSource(AF_SceneHandle scene, unsigned long long id) {
-    Scene* s = asScene(scene);
-    if (s) s->removeSource(id);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([id](Scene& s) { s.removeSource(id); });
 }
 
 void AF_SceneClearSources(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
-    if (s) s->clearSources();
+    SceneBox* b = asBox(scene);
+    if (b) b->post([](Scene& s) { s.clearSources(); });
 }
 
 int AF_SceneSourceCount(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
-    return s ? s->sourceCount() : 0;
+    SceneBox* b = asBox(scene);
+    if (!b) return 0;
+    const Scene::Results* r = b->snapshot();
+    return r ? static_cast<int>(r->id.size()) : b->scene.sourceCount();
 }
 
 // --- バッチ更新（段2）---
 
 void AF_SceneSetUpdateConfig(AF_SceneHandle scene, const AF_UpdateConfig* cfg) {
-    Scene* s = asScene(scene);
-    if (!s || !cfg) return;
+    SceneBox* b = asBox(scene);
+    if (!b || !cfg) return;
     Scene::UpdateConfig c;
     c.role1EveryN = cfg->role1EveryN;
     c.role2EveryN = cfg->role2EveryN;
@@ -545,76 +565,104 @@ void AF_SceneSetUpdateConfig(AF_SceneHandle scene, const AF_UpdateConfig* cfg) {
     c.earlyModel = cfg->earlyModel;
     c.earlyFaceSubTaps = cfg->earlyFaceSubTaps;
     c.echogramSkipFirstOrder = cfg->echogramSkipFirstOrder != 0;
-    s->setUpdateConfig(c);
+    b->post([c](Scene& s) { s.setUpdateConfig(c); });
 }
 
 void AF_SceneUpdate(AF_SceneHandle scene, float dt) {
-    Scene* s = asScene(scene);
-    if (s) s->update(dt);
+    SceneBox* b = asBox(scene);
+    if (b) b->update(dt);
+}
+
+void AF_SceneSetAsync(AF_SceneHandle scene, int enable) {
+    SceneBox* b = asBox(scene);
+    if (b) b->setAsync(enable != 0);
+}
+
+int AF_SceneIsAsync(AF_SceneHandle scene) {
+    SceneBox* b = asBox(scene);
+    return (b && b->async()) ? 1 : 0;
+}
+
+void AF_SceneAsyncWait(AF_SceneHandle scene) {
+    SceneBox* b = asBox(scene);
+    if (b) b->wait();
+}
+
+void AF_SceneGetUpdateStats(AF_SceneHandle scene, float* outComputeMs, int* outLagFrames,
+                            int* outSkippedFrames, int* outQueued) {
+    SceneBox* b = asBox(scene);
+    if (!b) return;
+    b->stats(outComputeMs, outLagFrames, outSkippedFrames, outQueued);
 }
 
 int AF_SceneSourceIndex(AF_SceneHandle scene, unsigned long long id) {
-    Scene* s = asScene(scene);
-    return s ? s->sourceIndexOf(id) : -1;
+    SceneBox* b = asBox(scene);
+    if (!b) return -1;
+    const Scene::Results* r = b->snapshot();
+    const int i = b->scene.sourceIndexOf(id, r);
+    if (i >= 0 || !r) return i;
+    // 写しにまだ無い id（登録直後）。同期の口で引き直す（仕事を待つのは登録直後の数フレームだけ）。
+    SyncGuard g(b);
+    return g.get()->sourceIndexOf(id);
 }
 
 void AF_SceneGetSourceOcclusion(AF_SceneHandle scene, int index, float* out6) {
-    Scene* s = asScene(scene);
-    if (s) s->getSourceOcclusion(index, out6);
+    SceneBox* b = asBox(scene);
+    if (b) b->scene.getSourceOcclusion(index, out6, b->snapshot());
 }
 
 float AF_SceneGetSourceOcclusionScalar(AF_SceneHandle scene, int index) {
-    Scene* s = asScene(scene);
-    return s ? s->getSourceOcclusionScalar(index) : 0.0f;
+    SceneBox* b = asBox(scene);
+    return b ? b->scene.getSourceOcclusionScalar(index, b->snapshot()) : 0.0f;
 }
 
 void AF_SceneGetSourceArrivalDir(AF_SceneHandle scene, int index, float* out3) {
-    Scene* s = asScene(scene);
-    if (s) s->getSourceArrivalDir(index, out3);
+    SceneBox* b = asBox(scene);
+    if (b) b->scene.getSourceArrivalDir(index, out3, b->snapshot());
 }
 
 int AF_SceneGetEarlyReflections(AF_SceneHandle scene, int index,
                                 AF_Vector3* outPos, float* outGain6, int maxTaps) {
-    Scene* s = asScene(scene);
-    if (!s || !outPos || !outGain6 || maxTaps <= 0) return 0;
+    SceneBox* b = asBox(scene);
+    if (!b || !outPos || !outGain6 || maxTaps <= 0) return 0;
     std::vector<Vec3> tmp(static_cast<size_t>(maxTaps));
-    const int n = s->getEarlyReflections(index, tmp.data(), outGain6, maxTaps);
+    const int n = b->scene.getEarlyReflections(index, tmp.data(), outGain6, maxTaps, b->snapshot());
     for (int i = 0; i < n; ++i) outPos[i] = fromVec3(tmp[static_cast<size_t>(i)]);
     return n;
 }
 
 int AF_SceneBakeStaticFaces(AF_SceneHandle scene, float cellSize, int subTaps) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? s->bakeStaticFaces(cellSize, subTaps) : 0;
 }
 
 void AF_SceneClearFaceBake(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (s) s->clearFaceBake();
 }
 
 int AF_SceneFaceBakeFaceCount(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? s->faceBakeFaceCount() : 0;
 }
 
 void AF_SceneSetInstanceDynamic(AF_SceneHandle scene, int instanceId, int dynamic) {
-    Scene* s = asScene(scene);
-    if (s) s->setInstanceDynamic(instanceId, dynamic != 0);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([instanceId, dynamic](Scene& s) { s.setInstanceDynamic(instanceId, dynamic != 0); });
 }
 
 int AF_SceneBvhNodeCount(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? s->bvhNodeCount() : 0;
 }
 
 int AF_SceneBvhOrderCount(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? s->bvhOrderCount() : 0;
 }
 
 int AF_SceneExportBvh(AF_SceneHandle scene, AF_BvhNode* outNodes, int maxNodes, int* outOrder, int maxOrder) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0;
     static_assert(sizeof(AF_BvhNode) == sizeof(Scene::BvhExportNode), "AF_BvhNode と BvhExportNode の並びを揃えること");
     return s->exportBvh(reinterpret_cast<Scene::BvhExportNode*>(outNodes), outNodes ? maxNodes : 0,
@@ -622,7 +670,7 @@ int AF_SceneExportBvh(AF_SceneHandle scene, AF_BvhNode* outNodes, int maxNodes, 
 }
 
 int AF_SceneGetInstance(AF_SceneHandle scene, int instanceId, AF_InstanceDesc* out) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !out) return 0;
     Obb obb; int mat = 0, geom = -1; bool active = false, moved = false, dyn = false;
     if (!s->getInstanceDesc(instanceId, obb, mat, geom, active, moved, dyn)) return 0;
@@ -634,44 +682,44 @@ int AF_SceneGetInstance(AF_SceneHandle scene, int instanceId, AF_InstanceDesc* o
 }
 
 int AF_SceneFaceBakeBytes(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? s->faceBakeBytes() : 0;
 }
 
 int AF_SceneFaceBakeExport(AF_SceneHandle scene, void* out, int cap) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? s->faceBakeExport(out, cap) : 0;
 }
 
 int AF_SceneFaceBakeImport(AF_SceneHandle scene, const void* data, int size) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return (s && s->faceBakeImport(data, size)) ? 1 : 0;
 }
 
 int AF_SceneGetDiffractionSources(AF_SceneHandle scene, int index,
                                   AF_Vector3* outPos, float* outGain, int maxSrc) {
-    Scene* s = asScene(scene);
-    if (!s || !outPos || !outGain || maxSrc <= 0) return 0;
+    SceneBox* b = asBox(scene);
+    if (!b || !outPos || !outGain || maxSrc <= 0) return 0;
     std::vector<Vec3> tmp(static_cast<size_t>(maxSrc));
-    const int n = s->getDiffractionSources(index, tmp.data(), outGain, maxSrc);
+    const int n = b->scene.getDiffractionSources(index, tmp.data(), outGain, maxSrc, b->snapshot());
     for (int i = 0; i < n; ++i) outPos[i] = fromVec3(tmp[static_cast<size_t>(i)]);
     return n;
 }
 
 int AF_SceneGetEchogramBands(AF_SceneHandle scene, int index, float* outBins, int numBins) {
-    Scene* s = asScene(scene);
-    return s ? s->getEchogramBands(index, outBins, numBins) : 0;
+    SceneBox* b = asBox(scene);
+    return b ? b->scene.getEchogramBands(index, outBins, numBins, b->snapshot()) : 0;
 }
 
 }  // extern "C"
 
 void AF_SceneSetApertureSpread(AF_SceneHandle scene, int points) {
-    Scene* s = asScene(scene);
-    if (s) s->setApertureSpread(points);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([points](Scene& s) { s.setApertureSpread(points); });
 }
 
 int AF_SceneGetApertureSpread(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? s->apertureSpread() : 0;
 }
 
@@ -679,7 +727,7 @@ int AF_SceneComputeDiffractionSourceBands(AF_SceneHandle scene,
                                           AF_Vector3 listener, AF_Vector3 source,
                                           AF_Vector3* outPos, float* outGain,
                                           float* outBand6, int maxSrc) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outPos || !outGain || maxSrc <= 0) return 0;
     std::vector<Vec3> pos(static_cast<size_t>(maxSrc));
     const int n = s->computeDiffractionSourceBands(toVec3(listener), toVec3(source),
@@ -690,96 +738,98 @@ int AF_SceneComputeDiffractionSourceBands(AF_SceneHandle scene,
 
 int AF_SceneAddPortal(AF_SceneHandle scene, AF_Vector3 center,
                       AF_Vector3 axisU, AF_Vector3 axisV, float halfU, float halfV) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return -1;
     return s->addPortal(toVec3(center), toVec3(axisU), toVec3(axisV), halfU, halfV);
 }
 
 void AF_SceneUpdatePortal(AF_SceneHandle scene, int id, AF_Vector3 center,
                           AF_Vector3 axisU, AF_Vector3 axisV, float halfU, float halfV) {
-    Scene* s = asScene(scene);
-    if (s) s->updatePortal(id, toVec3(center), toVec3(axisU), toVec3(axisV), halfU, halfV);
+    SceneBox* b = asBox(scene);
+    if (!b) return;
+    const Vec3 c = toVec3(center), u = toVec3(axisU), v = toVec3(axisV);
+    b->post([id, c, u, v, halfU, halfV](Scene& s) { s.updatePortal(id, c, u, v, halfU, halfV); });
 }
 
 // ★ホストは毎フレーム押してくる。値が変わったときだけ作り直すこと
 //   （rebuildAutoPortals は部屋グラフ全体の開口を舐めるので、毎フレームは無駄）。
 void AF_SceneSetAutoPortals(AF_SceneHandle scene, int enable) {
-    Scene* s = asScene(scene);
-    if (!s || s->autoPortals() == (enable != 0)) return;
-    s->setAutoPortals(enable != 0);
-    s->rebuildAutoPortals();          // 切り替えた瞬間に反映する（次の update を待たない）
+    SceneBox* b = asBox(scene);
+    if (!b) return;
+    b->post([enable](Scene& s) {
+        if (s.autoPortals() == (enable != 0)) return;
+        s.setAutoPortals(enable != 0);
+        s.rebuildAutoPortals();          // 切り替えた瞬間に反映する（次の update を待たない）
+    });
 }
 
 // ★ホストは毎フレーム押してくる。値が変わったときだけプールを作り直すこと
 //   （毎フレーム作り直したらスレッドの起こし直しで元も子もない）。setWorkerThreads が中で見ている。
 void AF_SceneSetWorkerThreads(AF_SceneHandle scene, int threads) {
-    Scene* s = asScene(scene);
-    if (!s) return;
-    s->setWorkerThreads(threads);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([threads](Scene& s) { s.setWorkerThreads(threads); });   // プールの作り直しは仕事の外で
 }
 
 int AF_SceneGetWorkerThreads(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
-    return s ? s->workerThreads() : 0;
+    SceneBox* b = asBox(scene);
+    return b ? b->scene.workerThreads() : 0;   // int の読みだけ
 }
 
 int AF_SceneTransmissionCarriers(AF_SceneHandle scene,
                                  AF_Vector3 listener, AF_Vector3 source,
                                  int* outInstance, int* outMaterial,
                                  float* outLossDb, int maxCount) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0;
     return s->transmissionCarriers(toVec3(listener), toVec3(source),
                                    outInstance, outMaterial, outLossDb, maxCount);
 }
 
 void AF_SceneSetSourceTier(AF_SceneHandle scene, unsigned long long id, int tier) {
-    Scene* s = asScene(scene);
-    if (!s) return;
-    s->setSourceTier(id, tier);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([id, tier](Scene& s) { s.setSourceTier(id, tier); });
 }
 
 void AF_SceneSetSourceAudibleRadius(AF_SceneHandle scene, unsigned long long id, float metres) {
-    Scene* s = asScene(scene);
-    if (!s) return;
-    s->setSourceAudibleRadius(id, metres);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([id, metres](Scene& s) { s.setSourceAudibleRadius(id, metres); });
 }
 
 int AF_SceneGetSourceTierEffective(AF_SceneHandle scene, int index) {
-    Scene* s = asScene(scene);
-    return s ? s->effectiveTier(index) : -1;
+    SceneBox* b = asBox(scene);
+    return b ? b->scene.effectiveTier(index, b->snapshot()) : -1;
 }
 
 void AF_SceneSetTierBudget(AF_SceneHandle scene, int exactMax, int simpleMax) {
-    Scene* s = asScene(scene);
-    if (s) s->setTierBudget(exactMax, simpleMax);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([exactMax, simpleMax](Scene& s) { s.setTierBudget(exactMax, simpleMax); });
 }
 
 void AF_SceneSetSourceLoudness(AF_SceneHandle scene, unsigned long long id, float gainLinear) {
-    Scene* s = asScene(scene);
-    if (s) s->setSourceLoudness(id, gainLinear);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([id, gainLinear](Scene& s) { s.setSourceLoudness(id, gainLinear); });
 }
 
 void AF_SceneSetSourceImportance(AF_SceneHandle scene, unsigned long long id, float importance, int pinned) {
-    Scene* s = asScene(scene);
-    if (s) s->setSourceImportance(id, importance, pinned != 0);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([id, importance, pinned](Scene& s) { s.setSourceImportance(id, importance, pinned != 0); });
 }
 
 float AF_SceneGetSourcePriority(AF_SceneHandle scene, int index) {
-    Scene* s = asScene(scene);
-    return s ? s->sourcePriority(index) : -1.0f;
+    SceneBox* b = asBox(scene);
+    return b ? b->scene.sourcePriority(index, b->snapshot()) : -1.0f;
 }
 
 int AF_SceneGetTierProbeIndex(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
-    return s ? s->tierProbeIndex() : -1;
+    SceneBox* b = asBox(scene);
+    return b ? b->scene.tierProbeIndex(b->snapshot()) : -1;
 }
 
 /* ── キャプチャ（サウンドデバッグツール。docs/SOUND_DEBUG_TOOL.md）───────── */
 
 void AF_SceneCaptureBegin(AF_SceneHandle scene, int prerollFrames, int postrollFrames,
                           int maxSources, int sampleRate, int recordPcm) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return;
     acoustic::dbg::CaptureConfig c;
     if (prerollFrames  > 0) c.prerollFrames  = prerollFrames;
@@ -791,32 +841,33 @@ void AF_SceneCaptureBegin(AF_SceneHandle scene, int prerollFrames, int postrollF
 }
 
 int AF_SceneGetTailShapeIndex(AF_SceneHandle scene, int index) {
-    Scene* s = asScene(scene);
-    return s ? s->tailShapeIndex(index) : -1;
+    SceneBox* b = asBox(scene);
+    return b ? b->scene.tailShapeIndex(index, b->snapshot()) : -1;
 }
 
 void AF_SceneDebugGetStagePhase(AF_SceneHandle scene, int* out8) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (s && out8) s->debugGetStagePhase(out8);
 }
 
 void AF_SceneDebugSetStagePhase(AF_SceneHandle scene, const int* in8) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (s && in8) s->debugSetStagePhase(in8);
 }
 
 void AF_SceneCaptureEnd(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (s) s->captureEnd();
 }
 
 void AF_SceneCaptureMark(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (s) s->captureMark();
 }
 
 int AF_SceneCaptureStatus(AF_SceneHandle scene, int* outFramesHeld) {
-    Scene* s = asScene(scene);
+    SceneBox* b = asBox(scene);
+    Scene* s = b ? &b->scene : nullptr;   // 数の読みだけ（毎フレーム呼ばれるので仕事を待たない）
     if (!s) return 0;
     if (outFramesHeld) *outFramesHeld = s->captureFramesHeld();
     /* 0=止まっている 1=録っている 2=前後が揃った（保存できる） */
@@ -824,26 +875,29 @@ int AF_SceneCaptureStatus(AF_SceneHandle scene, int* outFramesHeld) {
 }
 
 void AF_SceneCapturePushAudio(AF_SceneHandle scene, const float* interleavedStereo, int frames) {
-    Scene* s = asScene(scene);
-    if (s) s->capturePushAudio(interleavedStereo, frames);
+    SceneBox* b = asBox(scene);
+    if (b) b->scene.capturePushAudio(interleavedStereo, frames);   // オーディオスレッド。ロック無し（capture.h）
 }
 
 int AF_SceneCaptureWrite(AF_SceneHandle scene, const char* path,
                          const char* sceneName, unsigned int dllHash) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !path) return 0;
     return s->captureWrite(path, sceneName, dllHash) ? 1 : 0;
 }
 
 void AF_SceneSetAutoPortalMinArea(AF_SceneHandle scene, float m2) {
-    Scene* s = asScene(scene);
-    if (!s || s->autoPortalMinArea() == m2) return;
-    s->setAutoPortalMinArea(m2);
-    s->rebuildAutoPortals();
+    SceneBox* b = asBox(scene);
+    if (!b) return;
+    b->post([m2](Scene& s) {
+        if (s.autoPortalMinArea() == m2) return;
+        s.setAutoPortalMinArea(m2);
+        s.rebuildAutoPortals();
+    });
 }
 
 int AF_SceneGetPortalCounts(AF_SceneHandle scene, int* outAuto, int* outManual) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0;
     if (outAuto)   *outAuto   = s->autoPortalCount();
     if (outManual) *outManual = s->manualPortalCount();
@@ -853,7 +907,7 @@ int AF_SceneGetPortalCounts(AF_SceneHandle scene, int* outAuto, int* outManual) 
 int AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* outCenter,
                       AF_Vector3* outAxisU, AF_Vector3* outAxisV,
                       float* outHalfU, float* outHalfV) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || id < 0 || id >= s->portalCount()) return 0;
     const auto& p = s->portal(id);
     if (outCenter) *outCenter = fromVec3(p.center);
@@ -866,7 +920,7 @@ int AF_SceneGetPortal(AF_SceneHandle scene, int id, AF_Vector3* outCenter,
 
 int AF_SceneGetPortalRooms(AF_SceneHandle scene, int id,
                            int* outRoomA, int* outRoomB, int* outToOutside) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || id < 0 || id >= s->portalCount()) return 0;
     const auto& p = s->portal(id);
     if (outRoomA) *outRoomA = p.roomA;
@@ -876,12 +930,12 @@ int AF_SceneGetPortalRooms(AF_SceneHandle scene, int id,
 }
 
 void AF_SceneSetOutsideApertures(AF_SceneHandle scene, int on) {
-    Scene* s = asScene(scene);
-    if (s) s->setOutsideApertures(on);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([on](Scene& s) { s.setOutsideApertures(on); });
 }
 
 int AF_ScenePortalDiffuseCoupling(AF_SceneHandle scene, int id, float* out6) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !out6) return 0;
     float g[6];
     if (!s->portalDiffuseCoupling(id, g)) return 0;
@@ -895,7 +949,7 @@ int AF_ScenePortalDiffuseCoupling(AF_SceneHandle scene, int id, float* out6) {
  * 自動的に解ける。ナイフエッジ回折の厳密解はもともとこの形の積分。 */
 /* 【計測用】直近の開口積分で矩形に写った遮蔽物の枚数。-1 は未実行。 */
 void AF_SceneDebugPortalIntegral(AF_SceneHandle scene, double* numer, double* denom, float* limU) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return;
     if (numer) *numer = s->dbgNumer();
     if (denom) *denom = s->dbgDenom();
@@ -903,62 +957,62 @@ void AF_SceneDebugPortalIntegral(AF_SceneHandle scene, double* numer, double* de
 }
 
 void AF_SceneSetDiffractionSingleModel(AF_SceneHandle scene, int on) {
-    Scene* s = asScene(scene);
-    if (s) s->setDiffractionSingleModel(on);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([on](Scene& s) { s.setDiffractionSingleModel(on); });
 }
 
 void AF_SceneDebugDiffractionCounts(AF_SceneHandle scene, int* raw, int* cut, int* clusters) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (s) s->diffractionSearchCounts(raw, cut, clusters);
 }
 
 void AF_SceneSetInsideOtherContinuous(AF_SceneHandle scene, int on, float scale) {
-    Scene* s = asScene(scene);
-    if (s) s->setInsideOtherContinuous(on, scale);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([on, scale](Scene& s) { s.setInsideOtherContinuous(on, scale); });
 }
 
 void AF_SceneSetKeepDoubleOpen(AF_SceneHandle scene, int on) {
-    Scene* s = asScene(scene);
-    if (s) s->setKeepDoubleOpen(on);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([on](Scene& s) { s.setKeepDoubleOpen(on); });
 }
 
 int AF_SceneDebugDiffractionPath(AF_SceneHandle scene, AF_Vector3 listener, AF_Vector3 source,
                                  float* out17, int which) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0;
     return s->debugDiffractionPath(toVec3(listener), toVec3(source), out17, which);
 }
 
 int AF_SceneDebugPortalPolys(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? s->dbgPortalPolys() : -1;
 }
 
 void AF_SceneSetEdgePortals(AF_SceneHandle scene, int enable) {
-    Scene* s = asScene(scene);
-    if (s) s->setEdgePortals(enable != 0);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([enable](Scene& s) { s.setEdgePortals(enable != 0); });
 }
 
 /* 矩形の半幅をフレネル半径の何倍にするか（既定 1.0）。 */
 void AF_SceneSetEdgePortalSpan(AF_SceneHandle scene, float k) {
-    Scene* s = asScene(scene);
-    if (s) s->setEdgePortalSpan(k);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([k](Scene& s) { s.setEdgePortalSpan(k); });
 }
 
 void AF_SceneSetDiffractionGateMask(AF_SceneHandle scene, int mask) {
-    Scene* s = asScene(scene);
-    if (s) s->setDiffractionGateMask(mask);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([mask](Scene& s) { s.setDiffractionGateMask(mask); });
 }
 
 void AF_SceneSetPortalGovernRange(AF_SceneHandle scene, float meters) {
-    Scene* s = asScene(scene);
-    if (s) s->setPortalGovernRange(meters);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([meters](Scene& s) { s.setPortalGovernRange(meters); });
 }
 
 int AF_SceneMeasurePortal(AF_SceneHandle scene, int id,
                           AF_Vector3 listener, AF_Vector3 source,
                           float* outFrac6, AF_Vector3* outPoint) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outFrac6 || id < 0 || id >= s->portalCount()) return 0;
     Vec3 p(0, 0, 0);
     const bool ok = s->portalOpenBands(s->portal(id), toVec3(listener), toVec3(source),
@@ -968,23 +1022,23 @@ int AF_SceneMeasurePortal(AF_SceneHandle scene, int id,
 }
 
 void AF_SceneSetApertureIsTransmission(AF_SceneHandle scene, int on) {
-    Scene* s = asScene(scene);
-    if (s) s->setApertureIsTransmission(on);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([on](Scene& s) { s.setApertureIsTransmission(on); });
 }
 
 int AF_SceneRoomCount(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? static_cast<int>(s->roomGraph().rooms.size()) : 0;
 }
 
 int AF_SceneRoomAt(AF_SceneHandle scene, AF_Vector3 p) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? s->roomAt(toVec3(p)) : -1;
 }
 
 int AF_SceneRoomInfo(AF_SceneHandle scene, int room, float* outVolume,
                      AF_Vector3* outCentroid, AF_Vector3* outMin, AF_Vector3* outMax) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0;
     const auto& rr = s->roomGraph();
     if (room < 0 || room >= static_cast<int>(rr.rooms.size())) return 0;
@@ -998,13 +1052,13 @@ int AF_SceneRoomInfo(AF_SceneHandle scene, int room, float* outVolume,
 }
 
 void AF_SceneSetRoomCellSize(AF_SceneHandle scene, float meters) {
-    Scene* s = asScene(scene);
-    if (s) s->setRoomCellSize(meters);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([meters](Scene& s) { s.setRoomCellSize(meters); });
 }
 
 int AF_SceneRoomGridDegraded(AF_SceneHandle scene, float* outRequested, float* outActual,
                              double* outVoxels, double* outMaxVoxels) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0;
     const auto& g = s->roomGraph().grid;
     const float req = s->roomCellRequested();
@@ -1018,7 +1072,7 @@ int AF_SceneRoomGridDegraded(AF_SceneHandle scene, float* outRequested, float* o
 }
 
 void AF_SceneRoomGridDims(AF_SceneHandle scene, int* nx, int* ny, int* nz, float* cell) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return;
     const auto& g = s->roomGraph().grid;
     if (nx) *nx = g.nx;
@@ -1030,7 +1084,7 @@ void AF_SceneRoomGridDims(AF_SceneHandle scene, int* nx, int* ny, int* nz, float
 void AF_SceneRoomBuildTimes(AF_SceneHandle scene, float* alloc, float* fill,
                             float* dist, float* label, float* merge, float* grow,
                             int* dirtyBricks, int* totalBricks) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return;
     const auto& rr = s->roomGraph();
     if (alloc)       *alloc       = static_cast<float>(rr.msAlloc);
@@ -1044,42 +1098,42 @@ void AF_SceneRoomBuildTimes(AF_SceneHandle scene, float* alloc, float* fill,
 }
 
 void AF_SceneSetRoomBrick(AF_SceneHandle scene, int voxels) {
-    Scene* s = asScene(scene);
-    if (s) s->setRoomBrick(voxels);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([voxels](Scene& s) { s.setRoomBrick(voxels); });
 }
 
 void AF_SceneSetRoomSeedRadius(AF_SceneHandle scene, float meters) {
-    Scene* s = asScene(scene);
-    if (s) s->setRoomSeedRadius(meters);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([meters](Scene& s) { s.setRoomSeedRadius(meters); });
 }
 
 void AF_SceneSetDiffractionFlat(AF_SceneHandle scene, int flat) {
-    Scene* s = asScene(scene);
-    if (s) s->setDiffractionFlat(flat != 0);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([flat](Scene& s) { s.setDiffractionFlat(flat != 0); });
 }
 
 void AF_SceneSetRoomChamferFull(AF_SceneHandle scene, int full) {
-    Scene* s = asScene(scene);
-    if (s) s->setRoomChamferFull(full != 0);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([full](Scene& s) { s.setRoomChamferFull(full != 0); });
 }
 
 int AF_SceneRoomWeights(AF_SceneHandle scene, AF_Vector3 p, float radius,
                         int* outRooms, float* outWeights, int maxOut) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0;
     return s->roomWeights(toVec3(p), radius, outRooms, outWeights, maxOut);
 }
 
 int AF_SceneRoomShareAt(AF_SceneHandle scene, AF_Vector3 p, float radius,
                         int* outRooms, float* outWeights, int maxOut) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outRooms || !outWeights || maxOut <= 0) return 0;
     return s->roomShare(toVec3(p), radius, outRooms, outWeights, maxOut);
 }
 
 int AF_SceneDebugSurvivalParts(AF_SceneHandle scene, AF_Vector3 listener, AF_Vector3 source,
                                float* outSoft6, float* outDif6) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outSoft6 || !outDif6) return 0;
     float g[6];
     s->computeDirectSoft(toVec3(listener), toVec3(source), g, 8, 0.4f, nullptr, false, outSoft6, outDif6);
@@ -1087,19 +1141,19 @@ int AF_SceneDebugSurvivalParts(AF_SceneHandle scene, AF_Vector3 listener, AF_Vec
 }
 
 float AF_SceneRoomVolumeAt(AF_SceneHandle scene, AF_Vector3 p, float radius) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? s->roomVolumeAt(toVec3(p), radius) : 0.0f;
 }
 
 int AF_SceneRt60At(AF_SceneHandle scene, AF_Vector3 p, float radius, float* out, int count) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0;
     return s->rt60At(toVec3(p), radius, out, count);
 }
 
 int AF_SceneRoomAcoustics(AF_SceneHandle scene, int room, float* outSurface,
                           float* outOpenArea, float* outAbsorb6, float* outRt60_6) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0;
     const auto& rr = s->roomGraph();
     if (room < 0 || room >= static_cast<int>(rr.rooms.size())) return 0;
@@ -1114,14 +1168,14 @@ int AF_SceneRoomAcoustics(AF_SceneHandle scene, int room, float* outSurface,
 }
 
 int AF_SceneApertureCount(AF_SceneHandle scene) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     return s ? static_cast<int>(s->roomGraph().apertures.size()) : 0;
 }
 
 int AF_SceneApertureInfo(AF_SceneHandle scene, int index,
                          float* outArea, AF_Vector3* outCenter, AF_Vector3* outNormal,
                          int* outRoomA, int* outRoomB) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s) return 0;
     const auto& aps = s->roomGraph().apertures;
     if (index < 0 || index >= static_cast<int>(aps.size())) return 0;
@@ -1135,38 +1189,38 @@ int AF_SceneApertureInfo(AF_SceneHandle scene, int index,
 }
 
 void AF_SceneSetApertureContrast(AF_SceneHandle scene, float p) {
-    Scene* s = asScene(scene);
-    if (s) s->setApertureContrast(p);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([p](Scene& s) { s.setApertureContrast(p); });
 }
 
 void AF_SceneSetApertureTimbre(AF_SceneHandle scene, float k) {
-    Scene* s = asScene(scene);
-    if (s) s->setApertureTimbre(k);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([k](Scene& s) { s.setApertureTimbre(k); });
 }
 
 void AF_SceneSetUseBtm(AF_SceneHandle scene, int on) {
-    Scene* s = asScene(scene);
-    if (s) s->setUseBtm(on);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([on](Scene& s) { s.setUseBtm(on); });
 }
 
 void AF_SceneSetDirectPenumbra(AF_SceneHandle scene, int on) {
-    Scene* s = asScene(scene);
-    if (s) s->setDirectPenumbra(on);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([on](Scene& s) { s.setDirectPenumbra(on); });
 }
 
 void AF_SceneSetApertureDeltaWeight(AF_SceneHandle scene, float w) {
-    Scene* s = asScene(scene);
-    if (s) s->setApertureDeltaWeight(w);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([w](Scene& s) { s.setApertureDeltaWeight(w); });
 }
 
 void AF_SceneSetSlitBandSlope(AF_SceneHandle scene, float slope) {
-    Scene* s = asScene(scene);
-    if (s) s->setSlitBandSlope(slope);
+    SceneBox* b = asBox(scene);
+    if (b) b->post([slope](Scene& s) { s.setSlitBandSlope(slope); });
 }
 
 int AF_SceneMeasureApertureFresnel(AF_SceneHandle scene, AF_Vector3 listener,
                                    AF_Vector3 source, float* outFrac6) {
-    Scene* s = asScene(scene);
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outFrac6) return 0;
     const Vec3 L = toVec3(listener), S = toVec3(source);
     float f[kNumBands];
@@ -1315,7 +1369,7 @@ int AF_CaptureGetPcm(AF_CaptureHandle cap, float* outInterleaved, int maxFrames)
 }
 
 int AF_CaptureApplyFrame(AF_SceneHandle scene, AF_CaptureHandle cap, int frameIndex) {
-    Scene* s = asScene(scene);
+    SyncGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     CaptureBundle* b = asCapture(cap);
     if (!s || !b || frameIndex < 0 || frameIndex >= b->file.frames) return 0;
     const size_t k = static_cast<size_t>(frameIndex);

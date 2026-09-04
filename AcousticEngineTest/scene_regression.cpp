@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 #include "acoustic_scene.h"
@@ -7766,6 +7767,205 @@ void testTierBudget() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 【更新の非同期化】主スレッドは「入力を渡す・答えを読む」だけ。解くのは DLL のワーカー
+//
+//   縛るのは 6 つ:
+//     ① 同期と非同期で答えが**ビット一致**する（同じ入力列を流し、待ってから読む）
+//     ② 主スレッドの AF_SceneUpdate は µs の桁で帰る（同期は ms）
+//     ③ 仕事の最中に幾何の問い合わせを叩いても壊れず、落ち着いた後の答えは同期と一致する
+//     ④ 仕事の最中に同期の口（AddInstanceBox）を呼んでも壊れず、次の答えに効く
+//     ⑤ 非同期を切ると同期に戻る／仕事の最中に破棄しても壊れない
+//     ⑥ 主スレッドの壁時計: 問い合わせを叩きながら 120 フレーム回す時間が同期より短い
+// ─────────────────────────────────────────────────────────────────────
+void testAsyncUpdate() {
+    std::printf("\n[非同期] 更新をワーカースレッドへ ── 主スレッドは入力を渡して答えを読むだけ\n");
+    const float h = 4.0f, t = 0.3f, hw = 9.0f, hd = 9.0f;
+    struct Rig { AF_SceneHandle s; int door; };
+    auto build = [&](int nSrc) {
+        Rig r; r.s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(r.s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(r.s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(r.s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(r.s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(r.s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(r.s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(r.s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        // 衝立（扉の代わりに毎フレーム回す）
+        r.door = AF_SceneAddInstanceBox(r.s, V(0, h*0.5f, 0), V(3.0f, h*0.5f, 0.3f), V(1,0,0), V(0,1,0), m);
+        AF_SceneSetListener(r.s, V(-2.0f, 1.6f, -5.0f));
+        for (int i = 0; i < nSrc; ++i)
+            AF_SceneSetSource(r.s, static_cast<unsigned long long>(1 + i), V(-6.0f + i * (12.0f / nSrc), 1.6f, 5.0f));
+        AF_SceneSetTierBudget(r.s, 4, 2);
+        return r;
+    };
+    // フレーム f の入力（同じ列を同期・非同期の両方へ流す）
+    auto drive = [&](const Rig& r, int f) {
+        const float a = 0.02f * static_cast<float>(f);
+        AF_SceneUpdateInstance(r.s, r.door, V(0, h*0.5f, 0), V(3.0f, h*0.5f, 0.3f),
+                               V(std::cos(a), 0, std::sin(a)), V(0, 1, 0));
+        AF_SceneSetListener(r.s, V(-2.0f + 0.03f * static_cast<float>(f), 1.6f, -5.0f));
+        AF_SceneSetSource(r.s, 3, V(1.0f + 0.02f * static_cast<float>(f), 1.6f, 5.0f));
+    };
+    auto occOf = [](AF_SceneHandle s, int srcNo, float* out6) {
+        const int idx = AF_SceneSourceIndex(s, static_cast<unsigned long long>(srcNo));
+        for (int k = 0; k < kBands; ++k) out6[k] = -1.0f;
+        AF_SceneGetSourceOcclusion(s, idx, out6);
+        return idx;
+    };
+    char note[240];
+    using clk = std::chrono::high_resolution_clock;
+
+    // ① 一致
+    {
+        Rig a = build(6), b = build(6);
+        AF_SceneSetAsync(b.s, 1);
+        int mismatch = 0, frames = 90, cmp = 0;
+        float maxDiff = 0.0f;
+        for (int f = 0; f < frames; ++f) {
+            drive(a, f); AF_SceneUpdate(a.s, 1.0f / 60.0f);
+            drive(b, f); AF_SceneUpdate(b.s, 1.0f / 60.0f); AF_SceneAsyncWait(b.s);
+            for (int i = 1; i <= 6; ++i) {
+                float oa[kBands], ob[kBands];
+                const int ia = occOf(a.s, i, oa), ib = occOf(b.s, i, ob);
+                for (int k = 0; k < kBands; ++k) {
+                    const float d = std::fabs(oa[k] - ob[k]);
+                    maxDiff = std::max(maxDiff, d);
+                    if (d != 0.0f) ++mismatch;
+                    ++cmp;
+                }
+                if (AF_SceneGetSourceTierEffective(a.s, ia) != AF_SceneGetSourceTierEffective(b.s, ib)) ++mismatch;
+                AF_Vector3 pa[8], pb[8]; float ga[48], gb[48];
+                const int na = AF_SceneGetEarlyReflections(a.s, ia, pa, ga, 8);
+                const int nb = AF_SceneGetEarlyReflections(b.s, ib, pb, gb, 8);
+                if (na != nb) ++mismatch;
+                float ea[32 * kBands] = {}, eb[32 * kBands] = {};
+                const int ma = AF_SceneGetEchogramBands(a.s, ia, ea, 32);
+                const int mb = AF_SceneGetEchogramBands(b.s, ib, eb, 32);
+                if (ma != mb) ++mismatch;
+                for (int k = 0; k < ma * kBands; ++k) if (ea[k] != eb[k]) { ++mismatch; break; }
+            }
+        }
+        std::snprintf(note, sizeof(note), "(%d フレーム × 6 本、比較 %d、不一致 %d、最大差 %.3g)", frames, cmp, mismatch, maxDiff);
+        check("[非同期] 同期と非同期で答えがビット一致（遮蔽・段・早期反射の本数・尾）", mismatch == 0, note);
+        AF_SceneDestroy(a.s); AF_SceneDestroy(b.s);
+    }
+    // ② 主スレッドの AF_SceneUpdate の費用
+    {
+        Rig a = build(12), b = build(12);
+        AF_SceneSetAsync(b.s, 1);
+        for (int f = 0; f < 30; ++f) { drive(a, f); AF_SceneUpdate(a.s, 1.0f / 60.0f); drive(b, f); AF_SceneUpdate(b.s, 1.0f / 60.0f); AF_SceneAsyncWait(b.s); }
+        double syncMs = 0.0, launchUs = 0.0, skipUs = 0.0; float computeMs = 0.0f;
+        const int N = 60;
+        for (int f = 30; f < 30 + N; ++f) {
+            drive(a, f);
+            auto t0 = clk::now(); AF_SceneUpdate(a.s, 1.0f / 60.0f);
+            syncMs += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+            drive(b, f);
+            t0 = clk::now(); AF_SceneUpdate(b.s, 1.0f / 60.0f);            // 着手（写し＋待ち行列＋投げる）
+            launchUs += std::chrono::duration<double, std::micro>(clk::now() - t0).count();
+            t0 = clk::now(); AF_SceneUpdate(b.s, 1.0f / 60.0f);            // 仕事中: 何もしない
+            skipUs += std::chrono::duration<double, std::micro>(clk::now() - t0).count();
+            AF_SceneAsyncWait(b.s);
+            float cms; int lag, sk, q; AF_SceneGetUpdateStats(b.s, &cms, &lag, &sk, &q); computeMs += cms;
+        }
+        syncMs /= N; launchUs /= N; skipUs /= N; computeMs /= N;
+        std::printf("        主スレッドの AF_SceneUpdate（12 本・衝立が回る）\n");
+        std::printf("          同期        %8.3f ms\n", syncMs);
+        std::printf("          非同期 着手 %8.1f us（写し＋待ち行列＋投げる）／仕事中 %6.1f us／ワーカーの計算 %.3f ms\n", launchUs, skipUs, computeMs);
+        std::snprintf(note, sizeof(note), "(同期 %.3f ms → 非同期 着手 %.1f us)", syncMs, launchUs);
+        check("[非同期] 主スレッドの AF_SceneUpdate は同期の 1/10 以下", launchUs * 1e-3 < syncMs * 0.1, note);
+        AF_SceneDestroy(a.s); AF_SceneDestroy(b.s);
+    }
+    // ③ 仕事の最中に幾何の問い合わせを叩く ＋ ⑥ 壁時計
+    {
+        Rig a = build(12), b = build(12);
+        AF_SceneSetAsync(b.s, 1);
+        auto hammer = [&](AF_SceneHandle s, int f, int reps, bool* bad) {
+            const AF_Vector3 L = V(-2.0f + 0.03f * static_cast<float>(f), 1.6f, -5.0f);
+            for (int k = 0; k < reps; ++k) {
+                const int i = k % 12;
+                const AF_Vector3 S = V(-6.0f + i * 1.0f, 1.6f, 5.0f);
+                float tr[kBands], df[kBands], occ = 0.0f;
+                AF_SceneComputeTransmissionBands(s, L, S, tr, kBands);
+                AF_SceneComputeDiffractionBands(s, L, S, df, kBands);
+                AF_SceneComputeSoftOcclusion(s, L, S, tr, kBands, &occ);
+                AF_Vector3 mid; const float dd = AF_SceneDiffractionPath(s, S, L, &mid);
+                const int room = AF_SceneRoomAt(s, L);
+                float rt[kBands] = {}; AF_SceneRt60At(s, L, 2.0f, rt, kBands);
+                for (int q = 0; q < kBands; ++q)
+                    if (!(tr[q] >= 0.0f && tr[q] <= 1.0f) || !(df[q] >= 0.0f && df[q] <= 1.0f) || !(rt[q] >= 0.0f)) *bad = true;
+                if (!(occ >= 0.0f && occ <= 1.0f) || !(dd >= -1.0f) || room < -1) *bad = true;
+            }
+        };
+        bool badA = false, badB = false;
+        const int frames = 120, reps = 40;
+        auto t0 = clk::now();
+        for (int f = 0; f < frames; ++f) { drive(a, f); AF_SceneUpdate(a.s, 1.0f / 60.0f); hammer(a.s, f, reps, &badA); }
+        const double wallSync = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+        t0 = clk::now();
+        for (int f = 0; f < frames; ++f) { drive(b, f); AF_SceneUpdate(b.s, 1.0f / 60.0f); hammer(b.s, f, reps, &badB); }
+        const double wallAsync = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+        float cms; int lag, skipped, queued; AF_SceneGetUpdateStats(b.s, &cms, &lag, &skipped, &queued);
+        // 落ち着かせて（残りの入力を全部反映）から、問い合わせを同期と突き合わせる
+        AF_SceneAsyncWait(b.s); AF_SceneUpdate(b.s, 1.0f / 60.0f); AF_SceneAsyncWait(b.s);
+        AF_SceneUpdate(a.s, 1.0f / 60.0f);
+        int qmis = 0;
+        for (int i = 0; i < 12; ++i) {
+            const AF_Vector3 L = V(-2.0f + 0.03f * (frames - 1), 1.6f, -5.0f);
+            const AF_Vector3 S = V(-6.0f + i * 1.0f, 1.6f, 5.0f);
+            float ta[kBands], tb[kBands], oa = 0, ob = 0;
+            AF_SceneComputeSoftOcclusion(a.s, L, S, ta, kBands, &oa);
+            AF_SceneComputeSoftOcclusion(b.s, L, S, tb, kBands, &ob);
+            for (int q = 0; q < kBands; ++q) if (ta[q] != tb[q]) ++qmis;
+            if (AF_SceneRoomAt(a.s, S) != AF_SceneRoomAt(b.s, S)) ++qmis;
+        }
+        std::printf("        問い合わせを叩きながら %d フレーム（1 フレームに %d 組: 透過・回折・遮蔽・迂回路・部屋・RT60）\n", frames, reps);
+        std::printf("          壁時計  同期 %.1f ms ／ 非同期 %.1f ms（追いつかず %d フレーム、ワーカー %.2f ms/回）\n", wallSync, wallAsync, skipped, cms);
+        std::snprintf(note, sizeof(note), "(範囲外 同期 %d / 非同期 %d、落ち着いた後の不一致 %d)", badA ? 1 : 0, badB ? 1 : 0, qmis);
+        check("[非同期] 仕事の最中の問い合わせが壊れず、落ち着いた後は同期と一致する", !badB && qmis == 0, note);
+        std::snprintf(note, sizeof(note), "(同期 %.1f → 非同期 %.1f ms)", wallSync, wallAsync);
+        check("[非同期] 問い合わせ込みの主スレッドの壁時計が同期より短い", wallAsync < wallSync, note);
+        AF_SceneDestroy(a.s); AF_SceneDestroy(b.s);
+    }
+    // ④ 仕事の最中に同期の口（構築）を呼ぶ
+    {
+        Rig b = build(12);
+        AF_SceneSetAsync(b.s, 1);
+        for (int f = 0; f < 30; ++f) { drive(b, f); AF_SceneUpdate(b.s, 1.0f / 60.0f); }
+        AF_SceneAsyncWait(b.s);
+        float before[kBands]; occOf(b.s, 12, before);            // いちばん右の音源（見通せる）
+        const int m = AF_SceneAddMaterial(b.s, nullptr, nullptr, nullptr, 0);
+        drive(b, 30); AF_SceneUpdate(b.s, 1.0f / 60.0f);          // 投げた直後に
+        const int n0 = AF_SceneInstanceCount(b.s);
+        const int id = AF_SceneAddInstanceBox(b.s, V(2.0f, h*0.5f, 0), V(1.5f, h*0.5f, 0.3f), V(1,0,0), V(0,1,0), m);   // 同期: 仕事を待って入る
+        const int n1 = AF_SceneInstanceCount(b.s);
+        for (int f = 31; f < 40; ++f) { drive(b, f); AF_SceneUpdate(b.s, 1.0f / 60.0f); AF_SceneAsyncWait(b.s); }
+        float after[kBands]; occOf(b.s, 12, after);
+        std::snprintf(note, sizeof(note), "(id %d、数 %d → %d、生存 4kHz %.3f → %.3f)", id, n0, n1, before[5], after[5]);
+        check("[非同期] 仕事の最中の構築（AddInstanceBox）が壊れず次の答えに効く", id >= 0 && n1 == n0 + 1 && after[5] < before[5], note);
+        AF_SceneDestroy(b.s);
+    }
+    // ⑤ 切る／仕事の最中に破棄
+    {
+        Rig b = build(6);
+        AF_SceneSetAsync(b.s, 1);
+        for (int f = 0; f < 20; ++f) { drive(b, f); AF_SceneUpdate(b.s, 1.0f / 60.0f); }
+        AF_SceneSetAsync(b.s, 0);
+        const int isA = AF_SceneIsAsync(b.s);
+        drive(b, 20); AF_SceneUpdate(b.s, 1.0f / 60.0f);
+        float o[kBands]; const int idx = occOf(b.s, 1, o);
+        std::snprintf(note, sizeof(note), "(IsAsync %d、index %d、生存 %.3f)", isA, idx, o[0]);
+        check("[非同期] 切ると同期に戻り、答えは続く", isA == 0 && idx >= 0 && o[0] >= 0.0f && o[0] <= 1.0f, note);
+        AF_SceneDestroy(b.s);
+        Rig c = build(12);
+        AF_SceneSetAsync(c.s, 1);
+        drive(c, 0); AF_SceneUpdate(c.s, 1.0f / 60.0f);
+        AF_SceneDestroy(c.s);                                     // 仕事の最中に破棄（待ってから畳む）
+        check("[非同期] 仕事の最中に破棄しても壊れない", true, "");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 【調整支援】「この地点でこう聞こえてほしい」に合わせるための土台
 //
 //   道具の流れ:
@@ -11310,6 +11510,14 @@ int main() {
     scanDllFreshness();
     reportDllFreshness();
 
+    // 開発中の絞り込み: AF_ONLY=async（非同期）／tier（段の予算）でその節だけ回す（全体は 8 分かかる）。
+    if (const char* only = std::getenv("AF_ONLY")) {
+        if (std::strcmp(only, "async") == 0) testAsyncUpdate();
+        else if (std::strcmp(only, "tier") == 0) testTierBudget();
+        std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
+        return (g_failures == 0) ? 0 : 1;
+    }
+
     testDetectorSelfCheck();      // ★検出器が効いているかを先に確かめる
     testCaptureRoundTrip();
     testCaptureReplay();
@@ -11390,6 +11598,7 @@ int main() {
     testWorkerThreads();
     testSourceTiers();
     testTierBudget();
+    testAsyncUpdate();
     testTuningSupport();
     testEarlySharing();
     testGeometryIsPrimary();

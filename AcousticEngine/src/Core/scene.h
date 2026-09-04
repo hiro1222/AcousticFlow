@@ -164,6 +164,8 @@ struct SceneHit {
 
 class Scene {
 public:
+    struct Results;   // update() が置く結果（定義はゲッタの後ろ。ゲッタの引数で先に要るので前方宣言）
+public:
     // --- 構築（登録） ---
 
     // 材質をテーブルに追加し、その materialId を返す。
@@ -305,6 +307,7 @@ public:
     //   変わった領域を rooms::Builder に伝えてあるので、触れたブロックだけ塗り直される。
     const rooms::Result& roomGraph() const {
         if (!roomBuilder_.dirty()) return roomBuilder_.result();
+        ++roomBuilds_;   // 作り直しの回数（自動ポータルが「作り直されたか」を見る物差し）
         std::vector<rooms::SolidBox> statics;
         statics.reserve(instances_.size());
         for (const Instance& in : instances_) {
@@ -1572,6 +1575,8 @@ public:
     }
 
     void rebuildAutoPortals() {
+        roomGraph();                       // 先に部屋グラフを確定させ、その回数を印に持つ
+        portalRoomBuilds_ = roomBuilds_;
         // 自動ぶんは末尾に固めてあるので、そこだけ捨てる。
         if (autoPortalCount_ > 0) {
             portals_.resize(portals_.size() - static_cast<std::size_t>(autoPortalCount_));
@@ -6164,14 +6169,15 @@ public:
         for (auto& s : sources_) if (s.id == id) { s.importance = std::max(0.0f, importance); s.pinned = pinned; return; }
     }
     // 直近の順位の物差し。範囲外は -1。
-    float sourcePriority(int index) const {
+    float sourcePriority(int index, const Results* r = nullptr) const {
+        if (r) return (index >= 0 && index < static_cast<int>(r->score.size())) ? r->score[static_cast<size_t>(index)] : -1.0f;
         if (index < 0 || index >= static_cast<int>(sources_.size())) return -1.0f;
         return sources_[static_cast<size_t>(index)].score;
     }
     int tierBudgetExact() const { return budgetExact_; }
     int tierBudgetSimple() const { return budgetSimple_; }
     // このフレームに探り（保持 → 簡易で解き直し）に選ばれた音源の index。無ければ -1。
-    int tierProbeIndex() const { return probeIdx_; }
+    int tierProbeIndex(const Results* r = nullptr) const { return r ? r->probe : probeIdx_; }
 
     // 自由音場で聞こえなくなる距離(m)。0 以下で自動バーチャルを使わない。
     //
@@ -6214,7 +6220,11 @@ public:
     }
 
     // id → index。見つからなければ -1（af_Get* が id で引くときに使う）。
-    int sourceIndexOf(unsigned long long id) const {
+    int sourceIndexOf(unsigned long long id, const Results* r = nullptr) const {
+        if (r) {   // 写し（非同期）: 写しの id 表から引く
+            for (size_t i = 0; i < r->id.size(); ++i) if (r->id[i] == id) return static_cast<int>(i);
+            return -1;
+        }
         for (size_t i = 0; i < sources_.size(); ++i)
             if (sources_[i].id == id) return static_cast<int>(i);
         return -1;
@@ -6287,7 +6297,39 @@ public:
     const UpdateConfig& updateConfig() const { return cfg_; }
 
     // 毎フレーム 1 発。内部レートに従って各役割を実行し、結果を results_ に置く。
-    void update(float dt) {
+    void update(float dt) { updatePrepare(); updateCompute(dt); }
+
+    // ── 非同期更新のための 2 段（scene_async.h）──
+    //   prepare: 幾何の作り直し（部屋グラフ・自動ポータル・BVH・エッジカタログ・面の焼き）。**排他**で走らせる。
+    //   compute: 解く段。幾何は読むだけ、書くのは results_ と自分の作業域（tierScratch_ / echoAccum_ …）だけ。
+    //            主スレッドの幾何の問い合わせと**並走できる**（複数コアで音源を割るときと同じ規約）。
+    //   同期のときは続けて呼ぶだけ（= 従来の update）。結果は同じ。
+    void updatePrepare() {
+        // 部屋グラフ（遅延構築）。作り直されたら自動ポータルも作り直す。
+        //   ★dirty ではなく**作り直しの回数**で見る。主スレッドの問い合わせ（roomAt）が先に作ると dirty が消え、
+        //     自動ポータルが古いまま残るため（同期でも起きうる取りこぼしだった）。
+        roomGraph();
+        if (autoPortals_ && portalRoomBuilds_ != roomBuilds_) rebuildAutoPortals();
+        // BVH（遅延構築）。解く段の中で作り直さないよう、ここで済ませる。
+        ensureBvh();
+        if (sourceCount() == 0) return;   // 音源が無ければ周期を進めない（従来どおり）
+        // エッジカタログ（リスナー中心・全音源共有）。回折が使う。周期はここで数える。
+        if (cfg_.useEdgeCatalog) {
+            if (--catalogCountdown_ <= 0) {
+                catalogCountdown_ = (cfg_.catalogEveryN > 0) ? cfg_.catalogEveryN : 1;
+                buildEdgeCatalog(listenerPos_, cfg_.edgeCatalogRes, cfg_.edgeCatalogMaxDist);
+            }
+        } else {
+            clearEdgeCatalog();
+        }
+        // 焼く層が古ければ焼き直す（静的だった物が動いた／タグが変わった）。費用は 1 回だけ。
+        if (faceBakeStale_) {
+            faceBakeStale_ = false;
+            bakeStaticFaces(faceBake_.cell, faceBake_.K);
+        }
+    }
+
+    void updateCompute(float dt) {
         ++frame_;
         // 診断カウンタを戻す。
         //   thread_local にした結果、シーンをまたいで**前のシーンの値が残る**ようになった
@@ -6301,13 +6343,13 @@ public:
 
         // 部屋グラフが作り直されたなら、自動生成ポータルも作り直す。
         //   roomGraph() は中で dirty を見ているので毎フレーム呼んでも構築は走らない。
-        if (autoPortals_ && roomBuilder_.dirty()) { roomGraph(); rebuildAutoPortals(); }
+        // （部屋グラフと自動ポータルの作り直しは updatePrepare へ移した）
 
         const int n = sourceCount();
         results_.resize(n, cfg_);
         // ★音源が 0 でも録る。リスナーは動いているし、扉も動く。
         //   「無音の区間だけ記録が抜ける」と、あとでフレーム番号が合わなくなる。
-        if (n == 0) { captureFrame_(0); return; }
+        if (n == 0) { captureFrame_(0); stampResults_(0); return; }
 
         // 音源位置を配列へ（既存の multi 系 API がポインタ配列を取るため）。
         srcScratch_.resize(static_cast<size_t>(n));
@@ -6331,14 +6373,7 @@ public:
         ensureBvh();
 
         // a) エッジカタログ（リスナー中心・全音源共有）。回折が使う。
-        if (cfg_.useEdgeCatalog) {
-            if (--catalogCountdown_ <= 0) {
-                catalogCountdown_ = (cfg_.catalogEveryN > 0) ? cfg_.catalogEveryN : 1;
-                buildEdgeCatalog(listenerPos_, cfg_.edgeCatalogRes, cfg_.edgeCatalogMaxDist);
-            }
-        } else {
-            clearEdgeCatalog();
-        }
+        // a) エッジカタログは updatePrepare へ移した（作り直しは排他の段で）。
 
         // b) 役割1: 遮蔽・回折・透過・到来方向（音源ごと）。
         if (--role1Countdown_ <= 0) {
@@ -6351,10 +6386,7 @@ public:
         }
 
         // 焼く層が古ければ焼き直す（静的だった物が動いた／タグが変わった）。費用は 1 回だけ。
-        if (faceBakeStale_) {
-            faceBakeStale_ = false;
-            bakeStaticFaces(faceBake_.cell, faceBake_.K);
-        }
+        // （焼き直しは updatePrepare へ移した）
         // c) 役割2: 早期反射（音源ごと・低レート）。
         if (cfg_.enableEarlyReflections) {
             if (--earlyCountdown_ <= 0) {
@@ -6388,7 +6420,25 @@ public:
         // ★キャプチャは**全段が終わったあと**。出力を録るので、途中で録ると
         //   「今フレーム更新されなかった段」が前フレームの値のまま混ざる…のは正しいが、
         //   段の位相ずらしの結果そのものを見たいので、必ず最後に 1 回だけ。
+        stampResults_(n);
         captureFrame_(n);
+    }
+
+    // 写しに要る付随の答えを results_ に詰める（非同期更新の写しは results_ を丸ごと複製する）。
+    void stampResults_(int n) {
+        results_.tier.resize(static_cast<size_t>(n));
+        results_.tailRep.resize(static_cast<size_t>(n));
+        results_.id.resize(static_cast<size_t>(n));
+        results_.score.resize(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            const size_t k = static_cast<size_t>(i);
+            results_.tier[k]    = (k < tierScratch_.size()) ? tierScratch_[k] : static_cast<unsigned char>(TierExact);
+            results_.tailRep[k] = (k < tailRep_.size()) ? tailRep_[k] : i;
+            results_.id[k]      = sources_[k].id;
+            results_.score[k]   = sources_[k].score;
+        }
+        results_.probe = probeIdx_;
+        results_.frame = frame_;
     }
 
     // 1 フレームぶんを器へ落とす。★読むのは全部**公開の getter 経由**にしてある。
@@ -6457,45 +6507,50 @@ public:
     // --- 結果取得（前回 update ぶん）---
     // index は sourceIndexOf(id) で引く。範囲外は何もしない（呼び手のバッファは不変）。
 
-    void getSourceOcclusion(int index, float* out6) const {
-        if (!out6 || !validResult(index)) return;
-        const float* src = &results_.bands[static_cast<size_t>(index) * kNumBands];
+    void getSourceOcclusion(int index, float* out6, const Results* r = nullptr) const {
+        const Results& R = resultsOr_(r);
+        if (!out6 || !validResult(index, R)) return;
+        const float* src = &R.bands[static_cast<size_t>(index) * kNumBands];
         for (int b = 0; b < kNumBands; ++b) out6[b] = src[b];
     }
 
-    float getSourceOcclusionScalar(int index) const {
-        return validResult(index) ? results_.occ[static_cast<size_t>(index)] : 0.0f;
+    float getSourceOcclusionScalar(int index, const Results* r = nullptr) const {
+        const Results& R = resultsOr_(r);
+        return validResult(index, R) ? R.occ[static_cast<size_t>(index)] : 0.0f;
     }
 
-    void getSourceArrivalDir(int index, float* out3) const {
-        if (!out3 || !validResult(index)) return;
-        const float* d = &results_.dir[static_cast<size_t>(index) * 3];
+    void getSourceArrivalDir(int index, float* out3, const Results* r = nullptr) const {
+        const Results& R = resultsOr_(r);
+        if (!out3 || !validResult(index, R)) return;
+        const float* d = &R.dir[static_cast<size_t>(index) * 3];
         out3[0] = d[0]; out3[1] = d[1]; out3[2] = d[2];
     }
 
     // 早期反射タップ。書き込んだ本数を返す。
-    int getEarlyReflections(int index, Vec3* outPos, float* outGain6, int maxTaps) const {
-        if (!outPos || !outGain6 || maxTaps <= 0 || !validResult(index)) return 0;
-        const int cap = std::min(maxTaps, results_.earlyCap);
-        const int n = std::min(cap, results_.earlyCount[static_cast<size_t>(index)]);
-        const size_t base = static_cast<size_t>(index) * results_.earlyCap;
+    int getEarlyReflections(int index, Vec3* outPos, float* outGain6, int maxTaps, const Results* r = nullptr) const {
+        const Results& R = resultsOr_(r);
+        if (!outPos || !outGain6 || maxTaps <= 0 || !validResult(index, R)) return 0;
+        const int cap = std::min(maxTaps, R.earlyCap);
+        const int n = std::min(cap, R.earlyCount[static_cast<size_t>(index)]);
+        const size_t base = static_cast<size_t>(index) * R.earlyCap;
         for (int t = 0; t < n; ++t) {
-            outPos[t] = results_.earlyPos[base + static_cast<size_t>(t)];
-            const float* g = &results_.earlyGain[(base + static_cast<size_t>(t)) * kNumBands];
+            outPos[t] = R.earlyPos[base + static_cast<size_t>(t)];
+            const float* g = &R.earlyGain[(base + static_cast<size_t>(t)) * kNumBands];
             for (int b = 0; b < kNumBands; ++b) outGain6[t * kNumBands + b] = g[b];
         }
         return n;
     }
 
     // 回折二次音源。書き込んだ本数を返す。
-    int getDiffractionSources(int index, Vec3* outPos, float* outGain, int maxSrc) const {
-        if (!outPos || !outGain || maxSrc <= 0 || !validResult(index)) return 0;
-        const int cap = std::min(maxSrc, results_.diffCap);
-        const int n = std::min(cap, results_.diffCount[static_cast<size_t>(index)]);
-        const size_t base = static_cast<size_t>(index) * results_.diffCap;
+    int getDiffractionSources(int index, Vec3* outPos, float* outGain, int maxSrc, const Results* r = nullptr) const {
+        const Results& R = resultsOr_(r);
+        if (!outPos || !outGain || maxSrc <= 0 || !validResult(index, R)) return 0;
+        const int cap = std::min(maxSrc, R.diffCap);
+        const int n = std::min(cap, R.diffCount[static_cast<size_t>(index)]);
+        const size_t base = static_cast<size_t>(index) * R.diffCap;
         for (int t = 0; t < n; ++t) {
-            outPos[t] = results_.diffPos[base + static_cast<size_t>(t)];
-            outGain[t] = results_.diffGain[base + static_cast<size_t>(t)];
+            outPos[t] = R.diffPos[base + static_cast<size_t>(t)];
+            outGain[t] = R.diffGain[base + static_cast<size_t>(t)];
         }
         return n;
     }
@@ -6513,25 +6568,26 @@ public:
     //   ⚠ 代表を共有しても**人数ぶん足す**。ここを「代表の和」にすると、
     //     ホストが RT60/wet を出すのに使っている量が音源数ぶん小さくなり、
     //     出荷の残響レベルが変わってしまう。**意味は変えない。**
-    int getEchogramBands(int index, float* outBins, int numBins) const {
-        if (!outBins || numBins <= 0 || results_.echogramBins <= 0) return 0;
-        const int n = std::min(numBins, results_.echogramBins);
-        const size_t stride = static_cast<size_t>(results_.echogramBins) * kNumBands;
+    int getEchogramBands(int index, float* outBins, int numBins, const Results* r = nullptr) const {
+        const Results& R = resultsOr_(r);
+        if (!outBins || numBins <= 0 || R.echogramBins <= 0) return 0;
+        const int n = std::min(numBins, R.echogramBins);
+        const size_t stride = static_cast<size_t>(R.echogramBins) * kNumBands;
         if (index < 0) {
             for (int i = 0; i < n * kNumBands; ++i) outBins[i] = 0.0f;
-            for (int j = 0; j < results_.count; ++j) {
+            for (int j = 0; j < R.count; ++j) {
                 // 自分の部屋の代表を足す（人数ぶん足るので従来と同じ意味になる）。
-                const int r = tailShapeIndex(j);
-                const int k = (r >= 0 && r < results_.count) ? r : j;
-                const float* src = results_.echogram.data() + static_cast<size_t>(k) * stride;
+                const int rep = tailShapeIndex(j, r);
+                const int k = (rep >= 0 && rep < R.count) ? rep : j;
+                const float* src = R.echogram.data() + static_cast<size_t>(k) * stride;
                 for (int i = 0; i < n * kNumBands; ++i) outBins[i] += src[i];
             }
             return n;
         }
-        if (!validResult(index)) return 0;
-        const int rep = tailShapeIndex(index);             // 部屋の代表へ引き直す
-        if (rep >= 0 && rep < results_.count) index = rep;
-        const float* src = results_.echogram.data() + static_cast<size_t>(index) * stride;
+        if (!validResult(index, R)) return 0;
+        const int rep = tailShapeIndex(index, r);             // 部屋の代表へ引き直す
+        if (rep >= 0 && rep < R.count) index = rep;
+        const float* src = R.echogram.data() + static_cast<size_t>(index) * stride;
         for (int i = 0; i < n * kNumBands; ++i) outBins[i] = src[i];
         return n;
     }
@@ -6540,8 +6596,8 @@ public:
     int instanceCount() const { return static_cast<int>(instances_.size()); }
     int materialCount() const { return static_cast<int>(materials_.size()); }
 
-private:
-    // update() が置く結果。段5でこれをダブルバッファ化する。
+public:
+    // update() が置く結果。非同期更新（scene_async.h）はこれを丸ごと写して主スレッドへ渡す。
     struct Results {
         int count = 0;
         std::vector<float> occ;     // [count] 遮蔽スカラ
@@ -6561,6 +6617,14 @@ private:
 
         int echogramBins = 0;
         std::vector<float> echogram;   // [count*echogramBins*6]（音源ごと）
+
+        // ── 写しに要る付随の答え（非同期更新のため。update の最後に stampResults_ が詰める）──
+        std::vector<unsigned char> tier;        // [count] 実効の段（0 厳密／1 簡易／2 バーチャル／3 保持）
+        std::vector<int> tailRep;               // [count] 尾の代表
+        std::vector<unsigned long long> id;     // [count] 音源 id（index の引き直し）
+        std::vector<float> score;               // [count] 順位の物差し
+        int probe = -1;                         // 探りの index
+        int frame = 0;                          // update の通し番号
 
         void resize(int n, const UpdateConfig& c) {
             const int eCap = (c.earlyTaps > 0) ? c.earlyTaps : 1;
@@ -6586,9 +6650,16 @@ private:
         }
     };
 
+    const Results& results() const { return results_; }
+private:
     bool validResult(int index) const {
         return index >= 0 && index < results_.count;
     }
+    static bool validResult(int index, const Results& R) {
+        return index >= 0 && index < R.count;
+    }
+    // 写しから読むか自分の結果から読むか（r = null で自分）。
+    const Results& resultsOr_(const Results* r) const { return r ? *r : results_; }
 
     void runRole1(int n) {
         if (cfg_.useReflections) {
@@ -6859,7 +6930,8 @@ private:
 public:
     /// この音源の尾を担っている代表音源の index（同じ部屋の最も若いもの）。範囲外は -1。
     /// ★ホストはこれで尾の形を引く。ホスト側で同じ規則を持たないこと。
-    int tailShapeIndex(int index) const {
+    int tailShapeIndex(int index, const Results* r = nullptr) const {
+        if (r) return (index >= 0 && index < static_cast<int>(r->tailRep.size())) ? r->tailRep[static_cast<size_t>(index)] : -1;
         if (index < 0 || index >= static_cast<int>(tailRep_.size())) return -1;
         return tailRep_[static_cast<size_t>(index)];
     }
@@ -7453,7 +7525,8 @@ private:
     }
 public:
     // いま実際に使われている段（自動バーチャルと予算の結果込み）。0 厳密／1 簡易／2 バーチャル（素通し）／3 保持。範囲外は -1。
-    int effectiveTier(int index) const {
+    int effectiveTier(int index, const Results* r = nullptr) const {
+        if (r) return (index >= 0 && index < static_cast<int>(r->tier.size())) ? static_cast<int>(r->tier[static_cast<size_t>(index)]) : -1;
         if (index < 0 || index >= static_cast<int>(tierScratch_.size())) return -1;
         return static_cast<int>(tierScratch_[static_cast<size_t>(index)]);
     }
@@ -7615,6 +7688,8 @@ private:
     mutable std::vector<BvhNode> bvhNodes_;    // BVH ノード列（lazy 構築）
     mutable std::vector<int> bvhOrder_;        // アクティブなインスタンス index の並び
     mutable bool bvhDirty_ = true;             // インスタンス変更で立つ再構築フラグ
+    mutable int roomBuilds_ = 0;               // 部屋グラフの作り直し回数
+    int portalRoomBuilds_ = -1;                // 自動ポータルを作ったときの roomBuilds_
     // 部屋・開口の検出。幾何が変わった領域だけ塗り直す（毎フレームではない）。
     mutable std::vector<DiffEdge> edgeCatalog_;  // キューブマップ由来のシルエット稜線
     mutable rooms::Builder roomBuilder_;

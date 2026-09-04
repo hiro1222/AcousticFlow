@@ -303,6 +303,11 @@ namespace AcousticFlow
         [Tooltip("簡易（遮蔽の音量と帯域カーブだけ。回り込みの方向は出ない）の本数の上限。0 = 無制限。1 本 0.05 ms の桁。"
                  + "ここからも漏れた音源は「保持」＝最後の答えを保ち、毎フレーム 1 本ずつ簡易で探り直す（素通しにはしない）。")]
         public int tierBudgetSimple = 10;
+        [Header("更新の非同期化（主スレッドの上限）")]
+        [Tooltip("ON: 音響の更新は DLL のワーカースレッドが解き、主スレッドの Update は数 µs で帰る。"
+                 + "答えは 1 フレーム前の入力に対する物（出力の平滑 0.35 s より十分短い）。設定は待ち行列で次の着手に効き、"
+                 + "幾何の問い合わせ（ComputeSoftOcclusion など）は解く段と並走する。OFF で従来の同期（A/B 用）。")]
+        public bool asyncUpdate = true;
         [Header("扉の定点（隣の空間の響きを戸口の位置から鳴らす）")]
         [Tooltip("ON: 隣の部屋（洞窟の中など）の尾は、その部屋のバスをそのまま足すのではなく、"
                  + "戸口の位置に置いた定点から HRTF で鳴らす。口の結合率（閉じた扉なら板の透過）と"
@@ -1468,6 +1473,7 @@ namespace AcousticFlow
             _scene.SetOutsideApertures(portalTail && sharedTailBus && autoPortals);
             // 音源ごとの段を何コアで回すか。中で値の変化を見ているので毎フレーム押してよい。
             _scene.SetWorkerThreads(workerThreads);
+            _scene.SetAsync(asyncUpdate);   // 変わらなければ何もしない
             _scene.Update(Time.deltaTime);
             // 格子が上限に当たって粗くなっていたら警告する（中で 1 度だけ出す）。
             //   広い地面を 1 枚置くだけで roomCellSize が黙って無視されるので、
@@ -2622,6 +2628,14 @@ namespace AcousticFlow
                 string capE = tierBudgetExact > 0 ? tierBudgetExact.ToString() : "∞";
                 string capS = tierBudgetSimple > 0 ? tierBudgetSimple.ToString() : "∞";
                 GUILayout.Label($"段の予算: 厳密 {ne}/{capE}・簡易 {ns}/{capS}（探り込み）・保持 {nh}・仮想 {nv}", style);
+            }
+            if (_scene != null && _scene.IsValid)
+            {
+                // 更新の非同期化。主スレッドの数字は Update ＋ 結果の読み出し（_acousticMs）、ワーカーの数字は解いた時間。
+                _scene.GetUpdateStats(out float cms, out int lag, out int skipped, out int queued);
+                GUILayout.Label(_scene.IsAsync
+                    ? $"更新: 非同期  ワーカー {cms:F2} ms／答えの古さ {lag} フレーム／追いつかず {skipped}／待ち行列 {queued}   主スレッド {_acousticMs:F2} ms"
+                    : $"更新: 同期   主スレッド {_acousticMs:F2} ms", style);
             }
             GUILayout.Label($"焼き(面の見通し): {(bakeStaticFaces ? $"面 {_bakeFaces} / セル {_bakeCells} / {_bakeMs:F0} ms ／ 動く物 {_bakeDynamic}" : "OFF（生で解く）")}", style);
             // 扉の開き角。音を判断する前提なので数字でも出す（見た目だけだと追えない）。

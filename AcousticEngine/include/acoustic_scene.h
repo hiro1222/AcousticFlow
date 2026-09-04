@@ -986,6 +986,24 @@ ACOUSTIC_API void AF_SceneSetUpdateConfig(AF_SceneHandle scene, const AF_UpdateC
 /* 毎フレーム 1 回。内部レートに従って各役割を実行し、結果を内部バッファへ書く。 */
 ACOUSTIC_API void AF_SceneUpdate(AF_SceneHandle scene, float dt);
 
+/* ── 更新の非同期化（2026-09-04、docs/ASYNC_UPDATE.md）──
+ * AF_SceneSetAsync(1) で AF_SceneUpdate は解かずに帰る（数 µs）。解くのは DLL のワーカースレッド。
+ *   ・設定（SetListener / SetSource / UpdateInstance / SetUpdateConfig …）は待ち行列に入り、次の着手で順に効く。
+ *   ・結果（GetSourceOcclusion / GetEarlyReflections / GetEchogramBands / 段 …）は写しから返る。
+ *     写しは仕事が終わった次の AF_SceneUpdate で取り替わる ＝ **1 フレーム前の入力に対する答え**。
+ *   ・幾何の問い合わせ（ComputeSoftOcclusion / RoomAt / DiffractionPath …）は解く段と並走する
+ *     （作り直しの間だけ待つ）。
+ *   ・構築・焼き・書き出し・キャプチャ操作は仕事を待ってから走る（毎フレーム呼ぶ物ではない）。
+ * 仕事が 1 フレームに収まらないときは、その AF_SceneUpdate は何もしない（入力は溜まり、答えは古いまま）。
+ * ⚠ ホストはシーンを破棄してから終わること（破棄でワーカーを待って畳む）。 */
+ACOUSTIC_API void AF_SceneSetAsync(AF_SceneHandle scene, int enable);
+ACOUSTIC_API int  AF_SceneIsAsync(AF_SceneHandle scene);
+/* 走っている仕事を待ち、答えを写す（検査・「このフレームの答えが要る」ホスト用）。同期なら何もしない。 */
+ACOUSTIC_API void AF_SceneAsyncWait(AF_SceneHandle scene);
+/* 統計: 直近の仕事の計算時間(ms)、写しの古さ(フレーム)、追いつかず投げられなかったフレーム数、待ち行列の長さ。 */
+ACOUSTIC_API void AF_SceneGetUpdateStats(AF_SceneHandle scene, float* outComputeMs, int* outLagFrames,
+                                         int* outSkippedFrames, int* outQueued);
+
 /* --- 結果取得（index は登録順。AF_SceneSourceIndex で id から引く）--- */
 
 /* 音源 id → index。見つからなければ -1。 */

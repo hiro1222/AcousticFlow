@@ -381,6 +381,17 @@ namespace AcousticFlow
         public static extern float AF_SceneGetSourcePriority(IntPtr scene, int index);
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneGetTierProbeIndex(IntPtr scene);
+        // ── 更新の非同期化 ── AF_SceneUpdate は解かずに帰り、DLL のワーカーが解く（docs/ASYNC_UPDATE.md）。
+        //   設定は待ち行列で次の着手に効き、結果は 1 フレーム前の入力に対する写しから返る。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetAsync(IntPtr scene, int enable);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneIsAsync(IntPtr scene);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneAsyncWait(IntPtr scene);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneGetUpdateStats(IntPtr scene, out float outComputeMs, out int outLagFrames,
+                                                         out int outSkippedFrames, out int outQueued);
         // この音源の尾を担っている代表音源の index（同じ部屋のいちばん若いもの）。
         //   ★規則はエンジン側に 1 つだけ。ホストで同じ規則を持たないこと。
         [DllImport(Dll, CallingConvention = Cc)]
