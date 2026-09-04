@@ -802,8 +802,9 @@ ACOUSTIC_API void AF_SceneSetApertureTimbre(AF_SceneHandle scene, float k);
  * ON では前川の δ 減衰も開口率も使わない（まとめて置き換わる。両方掛けると二重になる）。 */
 ACOUSTIC_API void AF_SceneSetUseBtm(AF_SceneHandle scene, int on);
 
-/* 直接経路の半影を帯域ごとのフレネル半径で作る。1=新（既定） / 0=従来（音源まわり 0.4 m・8 点・帯域共通）。
- * 新旧を同じビルドで聞き比べるための切り替え。採用が固まったら 0 側ごと消す予定。 */
+/* 直接経路の半影の作り方。2=窓の走査線積分（既定、2026-09-05。影の区間を解析的に積むので扉の隙間で跳ばない）／
+ * 1=帯域ごとのフレネル半径の環に標本点（09-02。4 点の環が階段になる）／0=従来（音源まわり 0.4 m・8 点・帯域共通）。
+ * 同じビルドで聞き比べるための切り替え。採用が固まったら 0・1 側ごと消す予定。 */
 ACOUSTIC_API void AF_SceneSetDirectPenumbra(AF_SceneHandle scene, int on);
 
 /* 開口の積分で δ（遠回り）をどれだけ効かせるか。1=そのまま / 0=効かせない。既定 1。

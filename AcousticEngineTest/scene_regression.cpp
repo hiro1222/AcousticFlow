@@ -7998,6 +7998,141 @@ void probeKnownIssues() {
     };
     char note[240]; (void)note;
 
+    // #1 #2 部屋どうしの扉（Test_SwingDoor と同じ形: 仕切り＋戸口 1.2 m ＋ 手で置いたポータル）を 1° 刻みで掃引し、
+    //   合成前の 2 つの担い手（円盤の透過 soft ／ 開口積分の回折 dif）と合成後（生存）を分けて出す。
+    //   どちらが階段を作っているかを見る。外へ開く戸口（表ツール）とは別の配置。
+    {
+        const float T = 0.15f, H = 4.0f, doorW = 1.2f, doorH = 2.4f, hw = 6.0f, hd = 8.0f;
+        auto buildDoor = [&](float deg, int* outPid) {
+            AF_SceneHandle s = AF_SceneCreate();
+            const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+            AF_SceneAddInstanceBox(s, V(-(hw + 0.6f) * 0.5f, H*0.5f, 0), V((hw - 0.6f) * 0.5f, H*0.5f, T), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V((hw + 0.6f) * 0.5f, H*0.5f, 0), V((hw - 0.6f) * 0.5f, H*0.5f, T), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, (doorH + H) * 0.5f, 0), V(0.6f, (H - doorH) * 0.5f, T), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, -T, 0), V(hw, T, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, H + T, 0), V(hw, T, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(-hw, H*0.5f, 0), V(T, H*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V( hw, H*0.5f, 0), V(T, H*0.5f, hd), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, H*0.5f, -hd), V(hw, H*0.5f, T), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(0, H*0.5f,  hd), V(hw, H*0.5f, T), V(1,0,0), V(0,1,0), mat);
+            const float th = deg * 3.14159265f / 180.0f;
+            const float c = std::cos(th), sn = std::sin(th);
+            AF_SceneAddInstanceBox(s, V(-0.6f + c*doorW*0.5f, doorH*0.5f, sn*doorW*0.5f), V(doorW*0.5f, doorH*0.5f, 0.03f), V(c,0,sn), V(0,1,0), mat);
+            *outPid = AF_SceneAddPortal(s, V(0, doorH*0.5f, 0), V(1,0,0), V(0,1,0), doorW*0.5f, doorH*0.5f);
+            return s;
+        };
+        const AF_Vector3 L = V(0, 1.6f, -4.0f);
+        const float srcX[3] = {-2.0f, 0.0f, 2.0f};
+        std::printf("      #1 #2 部屋どうしの扉（戸口 1.2 m、蝶番 x=-0.6、奥へ開く。リスナー z=-4、音源 z=+3.5）を 1° 刻みで掃引\n");
+        std::printf("           広帯域 dB（生存＝合成後 ／ soft＝円盤の透過 ／ dif＝開口積分）。1° の最大段差と、3 dB を超えた回数\n");
+        for (int si = 0; si < 3; ++si) {
+            const AF_Vector3 S = V(srcX[si], 1.6f, 3.5f);
+            float prevG = 0, prevS = 0, prevD = 0; float mxG = 0, mxS = 0, mxD = 0; int atG = 0, atS = 0, atD = 0; int over3 = 0;
+            char line[400]; int len = 0; line[0] = 0;
+            for (int deg = 0; deg <= 90; ++deg) {
+                int pid; AF_SceneHandle s = buildDoor(static_cast<float>(deg), &pid);
+                AF_SceneSetListener(s, L); AF_SceneSetSource(s, 1, S);
+                for (int i = 0; i < 3; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+                float g6[kBands] = {}, so6[kBands] = {}, di6[kBands] = {};
+                AF_SceneGetSourceOcclusion(s, AF_SceneSourceIndex(s, 1), g6);
+                AF_SceneDebugSurvivalParts(s, L, S, so6, di6);
+                auto bb = [](const float* v) { float e = 0; for (int b = 0; b < kBands; ++b) e += v[b] * v[b]; return 10.0f * std::log10(std::max(e / kBands, 1e-12f)); };
+                const float G = bb(g6), Sf = bb(so6), D = bb(di6);
+                if (deg > 0) {
+                    if (std::fabs(G - prevG) > mxG) { mxG = std::fabs(G - prevG); atG = deg; }
+                    if (std::fabs(Sf - prevS) > mxS) { mxS = std::fabs(Sf - prevS); atS = deg; }
+                    if (std::fabs(D - prevD) > mxD) { mxD = std::fabs(D - prevD); atD = deg; }
+                    if (std::fabs(G - prevG) > 3.0f) ++over3;
+                }
+                if (deg % 10 == 0 && len < 360) len += std::snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %d:%.0f/%.0f/%.0f", deg, G, Sf, D);
+                prevG = G; prevS = Sf; prevD = D;
+                AF_SceneDestroy(s);
+            }
+            std::printf("         音源 x=%+.0f: 生存 %.1f dB @%d° ／ soft %.1f dB @%d° ／ dif %.1f dB @%d°。3 dB 超 %d 回\n", srcX[si], mxG, atG, mxS, atS, mxD, atD, over3);
+            std::printf("           %s\n", line);
+        }
+    }
+
+    // #1 #2 外へ開く戸口（表ツール AfPatternTable と同じ配置: 部屋 6×6×2.7、戸口 1.4 m、リスナーは戸口の正面・外 1.5 m）。
+    //   ポータルは外へ開く口なので直接経路の開口積分に入らない。担い手を分けて、残る跳びがどちらか見る。
+    //   さらに開き始め 0〜2° を 0.1° 刻みで（1° の跳びが「連続だが急」なのか「不連続」なのかを分ける）。
+    {
+        const float RW = 6.0f, RD = 6.0f, RH = 2.7f, DW = 1.4f, DH = 2.1f, WT = 0.2f, DT = 0.05f;
+        auto buildOut = [&](float deg, bool outward) {
+            AF_SceneHandle s = AF_SceneCreate();
+            const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+            const float cy = RH * 0.5f, hw = WT * 0.5f, gapCx = RW * 0.5f, gapL = gapCx - DW * 0.5f, gapR = gapCx + DW * 0.5f;
+            AF_SceneAddInstanceBox(s, V(-hw, cy, RD * 0.5f), V(hw, cy, RD * 0.5f + WT), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(RW + hw, cy, RD * 0.5f), V(hw, cy, RD * 0.5f + WT), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(RW * 0.5f, cy, -hw), V(RW * 0.5f + WT, cy, hw), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(RW * 0.5f, RH + hw, RD * 0.5f), V(RW * 0.5f + WT, hw, RD * 0.5f + WT), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(RW * 0.5f, -hw, RD * 0.5f), V(RW * 0.5f + WT, hw, RD * 0.5f + WT), V(1,0,0), V(0,1,0), mat);
+            const float zf = RD + hw;
+            AF_SceneAddInstanceBox(s, V(gapL * 0.5f, cy, zf), V(gapL * 0.5f, cy, hw), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V((gapR + RW) * 0.5f, cy, zf), V((RW - gapR) * 0.5f, cy, hw), V(1,0,0), V(0,1,0), mat);
+            AF_SceneAddInstanceBox(s, V(gapCx, (DH + RH) * 0.5f, zf), V(DW * 0.5f, (RH - DH) * 0.5f, hw), V(1,0,0), V(0,1,0), mat);
+            // 扉: 蝶番は戸口の右端。内開き（−z、奥へ）か外開き（+z、リスナー側へ）。
+            const float th = deg * 3.14159265f / 180.0f, c = std::cos(th), sn = std::sin(th);
+            const float hinge = gapR, rx = gapCx - hinge;                        // 負
+            const float zdir = outward ? +1.0f : -1.0f;
+            const float sgn = (outward ? -1.0f : 1.0f);                          // rx < 0 の向き
+const int doorId =             AF_SceneAddInstanceBox(s, V(hinge + rx * c, DH * 0.5f, zf + zdir * std::fabs(rx) * sn), V(DW * 0.5f, DH * 0.5f, DT * 0.5f), V(c, 0, sgn * sn), V(0,1,0), mat);
+            AF_SceneSetInstanceDynamic(s, doorId, 1);   // 扉は動く物: 部屋グラフに入れない（ホストの SwingDoor と同じ扱い）
+            // 部屋グラフの除外は「動いた」印（moved）なので、同じ姿勢で一度動かして印を付ける（ホストでは毎フレーム動く）
+            AF_SceneUpdateInstance(s, doorId, V(hinge + rx * c, DH * 0.5f, zf + zdir * std::fabs(rx) * sn), V(DW * 0.5f, DH * 0.5f, DT * 0.5f), V(c, 0, sgn * sn), V(0,1,0));
+            AF_SceneSetListener(s, V(gapCx, 1.6f, RD + WT + 1.5f));
+            return s;
+        };
+        // 音源は表ツールの 3 本相当（部屋の中: 左奥・中央・右奥）
+        const AF_Vector3 srcs[3] = { V(1.5f, 1.5f, 2.0f), V(3.0f, 1.5f, 1.5f), V(4.5f, 1.5f, 2.0f) };
+        for (int mode = 0; mode < 2; ++mode) {
+            const bool outward = (mode == 1);
+            std::printf("      #1 #2 外へ開く戸口・%s（1° 刻み 0〜90°）: 生存／soft／dif の広帯域 dB。1° の最大段差、3 dB 超の回数\n", outward ? "外開き（板がリスナー側）" : "内開き（板が奥）");
+            for (int si = 0; si < 3; ++si) {
+                float prevG = 0, prevS = 0, prevD = 0, mxG = 0, mxS = 0, mxD = 0; int atG = 0, atS = 0, atD = 0, over3 = 0, over3S = 0;
+                char line[520]; int len = 0; line[0] = 0;
+                for (int deg = 0; deg <= 90; ++deg) {
+                    AF_SceneHandle s = buildOut(static_cast<float>(deg), outward);
+                    AF_SceneSetSource(s, 1, srcs[si]);
+                    for (int i = 0; i < 3; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+                    float g6[kBands] = {}, so6[kBands] = {}, di6[kBands] = {};
+                    AF_SceneGetSourceOcclusion(s, AF_SceneSourceIndex(s, 1), g6);
+                    AF_SceneDebugSurvivalParts(s, V(3.0f, 1.6f, RD + WT + 1.5f), srcs[si], so6, di6);
+                    auto bb = [](const float* v) { float e = 0; for (int b = 0; b < kBands; ++b) e += v[b] * v[b]; return 10.0f * std::log10(std::max(e / kBands, 1e-12f)); };
+                    const float G = bb(g6), Sf = bb(so6), D = bb(di6);
+                    if (deg > 0) {
+                        if (std::fabs(G - prevG) > mxG) { mxG = std::fabs(G - prevG); atG = deg; }
+                        if (std::fabs(Sf - prevS) > mxS) { mxS = std::fabs(Sf - prevS); atS = deg; }
+                        if (std::fabs(D - prevD) > mxD) { mxD = std::fabs(D - prevD); atD = deg; }
+                        if (std::fabs(G - prevG) > 3.0f) ++over3;
+                        if (std::fabs(Sf - prevS) > 3.0f) ++over3S;
+                    }
+                    if ((deg <= 30 ? (deg % 2 == 0) : (deg % 10 == 0)) && len < 480) len += std::snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %d:%.0f/%.0f/%.0f", deg, G, Sf, D);
+                    prevG = G; prevS = Sf; prevD = D;
+                    AF_SceneDestroy(s);
+                }
+                std::printf("         音源%d: 生存 %.1f dB @%d°（3 dB 超 %d 回）／ soft %.1f dB @%d°（3 dB 超 %d 回）／ dif %.1f dB @%d°\n", si + 1, mxG, atG, over3, mxS, atS, over3S, mxD, atD);
+                std::printf("           %s\n", line);
+            }
+        }
+        // 開き始め 0〜2° を 0.1° 刻み（内開き、音源2）
+        {
+            std::printf("      開き始め（内開き・音源2）0〜2° を 0.1° 刻み: 角度:soft dB\n           ");
+            for (int k = 0; k <= 20; ++k) {
+                const float deg = 0.1f * k;
+                AF_SceneHandle s = buildOut(deg, false);
+                AF_SceneSetSource(s, 1, srcs[1]);
+                for (int i = 0; i < 2; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+                float so6[kBands] = {}, di6[kBands] = {};
+                AF_SceneDebugSurvivalParts(s, V(3.0f, 1.6f, RD + WT + 1.5f), srcs[1], so6, di6);
+                float e = 0; for (int b = 0; b < kBands; ++b) e += so6[b] * so6[b];
+                std::printf(" %.1f:%.0f", deg, 10.0f * std::log10(std::max(e / kBands, 1e-12f)));
+                AF_SceneDestroy(s);
+            }
+            std::printf("\n");
+        }
+    }
+
     // #5 V/RT60 の混ぜ（RoomWeights）: 外へ開く戸口を中→外へ歩く。0.1 m 刻みで V と RT60(1k) と空間版の重みの段差
     {
         AF_SceneHandle s = buildRoomWithDoor(1.2f, 0.8f);   // 種 0.8: 既定 0.6 だと 1.2 m の戸口で部屋が 0 個になる（#7）
@@ -10454,8 +10589,10 @@ void testRoomSegmentation() {
             const float narrow = portalTilt(0.08f);   // 1割弱だけ開いている
             const float wide   = portalTilt(1.00f);   // 全開
             { char bo[96]; std::snprintf(bo, sizeof(bo), "(狭 %.1f / 全開 %.1f dB)", narrow, wide);
+              // ★2026-09-05: 「狭 − 全開 ≥ 3 dB」に直した。旧は |狭| > |全開| + 3 で、全開の −0.8 dB（1.2 m の戸口が 125 Hz の
+              //   ゾーンを少し切る＝物理どおり）が差し引かれて 3.7 − 0.8 で落ちた。意図は「狭いと傾き、全開で平坦」の差。
               check("[開口] 隙間が狭いと音色が傾き、全開で平坦に戻る（差 3 dB 以上）",
-                    std::fabs(narrow) > std::fabs(wide) + 3.0f, bo); }
+                    (narrow - wide) > 3.0f, bo); }
             check("[開口] 全開なら帯域差はほぼ無い", wide < 1.5f);
         }
 

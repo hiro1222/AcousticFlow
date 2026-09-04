@@ -2961,7 +2961,11 @@ public:
     /// BTM（有限楔の稜線積分）で回折の帯域ゲインを出す。既定 OFF（前川＋開口積分）。
     ///   ON にすると前川の δ 減衰も開口率も使わず、BTM の値がそのまま帯域ゲインになる。
     void setUseBtm(int on) { useBtm_ = (on != 0); }
-    void setDirectPenumbra(int on) { directPenumbraFresnel_ = (on != 0); }
+    void setDirectPenumbra(int mode) {
+        directPenumbraMode_ = (mode < 0) ? 0 : (mode > 2 ? 2 : mode);
+        directPenumbraFresnel_ = (directPenumbraMode_ != 0);
+    }
+    int directPenumbraMode() const { return directPenumbraMode_; }
     int directPenumbra() const { return directPenumbraFresnel_ ? 1 : 0; }
     // 【診断】AF_APDIAG の有無は一度だけ読む（毎回 getenv すると回折の内側で効いてしまう）。
     static bool apDiag() { static const bool on = std::getenv("AF_APDIAG") != nullptr; return on; }
@@ -4365,7 +4369,188 @@ public:
         const float syq[4] = { +1.0f, +1.0f, -1.0f, -1.0f };
         float softE[kNumBands];            // 帯域別の滑らかな直接透過（エネルギー）
 
-        if (directPenumbraFresnel_) {
+        if (directPenumbraMode_ == 2) {
+            // ★2026-09-05: 窓の**走査線積分**（標本点をやめる）。
+            //   点で撒くと、扉の細い隙間は「点を含むか含まないか」の二値になり、蝶番側の音源が 1° で 9〜11 dB 跳んだ
+            //   （表ツール 1.5 m: 内開き 5→6° −37→−28、8→9° −27→−16、外開き 53→54° −25→−12。環 4 点の階段。
+            //   部屋どうしの扉でも、開口積分が連続なのに円盤の階段が max で漏れて 6.5 dB/° が残った）。
+            //   開口積分（portalOpenBands）は行ごとの影の区間で連続なので、同じ作りを直接経路の窓にも使う:
+            //     窓   = 見通し線の中点に垂直な正方形（半幅 kWin = 3 m。環の最外と同じ）
+            //     影   = 実体の凸包を、リスナー側の物はリスナーから、音源側の物は音源から窓へ落とす
+            //            （視点の面と窓の面で半空間にクリップ。跨ぐ物は両側から落ちる ＝ 旧の g1×g2 と同じ数え方）
+            //     核   = 帯域ごとのガウス exp(−ρ²/r1_b²)（09-02 の環と同じ）。u は区間ごとに解析（erf）、v は行の中点（中心に密な等比の行）
+            //     透過 = 区間の中で影の重なりの τ の積（computeTransmission と同じ。実体 1 つに 1 回、エネルギー）
+            //   ★同じ答えを 2 つ持たない: 標本点の環（mode 1）は聴き比べのために残し、採用が固まったら消す。
+            //   ⚠ 影は凸包 8 頂点まで（開口積分と同じ）。メッシュは三角形ごと（跨ぐ三角形は落とさない）。
+            constexpr float kBandHzS[kNumBands] = {125.0f, 250.0f, 500.0f, 1000.0f, 2000.0f, 4000.0f};
+            const float d1 = 0.5f * dist;
+            float r1b[kNumBands];
+            for (int b = 0; b < kNumBands; ++b) {
+                const float lam = 343.0f / kBandHzS[b];
+                r1b[b] = std::max(std::sqrt(lam * d1 * d1 / dist), 1e-3f);
+            }
+            const Vec3 c0 = listener + dir * d1;
+            constexpr float kWin = 3.0f;
+            struct SPoly { float u[8], v[8]; int n; int mat; };
+            static thread_local std::vector<SPoly> spolys;
+            spolys.clear();
+            auto hullInto = [&](const float* px, const float* py, int m, SPoly& out) {
+                int idx[32]; if (m > 32) m = 32;
+                for (int i = 0; i < m; ++i) idx[i] = i;
+                std::sort(idx, idx + m, [&](int a, int b2) { return (px[a] != px[b2]) ? (px[a] < px[b2]) : (py[a] < py[b2]); });
+                auto cr2 = [&](int o, int a, int b2) { return (px[a] - px[o]) * (py[b2] - py[o]) - (py[a] - py[o]) * (px[b2] - px[o]); };
+                int st[66]; int k = 0;
+                for (int i = 0; i < m; ++i) { while (k >= 2 && cr2(st[k - 2], st[k - 1], idx[i]) <= 0.0f) --k; st[k++] = idx[i]; }
+                const int lower = k + 1;
+                for (int i = m - 2; i >= 0; --i) { while (k >= lower && cr2(st[k - 2], st[k - 1], idx[i]) <= 0.0f) --k; st[k++] = idx[i]; }
+                out.n = std::min(k - 1, 8);
+                for (int i = 0; i < out.n; ++i) { out.u[i] = px[st[i]]; out.v[i] = py[st[i]]; }
+            };
+            // 視点 eye（fwd = 窓へ向かう向き）から点 q を窓へ落とす。
+            auto project = [&](const Vec3& eye, const Vec3& fwd, const Vec3& q, float& ou, float& ov) -> bool {
+                const Vec3 dq = q - eye;
+                const float dd = dot(fwd, dq);
+                if (dd < 1e-6f) return false;
+                const float t = dot(fwd, c0 - eye) / dd;
+                const Vec3 p = eye + dq * t;
+                ou = dot(p - c0, u); ov = dot(p - c0, v);
+                return true;
+            };
+            // 凸な点集合（箱 8 点／三角形 3 点、辺の表）を、視点の面と窓の面でクリップして落とす。
+            auto shadowConvex = [&](const Vec3* pts, int np, const int (*edges)[2], int ne,
+                                    const Vec3& eye, const Vec3& fwd, int mat) {
+                const float kEps = 1e-3f;
+                float sn[8], sf[8];
+                bool allBeyond = true, allBehind = true;
+                for (int i = 0; i < np; ++i) {
+                    sn[i] = dot(fwd, pts[i] - eye);        // 視点の前 > 0
+                    sf[i] = dot(fwd, c0 - pts[i]);         // 窓の手前 > 0
+                    if (sf[i] > kEps) allBeyond = false;
+                    if (sn[i] > kEps) allBehind = false;
+                }
+                if (allBeyond || allBehind) return;        // 全部が窓の向こう／全部が視点の後ろ
+                float px[32], py[32]; int m = 0;
+                for (int i = 0; i < np && m < 32; ++i)
+                    if (sn[i] > kEps && sf[i] > kEps && project(eye, fwd, pts[i], px[m], py[m])) ++m;
+                for (int e = 0; e < ne && m < 30; ++e) {
+                    const int a = edges[e][0], b2 = edges[e][1];
+                    if ((sf[a] > kEps) != (sf[b2] > kEps)) {                        // 窓の面をまたぐ辺
+                        const float tt = (sf[a] - kEps) / (sf[a] - sf[b2]);
+                        const Vec3 q = pts[a] + (pts[b2] - pts[a]) * tt;
+                        if (dot(fwd, q - eye) > kEps && project(eye, fwd, q, px[m], py[m])) ++m;
+                    }
+                    if ((sn[a] > kEps) != (sn[b2] > kEps)) {                        // 視点の面をまたぐ辺
+                        const float tt = (sn[a] - kEps) / (sn[a] - sn[b2]);
+                        const Vec3 q = pts[a] + (pts[b2] - pts[a]) * tt;
+                        if (dot(fwd, c0 - q) > kEps && project(eye, fwd, q, px[m], py[m])) ++m;
+                    }
+                }
+                if (m < 3) return;
+                SPoly pg; hullInto(px, py, m, pg); pg.mat = mat;
+                if (pg.n >= 3) spolys.push_back(pg);
+            };
+            static const int kBoxEdge[12][2] = {{0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7}};
+            static const int kTriEdge[3][2] = {{0,1},{1,2},{2,0}};
+            for (const Instance& inst : instances_) {
+                if (!inst.active) continue;
+                const Obb& ob = inst.obb;
+                const float rad = length(ob.halfExtents);
+                // 見通し線から遠い物は窓に影を落とさない（窓の半幅 ＋ 実体の半径）。
+                const float tt = clamp01(dot(ob.center - listener, dir) / dist);
+                const Vec3 cl = listener + dir * (tt * dist);
+                if (length(ob.center - cl) > kWin + rad) continue;
+                const float side = dot(dir, ob.center - c0);
+                const bool fromL = (side < rad), fromS = (side > -rad);   // 跨ぐ物は両側から
+                const bool isMesh = inst.geomId >= 0 && inst.geomId < static_cast<int>(meshes_.size())
+                                    && meshes_[static_cast<std::size_t>(inst.geomId)].used;
+                if (isMesh) {
+                    const MeshGeometry& g = meshes_[static_cast<std::size_t>(inst.geomId)];
+                    const int nt = g.bvh.triangleCount();
+                    for (int ti = 0; ti < nt && spolys.size() < 2048; ++ti) {
+                        const Triangle& lt = g.bvh.triangle(ti);
+                        const Vec3 tv[3] = {meshLocalToWorldPoint(lt.v0, ob), meshLocalToWorldPoint(lt.v1, ob), meshLocalToWorldPoint(lt.v2, ob)};
+                        if (fromL) shadowConvex(tv, 3, kTriEdge, 3, listener, dir, inst.materialId);
+                        if (fromS) shadowConvex(tv, 3, kTriEdge, 3, source, dir * -1.0f, inst.materialId);
+                    }
+                } else {
+                    Vec3 corner[8];
+                    for (int i = 0; i < 8; ++i) {
+                        const float sx = (i & 1) ? 1.0f : -1.0f, sy = (i & 2) ? 1.0f : -1.0f, sz = (i & 4) ? 1.0f : -1.0f;
+                        corner[i] = ob.center + ob.axisX * (ob.halfExtents.x * sx) + ob.axisY * (ob.halfExtents.y * sy) + ob.axisZ * (ob.halfExtents.z * sz);
+                    }
+                    if (fromL) shadowConvex(corner, 8, kBoxEdge, 12, listener, dir, inst.materialId);
+                    if (fromS) shadowConvex(corner, 8, kBoxEdge, 12, source, dir * -1.0f, inst.materialId);
+                }
+            }
+            if (spolys.empty()) {
+                for (int b = 0; b < kNumBands; ++b) softE[b] = 1.0f;
+            } else {
+                // 行: 中心に密な等比（0.012 → 3 m、片側 28 行）。核の u 積分は解析、v は行の中点。
+                constexpr int kSide = 28;
+                constexpr float kV0 = 0.012f;
+                const float qr = std::pow(kWin / kV0, 1.0f / static_cast<float>(kSide - 1));
+                double numer[kNumBands] = {0, 0, 0, 0, 0, 0}, denom[kNumBands] = {0, 0, 0, 0, 0, 0};
+                struct Ev { float x; int mat; int dir; };
+                static thread_local std::vector<Ev> evs;
+                static thread_local std::vector<int> active;
+                auto rowIntegrate = [&](float y, float hgt) {
+                    evs.clear();
+                    for (const SPoly& pg : spolys) {
+                        float lo, hi;
+                        if (!fresnel::polygonSpanAtY(pg.u, pg.v, pg.n, y, lo, hi)) continue;
+                        lo = std::max(lo, -kWin); hi = std::min(hi, kWin);
+                        if (hi <= lo) continue;
+                        evs.push_back(Ev{lo, pg.mat, +1}); evs.push_back(Ev{hi, pg.mat, -1});
+                    }
+                    std::sort(evs.begin(), evs.end(), [](const Ev& a, const Ev& b2) { return a.x < b2.x; });
+                    // ★核はガウス exp(−(u²+y²)/r1²)（09-02 の環と同じ）。開口積分のローレンツ核 1/(1+ρ²/r1²) を
+                    //   試したが裾が重く、3 m の窓では 4 kHz まで外側に引きずられて、ドアなしの正面の音源が
+                    //   −3.9 dB に落ちた（回帰 [主題] ±2 dB が落ちた）。開口積分は矩形で切られるので裾が効かない。
+                    //   ∫ exp(−(u²+y²)/r²) du = exp(−y²/r²) · (√π r / 2) · [erf(u/r)]
+                    float aB[kNumBands], invR[kNumBands];
+                    for (int b = 0; b < kNumBands; ++b) {
+                        invR[b] = 1.0f / r1b[b];
+                        aB[b] = std::exp(-(y * y) * invR[b] * invR[b]) * 0.886226925f * r1b[b];
+                    }
+                    auto I = [&](int b, float a, float c) { return static_cast<double>(aB[b]) * (std::erf(c * invR[b]) - std::erf(a * invR[b])); };
+                    for (int b = 0; b < kNumBands; ++b) denom[b] += hgt * I(b, -kWin, kWin);
+                    active.clear();
+                    float g[kNumBands] = {1, 1, 1, 1, 1, 1};
+                    float cursor = -kWin;
+                    std::size_t i = 0;
+                    for (;;) {
+                        const float next = (i < evs.size()) ? evs[i].x : kWin;
+                        if (next > cursor) {
+                            for (int b = 0; b < kNumBands; ++b) numer[b] += hgt * g[b] * I(b, cursor, next);
+                            cursor = next;
+                        }
+                        if (i >= evs.size()) break;
+                        const float x0 = evs[i].x;
+                        while (i < evs.size() && evs[i].x == x0) {
+                            if (evs[i].dir > 0) active.push_back(evs[i].mat);
+                            else for (std::size_t k = 0; k < active.size(); ++k)
+                                if (active[k] == evs[i].mat) { active[k] = active.back(); active.pop_back(); break; }
+                            ++i;
+                        }
+                        for (int b = 0; b < kNumBands; ++b) g[b] = 1.0f;
+                        for (int mi : active) {
+                            const AcousticMaterial& mm = materialOf(mi);
+                            for (int b = 0; b < kNumBands; ++b) g[b] *= mm.transmission[b];
+                        }
+                    }
+                };
+                float e0 = 0.0f;
+                for (int k = 0; k < kSide; ++k) {
+                    const float e1 = kV0 * std::pow(qr, static_cast<float>(k));
+                    const float hgt = e1 - e0, yc = 0.5f * (e0 + e1);
+                    rowIntegrate(+yc, hgt);
+                    rowIntegrate(-yc, hgt);
+                    e0 = e1;
+                }
+                for (int b = 0; b < kNumBands; ++b)
+                    softE[b] = (denom[b] > 1e-12) ? clamp01(static_cast<float>(numer[b] / denom[b])) : 1.0f;
+            }
+        } else if (directPenumbraFresnel_) {
             // ★2026-09-02: 縁の半影を**帯域ごとのフレネル半径**で作る。
             //
             //   従来（下の else）は音源まわり半径 0.4 m 固定・8 点で、開いた扉の板の縁が音源の
@@ -7666,6 +7851,7 @@ private:
     //   ★戻せるように残してある切り替え。新旧を同じビルドで聞き比べるためのもので、
     //     採用が固まったら OFF 側ごと消す（同じ問いに 2 つの答えを常設しない）。
     bool  directPenumbraFresnel_ = true;
+    int  directPenumbraMode_ = 2;             // 直接経路の半影: 0 旧（音源まわり 8 点）／1 環（09-02、標本点）／2 窓の走査線積分（既定）
     float btmWedgeAngle_ = 4.712389f;      // 1.5π＝箱の凸稜線
 
     float slitWidthRef_ = 0.35f;         // これより広ければ素通り(m)。500Hz の半波長あたり
