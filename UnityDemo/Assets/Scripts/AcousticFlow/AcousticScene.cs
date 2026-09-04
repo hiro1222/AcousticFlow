@@ -754,13 +754,15 @@ namespace AcousticFlow
             catch (System.Exception) { return 0; }
         }
 
-        /// 音源の段。どこまで解くかを**音源ごとに固定**する。
+        /// 音源の段。ホストが決める段は**上限**で、予算（SetTierBudget）がそこから下げる。
         ///   Exact   … 回折の合成まで。体験の芯（扉の奥の音・探しているベル）
         ///   Simple  … 遮蔽の音量と帯域カーブだけ。回り込みの方向は出ない
-        ///   Virtual … 解かない。ホストは再生位置だけ進める
-        /// ⚠ 距離で自動に切り替えないこと。歩くだけで段が変わると切り替わりが聞こえる。
+        ///   Virtual … 解かない。可聴限界の外＝素通し。ホストは再生位置だけ進める
+        /// GetSourceTierEffective は 3 = 保持（予算から漏れて最後の答えを保っている）も返す。
+        ///   聞こえている音源なので、Virtual と違って尾を止めないこと。
         /// ★2D の音（UI・音楽・ナレーション）に段はない。**音源として登録しない**。
         public enum SourceTier { Exact = 0, Simple = 1, Virtual = 2 }
+        public const int TierHeld = 3;   // GetSourceTierEffective の値だけに現れる
 
         public void SetSourceTier(ulong id, SourceTier tier)
         {
@@ -778,11 +780,49 @@ namespace AcousticFlow
             catch (System.Exception) { }
         }
 
-        /// いま実際に使われている段（自動バーチャルの結果込み）。見つからなければ -1。
+        /// いま実際に使われている段（自動バーチャルと予算の結果込み。3 = 保持）。見つからなければ -1。
         public int GetSourceTierEffective(int index)
         {
             if (_handle == IntPtr.Zero) return -1;
             try { return Native.AF_SceneGetSourceTierEffective(_handle, index); }
+            catch (System.Exception) { return -1; }
+        }
+
+        // ── 段の予算と順位（主スレッドの上限）──
+        //   厳密・簡易の本数。0 = 無制限（既定。呼ばなければ今までどおり手動の段）。超えたぶんは
+        //   可聴性（音量 × 1/r × 生存 × 重要度）の低い順に保持へ落ちる（docs/TIER_BUDGET.md）。
+        public void SetTierBudget(int exactMax, int simpleMax)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneSetTierBudget(_handle, exactMax, simpleMax); }
+            catch (System.Exception) { }   // 古い DLL: 予算なし（全音源が手動の段）
+        }
+        /// 順位の物差しの「音量」（線形）。AudioSource.volume を毎フレーム押してよい。
+        public void SetSourceLoudness(ulong id, float gainLinear)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneSetSourceLoudness(_handle, id, gainLinear); }
+            catch (System.Exception) { }
+        }
+        /// 重要度（倍率）と固定。固定は予算に関わらず段を保つ（枠は消費する）。
+        public void SetSourceImportance(ulong id, float importance, bool pinned)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneSetSourceImportance(_handle, id, importance, pinned ? 1 : 0); }
+            catch (System.Exception) { }
+        }
+        /// 直近の順位の物差し（HUD 用）。範囲外は -1。
+        public float GetSourcePriority(int index)
+        {
+            if (_handle == IntPtr.Zero) return -1f;
+            try { return Native.AF_SceneGetSourcePriority(_handle, index); }
+            catch (System.Exception) { return -1f; }
+        }
+        /// このフレームの探り（保持 → 簡易で解き直し）の音源 index。無ければ -1。
+        public int GetTierProbeIndex()
+        {
+            if (_handle == IntPtr.Zero) return -1;
+            try { return Native.AF_SceneGetTierProbeIndex(_handle); }
             catch (System.Exception) { return -1; }
         }
 

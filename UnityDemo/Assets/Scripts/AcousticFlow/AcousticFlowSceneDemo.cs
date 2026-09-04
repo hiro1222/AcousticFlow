@@ -295,6 +295,14 @@ namespace AcousticFlow
         public bool directionBus = true;
         [Tooltip("方向バスの本数（水平の環）。8 = 45° 刻み（費用 3.4%）。12 = 30°（5.4%）。両耳相関は 8 で基準と 0.02 以内。")]
         [Range(4, 16)] public int directionLanes = 8;
+        [Header("段の予算と順位（主スレッドの上限）")]
+        [Tooltip("厳密（回折の合成・面の線・二次音源まで解く）の本数の上限。0 = 無制限。1 本 0.3 ms の桁。"
+                 + "超えたぶんは可聴性（音量 × 1/r × 前フレームの生存 × 重要度）の低い順に落ちる。"
+                 + "重要度と固定は音源に AcousticSourcePriority を付けて決める。")]
+        public int tierBudgetExact = 6;
+        [Tooltip("簡易（遮蔽の音量と帯域カーブだけ。回り込みの方向は出ない）の本数の上限。0 = 無制限。1 本 0.05 ms の桁。"
+                 + "ここからも漏れた音源は「保持」＝最後の答えを保ち、毎フレーム 1 本ずつ簡易で探り直す（素通しにはしない）。")]
+        public int tierBudgetSimple = 10;
         [Header("扉の定点（隣の空間の響きを戸口の位置から鳴らす）")]
         [Tooltip("ON: 隣の部屋（洞窟の中など）の尾は、その部屋のバスをそのまま足すのではなく、"
                  + "戸口の位置に置いた定点から HRTF で鳴らす。口の結合率（閉じた扉なら板の透過）と"
@@ -1214,6 +1222,7 @@ namespace AcousticFlow
         //     鳴っているのは各音源の AudioSource のクリップ → IrConvolver / VoiceConvolver の畳み込みだけ。
         //     道を 2 本持っていると「1〜4 のソロが効かない＝別の何かが鳴っている」の切り分けができない。
         private AudioSource[] _srcAudio;    // 音源ごとの AudioSource（無い音源は null）
+        private AcousticSourcePriority[] _srcPriority;   // 音源ごとの順位のつまみ（無い音源は null ＝ 重要度 1・固定なし）
         private AudioClip[]   _srcClipOrig; // B で元に戻すためのクリップ
         private bool _muted;                // M: 音源を一括ミュート
         private float[] _outTmp;            // 出力レベル計測用（AudioListener.GetOutputData）
@@ -1230,12 +1239,14 @@ namespace AcousticFlow
         {
             if (_sources == null) return;
             _srcAudio = new AudioSource[_sources.Length];
+            _srcPriority = new AcousticSourcePriority[_sources.Length];
             _srcClipOrig = new AudioClip[_sources.Length];
             int playing = 0;
             for (int i = 0; i < _sources.Length; i++)
             {
                 var a = (_sources[i] != null) ? _sources[i].GetComponent<AudioSource>() : null;
                 _srcAudio[i] = a;
+                _srcPriority[i] = (_sources[i] != null) ? _sources[i].GetComponent<AcousticSourcePriority>() : null;
                 if (a == null) continue;
                 _srcClipOrig[i] = a.clip;
                 // 空間化は畳み込み器がやる。Unity 側の 3D 減衰が重なると距離の数字が合わなくなるので 2D に固定。
@@ -1419,6 +1430,16 @@ namespace AcousticFlow
             _scene.SetListener(listener.position);
             for (int i = 0; i < _sources.Length; i++)
                 _scene.SetSource(SourceId(i), _srcPos[i]);
+            // 段の予算と順位（主スレッドの上限）。予算と音量はここで押す。順位の規則はエンジンに 1 つだけ。
+            //   重要度と固定は AcousticSourcePriority（音源に付ける部品）。無い音源は既定（1・固定なし）のまま。
+            _scene.SetTierBudget(tierBudgetExact, tierBudgetSimple);
+            for (int i = 0; i < _sources.Length; i++)
+            {
+                var a = (_srcAudio != null && i < _srcAudio.Length) ? _srcAudio[i] : null;
+                _scene.SetSourceLoudness(SourceId(i), a != null ? a.volume : 1f);
+                var pr = (_srcPriority != null && i < _srcPriority.Length) ? _srcPriority[i] : null;
+                if (pr != null) _scene.SetSourceImportance(SourceId(i), pr.importance, pr.pinned);
+            }
 
             // 3) バッチ更新（ここから音響計算の時間計測）。
             _acStopwatch.Restart();
@@ -2583,6 +2604,24 @@ namespace AcousticFlow
                 var tb = _portalHost != null ? _portalHost : FindFirstObjectByType<TailBusRenderer>();
                 if (tb != null)
                     GUILayout.Label($"方向バス: {(tb.enableDirectionBus && tb.DirectionBusHandle != System.IntPtr.Zero ? $"{tb.directionLanes} 方向 × 2 耳（RMS {20f * Mathf.Log10(Mathf.Max(tb.DirectionBusRms, 1e-6f)):F1} dB）" : "OFF（タップごとの両耳化）")}", style);
+            }
+            if (_sources != null && _scene != null && _scene.IsValid)
+            {
+                // 段の内訳。探り（保持を 1 本だけ簡易で解き直す）は簡易に数えるので、簡易は上限 + 1 まで出る。
+                int ne = 0, ns = 0, nv = 0, nh = 0;
+                for (int i = 0; i < _sources.Length; i++)
+                {
+                    switch (_scene.GetSourceTierEffective(_scene.SourceIndex(SourceId(i))))
+                    {
+                        case 0: ne++; break;
+                        case 1: ns++; break;
+                        case 2: nv++; break;
+                        case 3: nh++; break;
+                    }
+                }
+                string capE = tierBudgetExact > 0 ? tierBudgetExact.ToString() : "∞";
+                string capS = tierBudgetSimple > 0 ? tierBudgetSimple.ToString() : "∞";
+                GUILayout.Label($"段の予算: 厳密 {ne}/{capE}・簡易 {ns}/{capS}（探り込み）・保持 {nh}・仮想 {nv}", style);
             }
             GUILayout.Label($"焼き(面の見通し): {(bakeStaticFaces ? $"面 {_bakeFaces} / セル {_bakeCells} / {_bakeMs:F0} ms ／ 動く物 {_bakeDynamic}" : "OFF（生で解く）")}", style);
             // 扉の開き角。音を判断する前提なので数字でも出す（見た目だけだと追えない）。

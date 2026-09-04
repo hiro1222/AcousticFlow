@@ -7576,6 +7576,196 @@ void testSourceTiers() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 【段の予算と順位】厳密の本数に上限を作り、可聴性の順に配る（主スレッドの上限）
+//
+//   物差し: score = 音量 × 1/r × 前フレームの生存 × 重要度。上から 厳密 → 簡易 → 保持。
+//   縛るのは 6 つ:
+//     ① 予算を呼ばなければ今までどおり（全音源が手動の段）
+//     ② 厳密の本数はちょうど上限。顔ぶれは近い順。残りは「保持」で素通しの仮想ではない
+//     ③ 保持は最後の答えを保つ（探りで解いた遮蔽が残り、1.0 に戻らない）
+//     ④ 固定は段を保ち枠を消費する。重要度と音量は順位を動かす
+//     ⑤ ヒステリシス: 入れ替わりは 1 s の後。現職の +3 dB を超えない差では入れ替わらない
+//     ⑥ 費用: 12 本・半分が影で、無制限 → 厳密 6 で平均が下がる
+// ─────────────────────────────────────────────────────────────────────
+void testTierBudget() {
+    std::printf("\n[段の予算] 厳密の本数に上限を作り、可聴性の順に配る\n");
+    const float h = 4.0f, t = 0.3f, hw = 9.0f, hd = 9.0f;
+    // 部屋 18 × 18 m。x 軸に沿って音源を 1.3 m 刻みに並べ、リスナーは −x の端。近い順 ＝ 順位。
+    auto build = [&](int nSrc) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneSetListener(s, V(-8.0f, 1.6f, 0.0f));
+        for (int i = 0; i < nSrc; ++i)
+            AF_SceneSetSource(s, static_cast<unsigned long long>(1 + i), V(-6.5f + i * 1.3f, 1.6f, 0.0f));
+        return s;
+    };
+    auto tierOf = [](AF_SceneHandle s, int i) {
+        return AF_SceneGetSourceTierEffective(s, AF_SceneSourceIndex(s, static_cast<unsigned long long>(1 + i)));
+    };
+    auto countTiers = [&](AF_SceneHandle s, int nSrc, int out[4]) {
+        for (int k = 0; k < 4; ++k) out[k] = 0;
+        for (int i = 0; i < nSrc; ++i) { const int tt = tierOf(s, i); if (tt >= 0 && tt < 4) ++out[tt]; }
+    };
+    auto run = [](AF_SceneHandle s, float sec) {
+        const int k = static_cast<int>(sec * 60.0f + 0.5f);
+        for (int i = 0; i < k; ++i) AF_SceneUpdate(s, 1.0f / 60.0f);
+    };
+    char note[240];
+
+    // ① 予算 OFF
+    {
+        AF_SceneHandle s = build(12);
+        run(s, 0.5f);
+        int c[4]; countTiers(s, 12, c);
+        std::snprintf(note, sizeof(note), "(厳密 %d / 簡易 %d / 仮想 %d / 保持 %d)", c[0], c[1], c[2], c[3]);
+        check("[段の予算] 予算を呼ばなければ全音源が厳密（今までどおり）", c[0] == 12, note);
+        AF_SceneDestroy(s);
+    }
+    // ② 厳密 4・簡易 3 の顔ぶれ
+    {
+        AF_SceneHandle s = build(12);
+        AF_SceneSetTierBudget(s, 4, 3);
+        run(s, 2.0f);
+        int c[4]; countTiers(s, 12, c);
+        const int probe = AF_SceneGetTierProbeIndex(s);
+        std::snprintf(note, sizeof(note), "(厳密 %d / 簡易 %d / 仮想 %d / 保持 %d / 探り idx %d)", c[0], c[1], c[2], c[3], probe);
+        check("[段の予算] 厳密は上限ちょうど（4 本）", c[0] == 4, note);
+        check("[段の予算] 簡易は上限 ＋ 探り 1 本", c[1] == 3 + (probe >= 0 ? 1 : 0), note);
+        check("[段の予算] 残りは保持で、素通しの仮想は 0", c[2] == 0 && c[3] == 12 - c[0] - c[1], note);
+        bool near4 = true;
+        for (int i = 0; i < 4; ++i) near4 = near4 && (tierOf(s, i) == 0);
+        std::snprintf(note, sizeof(note), "(段 %d %d %d %d | %d %d %d ...)", tierOf(s,0), tierOf(s,1), tierOf(s,2), tierOf(s,3), tierOf(s,4), tierOf(s,5), tierOf(s,6));
+        check("[段の予算] 厳密の 4 本は近い順", near4, note);
+        const float p0 = AF_SceneGetSourcePriority(s, AF_SceneSourceIndex(s, 1));
+        const float p11 = AF_SceneGetSourcePriority(s, AF_SceneSourceIndex(s, 12));
+        std::snprintf(note, sizeof(note), "(1.5 m: %.3f / 15.8 m: %.3f)", p0, p11);
+        check("[段の予算] 順位の物差しは近いほど大きい（1/r）", p0 > p11 * 5.0f, note);
+        std::printf("        順位の物差し: 近 %.3f → 遠 %.3f（比 %.1f）\n", p0, p11, (p11 > 0) ? p0 / p11 : 0.0f);
+        AF_SceneDestroy(s);
+    }
+    // ③ 保持は最後の答えを保つ（衝立の裏の遠い音源）
+    {
+        AF_SceneHandle s = build(12);
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        // 衝立: x=6.0 に立て、その裏（x 6.5 / 7.8）の 2 本を影にする
+        AF_SceneAddInstanceBox(s, V(6.0f, h*0.5f, 0), V(0.3f, h*0.5f, 3.0f), V(1,0,0), V(0,1,0), m);
+        AF_SceneSetTierBudget(s, 4, 3);
+        run(s, 3.0f);   // 保持 5 本を探りが数周する
+        const int tt = tierOf(s, 11);
+        float b[kBands] = {};
+        AF_SceneGetSourceOcclusion(s, AF_SceneSourceIndex(s, 12), b);
+        std::snprintf(note, sizeof(note), "(段 %d / 生存 125Hz %.3f / 4kHz %.3f)", tt, b[0], b[5]);
+        check("[段の予算] 衝立の裏の遠い音源は保持（か探り中の簡易）", tt == 3 || tt == 1, note);
+        check("[段の予算] 保持の生存は探りで解いた値のまま（素通し 1.0 に戻らない）", b[5] < 0.9f && b[0] > b[5], note);
+        AF_SceneDestroy(s);
+    }
+    // ④ 固定・重要度・音量
+    {
+        AF_SceneHandle s = build(12);
+        AF_SceneSetTierBudget(s, 4, 3);
+        AF_SceneSetSourceImportance(s, 12, 1.0f, 1);     // いちばん遠い音源を固定
+        AF_SceneSetSourceImportance(s, 1, 0.01f, 0);     // いちばん近い音源の重要度 −40 dB
+        run(s, 2.0f);
+        int c[4]; countTiers(s, 12, c);
+        std::snprintf(note, sizeof(note), "(遠い固定 段 %d / 近い −40 dB 段 %d / 厳密 %d 本)", tierOf(s, 11), tierOf(s, 0), c[0]);
+        check("[段の予算] 固定した遠い音源は厳密のまま", tierOf(s, 11) == 0, note);
+        check("[段の予算] 固定は枠を消費する（厳密は 4 本のまま）", c[0] == 4, note);
+        check("[段の予算] 重要度 −40 dB の近い音源は厳密から落ちる", tierOf(s, 0) != 0, note);
+        AF_SceneSetSourceLoudness(s, 2, 0.0f);            // 次に近い音源の音量 0
+        run(s, 2.0f);
+        std::snprintf(note, sizeof(note), "(音量 0 の音源 段 %d)", tierOf(s, 1));
+        check("[段の予算] 音量 0 の音源は厳密から落ちる", tierOf(s, 1) != 0, note);
+        AF_SceneDestroy(s);
+    }
+    // ⑤ ヒステリシス
+    {
+        AF_SceneHandle s = build(12);
+        AF_SceneSetTierBudget(s, 4, 3);
+        run(s, 2.0f);
+        AF_SceneSetListener(s, V(8.0f, 1.6f, 0.0f));     // 反対の端へ。遠かった音源が近くなる
+        run(s, 0.3f); const int e03 = tierOf(s, 11);
+        run(s, 1.0f); const int e13 = tierOf(s, 11);
+        std::snprintf(note, sizeof(note), "(0.3 s 後 段 %d / 1.3 s 後 段 %d)", e03, e13);
+        check("[段の予算] 入れ替わりは 1 s のヒステリシスの後（0.3 s ではまだ）", e03 != 0 && e13 == 0, note);
+        AF_SceneDestroy(s);
+    }
+    {
+        // 現職の加点: 2 本の音源の間で、差が +3 dB を超えない限り現職が残る
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0), V(20, t, 20), V(1,0,0), V(0,1,0), m);
+        AF_SceneSetSource(s, 1, V(-2.0f, 1.6f, 0));
+        AF_SceneSetSource(s, 2, V( 2.0f, 1.6f, 0));
+        AF_SceneSetTierBudget(s, 1, 0);
+        AF_SceneSetListener(s, V(-0.2f, 1.6f, 0));   // A が近い（1.8 m vs 2.2 m）
+        run(s, 1.5f);
+        const int a0 = tierOf(s, 0), b0 = tierOf(s, 1);
+        AF_SceneSetListener(s, V(0.2f, 1.6f, 0));    // B が近い。差は 2.2/1.8 = 1.22 倍（+1.7 dB）< 加点 +3 dB
+        run(s, 3.0f);
+        const int a1 = tierOf(s, 0), b1 = tierOf(s, 1);
+        AF_SceneSetListener(s, V(1.0f, 1.6f, 0));    // B が 3 倍近い（+9.5 dB）。入れ替わる
+        run(s, 1.5f);
+        const int a2 = tierOf(s, 0), b2 = tierOf(s, 1);
+        std::snprintf(note, sizeof(note), "(初 A%d B%d / +1.7dB 3s後 A%d B%d / +9.5dB 1.5s後 A%d B%d)", a0, b0, a1, b1, a2, b2);
+        check("[段の予算] 現職の加点: +1.7 dB の差では 3 s 経っても入れ替わらない", a0 == 0 && b0 != 0 && a1 == 0 && b1 != 0, note);
+        check("[段の予算] +9.5 dB の差なら 1 s 後に入れ替わる", a2 != 0 && b2 == 0, note);
+        AF_SceneDestroy(s);
+    }
+    // ⑥ 費用: 12 本・半分が影（衝立の裏）。無制限 vs 厳密 6・簡易 10
+    {
+        auto buildShadow = [&]() {
+            AF_SceneHandle s = AF_SceneCreate();
+            const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+            AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(3.0f, h*0.5f, 0.3f), V(1,0,0), V(0,1,0), m);
+            AF_SceneSetListener(s, V(0, 1.6f, -5.0f));
+            for (int i = 0; i < 12; ++i)
+                AF_SceneSetSource(s, static_cast<unsigned long long>(300 + i), V(-6.0f + i * 1.1f, 1.6f, 5.0f));
+            return s;
+        };
+        using clk = std::chrono::high_resolution_clock;
+        double avg[2] = {0, 0}, worst[2] = {0, 0};
+        int tiers[2][4] = {};
+        for (int mode = 0; mode < 2; ++mode) {
+            AF_SceneHandle s = buildShadow();
+            if (mode == 1) AF_SceneSetTierBudget(s, 6, 10);
+            for (int k = 0; k < 150; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);   // 2.5 s: 段が落ち着く
+            const int N = 120;
+            double sum = 0.0, mx = 0.0;
+            for (int k = 0; k < N; ++k) {
+                const auto t0 = clk::now();
+                AF_SceneUpdate(s, 1.0f / 60.0f);
+                const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+                sum += ms; mx = std::max(mx, ms);
+            }
+            avg[mode] = sum / N; worst[mode] = mx;
+            for (int i = 0; i < 12; ++i) {
+                const int tt = AF_SceneGetSourceTierEffective(s, AF_SceneSourceIndex(s, static_cast<unsigned long long>(300 + i)));
+                if (tt >= 0 && tt < 4) ++tiers[mode][tt];
+            }
+            AF_SceneDestroy(s);
+        }
+        std::printf("        費用（12 本・半分が影、1 コア）\n");
+        std::printf("          %-14s %10s %10s   段の内訳（厳密/簡易/仮想/保持）\n", "予算", "平均 ms", "最悪 ms");
+        std::printf("          %-14s %10.3f %10.3f   %d/%d/%d/%d\n", "無制限", avg[0], worst[0], tiers[0][0], tiers[0][1], tiers[0][2], tiers[0][3]);
+        std::printf("          %-14s %10.3f %10.3f   %d/%d/%d/%d\n", "厳密 6・簡易 10", avg[1], worst[1], tiers[1][0], tiers[1][1], tiers[1][2], tiers[1][3]);
+        std::snprintf(note, sizeof(note), "(平均 %.3f → %.3f ms)", avg[0], avg[1]);
+        check("[段の予算] 厳密 6 に絞ると平均が下がる", avg[1] < avg[0] * 0.9, note);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 【調整支援】「この地点でこう聞こえてほしい」に合わせるための土台
 //
 //   道具の流れ:
@@ -11199,6 +11389,7 @@ int main() {
     diagnoseBvhRebuildCost();
     testWorkerThreads();
     testSourceTiers();
+    testTierBudget();
     testTuningSupport();
     testEarlySharing();
     testGeometryIsPrimary();

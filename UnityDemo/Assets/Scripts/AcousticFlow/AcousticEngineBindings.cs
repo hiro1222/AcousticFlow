@@ -366,8 +366,21 @@ namespace AcousticFlow
         //     残響は距離でほとんど減らないので、距離だけで切ると聞こえている音を黙らせる。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneSetSourceAudibleRadius(IntPtr scene, ulong id, float metres);
+        // いま実際に使われている段: 0 厳密／1 簡易／2 バーチャル（素通し）／3 保持（予算から漏れた。止めないこと）。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneGetSourceTierEffective(IntPtr scene, int index);
+        // ── 段の予算と順位（主スレッドの上限）── 厳密・簡易の本数。0 = 無制限。
+        //   超えたぶんは可聴性（音量 × 1/r × 生存 × 重要度）の低い順に「保持」へ落ちる（docs/TIER_BUDGET.md）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetTierBudget(IntPtr scene, int exactMax, int simpleMax);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetSourceLoudness(IntPtr scene, ulong id, float gainLinear);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetSourceImportance(IntPtr scene, ulong id, float importance, int pinned);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern float AF_SceneGetSourcePriority(IntPtr scene, int index);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneGetTierProbeIndex(IntPtr scene);
         // この音源の尾を担っている代表音源の index（同じ部屋のいちばん若いもの）。
         //   ★規則はエンジン側に 1 つだけ。ホストで同じ規則を持たないこと。
         [DllImport(Dll, CallingConvention = Cc)]

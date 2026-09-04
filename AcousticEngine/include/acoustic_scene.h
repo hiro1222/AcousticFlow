@@ -369,6 +369,8 @@ ACOUSTIC_API int AF_SceneTransmissionCarriers(AF_SceneHandle scene,
                                               int* outInstance, int* outMaterial,
                                               float* outLossDb, int maxCount);
 
+/* 音源の段（0 厳密／1 簡易／2 バーチャル）。予算（AF_SceneSetTierBudget）を使うときは**上限**になる
+ * （簡易にした音源は予算が余っても厳密にならない）。既定 0。 */
 ACOUSTIC_API void AF_SceneSetSourceTier(AF_SceneHandle scene, unsigned long long id, int tier);
 
 /* 自由音場で聞こえなくなる距離(m)。0 以下＝自動でバーチャルへ落とさない（既定）。
@@ -381,9 +383,32 @@ ACOUSTIC_API void AF_SceneSetSourceTier(AF_SceneHandle scene, unsigned long long
 ACOUSTIC_API void AF_SceneSetSourceAudibleRadius(AF_SceneHandle scene,
                                                  unsigned long long id, float metres);
 
-/* いま実際に使われている段（自動バーチャルの結果を含む）。index は AF_SceneSourceIndex。
- * 見つからなければ -1。診断・検証用。 */
+/* いま実際に使われている段（自動バーチャルと予算の結果を含む）。index は AF_SceneSourceIndex。
+ *   0 厳密／1 簡易／2 バーチャル（可聴限界の外＝素通し。ホストは尾も止めてよい）／
+ *   3 保持（予算から漏れた。最後の答えを保っている。**聞こえている音源なので止めないこと**）。
+ * 見つからなければ -1。 */
 ACOUSTIC_API int AF_SceneGetSourceTierEffective(AF_SceneHandle scene, int index);
+
+/* ── 段の予算と順位（2026-09-04）── 主スレッドの上限。
+ * 主スレッドの費用は「厳密の本数」で決まる（1 本 0.3 ms の桁。簡易 0.05 ms、保持 0）。予算を超えたぶんは
+ * 可聴性の見積もり score = 音量 × 1/r × 前フレームの生存 × 重要度 の低い順に落とす。
+ *   exactMax / simpleMax … 厳密・簡易の本数。0 以下＝その段は無制限（既定。呼ばなければ今までどおり手動の段）。
+ *   落ちた音源は「保持」（AF_SceneGetSourceTierEffective が 3）: 役割1 を飛ばして最後の答えを保ち、面の線と
+ *   二次音源は 0 本、尾は部屋の代表の物をそのまま。素通しにはしない。保持の音源は毎フレーム 1 本ずつ
+ *   （いちばん古い物から）簡易で探り直すので、扉が開いて聞こえるようになれば順位が上がる。
+ * ヒステリシス: 現職に段 1 つあたり +3 dB の加点、昇格は 0.5 s・降格は 1 s 続いてから（登録直後は待たない）。
+ * ⚠ 厳密の上限は硬い。簡易は降格の通過点として最大 1 s だけ超えることがある。 */
+ACOUSTIC_API void  AF_SceneSetTierBudget(AF_SceneHandle scene, int exactMax, int simpleMax);
+/* 順位の物差しの「音量」（線形、既定 1）。AudioSource.volume などを毎フレーム押してよい。 */
+ACOUSTIC_API void  AF_SceneSetSourceLoudness(AF_SceneHandle scene, unsigned long long id, float gainLinear);
+/* 重要度（倍率、既定 1。2 = +6 dB ぶん落ちにくい）と固定（pinned != 0: 予算に関わらず手動の段のまま。
+ * 枠は消費する。探しているベルのような体験の芯だけに）。デザイナに渡すつまみ。 */
+ACOUSTIC_API void  AF_SceneSetSourceImportance(AF_SceneHandle scene, unsigned long long id,
+                                               float importance, int pinned);
+/* 直近の順位の物差し（診断・HUD）。範囲外は -1。 */
+ACOUSTIC_API float AF_SceneGetSourcePriority(AF_SceneHandle scene, int index);
+/* このフレームの探り（保持 → 簡易で解き直し）に選ばれた音源の index。無ければ -1。診断用。 */
+ACOUSTIC_API int   AF_SceneGetTierProbeIndex(AF_SceneHandle scene);
 
 /* この音源の尾（後期残響）を担っている代表音源の index。範囲外は -1。
  *

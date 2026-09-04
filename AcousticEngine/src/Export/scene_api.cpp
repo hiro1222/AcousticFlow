@@ -750,6 +750,31 @@ int AF_SceneGetSourceTierEffective(AF_SceneHandle scene, int index) {
     return s ? s->effectiveTier(index) : -1;
 }
 
+void AF_SceneSetTierBudget(AF_SceneHandle scene, int exactMax, int simpleMax) {
+    Scene* s = asScene(scene);
+    if (s) s->setTierBudget(exactMax, simpleMax);
+}
+
+void AF_SceneSetSourceLoudness(AF_SceneHandle scene, unsigned long long id, float gainLinear) {
+    Scene* s = asScene(scene);
+    if (s) s->setSourceLoudness(id, gainLinear);
+}
+
+void AF_SceneSetSourceImportance(AF_SceneHandle scene, unsigned long long id, float importance, int pinned) {
+    Scene* s = asScene(scene);
+    if (s) s->setSourceImportance(id, importance, pinned != 0);
+}
+
+float AF_SceneGetSourcePriority(AF_SceneHandle scene, int index) {
+    Scene* s = asScene(scene);
+    return s ? s->sourcePriority(index) : -1.0f;
+}
+
+int AF_SceneGetTierProbeIndex(AF_SceneHandle scene) {
+    Scene* s = asScene(scene);
+    return s ? s->tierProbeIndex() : -1;
+}
+
 /* ── キャプチャ（サウンドデバッグツール。docs/SOUND_DEBUG_TOOL.md）───────── */
 
 void AF_SceneCaptureBegin(AF_SceneHandle scene, int prerollFrames, int postrollFrames,

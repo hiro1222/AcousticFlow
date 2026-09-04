@@ -4851,7 +4851,9 @@ public:
             // ★バーチャル: 何も解かない。自由音場（素通り）を書いて、方向は音源の向き。
             //   ホストは再生位置だけ進める。可聴限界より下でしか選ばれないので、
             //   ここで素通りを書いても聞こえ方に出ない。
-            if (tierIs_(j, TierVirtual)) {
+            //   保持（予算から漏れた）も解かないが、出力は**書かない**（下の出力の所で飛ばす）。
+            //   ここの total は出力に使われないので値は何でもよい。
+            if (tierIs_(j, TierVirtual) || tierIs_(j, TierHold)) {
                 for (int b = 0; b < kNumBands; ++b) total[j * kNumBands + b] = 1.0f;
                 refDist[j] = std::max(length(sources[j] - listener), 1e-3f);
                 dirAccum[j] = normalized(sources[j] - listener) * directWeight;
@@ -4993,8 +4995,9 @@ public:
                 }
         }
 
-        // 出力。
+        // 出力。保持の音源は前の答えをそのまま残す（呼び手の箱は前フレームの結果）。
         for (int j = 0; j < count; ++j) {
+            if (tierIs_(j, TierHold)) continue;
             if (outBands)
                 for (int b = 0; b < kNumBands; ++b)
                     outBands[j * kNumBands + b] = total[j * kNumBands + b];
@@ -5427,9 +5430,9 @@ public:
                 float refl[kNumBands];
                 for (int b = 0; b < kNumBands; ++b)
                     refl[b] = clamp01(1.0f - mat.absorption[b] - mat.transmission[b]);
-                // ここだけ音源数ぶん。バーチャルの段は解かない。
+                // ここだけ音源数ぶん。バーチャルと保持の段は解かない。
                 for (int j = 0; j < count; ++j) {
-                    if (tierIs_(j, TierVirtual)) continue;
+                    if (tierIs_(j, TierVirtual) || tierIs_(j, TierHold)) continue;
                     float seg[kNumBands];
                     computeTransmission(q, sources[j], seg);
                     Tap t;
@@ -6091,14 +6094,20 @@ public:
     // ここで保持するようにしておくと、後段の af_Update（1発で全音源を回す）と
     // ワーカースレッド化（入力をスナップショットして投げる）が素直に乗る。
     // 段1では保持するだけで、既存クエリは引数版のまま＝挙動は一切変わらない。
-    // 音源の段。**音源ごとに固定**する（オーサリング）。
-    //   距離で自動に切り替えると、歩くだけで段が変わって切り替わりが聞こえる
-    //   ＝ 同じ音源が場面によって別の仕組みで鳴る（決めごと #1）。
-    //   固定なら、2 つの模型が同居しても同じ音源が混ざることはない。
+    // 音源の段。ホストが決める段（AF_SceneSetSourceTier）は**上限**で、予算（applyTierBudget_）が
+    //   そこから下げる。2026-09-04 までは「音源ごとに固定（オーサリング）」だったが、決める側が居らず
+    //   全音源が厳密のままだった。固定にした理由「歩くだけで段が変わって切り替わりが聞こえる」への答え:
+    //     ① 落ちるのは順位の低い音源（上位より静か）。いちばん聞こえない所で入れ替わる
+    //     ② 現職の加点（+3 dB）と時間のヒステリシス（昇格 0.5 s／降格 1 s）。境目で毎フレーム入れ替わらない
+    //     ③ 予算から漏れた音源は「保持」（最後の答えを保つ）であって「素通し」ではない
+    //   予算を呼ばなければ今までどおり（手動の段のまま）。
     enum SourceTier : unsigned char {
         TierExact   = 0,   // 回折の合成まで解く。体験の芯（扉の奥の音・探しているベル）
         TierSimple  = 1,   // 遮蔽の音量と帯域カーブだけ。「其処に何か在る」が伝わればよいもの
-        TierVirtual = 2,   // 解かない。ホストは再生位置だけ進める
+        TierVirtual = 2,   // 解かない。可聴限界の外＝素通し。ホストは再生位置だけ進める
+        TierHold    = 3,   // 解かない。**予算から漏れた**音源＝最後の答えを保つ（聞こえているので素通しにしない）。
+                           //   effectiveTier() の値としてだけ現れる（ホストは設定できない）。役割1 を飛ばし、
+                           //   面の線と二次音源は 0 本、尾は代表（部屋）の物をそのまま。順繰りに簡易で探り直す
     };
 
     struct SourceEntry {
@@ -6109,6 +6118,14 @@ public:
         // 自由音場で聞こえなくなる距離(m)。0 以下＝自動でバーチャルへ落とさない。
         float audibleRadius = 0.0f;
         bool  autoVirtual = false;     // ヒステリシスの状態（いま自動で落ちているか）
+        // ── 段の予算と順位（applyTierBudget_）──
+        float loudness   = 1.0f;       // ホストの音量（線形）。順位の物差しの 1 項。毎フレーム押してよい
+        float importance = 1.0f;       // デザイナの重要度（倍率）。値でなく規則を渡す
+        bool  pinned     = false;      // 予算に関わらず tier のまま（体験の芯）。枠は消費する
+        unsigned char budgetTier = 3;  // 予算が決めた段（0 厳密／1 簡易／3 保持）。新規は保持から入り、未解決なら待たずに昇格
+        float tierTimer  = 0.0f;       // 望みの段と違い続けている時間（秒）。ヒステリシス
+        float score      = 0.0f;       // 直近の順位の物差し（診断・HUD）
+        int   lastSolved = -1;         // 最後に役割1 を解いたフレーム。-1 = 未解決（探りの優先、昇格を待たない）
     };
 
     void setListener(const Vec3& pos) { listenerPos_ = pos; }
@@ -6131,6 +6148,30 @@ public:
                            : (tier == 1) ? TierSimple : TierVirtual;
         for (auto& s : sources_) if (s.id == id) { s.tier = t; return; }
     }
+
+    // ── 段の予算と順位 ──
+    // 厳密 exactMax 本・簡易 simpleMax 本。0 以下＝その段は無制限（既定。両方 0 なら予算は動かない）。
+    void setTierBudget(int exactMax, int simpleMax) {
+        budgetExact_  = std::max(0, exactMax);
+        budgetSimple_ = std::max(0, simpleMax);
+    }
+    // 順位の物差しの「音量」（線形）。負は 0 に丸める。
+    void setSourceLoudness(unsigned long long id, float gainLinear) {
+        for (auto& s : sources_) if (s.id == id) { s.loudness = std::max(0.0f, gainLinear); return; }
+    }
+    // 重要度（倍率）と固定。固定は予算に関わらず tier のまま（枠は消費する）。
+    void setSourceImportance(unsigned long long id, float importance, bool pinned) {
+        for (auto& s : sources_) if (s.id == id) { s.importance = std::max(0.0f, importance); s.pinned = pinned; return; }
+    }
+    // 直近の順位の物差し。範囲外は -1。
+    float sourcePriority(int index) const {
+        if (index < 0 || index >= static_cast<int>(sources_.size())) return -1.0f;
+        return sources_[static_cast<size_t>(index)].score;
+    }
+    int tierBudgetExact() const { return budgetExact_; }
+    int tierBudgetSimple() const { return budgetSimple_; }
+    // このフレームに探り（保持 → 簡易で解き直し）に選ばれた音源の index。無ければ -1。
+    int tierProbeIndex() const { return probeIdx_; }
 
     // 自由音場で聞こえなくなる距離(m)。0 以下で自動バーチャルを使わない。
     //
@@ -6246,7 +6287,8 @@ public:
     const UpdateConfig& updateConfig() const { return cfg_; }
 
     // 毎フレーム 1 発。内部レートに従って各役割を実行し、結果を results_ に置く。
-    void update(float /*dt*/) {
+    void update(float dt) {
+        ++frame_;
         // 診断カウンタを戻す。
         //   thread_local にした結果、シーンをまたいで**前のシーンの値が残る**ようになった
         //   （メンバだった頃はシーンごとに -1 から始まっていた）。実際、隙間幅を一度も
@@ -6272,7 +6314,7 @@ public:
         for (int i = 0; i < n; ++i) srcScratch_[static_cast<size_t>(i)] = sources_[static_cast<size_t>(i)].pos;
 
         // 段を解決する（固定の段＋自動バーチャル）。以後の各段はこれを見て仕事を飛ばす。
-        resolveTiers_(n);
+        resolveTiers_(n, dt);
         // 尾の共有（部屋ごとの代表）。★毎フレーム解く ── ホストが
         //   AF_SceneGetTailShapeIndex をいつ引いても答えられるようにするため。
         //   計算はエコグラムの周回の頭で固定した顔ぶれを使う（runEchogram 参照）。
@@ -6302,6 +6344,10 @@ public:
         if (--role1Countdown_ <= 0) {
             role1Countdown_ = (cfg_.role1EveryN > 0) ? cfg_.role1EveryN : 1;
             runRole1(n);
+            // 解いた印。予算の探り（保持の音源を順繰りに簡易で解く）が「いちばん古い物」を選ぶために要る。
+            for (int i = 0; i < n; ++i)
+                if (tierIs_(i, TierExact) || tierIs_(i, TierSimple))
+                    sources_[static_cast<size_t>(i)].lastSolved = frame_;
         }
 
         // 焼く層が古ければ焼き直す（静的だった物が動いた／タグが変わった）。費用は 1 回だけ。
@@ -6559,6 +6605,7 @@ private:
             //     500Hz 以上が材質に関係なく同じ値（実測 0.01156）に張り付いていた。
             //     ポータルも見ていなかったので、閉じた開口でも回折の床が残っていた。
             for (int i = 0; i < n; ++i) {
+                if (tierIs_(i, TierHold)) continue;   // 保持: 前の答えのまま
                 float g[kNumBands];
                 computeDirectSoft(listenerPos_, srcScratch_[static_cast<size_t>(i)],
                                   g, 8, 0.4f, nullptr);
@@ -7211,6 +7258,12 @@ private:
     mutable std::vector<float> rayScratch_;
     // 今フレーム実際に使う段（音源ごと）。固定の段＋自動バーチャルの結果。
     std::vector<unsigned char> tierScratch_;
+    // 段の予算と順位（applyTierBudget_）
+    int budgetExact_ = 0, budgetSimple_ = 0;   // 0 = 無制限
+    int frame_ = 0;                            // update の通し番号（lastSolved の物差し）
+    int probeIdx_ = -1;                        // このフレームの探り
+    std::vector<int> rankScratch_;
+    std::vector<unsigned char> wantScratch_;
     // 早期反射を共有で撃つための作業領域（厳密の段だけを詰めて渡す）。
     std::vector<int> earlyIdx_;
     std::vector<Vec3> earlySrc_;
@@ -7236,7 +7289,7 @@ private:
     //
     // ★ヒステリシスは半径 2 つ。境目で行き来すると入り直しのたびに費用を払い、
     //   復帰時に段が埋まるまでの数フレームが露出する（平滑 0.35 秒が支配的）。
-    void resolveTiers_(int n) {
+    void resolveTiers_(int n, float dt) {
         tierScratch_.resize(static_cast<size_t>(n));
         // 部屋の臨界距離。リスナーの居る所で採る（耳のある側）。
         float rc = 1e9f;   // 部屋が無い（屋外）＝残響が担わない＝自由音場の判定でよい
@@ -7268,9 +7321,138 @@ private:
             }
             tierScratch_[static_cast<size_t>(i)] = static_cast<unsigned char>(t);
         }
+        applyTierBudget_(n, dt);
+    }
+
+    // ── 段の予算と順位（2026-09-04）──
+    //   主スレッドの費用は「厳密の本数」で決まる（1 本 0.3 ms の桁: 役割1 0.1 ＋ 面の線 0.05〜0.1 ＋
+    //   二次音源 0.05 ＋ エコグラムの次イベント 0.1。簡易 0.05 ms、保持 0）。音声スレッドは方向バスで
+    //   音源数に依らなくなったので、段は主スレッドの予算で決める。
+    //   物差し（可聴性の見積もり）: score = 音量 × 1/max(r,1m) × 生存 × 重要度
+    //     生存 = 前フレームの帯域別生存の最大（費用ゼロ。帯域の最大にするのは、壁の向こうの低域だけ通る
+    //     音源を平均で消さないため）。未解決の音源は 1（楽観。先に探る）。
+    //   枠の配り方: 順位の上から厳密 → 簡易 → 保持。手動の段（tier）は上限（簡易にした音源は厳密の枠を
+    //     取らない）。pinned はその段のまま枠を先に取る。可聴限界の外（自動バーチャル）は予算の外。
+    //   ヒステリシスは 3 つ。
+    //     ・現職の加点: 段 1 つにつき +3 dB（×1.41）。1/r の数歩や平滑の残りで順位が入れ替わらない
+    //     ・昇格 0.5 s: 出力の平滑（0.35 s）より長く取り、瞬間の山で昇格しない。未解決の音源は待たない
+    //       （登録直後を 0.5 s 素通しで鳴らして跳ばせない）
+    //     ・降格 1.0 s: 消える成分（面の線・回折の合成）がちらつかない
+    //   落ちた音源は「保持」。役割1 を飛ばして最後の答えを保ち、面の線と二次音源は 0 本、尾は部屋の代表の物を
+    //     そのまま使う（エコグラムは代表の数ぶんしか撃たないので予算の外）。
+    //   探り: 保持の音源を毎フレーム 1 本、いちばん古い物から順に簡易で解き直す（0.05 ms）。
+    //     扉が開いて聞こえるようになった音源が、生存が更新されず保持のまま眠るのを防ぐ。
+    //   ⚠ 予算は厳密が硬い上限。簡易は降格の通過点として最大 1 s だけ超えることがある（厳密→簡易の降格は
+    //     枠を待たない。待たせると厳密の上限が破れるほうが高くつく）。
+    static constexpr float kTierPromoteSec = 0.5f;
+    static constexpr float kTierDemoteSec  = 1.0f;
+    static constexpr float kTierIncumbency = 1.41421356f;   // +3 dB／段
+    void applyTierBudget_(int n, float dt) {
+        probeIdx_ = -1;
+        const float dtS = (dt > 0.0f) ? std::min(dt, 0.1f) : (1.0f / 60.0f);
+        // 1) 物差し（予算 OFF でも出す。HUD が読む）
+        for (int i = 0; i < n; ++i) {
+            SourceEntry& s = sources_[static_cast<size_t>(i)];
+            float surv = 1.0f;
+            if (s.lastSolved >= 0 && i < results_.count) {
+                surv = 0.0f;
+                for (int b = 0; b < kNumBands; ++b)
+                    surv = std::max(surv, results_.bands[static_cast<size_t>(i) * kNumBands + b]);
+            }
+            const float r = std::max(length(s.pos - listenerPos_), 1.0f);
+            s.score = s.loudness * (1.0f / r) * surv * s.importance;
+        }
+        const bool on = (budgetExact_ > 0) || (budgetSimple_ > 0);
+        if (!on) {
+            for (int i = 0; i < n; ++i) {
+                SourceEntry& s = sources_[static_cast<size_t>(i)];
+                s.budgetTier = (s.tier == TierVirtual) ? TierHold : static_cast<unsigned char>(s.tier);
+                s.tierTimer = 0.0f;
+            }
+            return;
+        }
+        // 2) 候補と pinned の枠
+        int pinnedExact = 0, pinnedSimple = 0;
+        rankScratch_.clear();
+        wantScratch_.assign(static_cast<size_t>(n), static_cast<unsigned char>(TierHold));
+        for (int i = 0; i < n; ++i) {
+            SourceEntry& s = sources_[static_cast<size_t>(i)];
+            if (tierScratch_[static_cast<size_t>(i)] == TierVirtual) {   // 可聴限界の外。予算の外
+                s.budgetTier = TierHold; s.tierTimer = 0.0f; continue;
+            }
+            if (s.pinned) {
+                s.budgetTier = static_cast<unsigned char>(s.tier); s.tierTimer = 0.0f;
+                if (s.tier == TierExact) ++pinnedExact; else ++pinnedSimple;
+                continue;
+            }
+            rankScratch_.push_back(i);
+        }
+        // 3) 順位（現職の加点つき）。同点は index の若い順で安定
+        auto key = [&](int i) {
+            const SourceEntry& s = sources_[static_cast<size_t>(i)];
+            const float bonus = (s.budgetTier == TierExact)  ? kTierIncumbency * kTierIncumbency
+                              : (s.budgetTier == TierSimple) ? kTierIncumbency : 1.0f;
+            return s.score * bonus;
+        };
+        std::stable_sort(rankScratch_.begin(), rankScratch_.end(),
+                         [&](int a, int b) { return key(a) > key(b); });
+        // 4) 望みの段: 上から枠を配る
+        const int kInf = 1 << 20;
+        int exactLeft  = (budgetExact_  > 0) ? std::max(0, budgetExact_  - pinnedExact)  : kInf;
+        int simpleLeft = (budgetSimple_ > 0) ? std::max(0, budgetSimple_ - pinnedSimple) : kInf;
+        for (int i : rankScratch_) {
+            const SourceEntry& s = sources_[static_cast<size_t>(i)];
+            unsigned char w = TierHold;
+            if (s.tier == TierExact && exactLeft > 0) { w = TierExact; --exactLeft; }
+            else if (simpleLeft > 0)                  { w = TierSimple; --simpleLeft; }
+            wantScratch_[static_cast<size_t>(i)] = w;
+        }
+        // 5) 時間のヒステリシス → 降格（枠を空ける）→ 昇格（空いた枠へ上から）
+        for (int i : rankScratch_) {
+            SourceEntry& s = sources_[static_cast<size_t>(i)];
+            if (wantScratch_[static_cast<size_t>(i)] == s.budgetTier) s.tierTimer = 0.0f;
+            else s.tierTimer += dtS;
+        }
+        for (int i : rankScratch_) {
+            SourceEntry& s = sources_[static_cast<size_t>(i)];
+            const unsigned char w = wantScratch_[static_cast<size_t>(i)];
+            if (w > s.budgetTier && s.tierTimer >= kTierDemoteSec) { s.budgetTier = w; s.tierTimer = 0.0f; }
+        }
+        int exactUsed = pinnedExact, simpleUsed = pinnedSimple;
+        for (int i : rankScratch_) {
+            const unsigned char t = sources_[static_cast<size_t>(i)].budgetTier;
+            if (t == TierExact) ++exactUsed; else if (t == TierSimple) ++simpleUsed;
+        }
+        const int exactCap  = (budgetExact_  > 0) ? budgetExact_  : kInf;
+        const int simpleCap = (budgetSimple_ > 0) ? budgetSimple_ : kInf;
+        for (int i : rankScratch_) {
+            SourceEntry& s = sources_[static_cast<size_t>(i)];
+            const unsigned char w = wantScratch_[static_cast<size_t>(i)];
+            if (w >= s.budgetTier) continue;                                   // 昇格でない
+            if (s.tierTimer < kTierPromoteSec && s.lastSolved >= 0) continue;  // 未解決だけ待たない
+            if (w == TierExact && exactUsed < exactCap) {
+                if (s.budgetTier == TierSimple) --simpleUsed;
+                s.budgetTier = TierExact; ++exactUsed; s.tierTimer = 0.0f;
+            } else if (s.budgetTier == TierHold && simpleUsed < simpleCap) {
+                s.budgetTier = TierSimple; ++simpleUsed; s.tierTimer = 0.0f;   // 厳密の枠が無ければ簡易で待つ
+            }
+        }
+        // 6) 実効 = 手動の段と予算の段の悪いほう
+        for (int i : rankScratch_) {
+            unsigned char& t = tierScratch_[static_cast<size_t>(i)];
+            t = std::max(t, sources_[static_cast<size_t>(i)].budgetTier);
+        }
+        // 7) 探り: 保持の中でいちばん古い物を 1 本、このフレームだけ簡易で解く（簡易の枠の外）
+        int pick = -1, oldest = 0;
+        for (int i : rankScratch_) {
+            if (tierScratch_[static_cast<size_t>(i)] != TierHold) continue;
+            const int ls = sources_[static_cast<size_t>(i)].lastSolved;
+            if (pick < 0 || ls < oldest) { pick = i; oldest = ls; }
+        }
+        if (pick >= 0) { tierScratch_[static_cast<size_t>(pick)] = TierSimple; probeIdx_ = pick; }
     }
 public:
-    // いま実際に使われている段（自動バーチャルの結果込み）。範囲外は -1。
+    // いま実際に使われている段（自動バーチャルと予算の結果込み）。0 厳密／1 簡易／2 バーチャル（素通し）／3 保持。範囲外は -1。
     int effectiveTier(int index) const {
         if (index < 0 || index >= static_cast<int>(tierScratch_.size())) return -1;
         return static_cast<int>(tierScratch_[static_cast<size_t>(index)]);
