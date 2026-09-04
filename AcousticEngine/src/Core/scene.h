@@ -353,6 +353,19 @@ public:
         roomGraph();
         return roomBuilder_.roomWeightsAt(p, radius, rooms, weights, maxOut, true);
     }
+    // 点のまわりの空間のうち「どこかの部屋の中」である割合（0..1）。外へ出るときの残響の量はこれで縮める。
+    //   ★V と RT60 を空間版で混ぜても残響の量は連続にならない（不具合 #5、2026-09-05 に実測）:
+    //     V も RT60 も同じ割合で縮むので臨界距離 rc = 0.057√(V/RT60) が動かず、比は戸口の外でも変わらない。
+    //     そして球が最後の部屋のボクセルを離れる 2 m 外で V が 166 → 0 に落ちてホストが外形箱へ切り替わる（段）。
+    //     部屋の中の量（V・RT60・rc）は部屋どうしの割合（roomWeights、合計 1）のままにして、
+    //     **量の重み**だけをこの割合で付ける。戸口の 1.3 m 手前で 0.98、戸口で 0.64、0.7 m 外で 0.15、2 m 外で 0。
+    float roomShareTotalAt(const Vec3& p, float radius) const {
+        int ids[8]; float w[8];
+        const int n = roomShare(p, radius, ids, w, 8);
+        float t = 0.0f;
+        for (int i = 0; i < n; ++i) t += w[i];
+        return (t < 0.0f) ? 0.0f : (t > 1.0f ? 1.0f : t);
+    }
 
     // 点における帯域別の残響時間(s)。部屋ごとの Sabine 値を占め方で混ぜたもの。
     //   ★エコグラムから測ると (a) レイのばらつきがそのまま乗る (b) 「-60dB を超える最後の

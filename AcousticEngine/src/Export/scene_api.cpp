@@ -1124,6 +1124,11 @@ int AF_SceneRoomWeights(AF_SceneHandle scene, AF_Vector3 p, float radius,
     return s->roomWeights(toVec3(p), radius, outRooms, outWeights, maxOut);
 }
 
+float AF_SceneRoomShareTotalAt(AF_SceneHandle scene, AF_Vector3 p, float radius) {
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();   // 幾何の問い合わせ（非同期でも仕事を待たない）
+    return s ? s->roomShareTotalAt(toVec3(p), radius) : 0.0f;
+}
+
 int AF_SceneRoomShareAt(AF_SceneHandle scene, AF_Vector3 p, float radius,
                         int* outRooms, float* outWeights, int maxOut) {
     ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();

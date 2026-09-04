@@ -548,6 +548,9 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_TailBusHasIr(IntPtr bus);
 
+        // 点のまわりの空間のうち「どこかの部屋の中」である割合（0..1）。外へ出るときの残響の量はこれで縮める（#5）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern float AF_SceneRoomShareTotalAt(IntPtr scene, AFVector3 p, float radius);
         // 点のまわりの部屋の占め方・空間版（外の世界も分母。合計 ≤ 1、残りが屋外）。扉の定点の (1−w) はこちら。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneRoomShareAt(IntPtr scene, AFVector3 p, float radius,

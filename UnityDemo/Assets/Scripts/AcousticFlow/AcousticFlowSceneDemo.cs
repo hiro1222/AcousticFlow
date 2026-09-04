@@ -246,9 +246,13 @@ namespace AcousticFlow
                  + "0.25m だと幅 0.9m の戸口がぎりぎり（半ボクセルぶんの甘さがある）。")]
         [Range(0.1f, 0.5f)] public float roomCellSize = 0.25f;
         [Tooltip("部屋を戸口で割る半径(m)。幅がこの 2 倍に満たないくびれで部屋が分かれる。\n"
-                 + "0.6m なら人が通る戸口(〜1.2m)は分かれ、開けた口(2m〜)は分かれない。\n"
+                 + "★戸口の半幅以下だと部屋が戸口から外へ漏れて 0 個になる（実測: 0.6 は戸口 1.0 m まで、0.8 は 1.4 m まで、1.0 でも 2.0 m は漏れる）。\n"
+                 + "いちばん広い戸口の半幅 ＋ 1 セルより大きく、部屋の狭い所の半分より小さく。0 個ならコンソールに警告が出る。\n"
                  + "曲がり角・柱・腰高の仕切りでは分かれない（くびれていないため）。")]
         [Range(0f, 2f)] public float roomSeedRadius = 0.6f;
+        [Tooltip("外へ出るときの残響の量を「まわりの空間のうち部屋の中である割合」で縮める（#5）。\n"
+                 + "OFF だと V/RT60 の混ぜだけになり、球が最後の部屋を離れる 2 m 外で残響が一気に消える（段）。A/B 用。")]
+        public bool reverbShareFade = true;
 
         [Tooltip("【C1】部屋グラフの開口からポータルを自動生成する。\n\n"
                  + "ポータルは §4.3 のフレネル帯域積分の**積分範囲**で、"
@@ -602,6 +606,7 @@ namespace AcousticFlow
             public static bool Valid;
             public static float Fps;
             public static float AcousticMs;
+            public static float RoomShare = 1f;   // まわりの空間のうち部屋の中である割合（残響の量の重み）
             public static bool UseHrtf;
             public static bool UseSteer;
             public static string[] SourceNames;   // 音源ごとの表示名（クリップ名）
@@ -1479,6 +1484,7 @@ namespace AcousticFlow
             //   広い地面を 1 枚置くだけで roomCellSize が黙って無視されるので、
             //   気づけないと「部屋が割れていない」ことに最後まで気づかない。
             _scene.CheckRoomGridDegraded();
+            _scene.CheckRoomsFound(_occluders.Count, roomSeedRadius);
             // 部屋が 2 つ以上あるのにポータルが 0 枚なら警告する（中で 1 度だけ）。
             //   フレネル帯域積分が一度も走らない状態＝主題が動いていない状態。
             _scene.CheckPortalsPresent();
@@ -2405,7 +2411,14 @@ namespace AcousticFlow
             //   遠くにいるあいだ張り付いたままになる。ソフトニー（比が上がるほど
             //   効きを緩める）に置き換える。50 で 50 のまま、そこから上は圧縮されて
             //   ceiling に漸近するので、どこまで離れても反応は残る。
-            Status.ReverbTargetRatio = SoftCeiling(t, 50f, reverbRatioCeiling);
+            // ★外へ出るときの量（#5、2026-09-05）: まわりの空間のうち部屋の中である割合で縮める。
+            //   V と RT60 を空間版で混ぜても rc が動かず量は連続にならない。量だけをこの割合で付ける。
+            //   戸口の 1.3 m 手前で 0.98、戸口で 0.64、0.7 m 外で 0.15、2 m 外で 0（混ぜ半径 2 m）。
+            float share = 1f;
+            if (reverbShareFade && _scene != null && vol > 1f)
+                share = Mathf.Clamp01(_scene.RoomShareTotalAt(listener.position, roomBlendRadius));
+            Status.RoomShare = share;
+            Status.ReverbTargetRatio = SoftCeiling(t, 50f, reverbRatioCeiling) * share;
 
             // mixing time ≈ √V(ms)（Polack の目安）。広い部屋ほど反射が拡散に溶けるのが遅い＝
             // 早期タップとして扱える時間が長い。特大部屋で遠壁の反射が早期窓から漏れるのを防ぐ。

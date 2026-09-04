@@ -684,7 +684,10 @@ ACOUSTIC_API void AF_SceneRoomBuildTimes(AF_SceneHandle scene, float* alloc, flo
                                          float* grow,
                                          int* dirtyBricks, int* totalBricks);
 
-/* 【部屋を戸口で割る半径(m)】既定 0.6。自由空間をこの半径ぶん侵食してから連結成分を取る。
+/* 【部屋を戸口で割る半径(m)】既定 0.6。⚠ 種 ≤ 戸口の半幅だと部屋が戸口から外へ漏れて 0 個になる（実測 2026-09-05:
+ * 0.6 は戸口 1.0 m まで、0.8 は 1.4 m まで、1.0 でも 2.0 m は漏れる）。場面ごとに**いちばん広い戸口の半幅 ＋ 1 セル**より大きく、
+ * 狭い所の半分より小さく（0.8 にすると 1.0 m の廊下が消え、回帰の [焼き] も落ちた。既定を上げるのは見送った）。0 個なら AF_SceneRoomCount で分かる。
+ * 自由空間をこの半径ぶん侵食してから連結成分を取る。
  * 素の連結成分だと戸口で繋がった空間が全部ひとつの部屋になり、扉の向こうも同じ部屋に
  * なってしまう（残響を切り替える土台にならない）。幅がこの 2 倍に満たないくびれが
  * 千切れるので、そこで部屋が分かれる。落とした殻は最寄りの部屋へ塗り戻すので、
@@ -719,6 +722,13 @@ ACOUSTIC_API int  AF_SceneRoomWeights(AF_SceneHandle scene, AF_Vector3 p, float 
  * 外へ出るときの残響の量）はこちらを使うこと。
  * ★上の AF_SceneRoomWeights は部屋どうしの割合（合計 1）なので、外へ開く戸口では
  *   球が部屋に触れた瞬間に 0→1 と跳ぶ（実測: 戸口の 1.8 m 手前で 1 歩に 0→1.00）。 */
+/* 【部屋の中である割合】点のまわりの空間のうち、どこかの部屋の中である割合（0..1）。
+ * 外へ出るときの**残響の量**はこれで縮めること（2026-09-05、不具合 #5）。
+ * ⚠ V と RT60 を空間版で混ぜても量は連続にならない: 両方が同じ割合で縮むので臨界距離 rc = 0.057√(V/RT60)
+ *   が動かず、球が最後の部屋を離れる 2 m 外で V が一気に 0 になる。V・RT60 は部屋どうしの割合のまま使い、
+ *   量だけをこの割合で付ける（戸口の 1.3 m 手前 0.98 → 戸口 0.64 → 0.7 m 外 0.15 → 2 m 外 0）。 */
+ACOUSTIC_API float AF_SceneRoomShareTotalAt(AF_SceneHandle scene, AF_Vector3 p, float radius);
+
 ACOUSTIC_API int  AF_SceneRoomShareAt(AF_SceneHandle scene, AF_Vector3 p, float radius,
                                       int* outRooms, float* outWeights, int maxOut);
 

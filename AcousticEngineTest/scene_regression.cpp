@@ -7966,6 +7966,97 @@ void testAsyncUpdate() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 【部屋の種と、外へ出るときの残響の量】不具合 #5 #7（2026-09-05）
+//
+//   #7: 種の半径が戸口の半幅以下だと、部屋が戸口から外へ漏れて 0 個になる。既定 0.8 で 1.4 m の戸口が割れること。
+//   #5: 外へ出るとき、V/RT60 は球が最後の部屋を離れる所で一気に 0 になる（段）。残響の量は
+//       「まわりの空間のうち部屋の中である割合」で縮めるので、1 歩 0.1 m の段差が小さく、外で 0 になること。
+//       ★V と RT60 を空間版で混ぜても rc が動かない（両方が同じ割合で縮む）ので、量の重みを別に持つ。
+// ─────────────────────────────────────────────────────────────────────
+void testRoomSeedAndShare() {
+    std::printf("\n[部屋] 種の半径の既定と、外へ出るときの残響の量\n");
+    const float h = 3.0f, t = 0.3f, hw = 4.0f, hd = 4.0f;
+    auto build = [&](float doorW, float seed) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        const float side = (2.0f * hw - doorW) * 0.5f;
+        AF_SceneAddInstanceBox(s, V(-(doorW*0.5f + side*0.5f), h*0.5f, hd+t), V(side*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( (doorW*0.5f + side*0.5f), h*0.5f, hd+t), V(side*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, (2.1f + h) * 0.5f, hd+t), V(doorW*0.5f, (h - 2.1f) * 0.5f, t), V(1,0,0), V(0,1,0), m);
+        if (seed > 0.0f) AF_SceneSetRoomSeedRadius(s, seed);
+        AF_SceneSetListener(s, V(0, 1.6f, 0));
+        AF_SceneSetSource(s, 1, V(-2.0f, 1.6f, -2.0f));
+        for (int k = 0; k < 2; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        return s;
+    };
+    char note[200];
+    // #7 種は戸口の半幅より大きくないと部屋が外へ漏れる: 1.4 m の戸口は 0.6（既定）で 0 個、0.8 で 1 個。1.0 m は 0.6 で 1 個。
+    //   ★既定を 0.8 に上げる案は見送った: 1.0 m の廊下が消え（[開口] 曲がり角）、[焼き] の面が 6 → 10 になった（原因は未調査）。
+    //     場面ごとの値と、0 個の警告（ホスト CheckRoomsFound）で持つ。
+    {
+        AF_SceneHandle s = build(1.4f, 0.0f);
+        const int nDef = AF_SceneRoomCount(s);
+        AF_SceneDestroy(s);
+        s = build(1.4f, 0.8f);
+        const int n08 = AF_SceneRoomCount(s);
+        AF_SceneDestroy(s);
+        s = build(1.0f, 0.0f);
+        const int n10 = AF_SceneRoomCount(s);
+        AF_SceneDestroy(s);
+        std::snprintf(note, sizeof(note), "(戸口 1.4 m: 既定 0.6 で %d 部屋 / 種 0.8 で %d 部屋。戸口 1.0 m: 既定で %d 部屋)", nDef, n08, n10);
+        check("[部屋] 種が戸口の半幅以下だと部屋が漏れて 0 個（1.4 m: 0.6 で 0、0.8 で 1。1.0 m: 0.6 で 1）", nDef == 0 && n08 == 1 && n10 == 1, note);
+        // 閉じた箱（8×8×3 m、戸口なし）で種を振る: 部屋の数と体積が変わらないこと（0.8 で [焼き] が落ちた原因の切り分け。ここでは変わらない）
+        std::printf("        閉じた箱の部屋の数と体積（種 0.6 / 0.8 / 1.0）:");
+        for (float seed : {0.6f, 0.8f, 1.0f}) {
+            AF_SceneHandle c = AF_SceneCreate();
+            const int m = AF_SceneAddMaterial(c, nullptr, nullptr, nullptr, 0);
+            AF_SceneAddInstanceBox(c, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(c, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(c, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(c, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(c, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+            AF_SceneAddInstanceBox(c, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+            AF_SceneSetRoomSeedRadius(c, seed);
+            AF_SceneSetListener(c, V(0, 1.6f, 0)); AF_SceneSetSource(c, 1, V(1, 1.6f, 1));
+            AF_SceneUpdate(c, 1.0f / 60.0f);
+            const int nr = AF_SceneRoomCount(c);
+            float vol = 0.0f; if (nr > 0) AF_SceneRoomInfo(c, 0, &vol, nullptr, nullptr, nullptr);
+            std::printf("  %.1f: %d 部屋 %.0f m3", seed, nr, vol);
+            AF_SceneDestroy(c);
+        }
+        std::printf("\n");
+    }
+    // #5 外へ出るとき: 量の重み（部屋の中である割合）は 1 歩 0.1 m で 0.1 以下、2 m 外で 0。V の混ぜは 2 m 外で一気に落ちる（記録）。
+    {
+        AF_SceneHandle s = build(1.2f, 0.8f);   // 種 0.8: 既定 0.6 だと 1.2 m の戸口で部屋が 0 個（上の #7）
+        float prevW = -1.0f, prevV = -1.0f, maxDw = 0.0f, maxDv = 0.0f, atW = 0.0f, atV = 0.0f, wOut = 1.0f, wIn = 0.0f;
+        for (int i = 0; i <= 70; ++i) {
+            const float z = 0.1f * i;                      // 中 z=0 → 戸口 z=4.3 → 外 z=7
+            const AF_Vector3 p = V(0, 1.6f, z);
+            const float w = AF_SceneRoomShareTotalAt(s, p, 2.0f);
+            const float vol = AF_SceneRoomVolumeAt(s, p, 2.0f);
+            if (i == 0) wIn = w;
+            if (i == 70) wOut = w;
+            if (prevW >= 0.0f) {
+                if (std::fabs(w - prevW) > maxDw) { maxDw = std::fabs(w - prevW); atW = z; }
+                if (std::fabs(vol - prevV) > maxDv) { maxDv = std::fabs(vol - prevV); atV = z; }
+            }
+            prevW = w; prevV = vol;
+        }
+        std::printf("        量の重み: 中 %.3f → 外 %.3f、1 歩の最大段差 %.3f @ z=%.1f ／ V の混ぜ（部屋どうし）の最大段差 %.0f m3 @ z=%.1f\n",
+                    wIn, wOut, maxDw, atW, maxDv, atV);
+        std::snprintf(note, sizeof(note), "(中 %.3f / 外 %.3f / 最大段差 %.3f @ z=%.1f)", wIn, wOut, maxDw, atW);
+        check("[部屋] 外へ出るときの残響の量の重みが連続（1 歩 0.1 m で 0.1 以下）で、中 1・外 0", wIn > 0.99f && wOut < 0.01f && maxDw <= 0.1f, note);
+        AF_SceneDestroy(s);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 【探り】既知の不具合の現状を数字で採る（AF_ONLY=issues でだけ走る。合否は付けない）
 //   docs/SOUND_REVIEW_2026-09-04.md §2.3 の #5 #6 #7 #12。直す前に「いまどうか」を測る物差し。
 // ─────────────────────────────────────────────────────────────────────
@@ -8145,8 +8236,7 @@ const int doorId =             AF_SceneAddInstanceBox(s, V(hinge + rx * c, DH * 
             const AF_Vector3 p = V(0, 1.6f, z);
             const float vol = AF_SceneRoomVolumeAt(s, p, 2.0f);
             float rt[kBands] = {}; AF_SceneRt60At(s, p, 2.0f, rt, kBands);
-            int rooms[4]; float w[4]; const int nw = AF_SceneRoomShareAt(s, p, 2.0f, rooms, w, 4);
-            float w0 = 0.0f; for (int k = 0; k < nw; ++k) if (rooms[k] == 0) w0 = w[k];
+            const float w0 = AF_SceneRoomShareTotalAt(s, p, 2.0f);   // 量の重み（部屋の中である割合）
             const int room = AF_SceneRoomAt(s, p);
             if (i % 5 == 0 || (prevV >= 0 && std::fabs(vol - prevV) > 10.0f))
                 std::printf("         %5.1f   %3d   %6.1f   %6.2f    %5.3f\n", z, room, vol, rt[3], w0);
@@ -11786,6 +11876,7 @@ int main() {
         if (std::strcmp(only, "async") == 0) testAsyncUpdate();
         else if (std::strcmp(only, "tier") == 0) testTierBudget();
         else if (std::strcmp(only, "issues") == 0) probeKnownIssues();
+        else if (std::strcmp(only, "rooms") == 0) testRoomSeedAndShare();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }
@@ -11831,6 +11922,7 @@ int main() {
     diagnoseOutdoorWithBuilding();
     testOutdoorIsNotARoom();
     testRoomGridDegradeDetect();
+    testRoomSeedAndShare();
     testAutoPortals();
     diagnosePortalLeftRightSymmetry();
     diagnosePortalWidthVsDoorCurve();

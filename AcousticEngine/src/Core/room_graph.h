@@ -496,7 +496,7 @@ private:
     float cell_ = 0.25f;
     int   minVoxels_ = 16;
     int   brick_ = 16;
-    float seedRadius_ = 0.6f;
+    float seedRadius_ = 0.6f;   // 既定 0.6。0.8 にすると 1.0 m の廊下が消え、回帰の [焼き] の面が 6 → 10 になった（原因は未調査。回帰 3 件）。戸口の半幅 ＋ 1 セルより大きい値を場面ごとに（2026-09-05）
     bool  includeOutside_ = false;             // 外の世界との口を開口にするか
     std::vector<std::uint8_t> outside_;        // ボクセルが「外の世界」か（-1 に均す前の印）
     bool  chamferFull_ = true;

@@ -655,6 +655,32 @@ namespace AcousticFlow
         }
         /// 空間版。外の世界も分母に入るので合計は 1 以下（残りが屋外）。
         ///   屋外との境目で連続に混ぜたい量はこちら（GetRoomWeights は外へ開く戸口で 0→1 と跳ぶ）。
+        /// 点のまわりの空間のうち「どこかの部屋の中」である割合（0..1）。外へ出るときの残響の量はこれで縮める。
+        ///   V と RT60 を空間版で混ぜても量は連続にならない（両方が同じ割合で縮み rc が動かない）。量だけをこれで付ける。
+        public float RoomShareTotalAt(Vector3 p, float radius)
+        {
+            if (_handle == IntPtr.Zero) return 0f;
+            try { return Native.AF_SceneRoomShareTotalAt(_handle, new AFVector3(p), radius); }
+            catch (System.Exception) { return 1f; }   // 古い DLL: 縮めない（従来どおり）
+        }
+
+        /// 部屋が 1 つも取れていないのに囲われた形があるとき、一度だけ警告する（種の半径が戸口の半幅以下だと部屋が外へ漏れる）。
+        public void CheckRoomsFound(int instanceCountHint, float seedRadius)
+        {
+            if (_handle == IntPtr.Zero || _roomsWarned) return;
+            if (instanceCountHint < 6) return;   // 床・天井・壁 4 枚が無ければ部屋は出ない
+            int n;
+            try { n = Native.AF_SceneRoomCount(_handle); }
+            catch (System.Exception) { return; }
+            if (n > 0) return;
+            _roomsWarned = true;
+            UnityEngine.Debug.LogWarning(
+                $"[AcousticScene] 部屋が 1 つも取れていません（実体 {instanceCountHint} 個、種の半径 {seedRadius:0.##} m）。\n"
+                + "  種の半径が戸口の半幅以下だと、部屋が戸口から外へ漏れて 0 個になります（0.6 m は戸口 1.0 m まで、0.8 m は 1.4 m まで）。\n"
+                + "  roomSeedRadius を「いちばん広い戸口の半幅 ＋ 1 セル」より大きくしてください（部屋の狭い所の半分より小さく）。");
+        }
+        private bool _roomsWarned;
+
         public int GetRoomShare(Vector3 p, float radius, int[] outRooms, float[] outWeights)
         {
             if (_handle == IntPtr.Zero || outRooms == null || outWeights == null) return 0;
