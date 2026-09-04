@@ -151,4 +151,4 @@ updateCompute  解く:
 - 設計文書（順に読む）: EARLY_REFLECTION_FACES → BAKE_RUNTIME_LAYERS → DIRECTION_BUS → TIER_BUDGET → ASYNC_UPDATE。どれも「退けた書き方」と「壊れる所」がある。
 - 連絡板 `docs/GAME_SYSTEM_BOARD.md`: 今回 5 本追記（面の線／3 層／方向バス／段の予算／非同期）。ゲーム側への依頼は「体験の芯に `AcousticSourcePriority.pinned`」と「扉の向き」。
 - 記憶（memory）: early-reflection-faces / bake-structure-runtime-situation / direction-bus / tier-budget / async-update。
-- 直近のコミット: c9b020a 面の線 / cff52ba 焼き / d3ccc27 GPU 下ごしらえ / 32facb2 LOD と予算 / 75cfa1b 方向バス / 164693f 段の予算 / （非同期）。自レーンの未コミットは無い。
+- 直近のコミット: c9b020a 面の線 / cff52ba 焼き / d3ccc27 GPU 下ごしらえ / 32facb2 LOD と予算 / 75cfa1b 方向バス / 164693f 段の予算 / 6492b5a 非同期。自レーンの未コミットは無い。
