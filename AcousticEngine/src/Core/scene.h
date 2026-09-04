@@ -32,6 +32,7 @@
 #include "Core/material.h"
 #include "Core/mesh_geom.h"
 #include "Core/room_graph.h"
+#include "Core/tap_builder.h"   // タップの組み立て（ホストの BuildTapsForSource を DLL へ、2026-09-05）
 #include "Core/utd.h"
 #include "Core/vec3.h"
 #include "Core/worker_pool.h"
@@ -5032,7 +5033,9 @@ public:
     //                  実効経路 = 直接距離 + 回折δ（経路補完のぶん加算）＝遠回りほど直接が弱まりステアが開く。
     void occlusionReflectedMulti(const Vec3& listener, const Vec3* sources, int count,
                                  float* outOcc, float* outBands, float* outDir,
-                                 float directWeight, int numRays, int maxBounces) const {
+                                 float directWeight, int numRays, int maxBounces,
+                                 float* outSoft6 = nullptr, float* outDif6 = nullptr) const {
+        // outSoft6 / outDif6: [count*6] 合成前の担い手（直接の半影＝振幅、回折）。タップの組み立てが使う。null なら書かない。
         using namespace scene_detail;
         if (!sources || count <= 0) return;
         const float kEps = 1e-3f;
@@ -5065,7 +5068,9 @@ public:
             float detourDelta = 0.0f;
             const bool simple = tierIs_(j, TierSimple);
             computeDirectSoft(listener, sources[j], &total[j * kNumBands], 8, 0.4f, &detourDelta,
-                              simple);
+                              simple,
+                              outSoft6 ? &outSoft6[j * kNumBands] : nullptr,
+                              outDif6 ? &outDif6[j * kNumBands] : nullptr);
             refDist[j] = std::max(length(sources[j] - listener), 1e-3f);
             float directMean = 0.0f;
             for (int b = 0; b < kNumBands; ++b) directMean += total[j * kNumBands + b];
@@ -6333,6 +6338,19 @@ public:
 
     void setListener(const Vec3& pos) { listenerPos_ = pos; }
     const Vec3& listenerPos() const { return listenerPos_; }
+    // リスナーの向き（前・上）。タップの組み立てが到来方向をリスナー座標へ落とすのに要る（+x 右／+y 上／+z 前）。
+    void setListenerOrientation(const Vec3& fwd, const Vec3& up) {
+        const Vec3 f = (length(fwd) > 1e-6f) ? normalized(fwd) : Vec3(0, 0, 1);
+        Vec3 u = (length(up) > 1e-6f) ? normalized(up) : Vec3(0, 1, 0);
+        Vec3 r = cross(u, f);                       // 左手系（Unity）: right = up × forward
+        if (length(r) < 1e-6f) { u = (std::fabs(f.y) < 0.9f) ? Vec3(0, 1, 0) : Vec3(1, 0, 0); r = cross(u, f); }
+        r = normalized(r);
+        u = normalized(cross(f, r));
+        listenerFwd_ = f; listenerUp_ = u; listenerRight_ = r;
+    }
+    // タップの組み立ての規則の値（ホストのつまみ）。
+    void setTapParams(const TapParams& p) { tapParams_ = p; }
+    const TapParams& tapParams() const { return tapParams_; }
 
     // 音源を登録/更新する。同じ id なら位置だけ更新（毎フレーム呼ばれる想定）。
     void setSource(unsigned long long id, const Vec3& pos) {
@@ -6618,8 +6636,68 @@ public:
         // ★キャプチャは**全段が終わったあと**。出力を録るので、途中で録ると
         //   「今フレーム更新されなかった段」が前フレームの値のまま混ざる…のは正しいが、
         //   段の位相ずらしの結果そのものを見たいので、必ず最後に 1 回だけ。
+        buildPrograms_(n, dt);
         stampResults_(n);
         captureFrame_(n);
+    }
+
+    // ── タップの組み立て（tap_builder.h）── 役割1・面の線・二次音源・尾の代表から、畳み込み器へ渡す物を音源ごとに作る。
+    //   部屋の量（V・RT60・部屋の中である割合）はリスナーの所で 1 回。幾何は読むだけ（非同期の規約）。
+    void buildPrograms_(int n, float dt) {
+        if (n <= 0) return;
+        TapBuilder::SceneIn sc;
+        sc.listener = listenerPos_; sc.fwd = listenerFwd_; sc.up = listenerUp_; sc.right = listenerRight_;
+        sc.dt = (dt > 0.0f) ? std::min(dt, 0.1f) : (1.0f / 60.0f);
+        sc.speedOfSound = (cfg_.speedOfSound > 1.0f) ? cfg_.speedOfSound : 343.0f;
+        const float rad = std::max(0.3f, tapParams_.roomBlendRadius);
+        sc.roomVol = roomVolumeAt(listenerPos_, rad);
+        sc.hasRoom = sc.roomVol > 1.0f;
+        if (sc.hasRoom) {
+            float rt[kNumBands] = {};
+            rt60At(listenerPos_, rad, rt, kNumBands);
+            sc.roomRt60 = rt[2];                       // 500 Hz 帯を代表に（ホストと同じ）
+            sc.roomShare = roomShareTotalAt(listenerPos_, rad);
+        } else {
+            // 部屋が取れない（屋外・囲われていない）: 外形箱で当てる（ホストの従来の予備と同じ）。
+            Aabb box; bool any = false;
+            for (const Instance& in : instances_) {
+                if (!in.active) continue;
+                const Obb& ob = in.obb;
+                const float ex = std::fabs(ob.axisX.x) * ob.halfExtents.x + std::fabs(ob.axisY.x) * ob.halfExtents.y + std::fabs(ob.axisZ.x) * ob.halfExtents.z;
+                const float ey = std::fabs(ob.axisX.y) * ob.halfExtents.x + std::fabs(ob.axisY.y) * ob.halfExtents.y + std::fabs(ob.axisZ.y) * ob.halfExtents.z;
+                const float ez = std::fabs(ob.axisX.z) * ob.halfExtents.x + std::fabs(ob.axisY.z) * ob.halfExtents.y + std::fabs(ob.axisZ.z) * ob.halfExtents.z;
+                const Vec3 mn(ob.center.x - ex, ob.center.y - ey, ob.center.z - ez);
+                const Vec3 mx(ob.center.x + ex, ob.center.y + ey, ob.center.z + ez);
+                if (!any) { box.min = mn; box.max = mx; any = true; }
+                else {
+                    box.min = Vec3(std::min(box.min.x, mn.x), std::min(box.min.y, mn.y), std::min(box.min.z, mn.z));
+                    box.max = Vec3(std::max(box.max.x, mx.x), std::max(box.max.y, mx.y), std::max(box.max.z, mx.z));
+                }
+            }
+            sc.fallbackVol = any ? (box.max.x - box.min.x) * (box.max.y - box.min.y) * (box.max.z - box.min.z) : 0.0f;
+        }
+        static thread_local std::vector<unsigned long long> ids;
+        ids.resize(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            const size_t k = static_cast<size_t>(i);
+            ids[k] = sources_[k].id;
+            TapBuilder::SourceIn si;
+            si.id = sources_[k].id; si.pos = sources_[k].pos;
+            si.tier = (k < tierScratch_.size()) ? tierScratch_[k] : 0;
+            si.bands = &results_.bands[k * kNumBands];
+            si.arrivalDir = &results_.dir[k * 3];
+            si.softAmp = &results_.softAmp[k * kNumBands];
+            si.dif = &results_.dif[k * kNumBands];
+            si.earlyPos = &results_.earlyPos[k * results_.earlyCap];
+            si.earlyGain = &results_.earlyGain[k * results_.earlyCap * kNumBands];
+            si.earlyCount = results_.earlyCount[k];
+            si.diffPos = &results_.diffPos[k * results_.diffCap];
+            si.diffGain = &results_.diffGain[k * results_.diffCap];
+            si.diffCount = results_.diffCount[k];
+            si.tailShapeIndex = (k < tailRep_.size()) ? tailRep_[k] : i;
+            tapBuilder_.build(tapParams_, sc, si, results_.program[k]);
+        }
+        tapBuilder_.retain(ids.data(), n);
     }
 
     // 写しに要る付随の答えを results_ に詰める（非同期更新の写しは results_ を丸ごと複製する）。
@@ -6791,6 +6869,14 @@ public:
     }
 
     // --- 参照 ---
+    // 畳み込み器へ渡す物（タップの組み立ての答え）。範囲外は false。
+    bool voiceProgram(int index, VoiceProgram& out, const Results* r = nullptr) const {
+        const Results& R = resultsOr_(r);
+        if (index < 0 || index >= static_cast<int>(R.program.size())) return false;
+        out = R.program[static_cast<size_t>(index)];
+        return true;
+    }
+
     int instanceCount() const { return static_cast<int>(instances_.size()); }
     int materialCount() const { return static_cast<int>(materials_.size()); }
 
@@ -6815,6 +6901,11 @@ public:
 
         int echogramBins = 0;
         std::vector<float> echogram;   // [count*echogramBins*6]（音源ごと）
+
+        // ── タップの組み立ての材料と答え（2026-09-05）──
+        std::vector<float> softAmp;    // [count*6] 直接の半影（振幅、役割1 の合成前）
+        std::vector<float> dif;        // [count*6] 回折（振幅、ポータル混合後）
+        std::vector<VoiceProgram> program;   // [count] 畳み込み器へ渡す物（AF_SceneGetVoiceProgram）
 
         // ── 写しに要る付随の答え（非同期更新のため。update の最後に stampResults_ が詰める）──
         std::vector<unsigned char> tier;        // [count] 実効の段（0 厳密／1 簡易／2 バーチャル／3 保持）
@@ -6845,6 +6936,9 @@ public:
             diffCount.assign(static_cast<size_t>(n), 0);
             echogram.assign(static_cast<size_t>(n)
                             * static_cast<size_t>(std::max(0, c.echogramBins)) * kNumBands, 0.0f);
+            softAmp.assign(static_cast<size_t>(n) * kNumBands, 1.0f);
+            dif.assign(static_cast<size_t>(n) * kNumBands, 0.0f);
+            program.assign(static_cast<size_t>(n), VoiceProgram{});
         }
     };
 
@@ -6864,7 +6958,8 @@ private:
             occlusionReflectedMulti(listenerPos_, srcScratch_.data(), n,
                                     results_.occ.data(), results_.bands.data(),
                                     results_.dir.data(), cfg_.directWeight,
-                                    cfg_.reflectionRays, cfg_.reflectionBounces);
+                                    cfg_.reflectionRays, cfg_.reflectionBounces,
+                                    results_.softAmp.data(), results_.dif.data());
         } else {
             // 反射を使わない場合は直接経路のみ（透過⊕回折）。
             //   ★computeDirectSoft と**同じ規約**を通す。
@@ -6877,7 +6972,9 @@ private:
                 if (tierIs_(i, TierHold)) continue;   // 保持: 前の答えのまま
                 float g[kNumBands];
                 computeDirectSoft(listenerPos_, srcScratch_[static_cast<size_t>(i)],
-                                  g, 8, 0.4f, nullptr);
+                                  g, 8, 0.4f, nullptr, tierIs_(i, TierSimple),
+                                  &results_.softAmp[static_cast<size_t>(i) * kNumBands],
+                                  &results_.dif[static_cast<size_t>(i) * kNumBands]);
                 float sum = 0.0f;
                 for (int b = 0; b < kNumBands; ++b) {
                     results_.bands[static_cast<size_t>(i) * kNumBands + b] = g[b];
@@ -7528,6 +7625,10 @@ private:
     mutable std::vector<float> rayScratch_;
     // 今フレーム実際に使う段（音源ごと）。固定の段＋自動バーチャルの結果。
     std::vector<unsigned char> tierScratch_;
+    // タップの組み立て（2026-09-05）
+    Vec3 listenerFwd_{0, 0, 1}, listenerUp_{0, 1, 0}, listenerRight_{1, 0, 0};
+    TapParams tapParams_;
+    TapBuilder tapBuilder_;
     // 段の予算と順位（applyTierBudget_）
     int budgetExact_ = 0, budgetSimple_ = 0;   // 0 = 無制限
     int frame_ = 0;                            // update の通し番号（lastSolved の物差し）

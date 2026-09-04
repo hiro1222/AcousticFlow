@@ -371,6 +371,52 @@ namespace AcousticFlow
         public static extern int AF_SceneGetSourceTierEffective(IntPtr scene, int index);
         // ── 段の予算と順位（主スレッドの上限）── 厳密・簡易の本数。0 = 無制限。
         //   超えたぶんは可聴性（音量 × 1/r × 生存 × 重要度）の低い順に「保持」へ落ちる（docs/TIER_BUDGET.md）。
+        // ── タップの組み立て（2026-09-05）── ホストの BuildTapsForSource を DLL へ。★C の構造体と並びを合わせること（ABI 7）。
+        [StructLayout(LayoutKind.Sequential)]
+        public struct AFTapParams
+        {
+            public float distanceRef, diffractionDistanceRef, diffractionDistancePower, airAbsorptionScale;
+            public float transmissionTilt, transmissionHighCutDb, transmissionGainDb, diffractionGainDb;
+            public int   diffractionDistanceOnly;
+            public float diffractionHighCutDb, tapSmoothTime, directionSmoothTime, steerThreshold;
+            public int   diffractionHrtf;
+            public float diffractionHrtfMarginDb, reverbRatioExponent, reverbRatioCeiling, roomBlendRadius;
+            public int   reverbShareFade;
+            public float fallbackRt60;
+            public int   maxTaps, diffractionTapReserve;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct AFProgramTap
+        {
+            public float delayMs;
+            public float g0, g1, g2, g3, g4, g5;
+            public float panL, panR;
+            public float dirX, dirY, dirZ;
+            public float arrX, arrY, arrZ;
+            public int   type;          // 0 直接／1 反射／2 回折
+            public float hrtfWeight;
+        }
+        public const int ProgramMaxTaps = 64;
+        [StructLayout(LayoutKind.Sequential)]
+        public struct AFVoiceProgram
+        {
+            public int count;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = ProgramMaxTaps)] public AFProgramTap[] taps;
+            public float directDirX, directDirY, directDirZ;
+            public int   hrtfTapIndex;
+            public float hrtfDirX, hrtfDirY, hrtfDirZ;
+            public float itdgMs, sourceLevel, freeFieldDirect;
+            public int   tailShapeIndex;
+            public float tailRatio, tailRatioPhysical, mixingTimeMs, roomShare;
+            public int   tier;
+        }
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetListenerOrientation(IntPtr scene, AFVector3 forward, AFVector3 up);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_SceneSetTapParams(IntPtr scene, ref AFTapParams p);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneGetVoiceProgram(IntPtr scene, int index, out AFVoiceProgram outProgram);
+
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneSetTierBudget(IntPtr scene, int exactMax, int simpleMax);
         [DllImport(Dll, CallingConvention = Cc)]
@@ -658,7 +704,7 @@ namespace AcousticFlow
         //   DLL だけ古いまま C# を更新すると、AF_VoiceTap の長さが食い違って
         //   マーシャラが別の刻み幅で書き込む（44→48 バイトになった）。例外も出ずに
         //   タップの中身が化けるので、原因に辿り着けない。ここで止める。
-        public const int ExpectedAbiVersion = 6;
+        public const int ExpectedAbiVersion = 7;   // 2026-09-05: AF_TapParams / AF_VoiceProgram（タップの組み立てを DLL へ）
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_AbiVersion();
 

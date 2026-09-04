@@ -307,6 +307,11 @@ namespace AcousticFlow
         [Tooltip("簡易（遮蔽の音量と帯域カーブだけ。回り込みの方向は出ない）の本数の上限。0 = 無制限。1 本 0.05 ms の桁。"
                  + "ここからも漏れた音源は「保持」＝最後の答えを保ち、毎フレーム 1 本ずつ簡易で探り直す（素通しにはしない）。")]
         public int tierBudgetSimple = 10;
+        [Header("タップの組み立て（DLL 側）")]
+        [Tooltip("ON: タップ（1/r・空気吸収・パン・尾の比・平滑・HRTF の回折タップの選び方）は DLL が組み立て、ホストは写すだけ。"
+                 + "直接タップの透過は役割1 の半影（窓の走査線積分）＝生存と同じ模型になる。尾の比は音源ごと（#4）。\n"
+                 + "OFF で従来の自前の組み立て（AF_SceneComputeSoftOcclusion の円盤 32 点。A/B 用。採用が固まったら消す）。")]
+        public bool tapsFromEngine = true;
         [Header("更新の非同期化（主スレッドの上限）")]
         [Tooltip("ON: 音響の更新は DLL のワーカースレッドが解き、主スレッドの Update は数 µs で帰る。"
                  + "答えは 1 フレーム前の入力に対する物（出力の平滑 0.35 s より十分短い）。設定は待ち行列で次の着手に効き、"
@@ -722,6 +727,11 @@ namespace AcousticFlow
             //     柱で切れても消えない。遮蔽は SourceLevel の 1 箇所だけで効かせる。
             public float FreeFieldDirect = 1f;
             public Vector3 DirectDirLocal = Vector3.forward;   // HRTF 用の到来方向
+            // DLL の組み立てから来る音源ごとの尾の量（-1 = 無い＝ホストの全体値を使う）。
+            public float TailRatio = -1f;
+            public float TailRatioPhysical = 0f;
+            public float MixingTimeMs = -1f;
+            public float RoomShare = 1f;
 
             // 【B1】HRTF に載せる回折タップ。-1 = 無し（＝見通せている／回折が無い）。
             //   遮蔽されると直接音タップは材質の透過まで落ちるので、実際に耳へ届く
@@ -1438,8 +1448,10 @@ namespace AcousticFlow
             //   （＝「どの計算をいつ走らせるか」はエンジンの知識。移植時に書き直さずに済む）。
             //   ID は SourceId(i)（AF_SceneSetSource の鍵）。
             _scene.SetListener(listener.position);
+            _scene.SetListenerOrientation(listener.forward, listener.up);
             for (int i = 0; i < _sources.Length; i++)
                 _scene.SetSource(SourceId(i), _srcPos[i]);
+            if (tapsFromEngine) PushTapParams();
             // 段の予算と順位（主スレッドの上限）。予算と音量はここで押す。順位の規則はエンジンに 1 つだけ。
             //   重要度と固定は AcousticSourcePriority（音源に付ける部品）。無い音源は既定（1・固定なし）のまま。
             _scene.SetTierBudget(tierBudgetExact, tierBudgetSimple);
@@ -1815,7 +1827,20 @@ namespace AcousticFlow
                 for (int i = 0; i < _taps.Length; i++) _taps[i] = new SourceTaps();
                 Status.Taps = _taps;
             }
-            for (int i = 0; i < _srcPos.Length; i++) BuildTapsForSource(i, _taps[i]);
+            for (int i = 0; i < _srcPos.Length; i++)
+            {
+                // DLL の組み立て（既定）。口が無い古い DLL、または OFF なら従来の自前の組み立て。
+                if (tapsFromEngine && _scene.TapBuilderAvailable && FillTapsFromEngine(i, _taps[i])) continue;
+                BuildTapsForSource(i, _taps[i]);
+            }
+            if (tapsFromEngine && _taps.Length > 0 && _taps[0].TailRatio >= 0f)
+            {
+                // 表示は音源 0 の値（従来どおり）。畳み込み器は音源ごとの値を読む。
+                Status.ReverbTargetRatio = _taps[0].TailRatio;
+                Status.ReverbPhysicalRatio = _taps[0].TailRatioPhysical;
+                Status.MixingTimeMs = _taps[0].MixingTimeMs;
+                Status.RoomShare = _taps[0].RoomShare;
+            }
 
             // 主音源(0)はモニタウィンドウ用にエイリアスしておく。
             var t0 = _taps[0];
@@ -1832,8 +1857,80 @@ namespace AcousticFlow
         }
 
         // #2: 音源 si の全経路を「タップ」に束ねる（直接/反射/回折）。
+        // DLL の組み立ての規則の値（つまみ）を押す。規則そのものは DLL に 1 つ（tap_builder.h）。
+        private void PushTapParams()
+        {
+            var p = new Native.AFTapParams
+            {
+                distanceRef = distanceRef,
+                diffractionDistanceRef = diffractionDistanceRef,
+                diffractionDistancePower = diffractionDistancePower,
+                airAbsorptionScale = airAbsorptionScale,
+                transmissionTilt = transmissionTilt,
+                transmissionHighCutDb = transmissionHighCutDb,
+                transmissionGainDb = transmissionGainDb,
+                diffractionGainDb = diffractionGainDb,
+                diffractionDistanceOnly = diffractionDistanceOnly ? 1 : 0,
+                diffractionHighCutDb = diffractionHighCutDb,
+                tapSmoothTime = tapSmoothTime,
+                directionSmoothTime = directionSmoothTime,
+                steerThreshold = steerThreshold,
+                diffractionHrtf = diffractionHrtf ? 1 : 0,
+                diffractionHrtfMarginDb = diffractionHrtfMarginDb,
+                reverbRatioExponent = reverbRatioExponent,
+                reverbRatioCeiling = reverbRatioCeiling,
+                roomBlendRadius = roomBlendRadius,
+                reverbShareFade = reverbShareFade ? 1 : 0,
+                fallbackRt60 = Mathf.Max(0.05f, _reverbDecay),
+                maxTaps = SourceTaps.MaxTaps,
+                diffractionTapReserve = 8,
+            };
+            _scene.SetTapParams(ref p);
+        }
+
+        // DLL が組み立てたタップを SourceTaps へ写す（計算はしない）。写せなければ false。
+        private bool FillTapsFromEngine(int si, SourceTaps ts)
+        {
+            int idx = _scene.SourceIndex(SourceId(si));
+            if (idx < 0) return false;
+            if (!_scene.GetVoiceProgram(idx, out var pr)) return false;
+            int nb = AcousticEngine.NumBands;
+            int n = Mathf.Min(pr.count, SourceTaps.MaxTaps);
+            for (int i = 0; i < n; i++)
+            {
+                var t = pr.taps[i];
+                int o = i * nb;
+                ts.BandGain[o + 0] = t.g0; ts.BandGain[o + 1] = t.g1; ts.BandGain[o + 2] = t.g2;
+                ts.BandGain[o + 3] = t.g3; ts.BandGain[o + 4] = t.g4; ts.BandGain[o + 5] = t.g5;
+                ts.Gain[i] = (t.g0 + t.g1 + t.g2 + t.g3 + t.g4 + t.g5) / 6f;
+                ts.DelayMs[i] = t.delayMs;
+                ts.PanL[i] = t.panL; ts.PanR[i] = t.panR;
+                ts.Type[i] = (t.type == 0) ? 'D' : (t.type == 1) ? 'R' : 'F';
+                ts.Arrival[i] = new Vector3(t.arrX, t.arrY, t.arrZ);
+                ts.DirLocal[i] = new Vector3(t.dirX, t.dirY, t.dirZ);
+            }
+            ts.Count = n;
+            ts.EngineIndex = idx;
+            ts.TailShapeIndex = pr.tailShapeIndex >= 0 ? pr.tailShapeIndex : idx;
+            if (ts.TailShapeIndex == idx && _srcPos != null && si < _srcPos.Length)
+                _shapeRoom[idx] = _scene.RoomAt(_srcPos[si]);
+            ts.ItdgMs = pr.itdgMs;
+            ts.SourceLevel = pr.sourceLevel;
+            ts.FreeFieldDirect = pr.freeFieldDirect;
+            ts.DirectDirLocal = new Vector3(pr.directDirX, pr.directDirY, pr.directDirZ);
+            ts.HrtfTapIndex = pr.hrtfTapIndex;
+            ts.HrtfTapDirLocal = new Vector3(pr.hrtfDirX, pr.hrtfDirY, pr.hrtfDirZ);
+            ts.HrtfHasPrev = pr.hrtfTapIndex >= 0;
+            ts.TailRatio = pr.tailRatio;
+            ts.TailRatioPhysical = pr.tailRatioPhysical;
+            ts.MixingTimeMs = pr.mixingTimeMs;
+            ts.RoomShare = pr.roomShare;
+            return true;
+        }
+
         private void BuildTapsForSource(int si, SourceTaps ts)
         {
+            ts.TailRatio = -1f; ts.MixingTimeMs = -1f;   // 自前の組み立て: 尾の量はホストの全体値
             ts.Count = 0;
             ts.ItdgMs = 0f;
             Vector3 lp = listener.position;

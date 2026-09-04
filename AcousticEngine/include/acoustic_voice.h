@@ -67,7 +67,7 @@ typedef struct AF_VoiceConfig {
   *   4 : AF_SceneSetApertureTimbre 追加（開口の音色を音量と独立に調整する口）
  *   5 : AF_VoiceTap に dir 追加（反射タップの軽量な両耳化）
  */
-#define AF_ABI_VERSION 6   /* 2026-09-03: AF_UpdateConfig に earlyModel / earlyFaceSubTaps / echogramSkipFirstOrder を足した */
+#define AF_ABI_VERSION 7   /* 2026-09-05: AF_TapParams / AF_VoiceProgram（タップの組み立てを DLL へ）。6 は AF_UpdateConfig の earlyModel 等 */
 ACOUSTIC_API int AF_AbiVersion(void);
 
 typedef struct AF_VoiceTap {

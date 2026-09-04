@@ -814,6 +814,31 @@ namespace AcousticFlow
             catch (System.Exception) { return -1; }
         }
 
+        // ── タップの組み立て（DLL 側。docs/TAP_BUILDER.md）──
+        //   ホストはつまみとリスナーの向きを渡し、更新のあと GetVoiceProgram で受け取って畳み込み器へ写すだけ。
+        //   古い DLL（口が無い）なら false を返すので、ホストは従来の自前の組み立てへ落ちる。
+        public bool TapBuilderAvailable => _tapBuilderOk;
+        private bool _tapBuilderOk = true;
+        public void SetListenerOrientation(Vector3 forward, Vector3 up)
+        {
+            if (_handle == IntPtr.Zero || !_tapBuilderOk) return;
+            try { Native.AF_SceneSetListenerOrientation(_handle, new AFVector3(forward), new AFVector3(up)); }
+            catch (System.Exception) { _tapBuilderOk = false; }
+        }
+        internal void SetTapParams(ref Native.AFTapParams p)
+        {
+            if (_handle == IntPtr.Zero || !_tapBuilderOk) return;
+            try { Native.AF_SceneSetTapParams(_handle, ref p); }
+            catch (System.Exception) { _tapBuilderOk = false; }
+        }
+        internal bool GetVoiceProgram(int index, out Native.AFVoiceProgram program)
+        {
+            program = default;
+            if (_handle == IntPtr.Zero || !_tapBuilderOk || index < 0) return false;
+            try { return Native.AF_SceneGetVoiceProgram(_handle, index, out program) != 0; }
+            catch (System.Exception) { _tapBuilderOk = false; return false; }
+        }
+
         // ── 段の予算と順位（主スレッドの上限）──
         //   厳密・簡易の本数。0 = 無制限（既定。呼ばなければ今までどおり手動の段）。超えたぶんは
         //   可聴性（音量 × 1/r × 生存 × 重要度）の低い順に保持へ落ちる（docs/TIER_BUDGET.md）。

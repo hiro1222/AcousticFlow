@@ -24,6 +24,9 @@ using acoustic::kNumBands;
 using acoustic::Obb;
 using acoustic::Scene;
 using acoustic::SceneBox;
+using acoustic::TapParams;
+using acoustic::VoiceProgram;
+using acoustic::ProgramTap;
 using acoustic::SceneHit;
 using acoustic::Vec3;
 
@@ -507,6 +510,69 @@ int AF_SceneInstanceCount(AF_SceneHandle scene) {
 void AF_SceneSetListener(AF_SceneHandle scene, AF_Vector3 pos) {
     SceneBox* b = asBox(scene);
     if (b) { const Vec3 p = toVec3(pos); b->post([p](Scene& s) { s.setListener(p); }); }
+}
+
+void AF_SceneSetListenerOrientation(AF_SceneHandle scene, AF_Vector3 forward, AF_Vector3 up) {
+    SceneBox* b = asBox(scene);
+    if (!b) return;
+    const Vec3 f = toVec3(forward), u = toVec3(up);
+    b->post([f, u](Scene& s) { s.setListenerOrientation(f, u); });
+}
+
+void AF_SceneSetTapParams(AF_SceneHandle scene, const AF_TapParams* params) {
+    SceneBox* b = asBox(scene);
+    if (!b || !params) return;
+    TapParams p;
+    p.distanceRef = params->distanceRef;
+    p.diffractionDistanceRef = params->diffractionDistanceRef;
+    p.diffractionDistancePower = params->diffractionDistancePower;
+    p.airAbsorptionScale = params->airAbsorptionScale;
+    p.transmissionTilt = params->transmissionTilt;
+    p.transmissionHighCutDb = params->transmissionHighCutDb;
+    p.transmissionGainDb = params->transmissionGainDb;
+    p.diffractionGainDb = params->diffractionGainDb;
+    p.diffractionDistanceOnly = params->diffractionDistanceOnly != 0;
+    p.diffractionHighCutDb = params->diffractionHighCutDb;
+    p.tapSmoothTime = params->tapSmoothTime;
+    p.directionSmoothTime = params->directionSmoothTime;
+    p.steerThreshold = params->steerThreshold;
+    p.diffractionHrtf = params->diffractionHrtf != 0;
+    p.diffractionHrtfMarginDb = params->diffractionHrtfMarginDb;
+    p.reverbRatioExponent = params->reverbRatioExponent;
+    p.reverbRatioCeiling = params->reverbRatioCeiling;
+    p.roomBlendRadius = params->roomBlendRadius;
+    p.reverbShareFade = params->reverbShareFade != 0;
+    p.fallbackRt60 = params->fallbackRt60;
+    p.maxTaps = params->maxTaps;
+    p.diffractionTapReserve = params->diffractionTapReserve;
+    b->post([p](Scene& s) { s.setTapParams(p); });
+}
+
+int AF_SceneGetVoiceProgram(AF_SceneHandle scene, int index, AF_VoiceProgram* out) {
+    SceneBox* b = asBox(scene);
+    if (!b || !out) return 0;
+    VoiceProgram vp;
+    if (!b->scene.voiceProgram(index, vp, b->snapshot())) return 0;
+    std::memset(out, 0, sizeof(AF_VoiceProgram));
+    out->count = std::min(vp.count, AF_PROGRAM_MAX_TAPS);
+    for (int i = 0; i < out->count; ++i) {
+        const ProgramTap& t = vp.taps[i];
+        AF_ProgramTap& o = out->taps[i];
+        o.delayMs = t.delayMs;
+        for (int k = 0; k < 6; ++k) o.gain6[k] = t.gain[k];
+        o.panL = t.panL; o.panR = t.panR;
+        o.dirX = t.dir[0]; o.dirY = t.dir[1]; o.dirZ = t.dir[2];
+        o.arrX = t.arr[0]; o.arrY = t.arr[1]; o.arrZ = t.arr[2];
+        o.type = t.type; o.hrtfWeight = t.hrtfWeight;
+    }
+    out->directDirX = vp.directDir[0]; out->directDirY = vp.directDir[1]; out->directDirZ = vp.directDir[2];
+    out->hrtfTapIndex = vp.hrtfTapIndex;
+    out->hrtfDirX = vp.hrtfDir[0]; out->hrtfDirY = vp.hrtfDir[1]; out->hrtfDirZ = vp.hrtfDir[2];
+    out->itdgMs = vp.itdgMs; out->sourceLevel = vp.sourceLevel; out->freeFieldDirect = vp.freeFieldDirect;
+    out->tailShapeIndex = vp.tailShapeIndex;
+    out->tailRatio = vp.tailRatio; out->tailRatioPhysical = vp.tailRatioPhysical;
+    out->mixingTimeMs = vp.mixingTimeMs; out->roomShare = vp.roomShare; out->tier = vp.tier;
+    return 1;
 }
 
 void AF_SceneSetSource(AF_SceneHandle scene, unsigned long long id, AF_Vector3 pos) {

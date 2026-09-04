@@ -926,6 +926,69 @@ ACOUSTIC_API int AF_SceneInstanceCount(AF_SceneHandle scene);
 
 /* リスナー位置を設定する。 */
 ACOUSTIC_API void AF_SceneSetListener(AF_SceneHandle scene, AF_Vector3 pos);
+/* リスナーの向き（前・上、世界座標）。タップの組み立てが到来方向をリスナー座標（+x 右／+y 上／+z 前）へ落とすのに要る。
+ * 呼ばなければ +z 前・+y 上。 */
+ACOUSTIC_API void AF_SceneSetListenerOrientation(AF_SceneHandle scene, AF_Vector3 forward, AF_Vector3 up);
+
+/* ── タップの組み立て（2026-09-05、docs/TAP_BUILDER.md）──
+ * ホストの BuildTapsForSource（1/r・空気吸収・パン・尾の比・平滑・HRTF の回折タップの選び方）を DLL へ移した。
+ * ホストはつまみ（AF_TapParams）とリスナーの向きを渡し、更新のあと AF_SceneGetVoiceProgram で受け取って
+ * 畳み込み器へ写すだけ。直接タップの透過は役割1 の半影（窓の走査線積分）＝生存と同じ模型（同じ問いに答えは 1 つ）。
+ * ★尾の比は音源ごと（不具合 #4）。 */
+typedef struct AF_TapParams {
+    float distanceRef;              /* 1/r の基準距離(m)。0 で距離減衰なし。既定 1.5 */
+    float diffractionDistanceRef;   /* 回折タップの基準距離。0 = distanceRef */
+    float diffractionDistancePower; /* 回折タップの減衰の指数。既定 1 */
+    float airAbsorptionScale;       /* 空気吸収の倍率。既定 1 */
+    float transmissionTilt;         /* 透過のこもり（125 Hz 基準の傾きの指数）。既定 1 */
+    float transmissionHighCutDb;    /* 透過の高域カット(dB @4 kHz)。既定 0 */
+    float transmissionGainDb;       /* 透過の音量(dB)。既定 0 */
+    float diffractionGainDb;        /* 回折タップの音量(dB)。既定 6 */
+    int   diffractionDistanceOnly;  /* 1: 回折タップは方向と距離だけ（帯域は平坦）。既定 1 */
+    float diffractionHighCutDb;     /* 回折の高域カット(dB @4 kHz)。既定 0 */
+    float tapSmoothTime;            /* 透過・遮蔽割合の平滑（秒、dB 領域）。既定 0.08 */
+    float directionSmoothTime;      /* 直接音の向きの平滑（秒）。既定 0.18 */
+    float steerThreshold;           /* 遮蔽の深さがこれを超えたら向きを到来方向へ寄せ始める。既定 0.2 */
+    int   diffractionHrtf;          /* 1: HRTF に回折タップを 1 本載せる。既定 1 */
+    float diffractionHrtfMarginDb;  /* 乗り換えのヒステリシス(dB)。既定 2 */
+    float reverbRatioExponent;      /* 尾の比の知覚圧縮（1 = 物理）。既定 0.5 */
+    float reverbRatioCeiling;       /* 尾の比のソフトニーの天井（膝は 50）。既定 150 */
+    float roomBlendRadius;          /* 部屋の混ぜ半径(m)。既定 2 */
+    int   reverbShareFade;          /* 1: 外へ出るとき量を部屋の中である割合で縮める。既定 1 */
+    float fallbackRt60;             /* 部屋が取れないときの RT60(s)。既定 0.5 */
+    int   maxTaps;                  /* 音源 1 本のタップ上限（≤ 64）。既定 64 */
+    int   diffractionTapReserve;    /* 回折タップのために末尾に空けておく数。既定 8 */
+} AF_TapParams;
+ACOUSTIC_API void AF_SceneSetTapParams(AF_SceneHandle scene, const AF_TapParams* params);
+
+#define AF_PROGRAM_MAX_TAPS 64
+typedef struct AF_ProgramTap {
+    float delayMs;              /* 直接音を 0 とした相対遅延 */
+    float gain6[6];             /* 6 帯域の振幅（1/r・空気吸収込み） */
+    float panL, panR;           /* 等パワーのパン */
+    float dirX, dirY, dirZ;     /* 到来方向（リスナー座標） */
+    float arrX, arrY, arrZ;     /* 到来点（世界） */
+    int   type;                 /* 0 直接／1 反射／2 回折 */
+    float hrtfWeight;           /* HRTF に載せる割合（回折 1 本だけ 1） */
+} AF_ProgramTap;
+typedef struct AF_VoiceProgram {
+    int   count;
+    AF_ProgramTap taps[AF_PROGRAM_MAX_TAPS];
+    float directDirX, directDirY, directDirZ;   /* 直接音の向き（リスナー座標、平滑後） */
+    int   hrtfTapIndex;                         /* -1 = 無し */
+    float hrtfDirX, hrtfDirY, hrtfDirZ;
+    float itdgMs;                               /* 直接以外の最小遅延 */
+    float sourceLevel;                          /* 生存の平均（反射込み）。尾の送出量 */
+    float freeFieldDirect;                      /* 自由音場の直接レベル（遮蔽なし）。尾の校正基準 */
+    int   tailShapeIndex;                       /* 尾の形の代表（AF_SceneGetTailShapeIndex と同じ） */
+    float tailRatio;                            /* 尾の比（圧縮・天井・割合込み）★音源ごと */
+    float tailRatioPhysical;                    /* 圧縮前 (r/rc)² */
+    float mixingTimeMs;                         /* √V（5〜500） */
+    float roomShare;                            /* 部屋の中である割合 */
+    int   tier;                                 /* 段（0 厳密／1 簡易／2 バーチャル／3 保持） */
+} AF_VoiceProgram;
+/* 更新の答え。index は AF_SceneSourceIndex。非同期なら写し（1 フレーム前の入力）。範囲外は 0。 */
+ACOUSTIC_API int AF_SceneGetVoiceProgram(AF_SceneHandle scene, int index, AF_VoiceProgram* out);
 
 /* 音源を登録/更新する。既存の id なら位置を更新するだけ。
  *   id : ホスト側の音源識別子。Wwise の GameObject ID と揃えておくと配線が楽。 */

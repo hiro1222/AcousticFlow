@@ -7843,10 +7843,14 @@ void testAsyncUpdate() {
                 const int mb = AF_SceneGetEchogramBands(b.s, ib, eb, 32);
                 if (ma != mb) ++mismatch;
                 for (int k = 0; k < ma * kBands; ++k) if (ea[k] != eb[k]) { ++mismatch; break; }
+                AF_VoiceProgram pra{}, prb{};
+                AF_SceneGetVoiceProgram(a.s, ia, &pra); AF_SceneGetVoiceProgram(b.s, ib, &prb);
+                if (pra.count != prb.count || pra.tailRatio != prb.tailRatio || pra.hrtfTapIndex != prb.hrtfTapIndex) ++mismatch;
+                for (int k = 0; k < 6; ++k) if (pra.taps[0].gain6[k] != prb.taps[0].gain6[k]) { ++mismatch; break; }
             }
         }
         std::snprintf(note, sizeof(note), "(%d フレーム × 6 本、比較 %d、不一致 %d、最大差 %.3g)", frames, cmp, mismatch, maxDiff);
-        check("[非同期] 同期と非同期で答えがビット一致（遮蔽・段・早期反射の本数・尾）", mismatch == 0, note);
+        check("[非同期] 同期と非同期で答えがビット一致（遮蔽・段・早期反射の本数・尾・タップの組み立て）", mismatch == 0, note);
         AF_SceneDestroy(a.s); AF_SceneDestroy(b.s);
     }
     // ② 主スレッドの AF_SceneUpdate の費用
@@ -8053,6 +8057,121 @@ void testRoomSeedAndShare() {
         std::snprintf(note, sizeof(note), "(中 %.3f / 外 %.3f / 最大段差 %.3f @ z=%.1f)", wIn, wOut, maxDw, atW);
         check("[部屋] 外へ出るときの残響の量の重みが連続（1 歩 0.1 m で 0.1 以下）で、中 1・外 0", wIn > 0.99f && wOut < 0.01f && maxDw <= 0.1f, note);
         AF_SceneDestroy(s);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 【タップの組み立て】ホストの BuildTapsForSource を DLL へ（2026-09-05、docs/TAP_BUILDER.md）
+//
+//   縛るのは 7 つ:
+//     ① 直接タップの透過は役割1 の半影（AF_SceneDebugSurvivalParts の soft）× 空気吸収 × 1/r（同じ問いに答えは 1 つ）
+//     ② R タップの遅延は (全経路長 − 直接距離)/c
+//     ③ 遮られた音源には F タップが出て HRTF に 1 本載る。見通せる音源には出ない
+//     ④ 尾の比は音源ごと: 2 m と 10 m で物理の比が (10/2)² = 25 倍（不具合 #4）
+//     ⑤ 到来方向はリスナー座標: 右の音源は +x、パンは右寄り
+//     ⑥ 段の写しと同じく、非同期でも同じ答え（[非同期] で比較）
+//     ⑦ 部屋が無ければ尾の比は外形箱で当たる（ホストの予備と同じ）
+// ─────────────────────────────────────────────────────────────────────
+void testTapBuilder() {
+    std::printf("\n[タップ] 組み立てを DLL へ ── 直接・反射・回折のタップと尾の比を音源ごとに出す\n");
+    const float h = 4.0f, t = 0.3f, hw = 9.0f, hd = 9.0f;
+    AF_SceneHandle s = AF_SceneCreate();
+    const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(-4.0f, h*0.5f, 2.0f), V(2.0f, h*0.5f, 0.3f), V(1,0,0), V(0,1,0), m);   // 衝立（左奥）
+    const AF_Vector3 L = V(0, 1.6f, -4.0f);
+    AF_SceneSetListener(s, L);
+    AF_SceneSetListenerOrientation(s, V(0, 0, 1), V(0, 1, 0));
+    const AF_Vector3 A = V(2.0f, 1.6f, -4.0f);      // 右 2 m、見通せる
+    const AF_Vector3 B = V(-4.0f, 1.6f, 5.0f);      // 衝立の裏、約 9.8 m
+    AF_SceneSetSource(s, 1, A);
+    AF_SceneSetSource(s, 2, B);
+    AF_TapParams p{};
+    p.distanceRef = 1.5f; p.diffractionDistanceRef = 0.0f; p.diffractionDistancePower = 1.0f; p.airAbsorptionScale = 1.0f;
+    p.transmissionTilt = 1.0f; p.transmissionHighCutDb = 0.0f; p.transmissionGainDb = 0.0f; p.diffractionGainDb = 6.0f;
+    p.diffractionDistanceOnly = 1; p.diffractionHighCutDb = 0.0f; p.tapSmoothTime = 0.08f; p.directionSmoothTime = 0.18f;
+    p.steerThreshold = 0.2f; p.diffractionHrtf = 1; p.diffractionHrtfMarginDb = 2.0f; p.reverbRatioExponent = 1.0f;
+    p.reverbRatioCeiling = 1e9f; p.roomBlendRadius = 2.0f; p.reverbShareFade = 1; p.fallbackRt60 = 0.5f;
+    p.maxTaps = 64; p.diffractionTapReserve = 8;
+    AF_SceneSetTapParams(s, &p);
+    for (int k = 0; k < 60; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);   // 1 s: 平滑（0.08 s）が収束
+    const int ia = AF_SceneSourceIndex(s, 1), ib = AF_SceneSourceIndex(s, 2);
+    AF_VoiceProgram pa{}, pb{};
+    const int oka = AF_SceneGetVoiceProgram(s, ia, &pa), okb = AF_SceneGetVoiceProgram(s, ib, &pb);
+    char note[240];
+    std::snprintf(note, sizeof(note), "(A: %d 本 / B: %d 本)", pa.count, pb.count);
+    check("[タップ] 両方の音源にタップが出る（先頭は直接）", oka && okb && pa.count >= 1 && pb.count >= 1 && pa.taps[0].type == 0 && pb.taps[0].type == 0 && pa.taps[0].delayMs == 0.0f, note);
+
+    // ① 直接タップ = soft × 空気吸収 × 1/r
+    {
+        float soft[kBands] = {}, dif[kBands] = {};
+        AF_SceneDebugSurvivalParts(s, L, A, soft, dif);
+        const float dist = 2.0f;
+        const float airDb[6] = {0.0003f, 0.0008f, 0.0017f, 0.003f, 0.0085f, 0.025f};
+        float maxErr = 0.0f;
+        for (int b = 0; b < kBands; ++b) {
+            const float expect = soft[b] * std::pow(10.0f, -(airDb[b] * dist) / 20.0f) * (1.5f / std::max(dist, 1.5f));
+            maxErr = std::max(maxErr, std::fabs(pa.taps[0].gain6[b] - expect));
+        }
+        std::snprintf(note, sizeof(note), "(最大差 %.4f、125Hz: soft %.3f → タップ %.3f)", maxErr, soft[0], pa.taps[0].gain6[0]);
+        check("[タップ] 直接タップ ＝ 役割1 の半影 × 空気吸収 × 1/r（同じ模型）", maxErr < 0.02f, note);
+    }
+    // ② R タップの遅延
+    {
+        int nr = 0; float maxErr = 0.0f;
+        for (int i = 1; i < pa.count; ++i) {
+            if (pa.taps[i].type != 1) continue;
+            ++nr;
+            const float dx = pa.taps[i].arrX - L.x, dy = pa.taps[i].arrY - L.y, dz = pa.taps[i].arrZ - L.z;
+            const float pl = std::sqrt(dx*dx + dy*dy + dz*dz);
+            const float expect = std::max(0.0f, (pl - 2.0f) * 1000.0f / 343.0f);
+            maxErr = std::max(maxErr, std::fabs(pa.taps[i].delayMs - expect));
+        }
+        std::snprintf(note, sizeof(note), "(R %d 本、遅延の最大差 %.3f ms)", nr, maxErr);
+        check("[タップ] 反射タップの遅延 = (経路長 − 直接距離)/c", nr > 0 && maxErr < 0.05f, note);
+    }
+    // ③ F タップと HRTF
+    {
+        int nfA = 0, nfB = 0;
+        for (int i = 0; i < pa.count; ++i) if (pa.taps[i].type == 2) ++nfA;
+        for (int i = 0; i < pb.count; ++i) if (pb.taps[i].type == 2) ++nfB;
+        const bool hrtfOk = pb.hrtfTapIndex >= 0 && pb.hrtfTapIndex < pb.count && pb.taps[pb.hrtfTapIndex].type == 2 && pb.taps[pb.hrtfTapIndex].hrtfWeight == 1.0f;
+        std::snprintf(note, sizeof(note), "(見通せる A: F %d 本 hrtf %d / 影の B: F %d 本 hrtf %d)", nfA, pa.hrtfTapIndex, nfB, pb.hrtfTapIndex);
+        check("[タップ] 影の音源には回折タップが出て HRTF に 1 本載る。見通せる音源には出ない", nfA == 0 && pa.hrtfTapIndex < 0 && nfB > 0 && hrtfOk, note);
+    }
+    // ④ 尾の比は音源ごと（#4）
+    {
+        const float ratio = (pa.tailRatioPhysical > 1e-9f) ? pb.tailRatioPhysical / pa.tailRatioPhysical : 0.0f;
+        const float dA = 2.0f, dB = std::sqrt(4.0f * 4.0f + 9.0f * 9.0f);
+        const float expect = (dB * dB) / (dA * dA);
+        std::snprintf(note, sizeof(note), "(A %.2f / B %.2f → 比 %.2f、期待 %.2f。部屋の中 %.2f)", pa.tailRatioPhysical, pb.tailRatioPhysical, ratio, expect, pa.roomShare);
+        check("[タップ] 尾の比が音源ごと: (r_B/r_A)² に一致（#4）", pa.tailRatioPhysical > 0.0f && std::fabs(ratio - expect) < expect * 0.05f && pa.roomShare > 0.99f, note);
+    }
+    // ⑤ 向きとパン
+    {
+        std::snprintf(note, sizeof(note), "(A の向き (%.2f, %.2f, %.2f)、パン L %.2f / R %.2f)", pa.directDirX, pa.directDirY, pa.directDirZ, pa.taps[0].panL, pa.taps[0].panR);
+        check("[タップ] 右の音源はリスナー座標で +x、パンは右寄り", pa.directDirX > 0.9f && pa.taps[0].panR > pa.taps[0].panL, note);
+    }
+    AF_SceneDestroy(s);
+    // ⑦ 部屋が無い（床だけ）: 外形箱で当たる
+    {
+        AF_SceneHandle o = AF_SceneCreate();
+        const int mo = AF_SceneAddMaterial(o, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(o, V(0, -0.3f, 0), V(20, 0.3f, 20), V(1,0,0), V(0,1,0), mo);
+        AF_SceneSetListener(o, V(0, 1.6f, 0));
+        AF_SceneSetSource(o, 1, V(3.0f, 1.6f, 0));
+        AF_SceneSetTapParams(o, &p);
+        for (int k = 0; k < 10; ++k) AF_SceneUpdate(o, 1.0f / 60.0f);
+        AF_VoiceProgram po{};
+        AF_SceneGetVoiceProgram(o, AF_SceneSourceIndex(o, 1), &po);
+        std::snprintf(note, sizeof(note), "(尾の比 %.3f、mixing %.0f ms、部屋の中 %.2f)", po.tailRatio, po.mixingTimeMs, po.roomShare);
+        check("[タップ] 部屋が無ければ外形箱で当たる（比 > 0、mixing = √V）", po.tailRatio > 0.0f && po.mixingTimeMs > 5.0f, note);
+        AF_SceneDestroy(o);
     }
 }
 
@@ -11877,6 +11996,7 @@ int main() {
         else if (std::strcmp(only, "tier") == 0) testTierBudget();
         else if (std::strcmp(only, "issues") == 0) probeKnownIssues();
         else if (std::strcmp(only, "rooms") == 0) testRoomSeedAndShare();
+        else if (std::strcmp(only, "taps") == 0) testTapBuilder();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }
@@ -11923,6 +12043,7 @@ int main() {
     testOutdoorIsNotARoom();
     testRoomGridDegradeDetect();
     testRoomSeedAndShare();
+    testTapBuilder();
     testAutoPortals();
     diagnosePortalLeftRightSymmetry();
     diagnosePortalWidthVsDoorCurve();

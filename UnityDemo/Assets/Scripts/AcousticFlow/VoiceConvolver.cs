@@ -276,7 +276,8 @@ namespace AcousticFlow
             //   散乱率は遅延とともに上げる（高次反射ほど拡散へ溶ける）。正規化には
             //   **頭打ち前の真の mixing time** を使うこと（畳み込みの都合で下限を掛けた値だと
             //   狭い部屋で実際の4倍以上に膨らみ、散乱が効かなくなる）。
-            float mix = AcousticFlowSceneDemo.Status.MixingTimeMs;
+            // mixing time と尾の比は、DLL の組み立てなら音源ごと（#4）。無ければホストの全体値。
+            float mix = (ts.MixingTimeMs > 0f) ? ts.MixingTimeMs : AcousticFlowSceneDemo.Status.MixingTimeMs;
             if (mix <= 0f) mix = 25f;
             int n = Mathf.Min(ts.Count, _taps.Length);
             int nb = AcousticEngine.NumBands;
@@ -404,8 +405,10 @@ namespace AcousticFlow
                         //   「尾の開始」が同時にずれ、尾側はブロック境界でハードスワップなので
                         //   段差として聞こえる。以前は max(10, mixingTime) を毎回そのまま
                         //   渡していた（C# 経路は平滑していたので、そこも食い違っていた）。
-                        float mixT = AcousticFlowSceneDemo.Status.MixingTimeMs;
+                        float mixT = (ts.MixingTimeMs > 0f) ? ts.MixingTimeMs : AcousticFlowSceneDemo.Status.MixingTimeMs;
                         if (mixT <= 0f) mixT = 120f;
+                        // ★尾の比は音源ごと（不具合 #4）。以前は音源 0 の距離だけで全音源の比を決めていた。
+                        float tailRatio = (ts.TailRatio >= 0f) ? ts.TailRatio : AcousticFlowSceneDemo.Status.ReverbTargetRatio;
                         _splitMs = Mathf.Lerp(_splitMs, Mathf.Max(minSplitMs, mixT), 0.15f);
 
                         // ★耳ごとの帯域ゲイン（後期残響の左右バランス）を渡す。
@@ -416,7 +419,7 @@ namespace AcousticFlow
                             _voice, _echo, bins, AcousticFlowSceneDemo.Status.EchogramBinMs,
                             _splitMs, 20f,
                             30f, 0f, 0.6f, dg,
-                            AcousticFlowSceneDemo.Status.ReverbTargetRatio,
+                            tailRatio,
                             ear, ear != null ? ear.Length : 0);
                         tailPartitions = Native.AF_VoiceTailPartitions(_voice);
                         tailLatencySamples = Native.AF_VoiceTailLatency(_voice);
