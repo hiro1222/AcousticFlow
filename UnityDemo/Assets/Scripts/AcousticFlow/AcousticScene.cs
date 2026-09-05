@@ -1136,6 +1136,13 @@ namespace AcousticFlow
         {
             if (_handle != IntPtr.Zero) Native.AF_SceneSetRoomSeedRadius(_handle, meters);
         }
+        /// 直接経路の半影の作り方（2 = 窓の走査線積分・既定／1 = 環の標本点／0 = 旧）。同じビルドで聞き比べるための切り替え。
+        public void SetDirectPenumbra(int mode)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneSetDirectPenumbra(_handle, mode); }
+            catch (EntryPointNotFoundException) { }   // 古い DLL: その DLL の既定のまま
+        }
 
         // 反射経路：origin→dir を鏡面反射で maxBounces 回追い、通過点を outPoints に書き点数を返す。
         // 内部バッファ(_pathBuf)を使い回して毎フレームの GC を避ける。

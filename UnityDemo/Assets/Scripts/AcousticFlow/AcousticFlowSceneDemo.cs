@@ -348,6 +348,10 @@ namespace AcousticFlow
         [Tooltip("早期反射の模型。0 = 像源をレイで拾う（旧。像が見えた/消えたの二値でタップが跳ぶ）"
                  + "1 = 面ごとの線音源（2026-09-03 決定。鏡面点にピークを持つ下位タップの線。低域は点、高域は面いっぱいに広がる）")]
         [Range(0, 1)] public int earlyReflectModel = 1;
+        [Tooltip("直接経路の半影の作り方。2 = 窓の走査線積分（2026-09-05 既定。影の区間を解析的に積むので扉の隙間で跳ばない）"
+                 + "／1 = 帯域ごとのフレネル半径の環に標本点（09-02。4 点の環が階段になる）／0 = 旧（音源まわり 8 点）。"
+                 + "同じビルドで聞き比べるための切り替え（Play 中に動かしてよい）。採用が固まったら 0・1 側ごと消す。")]
+        [Range(0, 2)] public int directPenumbraMode = 2;
         [Tooltip("面 1 枚あたりの下位タップ数（面の線の分割数）。3〜5。")]
         [Range(1, 8)] public int earlyFaceSubTaps = 5;
         [Tooltip("ON: 起動時に静的な面のリストとセルごとの見通しを焼く（3 層構造の焼く層）。実行時は 焼いた見通し × 動いた物の遮蔽。OFF なら毎回生で解く（A/B 用。答えは同じ）。")]
@@ -1479,6 +1483,7 @@ namespace AcousticFlow
             _scene.SetApertureTimbre(apertureTimbre);
             _scene.SetApertureIsTransmission(apertureIsTransmission);
             _scene.SetUseBtm(useBtmDiffraction);
+            _scene.SetDirectPenumbra(directPenumbraMode);   // 中で丸めるだけ。毎フレーム押してよい
             // 部屋の検出設定。中で値の変化を見ているので、毎フレーム押しても作り直しは起きない。
             _scene.SetRoomCellSize(roomCellSize);
             _scene.SetRoomSeedRadius(roomSeedRadius);
@@ -2714,6 +2719,8 @@ namespace AcousticFlow
                 : "主音源の回折: なし", style);
             if (showDiffractionCandidates)
                 GUILayout.Label($"回折候補(主音源): {_diffCandCount} 本合成 (水色=最短) (C)", style);
+            GUILayout.Label($"直接の半影: {(directPenumbraMode == 2 ? "窓の走査線" : directPenumbraMode == 1 ? "環の標本点" : "旧(8 点)")} (Inspector directPenumbraMode)   "
+                            + $"タップの組み立て: {(tapsFromEngine && _scene != null && _scene.TapBuilderAvailable ? "DLL" : "ホスト")} (tapsFromEngine)", style);
             GUILayout.Label($"早期反射(IR の R タップ・{(earlyReflectModel == 1 ? "面の線" : "像源レイ")}): {(enableEarlyReflections ? "ON" : "OFF")} (F)   "
                             + $"回折二次音源(IR の F タップ): {(enableDiffractionSources ? "ON" : "OFF")} (V)", style);
             {

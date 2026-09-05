@@ -8347,3 +8347,11 @@ DLL は既定でスタブ Adapter だったので、あの経路（PostEvent / R
 - そちらのコードは変えていません。`AcousticFlowSceneDemo.tapsFromEngine`（既定 ON）が増えました。OFF で従来の自前の組み立て。つまみ（distanceRef、transmissionTilt、diffractionGainDb、tapSmoothTime、reverbRatioExponent …）はそのまま DLL に渡ります。
 - **DLL は要更新（ABI 7）**。古い DLL では起動時に警告が出て音響が止まります。配備済み。
 - 聞こえ方が変わる所: 直接音の縁の半影の幅と、隙間の立ち上がり。透過の追従は前より少し遅い（平滑の時定数が正しくなった。前は実質 3 倍速）。`tapSmoothTime` で合わせ直せます。
+
+---
+
+# 【サウンド→ゲームシステム】足した: 直接経路の半影の切り替えを Inspector へ（試聴用）
+
+- `AcousticFlowSceneDemo.directPenumbraMode`（既定 2 = 窓の走査線。1 = 環の標本点、0 = 旧）。Play 中に動かして聞き比べられます。前の板で「設定は増えていません」と書きましたが、Unity から切り替える口が無かったので足しました。
+- HUD に「直接の半影: …／タップの組み立て: DLL／ホスト」の 1 行が増えました。どちらの模型が鳴っているかを画面で確かめられます。
+- そちらのコードは変えていません。DLL はそのまま（ABI 7）。
