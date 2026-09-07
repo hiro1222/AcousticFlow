@@ -8176,6 +8176,75 @@ void testTapBuilder() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 【材質】部屋のプリセット（2026-09-08）。部屋の RT60 は Sabine で形と材質から出るので、
+//   プリセット＝材質。閉じた箱 8×8×3 m に貼って、RT60 の順と形（帯域の傾き）と、
+//   材質を差し替えたときに RT60 が追いつくこと（setMaterial / setInstanceMaterial → 部屋グラフの作り直し）を見る。
+void testMaterialPresets() {
+    std::printf("\n[材質] 部屋のプリセット（Sabine の RT60 は形と材質から）\n");
+    struct P { int id; const char* name; };
+    const P presets[] = { {1, "Concrete"}, {6, "Stone"}, {7, "Cave"}, {5, "WoodRoom"}, {0, "Default"}, {8, "Snow"} };
+    const int np = static_cast<int>(sizeof(presets) / sizeof(presets[0]));
+    const float h = 3.0f, t = 0.3f, hw = 4.0f, hd = 4.0f;
+    // 閉じた箱を材質 m で組む。wallOut に +Z の壁の instanceId を返す。
+    auto buildBox = [&](AF_SceneHandle s, int m, int* wallOut) {
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(hw+t, t, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(-hw-t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V( hw+t, h*0.5f, 0), V(t, h*0.5f, hd+t), V(1,0,0), V(0,1,0), m);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -hd-t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        const int w = AF_SceneAddInstanceBox(s, V(0, h*0.5f,  hd+t), V(hw+t, h*0.5f, t), V(1,0,0), V(0,1,0), m);
+        if (wallOut) *wallOut = w;
+        AF_SceneSetListener(s, V(0, 1.6f, 0)); AF_SceneSetSource(s, 1, V(1, 1.6f, 1));
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+    };
+    float rt[6][kBands] = {}; float vol[6] = {}; int nb[6] = {};
+    std::printf("        %-9s %6s  RT60[s] 125    250    500    1k     2k     4k\n", "材質", "V m3");
+    for (int i = 0; i < np; ++i) {
+        float tr[kBands], ab[kBands], sc[kBands];
+        nb[i] = AF_MaterialPresetBands(presets[i].id, tr, ab, sc);
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, tr, ab, sc, nb[i]);
+        buildBox(s, m, nullptr);
+        AF_SceneRt60At(s, V(0, 1.6f, 0), 2.0f, rt[i], kBands);
+        AF_SceneRoomInfo(s, 0, &vol[i], nullptr, nullptr, nullptr);
+        std::printf("        %-9s %6.0f          %5.2f  %5.2f  %5.2f  %5.2f  %5.2f  %5.2f\n", presets[i].name, vol[i],
+                    rt[i][0], rt[i][1], rt[i][2], rt[i][3], rt[i][4], rt[i][5]);
+        AF_SceneDestroy(s);
+    }
+    check("[材質] プリセット 5〜8 が 6 帯域で引ける", nb[1] == kBands && nb[2] == kBands && nb[3] == kBands && nb[5] == kBands);
+    check("[材質] 500 Hz の RT60 の順: Concrete > Stone > Cave > WoodRoom > Snow",
+          rt[0][2] > rt[1][2] && rt[1][2] > rt[2][2] && rt[2][2] > rt[3][2] && rt[3][2] > rt[5][2]);
+    checkInRange("[材質] Concrete 8×8×3 の RT60(500) は 3〜6 s（今の後反響）", rt[0][2], 3.0f, 6.0f);
+    checkInRange("[材質] WoodRoom 8×8×3 の RT60(500) は 0.6〜1.4 s", rt[3][2], 0.6f, 1.4f);
+    checkInRange("[材質] Snow 8×8×3 の RT60(500) は 0.3 s 以下（ほぼ無響）", rt[5][2], 0.0f, 0.3f);
+    checkGreater("[材質] WoodRoom は板が低域を吸う: RT60(1k) > RT60(125)", rt[3][3], rt[3][0]);
+    checkGreater("[材質] Default は高域から減る: RT60(125) > RT60(4k)", rt[4][0], rt[4][5]);
+    checkGreater("[材質] Snow は高域がほぼ無響: RT60(125) > 2 × RT60(4k)", rt[5][0], 2.0f * rt[5][5]);
+    // 差し替えの追従: Concrete の箱の材質を書き換える（setMaterial）→ RT60 が箱を登録し直さずに追いつく。
+    //   壁 1 枚だけ Snow にする（setInstanceMaterial）→ さらに短くなる。
+    {
+        float trC[kBands], abC[kBands], scC[kBands], trW[kBands], abW[kBands], scW[kBands], trS[kBands], abS[kBands], scS[kBands];
+        AF_MaterialPresetBands(1, trC, abC, scC); AF_MaterialPresetBands(5, trW, abW, scW); AF_MaterialPresetBands(8, trS, abS, scS);
+        AF_SceneHandle s = AF_SceneCreate();
+        const int m = AF_SceneAddMaterial(s, trC, abC, scC, kBands);
+        const int mSnow = AF_SceneAddMaterial(s, trS, abS, scS, kBands);
+        int wall = -1; buildBox(s, m, &wall);
+        float a[kBands], b[kBands], c[kBands];
+        AF_SceneRt60At(s, V(0, 1.6f, 0), 2.0f, a, kBands);
+        AF_SceneSetMaterial(s, m, trW, abW, scW, kBands);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        AF_SceneRt60At(s, V(0, 1.6f, 0), 2.0f, b, kBands);
+        AF_SceneSetInstanceMaterial(s, wall, mSnow);
+        AF_SceneUpdate(s, 1.0f / 60.0f);
+        AF_SceneRt60At(s, V(0, 1.6f, 0), 2.0f, c, kBands);
+        char note[160];
+        std::snprintf(note, sizeof(note), "(500 Hz: Concrete %.2f → 書き換え WoodRoom %.2f → 壁 1 枚 Snow %.2f s)", a[2], b[2], c[2]);
+        check("[材質] 材質を書き換えると部屋の RT60 が追いつく（setMaterial）", b[2] < 0.5f * a[2] && std::fabs(b[2] - rt[3][2]) < 0.05f, note);
+        check("[材質] 実体 1 つの材質を付け替えても追いつく（setInstanceMaterial）", c[2] < b[2] * 0.9f, note);
+        AF_SceneDestroy(s);
+    }
+}
+
 // 【探り】既知の不具合の現状を数字で採る（AF_ONLY=issues でだけ走る。合否は付けない）
 //   docs/SOUND_REVIEW_2026-09-04.md §2.3 の #5 #6 #7 #12。直す前に「いまどうか」を測る物差し。
 // ─────────────────────────────────────────────────────────────────────
@@ -11997,6 +12066,7 @@ int main() {
         else if (std::strcmp(only, "issues") == 0) probeKnownIssues();
         else if (std::strcmp(only, "rooms") == 0) testRoomSeedAndShare();
         else if (std::strcmp(only, "taps") == 0) testTapBuilder();
+        else if (std::strcmp(only, "materials") == 0) testMaterialPresets();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }
@@ -12044,6 +12114,7 @@ int main() {
     testRoomGridDegradeDetect();
     testRoomSeedAndShare();
     testTapBuilder();
+    testMaterialPresets();
     testAutoPortals();
     diagnosePortalLeftRightSymmetry();
     diagnosePortalWidthVsDoorCurve();

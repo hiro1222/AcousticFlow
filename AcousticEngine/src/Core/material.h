@@ -39,6 +39,13 @@ struct AcousticMaterial {
     // 完全不透過（検証用）。透過を 0 にすると「回り込んだ音だけ」が残るので、
     // 回折の定位と減衰を単体で確かめられる。現実の材質ではない。
     static AcousticMaterial opaque();
+    // --- 部屋のプリセット（2026-09-08。部屋の境界に貼る「面積平均の材質」）---
+    //   部屋の響きは Sabine（RT60 = 0.161 V / ΣSα）で形と材質から出る。だから「部屋の響きのプリセット」は
+    //   別の仕組みではなく材質そのもの（答えは 1 つ）。壁・床・天井の文献値を面積で平均してある。
+    static AcousticMaterial woodRoom();     // 板張りの部屋（乾いた短い響き。板は低域を吸い、高域は返す）
+    static AcousticMaterial stone();        // 石積み（遺跡・神殿。よく遮り、吸わず、粗いので散る）
+    static AcousticMaterial cave();         // 岩肌（洞窟。ごく粗く、長く、拡散する）
+    static AcousticMaterial snow();         // 新雪（高域ほど吸う。ほぼ無響）
 };
 
 }  // namespace acoustic

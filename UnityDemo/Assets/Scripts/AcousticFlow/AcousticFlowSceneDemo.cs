@@ -33,7 +33,9 @@ namespace AcousticFlow
         public bool autoCollectBoxColliders = true;   // 名前は歴史的。MeshCollider も拾う
         [Tooltip("手動指定の occluder（autoCollect と併用可）。Box / Mesh どちらでもよい。")]
         public Collider[] extraOccluders;
-        [Tooltip("occluder の材質プリセット（全 occluder 共通・最小デモ用）。")]
+        [Tooltip("部屋の材質（AcousticSurface の無い occluder 全部の既定）。部屋の響きのプリセットはここ: "
+                 + "Concrete = 今の後反響 / WoodRoom = 板張りの部屋 / Stone = 石積み / Cave = 岩肌 / Snow = 新雪 / Default = 内壁。 "
+                 + "Play 中に変えてよい（L キーで巡る）。反射・尾・Sabine の RT60 が一緒に変わる。")]
         public AcousticMaterialPreset occluderMaterial = AcousticMaterialPreset.Concrete;
 
         [Header("移動 (WASD)")]
@@ -518,6 +520,16 @@ namespace AcousticFlow
 
         private AcousticScene _scene;
         private int _materialId;
+        private AcousticMaterialPreset _appliedOccluderMaterial;   // 部屋の材質の切り替え（L）を見るための「今エンジンにある物」
+        // 部屋の材質として意味のある物だけを巡る（Glass / Opaque / WoodDoor は面や検証用）。
+        private static readonly AcousticMaterialPreset[] kRoomPresets = {
+            AcousticMaterialPreset.Concrete, AcousticMaterialPreset.WoodRoom, AcousticMaterialPreset.Stone,
+            AcousticMaterialPreset.Cave, AcousticMaterialPreset.Snow, AcousticMaterialPreset.Default };
+        private static AcousticMaterialPreset NextRoomPreset(AcousticMaterialPreset cur)
+        {
+            int i = System.Array.IndexOf(kRoomPresets, cur);   // 無ければ -1 → 0（Concrete）から
+            return kRoomPresets[(i + 1) % kRoomPresets.Length];
+        }
         // 材質の中身→materialId。同じ値の壁が何枚あってもテーブルは1つで済ませる。
         //   ★キーをプリセットの enum にしてはいけない（任意材質が同じ ID に潰れる）。
         private readonly System.Collections.Generic.Dictionary<string, int> _materialIdByContent
@@ -818,6 +830,7 @@ namespace AcousticFlow
             LatestBandGains = _monBandGains;
 
             _materialId = _scene.AddMaterial(AcousticMaterial.FromPreset(occluderMaterial));
+            _appliedOccluderMaterial = occluderMaterial;
             CollectOccluders();
             RegisterInstances();
             CollectPortals();
@@ -1424,6 +1437,8 @@ namespace AcousticFlow
             //   ★扉の開閉の連続性（タップのパラメータ補間）は C++ 側にしか入っていないので、
             //     「開けた瞬間ガタっと変わる」を聞き分けるときは必ずこちらで確認すること。
             if (Input.GetKeyDown(KeyCode.Y)) SetDspPath(!useCppDsp);
+            // L：部屋の材質（AcousticSurface の無い occluder の既定）を巡る。反射・尾・Sabine の RT60 が一緒に変わる。
+            if (Input.GetKeyDown(KeyCode.L)) occluderMaterial = NextRoomPreset(occluderMaterial);
             // HUD の出し入れ。既定 None なのでキーは奪わない（シーンで割り当てたときだけ効く）。
             if (hudToggleKey != KeyCode.None && Input.GetKeyDown(hudToggleKey)) showHud = !showHud;
 
@@ -1472,6 +1487,14 @@ namespace AcousticFlow
             _scene.SetUpdateConfig(BuildUpdateConfig());
             // 開口の演出つまみ。Inspector で動かしたら次のフレームから効く。
             UpdatePortals();          // 扉ごと動く戸口もあるので配置を送り直す
+            // 部屋の材質の切り替え（L キー／Inspector）。既定の材質を**書き換える**ので、使っている実体が一斉に変わる。
+            //   部屋の Sabine（RT60）も DLL の中で作り直される（反射・尾・RT60 が同じ材質。答えは 1 つ）。
+            if (occluderMaterial != _appliedOccluderMaterial)
+            {
+                var rm = AcousticMaterial.FromPreset(occluderMaterial);
+                _scene.SetMaterial(_materialId, rm.transmission, rm.absorption, rm.scattering);
+                _appliedOccluderMaterial = occluderMaterial;
+            }
             if (liveMaterialUpdate)   // Play 中に材質を切り替えて聞き比べたいとき
                 for (int i = 0; i < _occluders.Count; i++)
                 {
@@ -2687,6 +2710,8 @@ namespace AcousticFlow
             {
                 float wetP = _reverbWet * 100f;                 // 物理wet%（t/(1+t)）
                 GUILayout.Label($"直接:反響(物理) = {100f - wetP:F0}:{wetP:F0}   RT {_reverbDecay:F2}s", style);
+                GUILayout.Label($"部屋の材質(L): {occluderMaterial}" + (_roomRt60 != null
+                    ? $"   Sabine RT60 125/500/4k = {_roomRt60[0]:F2}/{_roomRt60[2]:F2}/{_roomRt60[5]:F2} s" : ""), style);
                 // 部屋（幾何から自動検出）。部屋番号は表示だけで、音は割合で混ぜている。
                 if (_scene != null)
                 {

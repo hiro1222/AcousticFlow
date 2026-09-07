@@ -8355,3 +8355,14 @@ DLL は既定でスタブ Adapter だったので、あの経路（PostEvent / R
 - `AcousticFlowSceneDemo.directPenumbraMode`（既定 2 = 窓の走査線。1 = 環の標本点、0 = 旧）。Play 中に動かして聞き比べられます。前の板で「設定は増えていません」と書きましたが、Unity から切り替える口が無かったので足しました。
 - HUD に「直接の半影: …／タップの組み立て: DLL／ホスト」の 1 行が増えました。どちらの模型が鳴っているかを画面で確かめられます。
 - そちらのコードは変えていません。DLL はそのまま（ABI 7）。
+
+---
+
+# 【サウンド→ゲームシステム】入れた: 部屋の響きのプリセット（材質 4 つ）と、材質を差し替えたとき RT60 が追いつかなかった二重の修正
+
+部屋の響きを名前で選べるように、材質のプリセットを 4 つ足しました（docs/ROOM_PRESETS.md）。**プリセット＝材質**です。部屋の RT60 は Sabine で形と材質から出るので、RT60 の表を別に持ちません。
+- `AcousticMaterialPreset.WoodRoom`（板張りの部屋）／`Stone`（石積み。遺跡・神殿）／`Cave`（岩肌）／`Snow`（新雪）。`AcousticSurface` の material にも選べます。既存 0〜4 の値は変えていません。
+- 8×8×3 m の箱での RT60(500 Hz): Concrete 4.2 s / Stone 3.2 / Cave 2.1 / WoodRoom 0.86 / Snow 0.16。
+- **直した所**: `AcousticScene.SetMaterial` や `SetInstanceMaterial` で材質を差し替えても、部屋の RT60 は登録時の材質のままでした（反射・尾だけ新しい材質）。そちらの材質切り替え（`liveMaterialUpdate` や `BellGameSourceSettings`）でも今日から RT60 が一緒に動きます。
+- `AcousticFlowSceneDemo.occluderMaterial` を Play 中に変えられるようになり、**L キー**で巡ります。HUD に「部屋の材質(L)」と Sabine の RT60 が出ます。
+- そちらのコードは変えていません。**DLL は要更新**（AF_MaterialPresetBands の 5〜8 と、Sabine の追従）。古い DLL では C# の保険の表で同じ値になりますが、RT60 は追いつきません。

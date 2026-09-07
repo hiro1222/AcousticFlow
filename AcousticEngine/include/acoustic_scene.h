@@ -55,6 +55,10 @@ ACOUSTIC_API void AF_SceneDestroy(AF_SceneHandle scene);
  *   Default と Concrete の透過が 6〜8dB 食い違っていた（C++ 側だけ意図的に上げて、
  *   C# が置き去りになった）。回帰テストが守る遮音量と出荷する音が違う状態で、
  *   決めごと #1「同じ問いに 2 つの答えを持たせない」そのもの。
+ * preset: 0 Default（内壁）/ 1 Concrete / 2 Glass / 3 Opaque（検証用）/ 4 WoodDoor /
+ *         5 WoodRoom（板張りの部屋）/ 6 Stone（石積み）/ 7 Cave（岩肌）/ 8 Snow（新雪）。範囲外は 0。
+ *   5〜8 は「部屋の響きのプリセット」（2026-09-08）。部屋の RT60 は Sabine で形と材質から出るので、
+ *   響きのプリセットは材質として持つ（RT60 の表を別に持たない）。
  *   ホストはこの関数から引くこと。 */
 ACOUSTIC_API int AF_MaterialPresetBands(int preset, float* outTransmission,
                                         float* outAbsorption, float* outScattering);

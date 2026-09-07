@@ -16,6 +16,12 @@ namespace AcousticFlow
         Glass = 2,     // ガラス（やや抜ける）
         Opaque = 3,    // 完全不透過（検証用。回り込んだ音だけを残して回折を単体で聴く）
         WoodDoor = 4,  // 木の扉（壁より弱い＝部屋の弱点。閉めていても向こうが聞こえる）
+        // ── 部屋の響きのプリセット（2026-09-08）。部屋の RT60 は Sabine で形と材質から出るので、
+        //   響きのプリセットは材質として持つ（値はエンジンの material.cpp が正）。
+        WoodRoom = 5,  // 板張りの部屋（乾いた短い響き。板は低域を吸い、高域は返す）
+        Stone = 6,     // 石積み（遺跡・神殿。よく遮り、吸わず、粗いので散る）
+        Cave = 7,      // 岩肌（洞窟。ごく粗く、長く、拡散する）
+        Snow = 8,      // 新雪（高域ほど吸う。ほぼ無響）
     }
 
     [Serializable]
@@ -76,6 +82,24 @@ namespace AcousticFlow
             new[] { 0.10f, 0.10f, 0.15f, 0.20f, 0.30f, 0.40f },
             new[] { 0.10f, 0.15f, 0.20f, 0.30f, 0.40f, 0.50f });
 
+        // 部屋の響きのプリセット（保険。値は material.cpp と同じ。正はエンジン）。
+        public static AcousticMaterial WoodRoom() => new AcousticMaterial(
+            new[] { 0.00631f, 0.00251f, 0.001f, 0.000398f, 0.0002f, 0.000126f },
+            new[] { 0.25f, 0.19f, 0.15f, 0.09f, 0.09f, 0.10f },
+            new[] { 0.08f, 0.12f, 0.18f, 0.25f, 0.32f, 0.40f });
+        public static AcousticMaterial Stone() => new AcousticMaterial(
+            new[] { 0.000251f, 0.0001f, 0.0000251f, 0.00000631f, 0.00000158f, 0.000000631f },
+            new[] { 0.03f, 0.03f, 0.04f, 0.05f, 0.06f, 0.08f },
+            new[] { 0.20f, 0.30f, 0.45f, 0.60f, 0.70f, 0.80f });
+        public static AcousticMaterial Cave() => new AcousticMaterial(
+            new[] { 0.000001f, 0.000000398f, 0.000000158f, 0.0000000631f, 0.0000000251f, 0.00000001f },
+            new[] { 0.04f, 0.05f, 0.06f, 0.08f, 0.10f, 0.12f },
+            new[] { 0.35f, 0.50f, 0.65f, 0.80f, 0.90f, 0.95f });
+        public static AcousticMaterial Snow() => new AcousticMaterial(
+            new[] { 0.01f, 0.00398f, 0.00158f, 0.000631f, 0.000316f, 0.0002f },
+            new[] { 0.35f, 0.60f, 0.80f, 0.90f, 0.95f, 0.95f },
+            new[] { 0.30f, 0.45f, 0.60f, 0.75f, 0.85f, 0.90f });
+
         // ★プリセットは**エンジンから引く**。下の C# 側の表は、DLL が古い/読めないときの
         //   保険であって正ではない。
         //
@@ -119,6 +143,10 @@ namespace AcousticFlow
                 case AcousticMaterialPreset.Glass: return Glass();
                 case AcousticMaterialPreset.Opaque: return Opaque();
                 case AcousticMaterialPreset.WoodDoor: return WoodDoor();
+                case AcousticMaterialPreset.WoodRoom: return WoodRoom();
+                case AcousticMaterialPreset.Stone: return Stone();
+                case AcousticMaterialPreset.Cave: return Cave();
+                case AcousticMaterialPreset.Snow: return Snow();
                 default: return DefaultWall();
             }
         }

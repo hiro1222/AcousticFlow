@@ -90,6 +90,10 @@ int AF_MaterialPresetBands(int preset, float* outTransmission,
         case 2:  m = AcousticMaterial::glass();       break;
         case 3:  m = AcousticMaterial::opaque();      break;
         case 4:  m = AcousticMaterial::woodDoor();    break;
+        case 5:  m = AcousticMaterial::woodRoom();    break;
+        case 6:  m = AcousticMaterial::stone();       break;
+        case 7:  m = AcousticMaterial::cave();        break;
+        case 8:  m = AcousticMaterial::snow();        break;
         default: m = AcousticMaterial::defaultWall(); break;
     }
     for (int b = 0; b < kNumBands; ++b) {

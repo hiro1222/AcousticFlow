@@ -181,6 +181,12 @@ public:
     bool setMaterial(int id, const AcousticMaterial& m) {
         if (id < 0 || id >= materialCount()) return false;
         materials_[static_cast<std::size_t>(id)] = m;
+        // ★部屋の Sabine（吸音面積）は部屋グラフが登録時に写している。使っている静的な実体の領域を
+        //   触って作り直させないと、反射・尾は新しい材質、RT60 は古い材質のまま（答えが 2 つ）になる。
+        //   2026-09-08 に部屋の材質の切り替え（ホストの L キー）で見つけた。
+        for (const Instance& in : instances_)
+            if (in.active && !in.moved && in.materialId == id)
+                roomBuilder_.touch(rooms::obbBounds(in.obb));
         return true;
     }
 
@@ -188,7 +194,11 @@ public:
     bool setInstanceMaterial(int instanceId, int materialId) {
         if (!validInstance(instanceId)) return false;
         if (materialId < 0 || materialId >= materialCount()) return false;
-        instances_[static_cast<std::size_t>(instanceId)].materialId = materialId;
+        Instance& in = instances_[static_cast<std::size_t>(instanceId)];
+        if (in.materialId == materialId) return true;
+        in.materialId = materialId;
+        // 部屋の Sabine を追いつかせる（setMaterial と同じ理由）。動く物は部屋グラフに入っていないので触らない。
+        if (in.active && !in.moved) roomBuilder_.touch(rooms::obbBounds(in.obb));
         return true;
     }
 
