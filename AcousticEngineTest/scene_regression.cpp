@@ -13413,8 +13413,9 @@ void placeDoor(Scn& u, float deg) {
         V(kDoorW * 0.5f, kHh * 0.5f, kDoorT * 0.5f), right, V(0, 1, 0));
 }
 
-void build(Scn& u, int doorPreset) {
+void build(Scn& u, int doorPreset, int apertureLaw = 0) {
     u.s = AF_SceneCreate();
+    AF_SceneSetApertureLaw(u.s, apertureLaw);
     float ct[6], ca[6], cs[6], dt2[6], da[6], ds[6];
     AF_MaterialPresetBands(1, ct, ca, cs);              // Concrete
     AF_MaterialPresetBands(doorPreset, dt2, da, ds);    // 既定は WoodDoor(4)
@@ -13505,7 +13506,12 @@ void diagnoseDoorStaircase() {
     std::printf("\n[階段] 扉を 0.2 秒で 10 度開いて 5 秒停止、を繰り返す（部屋は Test_SwingDoor と同じ）\n");
     std::printf("        リスナー (0,1.6,-3) / 音源 (0,1.6,3) / 戸口 幅 1 m / 扉 WoodDoor / 部屋 Concrete\n");
 
-    doorstep::Scn u; doorstep::build(u, 4);            // 4 = WoodDoor
+    // 理想は「開き始めが一番動き、そのあと変化が小さくなる」。実測がそうなっているかを見る。
+    //   参照として、射影の開口 (1−cosθ) だけで決まるなら段ごとの増分は
+    //   6.0 / 3.5 / 2.4 / 1.8 / 1.5 / 1.2 / 1.0 / 0.8 dB と単調に減る。
+    static float dLvl[2][10], dCol[2][10], fLvl[2][10], fCol[2][10];
+    for (int law = 0; law <= 1; ++law) {
+    doorstep::Scn u; doorstep::build(u, 4, law);       // 4 = WoodDoor
     const float dt = 1.0f / 60.0f;
     const int rampN = 12;                              // 0.2 秒
     const int holdN = 300;                             // 5 秒
@@ -13518,6 +13524,7 @@ void diagnoseDoorStaircase() {
     std::printf("        閉じた状態: 音量 %.1f dB / 色 %.1f dB   （直接 %.1f / 反射 %.1f / 回折 %.1f）\n\n",
                 lvl0, col0, by0[0], by0[1], by0[2]);
 
+    std::printf("        [開口の法則 %d]\n", law);
     std::printf("        段  角度      到達    音が止まる     差    止まった音量  前段からの差   色    直接   反射   回折\n");
     static float lv[400], cl[400];
     float prevLvl = lvl0;
@@ -13543,12 +13550,34 @@ void diagnoseDoorStaircase() {
         std::printf("        %2d %5.0f°  %6.0f ms  %7.0f ms %7.0f ms   %8.1f dB   %+8.1f dB %6.1f %6.1f %6.1f %6.1f\n",
                     stp, a1, tDoor, tSettle, tSettle - tDoor, fin, fin - prevLvl, finC,
                     byF[0], byF[1], byF[2]);
+        dLvl[law][stp] = fin - prevLvl;
+        dCol[law][stp] = (stp == 1) ? (col0 - finC) : (fCol[law][stp - 1] - finC);
+        fLvl[law][stp] = fin; fCol[law][stp] = finC;
         prevLvl = fin;
     }
     AF_SceneDestroy(u.s);
+    std::printf("\n");
+    }
+
+    // 段ごとの増分を並べる。理想は左ほど大きく、右へ小さくなる形。
+    const float projInc[10] = {0.0f, 0.0f, 6.0f, 3.5f, 2.4f, 1.8f, 1.5f, 1.2f, 1.0f, 0.8f};
+    std::printf("        段ごとの増分（理想は左ほど大きい）\n");
+    std::printf("        段            1     2     3     4     5     6     7     8     9\n");
+    std::printf("        角度        10    20    30    40    50    60    70    80    90\n");
+    const char* nm[2] = { "法則0 音量  ", "法則1 音量  " };
+    for (int law = 0; law <= 1; ++law) {
+        std::printf("        %s", nm[law]);
+        for (int k = 1; k <= 9; ++k) std::printf("%6.1f", dLvl[law][k]);
+        std::printf("\n        %s", (law == 0) ? "法則0 色    " : "法則1 色    ");
+        for (int k = 1; k <= 9; ++k) std::printf("%6.1f", dCol[law][k]);
+        std::printf("\n");
+    }
+    std::printf("        射影の参照  ");
+    for (int k = 1; k <= 9; ++k) std::printf("%6.1f", projInc[k]);
+    std::printf("   ← 開口 (1-cosθ) だけならこう減る\n");
     std::printf("      ※「音が止まる」＝ 最終値から %.1f dB 以上ずれた最後の時刻の次。\n"
                 "        差が正なら、扉が止まったあとも音が動いている（追い付いてくる）。\n"
-                "        ここに出ていない遅れ: 非同期の写し 16.7 ms・DSP バッファ 21.3 ms・出力の待ち約 43 ms。\n", eps);
+                "        ここに出ていない遅れ: 非同期の写し 16.7 ms・DSP バッファ 21.3 ms・出力の待ち約 43 ms。\n", 0.1f);
 }
 
 int main() {
