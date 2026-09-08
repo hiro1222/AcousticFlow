@@ -13152,6 +13152,209 @@ void diagnoseSpatialDepth() {
                 "              B で ITDG が縮み・尾の比が増えていれば、遠さは出ている。\n");
 }
 
+// ================================ 【探り】扉を動かしてから音が追い付くまで（AF_ONLY=lag）
+// 2026-09-08 の試聴「ドア動かしてから音が追い付いてくるまで若干ラグがある」から。合否は付けない。
+//
+// 遅れの出どころは重なっているので、1 つずつ外して差を見る。
+//   (1) 解く周期    ── 遮蔽は毎フレーム、回折は 2 フレームに 1 回、稜線カタログは 3 回に 1 回…
+//                      ホストの既定（AcousticFlowSceneDemo）をそのまま入れる。
+//   (2) 時間の平滑  ── タップの帯域ゲインは dB 領域で指数平滑（tapSmoothTime 既定 0.08 s）、
+//                      直接音の向きは SmoothDamp（directionSmoothTime 既定 0.18 s）。
+//                      連続性のために**わざと**入れた物なので、これが効いているのは想定内。
+//                      問題は「どれだけ効いているか」を誰も数字で見ていないこと。
+//   (3) 非同期の写し ── 結果は 1 フレーム前（ここでは同期で測るので出ない。+16.7 ms 固定）。
+//
+// 扉を 0° から 60° へ 1 フレームで飛ばし、そのあと毎フレーム音の大きさを読む。
+// 最終値までの変化のうち 63%（時定数）・90%・99% に達するのが何 ms かを出す。
+namespace doorlag {
+
+struct Setup {
+    AF_SceneHandle s = nullptr;
+    int doorInst = -1;
+    float hh = 3.0f, doorW = 1.0f, doorT2 = 0.03f;
+};
+
+// 扉をその角度へ置く。蝶番は x = -doorW/2、+Z 側へ振れる（testDoorOpenTimbre と同じ形）。
+void placeDoor(Setup& u, float deg) {
+    const float t2 = deg * 3.14159265f / 180.0f;
+    const AF_Vector3 right = V(std::cos(t2), 0.0f, std::sin(t2));
+    const float hx = -u.doorW * 0.5f, hy = u.hh * 0.5f;
+    AF_SceneUpdateInstance(u.s, u.doorInst,
+        V(hx + right.x * u.doorW * 0.5f, hy, right.z * u.doorW * 0.5f),
+        V(u.doorW * 0.5f, u.hh * 0.5f, u.doorT2), right, V(0, 1, 0));
+}
+
+// 全タップの帯域エネルギーの和を dB で。耳に届く量の代表。
+float levelDb(AF_SceneHandle s) {
+    AF_VoiceProgram vp{};
+    const int idx = AF_SceneSourceIndex(s, 1);
+    double tot = 0.0;
+    if (idx >= 0 && AF_SceneGetVoiceProgram(s, idx, &vp)) {
+        for (int i = 0; i < vp.count && i < AF_PROGRAM_MAX_TAPS; ++i)
+            for (int b = 0; b < kBands; ++b) {
+                const double g = vp.taps[static_cast<std::size_t>(i)].gain6[b];
+                tot += g * g;
+            }
+    }
+    return static_cast<float>(10.0 * std::log10(std::max(tot, 1e-20)));
+}
+
+// エコグラム（尾の材料）の総量。尾はこれを畳んで鳴るので、ここが動くまで残響は変わらない。
+float echoDb(AF_SceneHandle s) {
+    static float eb[240 * 6];
+    const int idx = AF_SceneSourceIndex(s, 1);
+    const int nb = (idx >= 0) ? AF_SceneGetEchogramBands(s, idx, eb, 240) : 0;
+    double tot = 0.0;
+    for (int k = 0; k < nb; ++k)
+        for (int b = 0; b < kBands; ++b) tot += eb[static_cast<std::size_t>(k) * kBands + b];
+    return static_cast<float>(10.0 * std::log10(std::max(tot, 1e-20)));
+}
+
+void build(Setup& u) {
+    const float wallT[6] = {0.000398f, 0.0001585f, 0.0000398f,
+                            0.00001f, 0.00000251f, 0.000001f};
+    const float doorT[6] = {0.0316f, 0.0158f, 0.00794f, 0.00398f, 0.00251f, 0.002f};
+    const float th = 0.2f, hf = 7.0f;
+    u.s = AF_SceneCreate();
+    const int mw = AF_SceneAddMaterial(u.s, wallT, nullptr, nullptr, 6);
+    const int md = AF_SceneAddMaterial(u.s, doorT, nullptr, nullptr, 6);
+    AF_SceneAddInstanceBox(u.s, V(0, -th, 0),        V(hf, th, hf), V(1,0,0), V(0,1,0), mw);
+    AF_SceneAddInstanceBox(u.s, V(0, u.hh+th, 0),    V(hf, th, hf), V(1,0,0), V(0,1,0), mw);
+    AF_SceneAddInstanceBox(u.s, V(-hf, u.hh*0.5f, 0), V(th, u.hh*0.5f, hf), V(1,0,0), V(0,1,0), mw);
+    AF_SceneAddInstanceBox(u.s, V( hf, u.hh*0.5f, 0), V(th, u.hh*0.5f, hf), V(1,0,0), V(0,1,0), mw);
+    AF_SceneAddInstanceBox(u.s, V(0, u.hh*0.5f, -hf), V(hf, u.hh*0.5f, th), V(1,0,0), V(0,1,0), mw);
+    AF_SceneAddInstanceBox(u.s, V(0, u.hh*0.5f,  hf), V(hf, u.hh*0.5f, th), V(1,0,0), V(0,1,0), mw);
+    const float side = (2.0f*hf - u.doorW) * 0.5f;
+    AF_SceneAddInstanceBox(u.s, V(-(u.doorW*0.5f + side*0.5f), u.hh*0.5f, 0),
+                           V(side*0.5f, u.hh*0.5f, th*0.5f), V(1,0,0), V(0,1,0), mw);
+    AF_SceneAddInstanceBox(u.s, V( (u.doorW*0.5f + side*0.5f), u.hh*0.5f, 0),
+                           V(side*0.5f, u.hh*0.5f, th*0.5f), V(1,0,0), V(0,1,0), mw);
+    u.doorInst = AF_SceneAddInstanceBox(u.s, V(0, u.hh*0.5f, 0),
+                           V(u.doorW*0.5f, u.hh*0.5f, u.doorT2), V(1,0,0), V(0,1,0), md);
+    // 扉は動くので動的に。静的な木に入れたままだと毎フレーム作り直しになる。
+    AF_SceneSetInstanceDynamic(u.s, u.doorInst, 1);
+    AF_SceneAddPortal(u.s, V(0, u.hh * 0.5f, 0), V(1, 0, 0), V(0, 1, 0),
+                      u.doorW * 0.5f, u.hh * 0.5f);
+    AF_SceneSetListener(u.s, V(0, 1.6f, -3));
+    AF_SceneSetListenerOrientation(u.s, V(0,0,1), V(0,1,0));
+    AF_SceneSetSource(u.s, 1, V(0, 1.6f, 3));
+}
+
+// 1 本の測定。戻り値は 63% / 90% / 99% に達した時刻(ms)。届かなければ -1。
+struct Curve { float t63 = -1, t90 = -1, t99 = -1, before = 0, after = 0; int firstFrame = -1; };
+struct Settle { Curve tap, echo, ratio; };
+
+// 1 本の曲線から 63/90/99% 到達時刻を出す。
+void fill(Curve& c, const float* v, int n, float dt) {
+    c.after = v[n - 1];
+    const float span = c.after - c.before;
+    if (std::fabs(span) < 0.05f) return;
+    for (int i = 0; i < n; ++i) {
+        const float f = (v[i] - c.before) / span;
+        if (c.firstFrame < 0 && std::fabs(v[i] - c.before) > 0.2f) c.firstFrame = i;
+        if (c.t63 < 0 && f >= 0.63f) c.t63 = (i + 1) * dt * 1000.0f;
+        if (c.t90 < 0 && f >= 0.90f) c.t90 = (i + 1) * dt * 1000.0f;
+        if (c.t99 < 0 && f >= 0.99f) c.t99 = (i + 1) * dt * 1000.0f;
+    }
+}
+
+Settle measure(bool hostCadence, bool smoothing) {
+    Setup u; build(u);
+
+    AF_UpdateConfig cfg{};
+    // ホストの既定（AcousticFlowSceneDemo の Inspector 既定値）
+    cfg.role1EveryN   = hostCadence ? 1 : 1;
+    cfg.diffSrcEveryN = hostCadence ? 2 : 1;
+    cfg.earlyEveryN   = hostCadence ? 3 : 1;
+    cfg.catalogEveryN = hostCadence ? 3 : 1;
+    cfg.role2EveryN   = hostCadence ? 4 : 1;
+    cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+    cfg.directWeight = 1.0f; cfg.useReflections = 1; cfg.speedOfSound = 343.0f;
+    cfg.distanceRef = 4.0f;
+    cfg.enableReverb = 1; cfg.echogramBins = 100; cfg.echogramBinSeconds = 0.01f;
+    cfg.echogramRays = 512; cfg.echogramBounces = 24;
+    cfg.enableEarlyReflections = 1; cfg.earlyTaps = 48;
+    cfg.earlyRays = 512; cfg.earlyBounces = 2; cfg.earlyModel = 1; cfg.earlyFaceSubTaps = 5;
+    cfg.echogramSkipFirstOrder = 1;
+    cfg.enableDiffractionSources = 1; cfg.diffSources = 8;
+    cfg.useEdgeCatalog = 1; cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+    AF_SceneSetUpdateConfig(u.s, &cfg);
+
+    AF_TapParams tp{};
+    tp.distanceRef = 1.5f; tp.diffractionDistancePower = 1.0f; tp.airAbsorptionScale = 1.0f;
+    tp.transmissionTilt = 1.0f; tp.diffractionGainDb = 6.0f; tp.diffractionDistanceOnly = 1;
+    tp.tapSmoothTime = smoothing ? 0.08f : 0.0f;
+    tp.directionSmoothTime = smoothing ? 0.18f : 0.0f;
+    tp.steerThreshold = 0.2f; tp.diffractionHrtf = 1; tp.diffractionHrtfMarginDb = 2.0f;
+    tp.reverbRatioExponent = 0.5f; tp.reverbRatioCeiling = 150.0f;
+    tp.roomBlendRadius = 2.0f; tp.reverbShareFade = 1; tp.fallbackRt60 = 0.5f;
+    tp.maxTaps = 64; tp.diffractionTapReserve = 8;
+    AF_SceneSetTapParams(u.s, &tp);
+
+    const float dt = 1.0f / 60.0f;
+    // 閉じた状態で落ち着かせる。平滑の状態が残っていると測る物が変わる。
+    placeDoor(u, 0.0f);
+    for (int i = 0; i < 180; ++i) AF_SceneUpdate(u.s, dt);
+
+    Settle r;
+    r.tap.before = levelDb(u.s);
+    r.echo.before = echoDb(u.s);
+    {
+        AF_VoiceProgram vp{};
+        const int idx = AF_SceneSourceIndex(u.s, 1);
+        if (idx >= 0 && AF_SceneGetVoiceProgram(u.s, idx, &vp)) r.ratio.before = vp.tailRatio;
+    }
+    placeDoor(u, 60.0f);                       // ここで 1 フレームのうちに開く
+
+    static float lvl[300], ech[300], rat[300];
+    const int N = 240;                         // 4 秒
+    for (int i = 0; i < N; ++i) {
+        AF_SceneUpdate(u.s, dt);
+        lvl[i] = levelDb(u.s);
+        ech[i] = echoDb(u.s);
+        AF_VoiceProgram vp{};
+        const int idx = AF_SceneSourceIndex(u.s, 1);
+        rat[i] = (idx >= 0 && AF_SceneGetVoiceProgram(u.s, idx, &vp)) ? vp.tailRatio : 0.0f;
+    }
+    fill(r.tap, lvl, N, dt);
+    fill(r.echo, ech, N, dt);
+    fill(r.ratio, rat, N, dt);
+    AF_SceneDestroy(u.s);
+    return r;
+}
+
+}  // namespace doorlag
+
+void diagnoseDoorLag() {
+    std::printf("\n[探り] 扉を動かしてから音が追い付くまで（0° → 60° を 1 フレームで）\n");
+    std::printf("        条件                        量  変化量   最初に動く   63%%    90%%    99%%\n");
+
+    struct Case { const char* name; bool cadence, smooth; };
+    const Case cases[] = {
+        { "ホストの既定（周期＋平滑）", true,  true  },
+        { "平滑だけ外す              ", true,  false },
+        { "周期だけ 1 に             ", false, true  },
+        { "両方外す（解く速さの下限）", false, false },
+    };
+    for (int k = 0; k < 4; ++k) {
+        const doorlag::Settle r = doorlag::measure(cases[k].cadence, cases[k].smooth);
+        const doorlag::Curve* cs[3] = { &r.tap, &r.echo, &r.ratio };
+        const char* nm[3] = { "タップ dB", "エコグラム", "尾の比    " };
+        for (int j = 0; j < 3; ++j) {
+            const doorlag::Curve& c = *cs[j];
+            std::printf("        %s %s %7.2f  %8.1f ms %6.0f %6.0f %6.0f\n",
+                        (j == 0) ? cases[k].name : "                          ",
+                        nm[j], c.after - c.before,
+                        (c.firstFrame >= 0) ? (c.firstFrame + 1) * (1000.0f / 60.0f) : -1.0f,
+                        c.t63, c.t90, c.t99);
+        }
+    }
+    std::printf("      ※ここに出ていない遅れ: 非同期の写しで +16.7 ms（結果は 1 フレーム前）、\n"
+                "        尾の IR の差し替えの渡り（tailCrossfadeMs 既定 50 ms）、Unity の DSP バッファ。\n"
+                "        平滑（tapSmoothTime 0.08 s / directionSmoothTime 0.18 s）は連続性のために\n"
+                "        わざと入れた物で、消せば追従は速くなるが歩いたときのぐらつきが戻る。\n");
+}
+
 int main() {
     std::printf("=== AF_Scene* 数値回帰テスト ===\n");
     std::printf("（期待値は絶対値でなく「関係」で書いている。詳細は冒頭コメント参照）\n");
@@ -13165,7 +13368,8 @@ int main() {
     //   合否あり: async 非同期／tier 段の予算／rooms 部屋の種と共有／taps タップの組み立て／
     //             materials 材質のプリセット／door 扉のプツプツ／walk 歩いたときの連続性／
     //             closed 閉じた扉の音色／open 開いた扉の音色
-    //   合否なし（数字を採るだけ）: issues 既知の不具合／aperture 開口と角度／depth 空間の奥行き
+    //   合否なし（数字を採るだけ）: issues 既知の不具合／aperture 開口と角度／depth 空間の奥行き／
+    //                               lag 扉を動かしてから音が追い付くまで
     if (const char* only = std::getenv("AF_ONLY")) {
         if (std::strcmp(only, "async") == 0) testAsyncUpdate();
         else if (std::strcmp(only, "tier") == 0) testTierBudget();
@@ -13179,6 +13383,7 @@ int main() {
         else if (std::strcmp(only, "open") == 0) testDoorOpenTimbre();
         else if (std::strcmp(only, "aperture") == 0) diagnoseApertureVsAngle();
         else if (std::strcmp(only, "depth") == 0) diagnoseSpatialDepth();
+        else if (std::strcmp(only, "lag") == 0) diagnoseDoorLag();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }

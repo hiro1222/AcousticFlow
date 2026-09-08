@@ -2563,6 +2563,82 @@ void testDirectionBus() {
 }
 
 
+// ================================ 【探り】扉が開いてから尾（残響）が追い付くまで
+// 2026-09-08 の試聴「ドア動かしてから音が追い付いてくるまで若干ラグがある」の続き。
+//
+// エンジン側（タップとエコグラム）は AF_ONLY=lag で 83 ms 以内に収まることが分かった。
+// 残るのは尾の IR の作り直しで、ここには**更新をまたいだ時間平均**が入っている。
+//   envAcc += (env - envAcc) * envAlpha        （reverb_tail_ir.h の accumulateEnvelope）
+// ホストは envAlpha = 0.6 を渡す（VoiceConvolver.cs）。1 回の作り直しで差の 6 割しか詰めない。
+// 作り直しはエコグラムの版が変わったときだけなので、実測の更新間隔 83 ms を刻みにして測る。
+void diagnoseTailCatchUp() {
+    std::printf("\n[探り] 扉が開いてから尾（残響）が追い付くまで\n");
+
+    const int sr = 48000, len = sr / 2, channels = 2;
+    const int bins = 100;
+    const float binMs = 10.0f;                 // ホストの既定（echogramBinSeconds = 0.01）
+    const float startMs = 22.8f;               // Test_SwingDoor の尾の開始（√V）
+    const float rebuildMs = 83.0f;             // エコグラムが 1 周する実測値（AF_ONLY=lag）
+
+    // 扉が開くと、隣の部屋が繋がって尾の**減衰が遅くなる**。量ではなく形が変わる。
+    //   （量＝尾の比は扉の開閉でほとんど動かない。AF_ONLY=lag の実測で −0.20 dB。
+    //     IR はエネルギー 1 に正規化されるので、量は呼び手が別に決めている。）
+    auto makeEcho = [&](float decay, std::vector<float>& echo) {
+        echo.assign(static_cast<std::size_t>(bins) * 6, 0.0f);
+        for (int k = 0; k < bins; ++k) {
+            const float e = std::pow(decay, static_cast<float>(k));
+            for (int b = 0; b < 6; ++b) echo[static_cast<std::size_t>(k) * 6 + b] = e;
+        }
+    };
+    std::vector<float> closed, open;
+    makeEcho(0.85f, closed);                   // 閉: 早く減る
+    makeEcho(0.95f, open);                     // 開: 長く残る
+
+    // 形の物差し: IR の後半（300〜500 ms）が全体の何 dB か。減衰が遅いほど大きい。
+    auto lateDb = [&](const af::dsp::ReverbTailIr& t) {
+        double late = 0.0, all = 0.0;
+        const int a = static_cast<int>(0.300 * sr), b2 = static_cast<int>(0.500 * sr);
+        for (int c = 0; c < channels; ++c)
+            for (int i = 0; i < len; ++i) {
+                const double v = t.ir(c)[i]; const double e = v * v;
+                all += e;
+                if (i >= a && i < b2) late += e;
+            }
+        return 10.0 * std::log10(std::max(late / std::max(all, 1e-20), 1e-10));
+    };
+
+    std::printf("        envAlpha  作り直し   形の変化 dB   63%%      90%%      99%%\n");
+    const float alphas[] = { 0.6f, 1.0f };
+    for (int a = 0; a < 2; ++a) {
+        af::dsp::ReverbTailIr tail(sr, len, channels, bins);
+        // 閉じた状態で落ち着かせる。
+        for (int i = 0; i < 40; ++i)
+            tail.build(closed.data(), bins, binMs, startMs, 20.0f, 30.0f, 0.0f, alphas[a]);
+        const float beforeDb = static_cast<float>(lateDb(tail));
+
+        // 扉が開いた。以降は作り直しのたびに開のエコグラムを渡す。
+        float db[80]; int nb = 0;
+        for (int i = 0; i < 60; ++i) {
+            tail.build(open.data(), bins, binMs, startMs, 20.0f, 30.0f, 0.0f, alphas[a]);
+            db[nb++] = static_cast<float>(lateDb(tail));
+        }
+        const float afterDb = db[nb - 1];
+        const float span = afterDb - beforeDb;
+        float t63 = -1, t90 = -1, t99 = -1;
+        for (int i = 0; i < nb; ++i) {
+            const float f = (db[i] - beforeDb) / span;
+            if (t63 < 0 && f >= 0.63f) t63 = (i + 1) * rebuildMs;
+            if (t90 < 0 && f >= 0.90f) t90 = (i + 1) * rebuildMs;
+            if (t99 < 0 && f >= 0.99f) t99 = (i + 1) * rebuildMs;
+        }
+        std::printf("        %8.2f %7.0f ms %9.1f %8.0f %8.0f %8.0f\n",
+                    alphas[a], rebuildMs, span, t63, t90, t99);
+    }
+    std::printf("      ※ envAlpha = 0.6 がホストの既定（VoiceConvolver.cs）。1.0 は時間平均なし。\n"
+                "        これに非同期の写し 16.7 ms・IR 差し替えの渡り 50 ms・Unity の DSP バッファが乗る。\n"
+                "        尾の左右（方向）はさらに別の平滑を通る: directionalTailSmoothSec = 0.35 s。\n");
+}
+
 int main() {
     std::printf("=== DSP 数値回帰テスト（段4: C++ 移行）===\n");
     testFft();
@@ -2583,6 +2659,7 @@ int main() {
     testTailCalibration();
     testVoiceTailBus();
     testVoiceRenderer();
+    diagnoseTailCatchUp();
 
     std::printf("\n----\n");
     if (g_failures == 0) {
