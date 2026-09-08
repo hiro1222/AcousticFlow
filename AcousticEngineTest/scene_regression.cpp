@@ -12927,6 +12927,231 @@ void testDoorWorksForOffAxisSources() {
     }
 }
 
+// ================================ 【探り】空間の奥行き ── 早期反射の到達時間（AF_ONLY=depth）
+// 2026-09-08 の試聴「空間の奥行き感が分かりにくい。早期反響の到達時間かな」から。合否は付けない。
+//
+// 部屋の大きさは、直接音のあとに反射がどう並ぶかで聞こえる。ここで見たいのは 3 つ。
+//   (1) 直接音と最初の反射の間（ITDG）が、部屋を大きくすると伸びるか。
+//   (2) 床・天井・壁を分けたとき、**壁**の到達時間が部屋の広さに追随するか。
+//       床と天井はリスナーの高さで決まるので広さに依らない。広さの手掛かりは壁にしかない。
+//       ITDG だけ見ていると床に頭を押さえられて、どの部屋でも同じ値になる。
+//   (3) 音源との距離を変えたとき、ITDG が縮み・尾の比が増える（＝遠くに聞こえる）か。
+// 到達点 arrX/arrY/arrZ がタップに載っているので、面の区別は幾何から付けられる。
+namespace depthcue {
+
+struct Firsts {
+    float itdg = -1.0f;      // 直接以外の最小遅延（プログラムの値）
+    float floorMs = -1.0f;   // 床で跳ねた最初の反射
+    float ceilMs = -1.0f;    // 天井
+    float wallMs = -1.0f;    // 壁（前後左右）
+    float lastMs = -1.0f;    // 反射の最後
+    int   nRefl = 0;
+    float mixing = 0.0f;
+    float ratio = 0.0f;
+    float wallDb = -120.0f;   // 最初の壁の反射（直接音を 0 dB とする）
+    float floorDb = -120.0f;  // 最初の床の反射
+    float echoOnMs = -1.0f;   // エコグラムが山の -30 dB を超える最初の時刻
+    float echoPeakMs = -1.0f; // エコグラムの山
+};
+
+// 箱の部屋を建てて 1 音源を置き、反射タップの到達時間を面ごとに分けて拾う。
+//   half   : 床の半径（x と z）。room = 2*half 角
+//   height : 天井の高さ
+//   dist   : リスナー正面（+z）の音源までの距離
+float* g_echoOut = nullptr;   // null でなければエコグラムの帯域和を dB で 240 ビンぶん書く
+Firsts probeBox(float half, float height, float dist, int earlyModel) {
+    Firsts f;
+    AF_SceneHandle s = AF_SceneCreate();
+    const int m = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    const float t = 0.2f;                    // 壁の厚み。薄すぎるとレイが抜ける
+    const float hy = height * 0.5f;
+    AF_SceneAddInstanceBox(s, V(0, -t, 0),            V(half + t, t, half + t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, height + t, 0),    V(half + t, t, half + t), V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(-half - t, hy, 0),    V(t, hy, half + t),       V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V( half + t, hy, 0),    V(t, hy, half + t),       V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, hy, -half - t),    V(half + t, hy, t),       V(1,0,0), V(0,1,0), m);
+    AF_SceneAddInstanceBox(s, V(0, hy,  half + t),    V(half + t, hy, t),       V(1,0,0), V(0,1,0), m);
+    AF_SceneSetListener(s, V(0, 1.6f, 0));
+    AF_SceneSetListenerOrientation(s, V(0,0,1), V(0,1,0));
+    AF_SceneSetSource(s, 1, V(0, 1.6f, dist));
+
+    AF_UpdateConfig cfg{};
+    cfg.role1EveryN = 1; cfg.role2EveryN = 1; cfg.earlyEveryN = 1;
+    cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 1;
+    cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+    cfg.directWeight = 1.0f; cfg.useReflections = 1;
+    cfg.useEdgeCatalog = 0;
+    cfg.enableReverb = 1; cfg.echogramBins = 120; cfg.echogramBinSeconds = 0.01f;
+    cfg.echogramRays = 512; cfg.echogramBounces = 24;
+    cfg.speedOfSound = 343.0f; cfg.distanceRef = 4.0f;
+    cfg.enableEarlyReflections = 1; cfg.earlyTaps = 48;
+    cfg.earlyRays = 1024; cfg.earlyBounces = 2;
+    cfg.earlyModel = earlyModel; cfg.earlyFaceSubTaps = 5;
+    cfg.echogramSkipFirstOrder = 1;
+    cfg.enableDiffractionSources = 0;
+    AF_SceneSetUpdateConfig(s, &cfg);
+    for (int it = 0; it < 10; ++it) AF_SceneUpdate(s, 1.0f / 60.0f);
+
+    AF_VoiceProgram vp{};
+    const int idx = AF_SceneSourceIndex(s, 1);
+    if (idx >= 0 && AF_SceneGetVoiceProgram(s, idx, &vp)) {
+        f.itdg = vp.itdgMs; f.mixing = vp.mixingTimeMs; f.ratio = vp.tailRatio;
+        for (int i = 0; i < vp.count && i < AF_PROGRAM_MAX_TAPS; ++i) {
+            const AF_ProgramTap& tp = vp.taps[static_cast<std::size_t>(i)];
+            if (tp.type != 1) continue;
+            ++f.nRefl;
+            const float d = tp.delayMs;
+            if (f.lastMs < d) f.lastMs = d;
+            // 到達点の高さで床／天井を分け、それ以外を壁とする。
+            const float y = tp.arrY;
+            float* slot = nullptr; float* slotDb = nullptr;
+            if (y < 0.5f)               { slot = &f.floorMs; slotDb = &f.floorDb; }
+            else if (y > height - 0.5f) { slot = &f.ceilMs;  slotDb = nullptr; }
+            else                        { slot = &f.wallMs;  slotDb = &f.wallDb; }
+            if (*slot < 0.0f || d < *slot) {
+                *slot = d;
+                if (slotDb) {
+                    double e = 0.0;
+                    for (int b = 0; b < kBands; ++b) { const double g = tp.gain6[b]; e += g * g; }
+                    *slotDb = static_cast<float>(10.0 * std::log10(std::max(e, 1e-20)));
+                }
+            }
+        }
+        // 直接音を 0 dB にそろえる（部屋ごとに音源距離が違うので絶対値では比べられない）。
+        double eDir = 0.0;
+        for (int i = 0; i < vp.count && i < AF_PROGRAM_MAX_TAPS; ++i) {
+            const AF_ProgramTap& tp = vp.taps[static_cast<std::size_t>(i)];
+            if (tp.type != 0) continue;
+            for (int b = 0; b < kBands; ++b) { const double g = tp.gain6[b]; eDir += g * g; }
+        }
+        const float dirDb = static_cast<float>(10.0 * std::log10(std::max(eDir, 1e-20)));
+        if (f.wallDb  > -119.0f) f.wallDb  -= dirDb;
+        if (f.floorDb > -119.0f) f.floorDb -= dirDb;
+
+        // エコグラム（尾の材料）が実際にいつ立ち上がるか。尾の開始（mixing）が
+        // これより前だと、まだ何も返ってきていない時間に残響が鳴ることになる。
+        static float eb[240 * 6];
+        const int nb = AF_SceneGetEchogramBands(s, idx, eb, 240);
+        double peak = 0.0; int peakK = -1;
+        for (int k = 0; k < nb; ++k) {
+            double e = 0.0;
+            for (int b = 0; b < kBands; ++b) e += eb[static_cast<std::size_t>(k) * kBands + b];
+            if (e > peak) { peak = e; peakK = k; }
+        }
+        if (peak > 0.0) {
+            const double thr = peak * 1e-3;   // 山の -30 dB
+            for (int k = 0; k < nb; ++k) {
+                double e = 0.0;
+                for (int b = 0; b < kBands; ++b) e += eb[static_cast<std::size_t>(k) * kBands + b];
+                if (e > thr) { f.echoOnMs = (k + 0.5f) * 10.0f; break; }
+            }
+            f.echoPeakMs = (peakK + 0.5f) * 10.0f;
+            if (g_echoOut) {
+                for (int k = 0; k < 240; ++k) {
+                    double e = 0.0;
+                    if (k < nb) for (int b = 0; b < kBands; ++b) e += eb[static_cast<std::size_t>(k) * kBands + b];
+                    g_echoOut[k] = static_cast<float>(10.0 * std::log10(std::max(e / peak, 1e-10)));
+                }
+            }
+        }
+    }
+    AF_SceneDestroy(s);
+    return f;
+}
+
+// 像源から出る「そこにあるはずの」到達時間。実測がこれに追随していなければ、
+// 部屋の形が耳に届いていない。
+struct Ideal { float floorMs, ceilMs, wallMs; };
+Ideal idealBox(float half, float height, float dist) {
+    const float c = 343.0f, eh = 1.6f;
+    auto gap = [&](float pathLen) { return (pathLen - dist) / c * 1000.0f; };
+    const float fl = std::sqrt(dist * dist + (2.0f * eh) * (2.0f * eh));
+    const float ce = std::sqrt(dist * dist + (2.0f * (height - eh)) * (2.0f * (height - eh)));
+    const float front = 2.0f * half - dist;                       // 正面の壁（音源の向こう）
+    const float back  = 2.0f * half + dist;                       // 背面の壁
+    const float side  = std::sqrt(4.0f * half * half + dist * dist);
+    float w = front; if (back < w) w = back; if (side < w) w = side;
+    return Ideal{ gap(fl), gap(ce), gap(w) };
+}
+
+}  // namespace depthcue
+
+void diagnoseSpatialDepth() {
+    std::printf("\n[探り] 空間の奥行き ── 早期反射の到達時間が部屋と距離に追随するか\n");
+    std::printf("        （単位 ms。「理」は像源から出る値、「実」は実測。★は理から 2 ms 以上ずれ）\n");
+
+    std::printf("\n      A. 部屋の広さを振る（音源は正面 1.5 m 固定・天井 3 m 固定）\n");
+    std::printf("        広さ 模型  ITDG   床:理 実   天井:理 実   壁:理  実      最後  mixing  尾開始→壁   尾比  壁dB  床dB  本\n");
+    const float halves[] = { 2.0f, 4.0f, 8.0f, 16.0f };
+    for (int mdl = 1; mdl >= 0; --mdl) {
+        for (int k = 0; k < 4; ++k) {
+            const float h = halves[k];
+            const depthcue::Ideal id = depthcue::idealBox(h, 3.0f, 1.5f);
+            const depthcue::Firsts f = depthcue::probeBox(h, 3.0f, 1.5f, mdl);
+            std::printf("        %4.0fm %s %6.1f  %5.1f %5.1f  %5.1f %5.1f  %6.1f %6.1f%s %7.1f %6.1f %8.1f%s %5.2f %5.1f %5.1f %3d\n",
+                        h * 2.0f, (mdl == 1 ? "線" : "点"), f.itdg,
+                        id.floorMs, f.floorMs, id.ceilMs, f.ceilMs, id.wallMs, f.wallMs,
+                        (f.wallMs >= 0.0f && std::fabs(f.wallMs - id.wallMs) > 2.0f) ? "★" : "  ",
+                        f.lastMs, f.mixing,
+                        (f.wallMs >= 0.0f) ? (f.wallMs - f.mixing) : 0.0f,
+                        (f.wallMs >= 0.0f && f.wallMs - f.mixing > 5.0f) ? "★" : " ",
+                        f.ratio, f.wallDb, f.floorDb, f.nRefl);
+        }
+    }
+
+    std::printf("\n      B. 音源までの距離を振る（16 m 角の部屋・線音源）\n");
+    std::printf("        距離  ITDG   床:理 実   壁:理  実      最後  広がり  尾の比\n");
+    const float dists[] = { 1.0f, 2.0f, 4.0f, 7.0f };
+    for (int k = 0; k < 4; ++k) {
+        const float d = dists[k];
+        const depthcue::Ideal id = depthcue::idealBox(8.0f, 3.0f, d);
+        const depthcue::Firsts f = depthcue::probeBox(8.0f, 3.0f, d, 1);
+        std::printf("        %4.1fm %6.1f  %5.1f %5.1f  %6.1f %6.1f  %7.1f %6.1f %6.2f\n",
+                    d, f.itdg, id.floorMs, f.floorMs, id.wallMs, f.wallMs,
+                    f.lastMs, (f.lastMs >= 0 && f.itdg >= 0) ? (f.lastMs - f.itdg) : -1.0f, f.ratio);
+    }
+    std::printf("\n      C. 尾の開始と、実際に音が戻ってくる時刻（線音源）\n");
+    std::printf("        広さ  尾の開始(mixing)  最初の壁  エコグラムの立上り  エコの山\n");
+    for (int k = 0; k < 4; ++k) {
+        const float h = halves[k];
+        const depthcue::Firsts f = depthcue::probeBox(h, 3.0f, 1.5f, 1);
+        std::printf("        %4.0fm %13.1f %10.1f %17.1f %11.1f%s\n",
+                    h * 2.0f, f.mixing, f.wallMs, f.echoOnMs, f.echoPeakMs,
+                    (f.wallMs > f.mixing + 5.0f) ? "   ★尾が壁より先に鳴る" : "");
+    }
+    {
+        // 実際に聞いている部屋（Test_SwingDoor は 14×14 m・高 3 m）。
+        const depthcue::Firsts f = depthcue::probeBox(7.0f, 3.0f, 1.5f, 1);
+        const depthcue::Ideal id = depthcue::idealBox(7.0f, 3.0f, 1.5f);
+        std::printf("        %4.0fm %13.1f %10.1f %17.1f %11.1f%s   ← Test_SwingDoor\n",
+                    14.0f, f.mixing, f.wallMs, f.echoOnMs, f.echoPeakMs,
+                    (f.wallMs > f.mixing + 5.0f) ? "   ★尾が壁より先に鳴る" : "");
+        std::printf("              （壁の理論値 %.1f ms・実測 %.1f ms／壁の大きさ %.1f dB・床 %.1f dB）\n",
+                    id.wallMs, f.wallMs, f.wallDb, f.floorDb);
+    }
+    std::printf("\n      D. エコグラム（尾の材料）の形。山を 0 dB とした 10 ms ビン。| が尾の開始\n");
+    for (int k = 0; k < 4; ++k) {
+        const float h = halves[k];
+        static float prof[240];
+        depthcue::g_echoOut = prof;
+        const depthcue::Firsts f = depthcue::probeBox(h, 3.0f, 1.5f, 1);
+        depthcue::g_echoOut = nullptr;
+        const int split = static_cast<int>(f.mixing / 10.0f);
+        const int wallK = (f.wallMs >= 0.0f) ? static_cast<int>(f.wallMs / 10.0f) : -1;
+        std::printf("        %4.0fm ", h * 2.0f);
+        for (int b = 0; b < 16; ++b) {
+            const char* mark = (b == split) ? "|" : (b == wallK ? "W" : " ");
+            std::printf("%s%4.0f", mark, prof[b]);
+        }
+        std::printf("   (0-160ms)\n");
+    }
+    std::printf("              W = 最初の壁が届くビン。| より右が尾になる。| と W の間は\n"
+                "              「まだ壁から返っていないのに残響が鳴っている」時間。\n");
+    std::printf("\n      読み方: A で「壁:実」が広さなりに伸びていなければ、部屋の大小が時間に出ていない。\n"
+                "              ITDG は床に頭を押さえられるので、ITDG だけを見ても広さは分からない。\n"
+                "              B で ITDG が縮み・尾の比が増えていれば、遠さは出ている。\n");
+}
+
 int main() {
     std::printf("=== AF_Scene* 数値回帰テスト ===\n");
     std::printf("（期待値は絶対値でなく「関係」で書いている。詳細は冒頭コメント参照）\n");
@@ -12936,7 +13161,11 @@ int main() {
     scanDllFreshness();
     reportDllFreshness();
 
-    // 開発中の絞り込み: AF_ONLY=async（非同期）／tier（段の予算）でその節だけ回す（全体は 8 分かかる）。
+    // 開発中の絞り込み: AF_ONLY=<節名> でその節だけ回す（全体は 8 分かかる）。
+    //   合否あり: async 非同期／tier 段の予算／rooms 部屋の種と共有／taps タップの組み立て／
+    //             materials 材質のプリセット／door 扉のプツプツ／walk 歩いたときの連続性／
+    //             closed 閉じた扉の音色／open 開いた扉の音色
+    //   合否なし（数字を採るだけ）: issues 既知の不具合／aperture 開口と角度／depth 空間の奥行き
     if (const char* only = std::getenv("AF_ONLY")) {
         if (std::strcmp(only, "async") == 0) testAsyncUpdate();
         else if (std::strcmp(only, "tier") == 0) testTierBudget();
@@ -12949,6 +13178,7 @@ int main() {
         else if (std::strcmp(only, "closed") == 0) testClosedDoorTimbre();
         else if (std::strcmp(only, "open") == 0) testDoorOpenTimbre();
         else if (std::strcmp(only, "aperture") == 0) diagnoseApertureVsAngle();
+        else if (std::strcmp(only, "depth") == 0) diagnoseSpatialDepth();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }
