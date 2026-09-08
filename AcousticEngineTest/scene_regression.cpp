@@ -8091,7 +8091,7 @@ void diagnoseApertureVsAngle() {
     const int nA = static_cast<int>(sizeof(angles) / sizeof(angles[0]));
 
     std::printf("        法則 角度   開口率   口の125Hz  口の1k   口の4k   射影(1-cos)  楔(sin)  自由端mm 回折本 回折dB  直接dB\n");
-    for (int law = 0; law <= 1; ++law) {
+    for (int law = 0; law <= 2; ++law) {
     for (int k = 0; k < nA; ++k) {
         AF_SceneHandle s = AF_SceneCreate();
         // 0 = 戸口の面への射影（既定に差し戻した側）／1 = 出ていった遮蔽物は蓋でなくなる。
@@ -13476,7 +13476,10 @@ void build(Scn& u, int doorPreset, int apertureLaw = 0, float listenerX = 0.0f) 
 
 // 耳に届く量。全タップの帯域エネルギー和（音量）と、125Hz/4kHz の比（色）。
 //   byType が非 null なら 種類ごと（0 直接／1 反射／2 回折）の dB も書く。
-void readLevel(AF_SceneHandle s, float* outLvl, float* outCol, float* byType = nullptr) {
+// A 特性（聴感の重み）。125/250/500/1k/2k/4k の中心での近似値（dB）。
+//   広帯域の単純和は 125 Hz の漏れに引っ張られて「音量」が後ろ重く見える。耳は低域を軽く聞く。
+static const float kAWeightDb[kBands] = { -16.1f, -8.6f, -3.2f, 0.0f, 1.2f, 1.0f };
+void readLevel(AF_SceneHandle s, float* outLvl, float* outCol, float* byType = nullptr, float* outLvlA = nullptr) {
     AF_VoiceProgram vp{};
     const int idx = AF_SceneSourceIndex(s, 1);
     double e[kBands] = {0, 0, 0, 0, 0, 0};
@@ -13491,10 +13494,14 @@ void readLevel(AF_SceneHandle s, float* outLvl, float* outCol, float* byType = n
             }
             if (tp.type >= 0 && tp.type < 3) et[tp.type] += se;
         }
-    double tot = 0.0;
-    for (int b = 0; b < kBands; ++b) tot += e[b];
+    double tot = 0.0, totA = 0.0;
+    for (int b = 0; b < kBands; ++b) {
+        tot += e[b];
+        totA += e[b] * std::pow(10.0, kAWeightDb[b] / 10.0);
+    }
     *outLvl = static_cast<float>(10.0 * std::log10(std::max(tot, 1e-20)));
     *outCol = static_cast<float>(10.0 * std::log10(std::max(e[0], 1e-20) / std::max(e[5], 1e-20)));
+    if (outLvlA) *outLvlA = static_cast<float>(10.0 * std::log10(std::max(totA, 1e-20)));
     if (byType)
         for (int t = 0; t < 3; ++t)
             byType[t] = static_cast<float>(10.0 * std::log10(std::max(et[t], 1e-20)));
@@ -13513,11 +13520,11 @@ void diagnoseDoorStaircase() {
     //   正面は扉が物理的に目の前を通るので、直接音が後半で跳ぶのは幾何として正しい。
     //   横へずれれば扉は見通し線を塞がないので、そこで分かれれば「模型の問題」ではなく
     //   「試験の置き方の問題」と切り分けられる。
-    static float dLvl[3][10], dCol[3][10], fLvl[3][10], fCol[3][10];
-    const int   caseLaw[3] = { 0, 1, 0 };
-    const float caseX[3]   = { 0.0f, 0.0f, -2.0f };
-    const char* caseName[3] = { "正面・法則0", "正面・法則1", "横2m・法則0" };
-    for (int ci = 0; ci < 3; ++ci) {
+    static float dLvl[4][10], dCol[4][10], fLvl[4][10], fCol[4][10], dLvlA[4][10];
+    const int   caseLaw[4] = { 0, 2, 0, 2 };
+    const float caseX[4]   = { 0.0f, 0.0f, -2.0f, -2.0f };
+    const char* caseName[4] = { "正面・法則0", "正面・法則2", "横2m・法則0", "横2m・法則2" };
+    for (int ci = 0; ci < 4; ++ci) {
     const int law = ci;
     doorstep::Scn u; doorstep::build(u, 4, caseLaw[ci], caseX[ci]);   // 4 = WoodDoor
     const float dt = 1.0f / 60.0f;
@@ -13528,7 +13535,8 @@ void diagnoseDoorStaircase() {
     // 閉じた状態で落ち着かせる。
     doorstep::placeDoor(u, 0.0f);
     for (int i = 0; i < 180; ++i) AF_SceneUpdate(u.s, dt);
-    float lvl0, col0, by0[3]; doorstep::readLevel(u.s, &lvl0, &col0, by0);
+    float lvl0, col0, by0[3], lvlA0; doorstep::readLevel(u.s, &lvl0, &col0, by0, &lvlA0);
+    float prevLvlA = lvlA0;
     std::printf("        閉じた状態: 音量 %.1f dB / 色 %.1f dB   （直接 %.1f / 反射 %.1f / 回折 %.1f）\n\n",
                 lvl0, col0, by0[0], by0[1], by0[2]);
 
@@ -13550,7 +13558,7 @@ void diagnoseDoorStaircase() {
         }
         // 「止まった」＝ 最終値から eps 以上ずれた最後の時刻。そこを過ぎたら以後動かない。
         const float fin = lv[n - 1], finC = cl[n - 1];
-        float byF[3]; doorstep::readLevel(u.s, &lv[n - 1], &cl[n - 1], byF);
+        float byF[3], finA; doorstep::readLevel(u.s, &lv[n - 1], &cl[n - 1], byF, &finA);
         int last = -1;
         for (int i = 0; i < n; ++i) if (std::fabs(lv[i] - fin) > eps) last = i;
         const float tSettle = (last + 2) * dt * 1000.0f;      // 次のフレームで止まっている
@@ -13559,6 +13567,7 @@ void diagnoseDoorStaircase() {
                     stp, a1, tDoor, tSettle, tSettle - tDoor, fin, fin - prevLvl, finC,
                     byF[0], byF[1], byF[2]);
         dLvl[law][stp] = fin - prevLvl;
+        dLvlA[law][stp] = finA - prevLvlA; prevLvlA = finA;
         dCol[law][stp] = (stp == 1) ? (col0 - finC) : (fCol[law][stp - 1] - finC);
         fLvl[law][stp] = fin; fCol[law][stp] = finC;
         prevLvl = fin;
@@ -13572,7 +13581,7 @@ void diagnoseDoorStaircase() {
     std::printf("        段ごとの増分（理想は左ほど大きい）\n");
     std::printf("        段            1     2     3     4     5     6     7     8     9\n");
     std::printf("        角度        10    20    30    40    50    60    70    80    90\n");
-    for (int ci = 0; ci < 3; ++ci) {
+    for (int ci = 0; ci < 4; ++ci) {
         std::printf("        %s 音量", caseName[ci]);
         for (int k = 1; k <= 9; ++k) std::printf("%6.1f", dLvl[ci][k]);
         std::printf("\n        %s 色  ", caseName[ci]);
@@ -13592,15 +13601,16 @@ void diagnoseDoorStaircase() {
     //     射影（開口 ∝ 1−cosθ）だと 10 度から先が 18.5 dB もあるので、この配分にならない。
     std::printf("\n        配分（試聴の目標: 0-10 度 70%% ／ 10-30 度 20%% ／ 30-90 度 10%%）\n");
     std::printf("        量           0-10 度   10-30 度   30-90 度   合計\n");
-    for (int ci = 0; ci < 3; ++ci) {
-        for (int which = 0; which < 2; ++which) {
-            const float* d = which ? dCol[ci] : dLvl[ci];
+    for (int ci = 0; ci < 4; ++ci) {
+        for (int which = 0; which < 3; ++which) {
+            const float* d = (which == 1) ? dCol[ci] : (which == 2) ? dLvlA[ci] : dLvl[ci];
             float a = d[1], b = d[2] + d[3], c = 0.0f;
             for (int k = 4; k <= 9; ++k) c += d[k];
             const float tot = a + b + c;
             const float sc = (std::fabs(tot) > 1e-3f) ? 100.0f / tot : 0.0f;
             std::printf("        %s %s %7.0f%%  %8.0f%%  %8.0f%%  %6.1f dB\n",
-                        caseName[ci], which ? "色  " : "音量", a * sc, b * sc, c * sc, tot);
+                        caseName[ci], (which == 1) ? "色    " : (which == 2) ? "音量A " : "音量  ",
+                        a * sc, b * sc, c * sc, tot);
         }
     }
     std::printf("        ※目標に近いほど左が大きい。音量は直接音と反射が後ろで跳ぶので後ろ重い。\n");

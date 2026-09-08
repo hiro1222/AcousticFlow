@@ -364,8 +364,11 @@ namespace AcousticFlow
                  + "★試聴で『高音域が抜けすぎ』となったので既定を 0 へ戻した（2026-09-08）。\n"
                  + "  1 は開き始めの数度が効くようになる利点があるので消していない。\n"
                  + "  高域の量を落として 1 を活かす道は docs/DIRECT_PENUMBRA.md に書いた。\n"
-                 + "閉じた扉（奥行き 0）では 0 と 1 は厳密に同じ値。")]
-        [Range(0, 1)] public int apertureLaw = 0;
+                 + "閉じた扉（奥行き 0）では 0 と 1 は厳密に同じ値。\n"
+                 + "2 = 出ていった遮蔽物の自由端と枠の間の弦を開口幅とする（2026-09-08 追加、試聴待ち）。\n"
+                 + "  射影は角度の 2 乗でしか開かないが、弦は角度に比例する＝開いた瞬間が一番大きい形。\n"
+                 + "  帯域に依らないので 1 のように高域だけが明るくならない。60 度から先は 0 と同じ。")]
+        [Range(0, 2)] public int apertureLaw = 0;
         [Tooltip("聞き比べのラウドネス合わせ。像源レイ（earlyReflectModel=0）の反射タップに掛ける減衰(dB)。\n"
                  + "U で模型を切り替えたときに音量が変わると「大きい方が良い」に引っ張られるので揃える。\n"
                  + "既定 3.8 dB は回帰 [歩行] の実測（戸口をくぐる経路で 面の線 -26.2 / レイ追跡 -22.3 dB）。\n"
@@ -2783,7 +2786,7 @@ namespace AcousticFlow
             if (showDiffractionCandidates)
                 GUILayout.Label($"回折候補(主音源): {_diffCandCount} 本合成 (水色=最短) (C)", style);
             GUILayout.Label($"直接の半影: {(directPenumbraMode == 3 ? "走査線+透過は帯域非依存" : directPenumbraMode == 2 ? "窓の走査線" : directPenumbraMode == 1 ? "環の標本点" : "旧(8 点)")}   "
-                            + $"開口: {(apertureLaw == 1 ? "出ていった物は蓋でない" : "面への射影")} (apertureLaw)   "
+                            + $"開口: {(apertureLaw == 2 ? "自由端と枠の弦" : apertureLaw == 1 ? "出ていった物は蓋でない" : "面への射影")} (apertureLaw)   "
                             + $"タップの組み立て: {(tapsFromEngine && _scene != null && _scene.TapBuilderAvailable ? "DLL" : "ホスト")} (tapsFromEngine)", style);
             GUILayout.Label($"早期反射(IR の R タップ): {(enableEarlyReflections ? "ON" : "OFF")} (F)   "
                             + $"模型: {(earlyReflectModel == 1 ? "面の線音源" : $"像源レイ（既存・音量合わせ -{earlyModelLevelMatchDb:F1} dB）")} (U で切替)   "

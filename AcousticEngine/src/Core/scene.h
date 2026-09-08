@@ -1553,7 +1553,7 @@ public:
     /// 開口の法則。0 = 戸口の面への射影（従来）／1 = 出ていった遮蔽物は蓋でなくなる（既定）。
     ///   1 では、開いた扉が戸口の面から離れるにつれて「塞ぐ度合い」が連続に落ちる。
     ///   物差しは帯域ごとのフレネル半径なので、高域から先に抜ける。
-    void setApertureLaw(int law) { apertureLaw_ = (law != 0) ? 1 : 0; }
+    void setApertureLaw(int law) { apertureLaw_ = (law < 0) ? 0 : (law > 2 ? 2 : law); }
     int apertureLaw() const { return apertureLaw_; }
 
     /// (B) を使うか。既定 OFF（従来の前川＋開口積分）。
@@ -1923,8 +1923,14 @@ public:
         buildRows(false, openRow, begin_, true);
         // 出ていった遮蔽物があるときだけ 2 本目を作る（費用の増分をそこに限る）。
         double swungSum = 0.0; int swungN = 0;
+        double swungFoot = 0.0;    // 出ていった遮蔽物が矩形に落とす足跡の幅（u 方向）。法則 2 の弦に使う
         for (const Poly& pg : polys)
-            if (pg.depth > 1e-3f) { swungSum += pg.depth; ++swungN; }
+            if (pg.depth > 1e-3f) {
+                swungSum += pg.depth; ++swungN;
+                float umin = 1e30f, umax = -1e30f;
+                for (int q = 0; q < pg.n; ++q) { umin = std::min(umin, pg.u[q]); umax = std::max(umax, pg.u[q]); }
+                if (umax > umin) swungFoot += static_cast<double>(umax - umin);
+            }
         const bool hasSwung = (apertureLaw_ != 0) && (swungN > 0);
         const float swungDepth = hasSwung
             ? static_cast<float>(swungSum / swungN) : 0.0f;
@@ -2033,9 +2039,30 @@ public:
                 //   ★文献: 部分開口の遮音は「空気が通る実面積」で整理される（換気との
                 //     トレードオフとして測られる）。戸口の面への射影ではない。
                 const double fs = numerSeal / denom;
-                const double dd = static_cast<double>(swungDepth) / static_cast<double>(r1);
-                const double seal = std::exp(-dd * dd);
-                fb = fb + (fs - fb) * (1.0 - seal);
+                double k;
+                if (apertureLaw_ == 2) {
+                    // 【開口の法則 2】出ていった遮蔽物の「自由端と枠の間の弦」を開口幅とする（2026-09-08）。
+                    //   射影で残る幅 g = W − 足跡幅、奥行き d から、弦 c = √(g² + d²)。
+                    //   開口率を c/W で置き直す（W で頭打ち）。**帯域に依らない**。
+                    //   閉じた扉: d = 0, g = 0 → k = 0 ＝ 従来と厳密に同じ。
+                    //   自由端が枠の幅まで離れた所（幅 1 m の扉なら 60 度）で k = 1 ＝ 蓋でなくなる。
+                    //   ★なぜ弦か: 音が通るのは「戸口の面に残った射影」ではなく「自由端と枠の間の隙間」。
+                    //     射影 (1−cosθ) は角度の 2 乗でしか開かず（10 度で 1.5%）、弦 2sin(θ/2) は
+                    //     角度に比例する（10 度で 17%）。開いた瞬間が一番大きく、あとがなだらかになる形。
+                    //   ★法則 1 との違い: 帯域に依らないので「高域だけ +10 dB」の副作用が無く、
+                    //     60 度から先は射影と一致する（法則 1 は 45 度でもまだ +8 dB あった）。
+                    const double W = 2.0 * static_cast<double>(pt.halfU);
+                    const double g = std::max(0.0, W - swungFoot);
+                    const double c = std::sqrt(g * g + static_cast<double>(swungDepth) * static_cast<double>(swungDepth));
+                    const double oc = std::min(1.0, c / std::max(W, 1e-6));
+                    const double op = std::min(1.0, g / std::max(W, 1e-6));
+                    k = (op >= 1.0 - 1e-6) ? 1.0 : std::min(1.0, std::max(0.0, (oc - op) / (1.0 - op)));
+                } else {
+                    const double dd = static_cast<double>(swungDepth) / static_cast<double>(r1);
+                    const double seal = std::exp(-dd * dd);
+                    k = 1.0 - seal;
+                }
+                fb = fb + (fs - fb) * k;
             }
             outFrac6[b] = static_cast<float>(std::min(1.0, std::max(0.0, fb)));
         }
@@ -7716,6 +7743,7 @@ private:
     //   1 を既定にしていたが、試聴で「高音域が抜けすぎ」となり 2026-09-08 に 0 へ差し戻した。
     //   1 の狙い（開き始めの数度を効かせる）は達成できていたが、同じ +10 dB が 8〜45 度の
     //   全域に乗り続け、扉が実際に居る角度の音色を支配していた（docs/DIRECT_PENUMBRA.md）。
+    //   2 = 出ていった遮蔽物の「自由端と枠の弦」を開口幅とする（2026-09-08、帯域に依らない。試聴待ち）。
     int   apertureLaw_ = 0;
     bool  edgePortals_ = false;
     // 矩形の半幅 = これ × フレネル半径。★1 倍では積分が切れて形が壊れる。
