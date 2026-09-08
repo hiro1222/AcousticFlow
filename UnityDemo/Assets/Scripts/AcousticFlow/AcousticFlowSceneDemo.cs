@@ -357,6 +357,11 @@ namespace AcousticFlow
                  + "0 = 旧（音源まわり 8 点）\n"
                  + "同じビルドで聞き比べるための切り替え（Play 中に動かしてよい）。採用が固まったら下側を消す。")]
         [Range(0, 3)] public int directPenumbraMode = 3;
+        [Tooltip("開口の法則。1 = 戸口の面から出ていった遮蔽物は、出ていったぶん「蓋」でなくなる（既定）\n"
+                 + "／0 = 戸口の面への射影（従来。開いた扉の開口が角度の 2 乗でしか広がらず、最初の数度が効かない）。\n"
+                 + "1 では奥行きを帯域ごとのフレネル半径で量るので、狭い隙間ほど高域から抜ける。\n"
+                 + "実測: 8 度の開口 4 kHz が 0.016 → 0.053（+10 dB）、125 Hz はほぼ据え置き。閉じた扉では同じ。")]
+        [Range(0, 1)] public int apertureLaw = 1;
         [Tooltip("聞き比べのラウドネス合わせ。像源レイ（earlyReflectModel=0）の反射タップに掛ける減衰(dB)。\n"
                  + "U で模型を切り替えたときに音量が変わると「大きい方が良い」に引っ張られるので揃える。\n"
                  + "既定 3.8 dB は回帰 [歩行] の実測（戸口をくぐる経路で 面の線 -26.2 / レイ追跡 -22.3 dB）。\n"
@@ -1519,6 +1524,7 @@ namespace AcousticFlow
             _scene.SetApertureIsTransmission(apertureIsTransmission);
             _scene.SetUseBtm(useBtmDiffraction);
             _scene.SetDirectPenumbra(directPenumbraMode);   // 中で丸めるだけ。毎フレーム押してよい
+            _scene.SetApertureLaw(apertureLaw);
             // 部屋の検出設定。中で値の変化を見ているので、毎フレーム押しても作り直しは起きない。
             _scene.SetRoomCellSize(roomCellSize);
             _scene.SetRoomSeedRadius(roomSeedRadius);
@@ -2765,7 +2771,8 @@ namespace AcousticFlow
                 : "主音源の回折: なし", style);
             if (showDiffractionCandidates)
                 GUILayout.Label($"回折候補(主音源): {_diffCandCount} 本合成 (水色=最短) (C)", style);
-            GUILayout.Label($"直接の半影: {(directPenumbraMode == 3 ? "走査線+透過は帯域非依存" : directPenumbraMode == 2 ? "窓の走査線" : directPenumbraMode == 1 ? "環の標本点" : "旧(8 点)")} (Inspector directPenumbraMode)   "
+            GUILayout.Label($"直接の半影: {(directPenumbraMode == 3 ? "走査線+透過は帯域非依存" : directPenumbraMode == 2 ? "窓の走査線" : directPenumbraMode == 1 ? "環の標本点" : "旧(8 点)")}   "
+                            + $"開口: {(apertureLaw == 1 ? "出ていった物は蓋でない" : "面への射影")} (apertureLaw)   "
                             + $"タップの組み立て: {(tapsFromEngine && _scene != null && _scene.TapBuilderAvailable ? "DLL" : "ホスト")} (tapsFromEngine)", style);
             GUILayout.Label($"早期反射(IR の R タップ): {(enableEarlyReflections ? "ON" : "OFF")} (F)   "
                             + $"模型: {(earlyReflectModel == 1 ? "面の線音源" : $"像源レイ（既存・音量合わせ -{earlyModelLevelMatchDb:F1} dB）")} (U で切替)   "

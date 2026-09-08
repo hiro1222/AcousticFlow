@@ -1136,6 +1136,14 @@ namespace AcousticFlow
         {
             if (_handle != IntPtr.Zero) Native.AF_SceneSetRoomSeedRadius(_handle, meters);
         }
+        /// 開口の法則（1 = 出ていった遮蔽物は蓋でなくなる・既定／0 = 戸口の面への射影）。
+        public void SetApertureLaw(int law)
+        {
+            if (_handle == IntPtr.Zero) return;
+            try { Native.AF_SceneSetApertureLaw(_handle, law); }
+            catch (EntryPointNotFoundException) { }   // 古い DLL: 射影のまま
+        }
+
         /// 直接経路の半影の作り方（2 = 窓の走査線積分・既定／1 = 環の標本点／0 = 旧）。同じビルドで聞き比べるための切り替え。
         public void SetDirectPenumbra(int mode)
         {

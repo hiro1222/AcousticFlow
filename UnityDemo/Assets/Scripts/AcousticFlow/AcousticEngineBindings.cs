@@ -810,6 +810,9 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_SceneSetDirectPenumbra(IntPtr scene, int on);
 
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void AF_SceneSetApertureLaw(IntPtr scene, int law);
+
         // 反射経路トレース：origin→dir を鏡面反射で maxBounces 回追い、通過点を outPoints に書く。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneTraceReflectionPath(

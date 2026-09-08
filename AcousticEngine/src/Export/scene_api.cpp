@@ -1283,6 +1283,11 @@ void AF_SceneSetDirectPenumbra(AF_SceneHandle scene, int on) {
     if (b) b->post([on](Scene& s) { s.setDirectPenumbra(on); });
 }
 
+void AF_SceneSetApertureLaw(AF_SceneHandle scene, int law) {
+    SceneBox* b = asBox(scene);
+    if (b) b->post([law](Scene& s) { s.setApertureLaw(law); });
+}
+
 void AF_SceneSetApertureDeltaWeight(AF_SceneHandle scene, float w) {
     SceneBox* b = asBox(scene);
     if (b) b->post([w](Scene& s) { s.setApertureDeltaWeight(w); });

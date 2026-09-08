@@ -1550,6 +1550,12 @@ public:
         pt.fresnelSized = true;   // 矩形は積分範囲。帯域ごとに r1 で切る
         return portalOpenBands(pt, listener, source, outFrac6, outPoint);
     }
+    /// 開口の法則。0 = 戸口の面への射影（従来）／1 = 出ていった遮蔽物は蓋でなくなる（既定）。
+    ///   1 では、開いた扉が戸口の面から離れるにつれて「塞ぐ度合い」が連続に落ちる。
+    ///   物差しは帯域ごとのフレネル半径なので、高域から先に抜ける。
+    void setApertureLaw(int law) { apertureLaw_ = (law != 0) ? 1 : 0; }
+    int apertureLaw() const { return apertureLaw_; }
+
     /// (B) を使うか。既定 OFF（従来の前川＋開口積分）。
     void setEdgePortals(bool on) { edgePortals_ = on; }
     bool edgePortals() const { return edgePortals_; }
@@ -1696,7 +1702,9 @@ public:
 
         // 遮るものを**リスナーから見た影**として矩形面へ落とす（凸多角形の集まり）。
         //   断面ではなく影なのは、斜めに立った薄い板が断面にほぼ現れないため（実測で確認）。
-        struct Poly { float u[8], v[8]; int n; };
+        //   depth = 遮蔽物の中心が**戸口の面より奥**にある距離(m)。0 なら面の上（＝蓋）。
+        //   開いた扉は蝶番を軸に奥へ出ていくので depth が増える。開口の法則 1 で使う。
+        struct Poly { float u[8], v[8]; int n; float depth; };
         static thread_local std::vector<Poly> polys;
         polys.clear();
         const float planeD = dot(n, pt.center - listener);
@@ -1798,6 +1806,7 @@ public:
                     for (int i = 0; i < 3 && ok; ++i) ok = project(tv[i], pg.u[i], pg.v[i]);
                     if (!ok) continue;
                     pg.n = 3;
+                    pg.depth = std::max(0.0f, -dot(inst.obb.center - pt.center, planeN));
                     polys.push_back(pg);
                 }
             } else {
@@ -1858,6 +1867,7 @@ public:
                 }
                 if (m < 3) continue;      // 全部リスナーの後ろ＝影を落とさない
                 Poly pg; hullInto(px, py, m, pg);
+                pg.depth = std::max(0.0f, -dot(ob.center - pt.center, planeN));
                 if (pg.n >= 3) polys.push_back(pg);
             }
         }
@@ -1869,47 +1879,68 @@ public:
         struct Span { float lo, hi; };
         static thread_local std::vector<Span> spans, openRow;
         static thread_local std::vector<int> begin_;
-        openRow.clear();
-        begin_.assign(kRows + 1, 0);
+        static thread_local std::vector<Span> sealRow;
+        static thread_local std::vector<int> beginSeal_;
         const float rowH = 2.0f * pt.halfV / kRows;
         double area = 0.0, ccu = 0.0, ccv = 0.0;
-        for (int j = 0; j < kRows; ++j) {
-            begin_[j] = static_cast<int>(openRow.size());
-            const float y = -pt.halfV + rowH * (j + 0.5f);
-            spans.clear();
-            for (const Poly& pg : polys) {
-                float lo, hi;
-                if (fresnel::polygonSpanAtY(pg.u, pg.v, pg.n, y, lo, hi))
-                    spans.push_back(Span{lo, hi});
+        // sealingOnly=true では、戸口の面から**出ていった**遮蔽物（開いた扉など）を外す。
+        //   ＝「扉がもう蓋ではない」状態の開口。両者を帯域ごとの重みで混ぜる（開口の法則 1）。
+        auto buildRows = [&](bool sealingOnly, std::vector<Span>& outRow,
+                             std::vector<int>& outBegin, bool accumArea) {
+            outRow.clear();
+            outBegin.assign(kRows + 1, 0);
+            for (int j = 0; j < kRows; ++j) {
+                outBegin[static_cast<std::size_t>(j)] = static_cast<int>(outRow.size());
+                const float y = -pt.halfV + rowH * (j + 0.5f);
+                spans.clear();
+                for (const Poly& pg : polys) {
+                    if (sealingOnly && pg.depth > 1e-3f) continue;
+                    float lo, hi;
+                    if (fresnel::polygonSpanAtY(pg.u, pg.v, pg.n, y, lo, hi))
+                        spans.push_back(Span{lo, hi});
+                }
+                std::sort(spans.begin(), spans.end(),
+                          [](const Span& a, const Span& b) { return a.lo < b.lo; });
+                float cursor = -pt.halfU;
+                auto emit = [&](float lo, float hi) {
+                    if (hi <= lo) return;
+                    outRow.push_back(Span{lo, hi});
+                    if (!accumArea) return;
+                    const double w = static_cast<double>(hi - lo) * rowH;
+                    area += w; ccu += w * 0.5 * (lo + hi); ccv += w * y;
+                };
+                for (const Span& sp : spans) {
+                    const float lo = std::min(std::max(sp.lo, -pt.halfU), pt.halfU);
+                    const float hi = std::min(std::max(sp.hi, -pt.halfU), pt.halfU);
+                    if (lo > cursor) emit(cursor, lo);
+                    cursor = std::max(cursor, hi);
+                    if (cursor >= pt.halfU) break;
+                }
+                if (cursor < pt.halfU) emit(cursor, pt.halfU);
             }
-            std::sort(spans.begin(), spans.end(),
-                      [](const Span& a, const Span& b) { return a.lo < b.lo; });
-            float cursor = -pt.halfU;
-            auto emit = [&](float lo, float hi) {
-                if (hi <= lo) return;
-                openRow.push_back(Span{lo, hi});
-                const double w = static_cast<double>(hi - lo) * rowH;
-                area += w; ccu += w * 0.5 * (lo + hi); ccv += w * y;
-            };
-            for (const Span& sp : spans) {
-                const float lo = std::min(std::max(sp.lo, -pt.halfU), pt.halfU);
-                const float hi = std::min(std::max(sp.hi, -pt.halfU), pt.halfU);
-                if (lo > cursor) emit(cursor, lo);
-                cursor = std::max(cursor, hi);
-                if (cursor >= pt.halfU) break;
-            }
-            if (cursor < pt.halfU) emit(cursor, pt.halfU);
-        }
-        begin_[kRows] = static_cast<int>(openRow.size());
+            outBegin[kRows] = static_cast<int>(outRow.size());
+        };
+        buildRows(false, openRow, begin_, true);
+        // 出ていった遮蔽物があるときだけ 2 本目を作る（費用の増分をそこに限る）。
+        double swungSum = 0.0; int swungN = 0;
+        for (const Poly& pg : polys)
+            if (pg.depth > 1e-3f) { swungSum += pg.depth; ++swungN; }
+        const bool hasSwung = (apertureLaw_ != 0) && (swungN > 0);
+        const float swungDepth = hasSwung
+            ? static_cast<float>(swungSum / swungN) : 0.0f;
+        if (hasSwung) buildRows(true, sealRow, beginSeal_, false);
 
-        if (area <= 1e-9) {                       // 完全に塞がれている
+        if (area <= 1e-9 && !hasSwung) {          // 完全に塞がれている（出ていった物も無い）
             for (int b = 0; b < kNumBands; ++b) outFrac6[b] = 0.0f;
             if (outPoint) *outPoint = pt.center;
             return true;
         }
+        // 到来点は素通しの区間の重心のまま（定位を動かさない）。開いていなければ矩形の中心。
         if (outPoint)
-            *outPoint = pt.center + u * static_cast<float>(ccu / area)
-                                  + v * static_cast<float>(ccv / area);
+            *outPoint = (area > 1e-9)
+                      ? pt.center + u * static_cast<float>(ccu / area)
+                                  + v * static_cast<float>(ccv / area)
+                      : pt.center;
 
         for (int b = 0; b < kNumBands; ++b) {
             const float lambda = 343.0f / kBandHz[b];
@@ -1949,7 +1980,7 @@ public:
             //     丸ごと外れる。実測: 扉 10° の開口率が 0.0362 → 0.0000（20° も 0）。
             //     出荷中の扉が黙って死んでいた（検査が無かったので 2 日気づかなかった）。
             //   → 戸口のときは**矩形そのもの**を範囲にする（従来どおり）。
-            double numer = 0.0, denom = 0.0;
+            double numer = 0.0, denom = 0.0, numerSeal = 0.0;
             if (!pt.fresnelSized) {
                 for (int j = 0; j < kRows; ++j) {
                     const float y = -pt.halfV + rowH * (j + 0.5f);
@@ -1957,6 +1988,10 @@ public:
                     for (int i = begin_[j]; i < begin_[j + 1]; ++i)
                         numer += integ(openRow[static_cast<std::size_t>(i)].lo,
                                        openRow[static_cast<std::size_t>(i)].hi, y);
+                    if (hasSwung)
+                        for (int i = beginSeal_[j]; i < beginSeal_[j + 1]; ++i)
+                            numerSeal += integ(sealRow[static_cast<std::size_t>(i)].lo,
+                                               sealRow[static_cast<std::size_t>(i)].hi, y);
                 }
             } else {
                 // 稜線ポータル: 矩形は積分範囲なので、帯域ごとのゾーンで切る。
@@ -1975,14 +2010,34 @@ public:
                                                   cu + limU);
                         numer += integ(lo, hi, y);
                     }
+                    if (hasSwung)
+                        for (int i = beginSeal_[j]; i < beginSeal_[j + 1]; ++i) {
+                            const float lo2 = std::max(sealRow[static_cast<std::size_t>(i)].lo,
+                                                       cu - limU);
+                            const float hi2 = std::min(sealRow[static_cast<std::size_t>(i)].hi,
+                                                       cu + limU);
+                            numerSeal += integ(lo2, hi2, y);
+                        }
                 }
             }
             if (b == 0) {
                 dbgNumer_ = numer; dbgDenom_ = denom;
                 dbgLimU_ = pt.fresnelSized ? std::min(pt.halfU, edgePortalSpan_ * r1) : pt.halfU;
             }
-            outFrac6[b] = (denom > 1e-12)
-                        ? static_cast<float>(std::min(1.0, numer / denom)) : 1.0f;
+            double fb = (denom > 1e-12) ? (numer / denom) : 1.0;
+            if (hasSwung && denom > 1e-12) {
+                // 【開口の法則 1】戸口の面から出ていった遮蔽物は、出ていったぶん「蓋」でなくなる。
+                //   物差しは**帯域ごとのフレネル半径**。高域ほど半径が小さいので先に抜ける。
+                //   前提「隙間から高域だけが漏れる」を、調整定数ではなく波長から出す形。
+                //   奥行き 0（閉じた扉）で seal = 1 ＝ 従来と厳密に同じ。
+                //   ★文献: 部分開口の遮音は「空気が通る実面積」で整理される（換気との
+                //     トレードオフとして測られる）。戸口の面への射影ではない。
+                const double fs = numerSeal / denom;
+                const double dd = static_cast<double>(swungDepth) / static_cast<double>(r1);
+                const double seal = std::exp(-dd * dd);
+                fb = fb + (fs - fb) * (1.0 - seal);
+            }
+            outFrac6[b] = static_cast<float>(std::min(1.0, std::max(0.0, fb)));
         }
         applyApertureTimbre(outFrac6);
         return true;
@@ -7657,6 +7712,7 @@ private:
     bool  insideOtherContinuous_ = false;
     float insideOtherScale_ = 0.08f;
     // (B) 稜線からポータルを生成してフレネル積分する。既定 OFF（従来経路）。
+    int   apertureLaw_ = 1;         // 0 = 射影（従来）／1 = 出ていった物は蓋でなくなる（既定）
     bool  edgePortals_ = false;
     // 矩形の半幅 = これ × フレネル半径。★1 倍では積分が切れて形が壊れる。
     //   実測（衝立の陰を歩き、従来経路との比のばらつき＝形の一致度）:
