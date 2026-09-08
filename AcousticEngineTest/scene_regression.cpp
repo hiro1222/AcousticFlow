@@ -8072,6 +8072,94 @@ void testRoomSeedAndShare() {
 //     ⑥ 段の写しと同じく、非同期でも同じ答え（[非同期] で比較）
 //     ⑦ 部屋が無ければ尾の比は外形箱で当たる（ホストの予備と同じ）
 // ─────────────────────────────────────────────────────────────────────
+// ============================ 開口は角度に対してどう動くか（打ち手を決めるための切り分け）
+// 2026-09-08。「開き始めが一番変化してほしい」に対し、いまは最初の数度が動かない。
+// 原因を決める前に、**開口そのものが角度に対してどんな形か**を細かく測る。
+//   候補 A: 戸口の面への射影 ∝ (1 − cosθ)   … 角度の 2 乗。2° で 0.6 mm
+//   候補 B: 自由端の楔形の口 ∝ sinθ          … 角度に比例。2° で 35 mm
+//   候補 C: どちらでもない（平ら → 段）      … 別の機構（見通しの二値など）
+// どれかで打ち手が変わるので、推測せずに形を採る。
+void diagnoseApertureVsAngle() {
+    std::printf("\n[診断] 開口は角度に対してどう動くか（0.5° 刻み）\n");
+    const float wallT[6] = {0.000398f, 0.0001585f, 0.0000398f,
+                            0.00001f, 0.00000251f, 0.000001f};
+    const float doorT[6] = {0.0316f, 0.0158f, 0.00794f, 0.00398f, 0.00251f, 0.002f};
+    const float hh = 3.0f, th = 0.2f, hf = 7.0f, doorW = 1.0f, doorT2 = 0.03f;
+    const AF_Vector3 L = V(0, 1.6f, -3), Sr = V(0, 1.6f, 3);
+    const float angles[] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                             8.0f, 12.0f, 16.0f, 24.0f, 32.0f, 45.0f, 90.0f };
+    const int nA = static_cast<int>(sizeof(angles) / sizeof(angles[0]));
+
+    std::printf("        角度   開口率   口の125Hz  口の1k   口の4k   射影(1-cos)  楔(sin)  自由端mm 回折本 回折dB  直接dB\n");
+    for (int k = 0; k < nA; ++k) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mw = AF_SceneAddMaterial(s, wallT, nullptr, nullptr, 6);
+        const int md = AF_SceneAddMaterial(s, doorT, nullptr, nullptr, 6);
+        AF_SceneAddInstanceBox(s, V(0, -th, 0),    V(hf, th, hf), V(1,0,0), V(0,1,0), mw);
+        AF_SceneAddInstanceBox(s, V(0, hh+th, 0),  V(hf, th, hf), V(1,0,0), V(0,1,0), mw);
+        AF_SceneAddInstanceBox(s, V(-hf, hh*0.5f, 0), V(th, hh*0.5f, hf), V(1,0,0), V(0,1,0), mw);
+        AF_SceneAddInstanceBox(s, V( hf, hh*0.5f, 0), V(th, hh*0.5f, hf), V(1,0,0), V(0,1,0), mw);
+        AF_SceneAddInstanceBox(s, V(0, hh*0.5f, -hf), V(hf, hh*0.5f, th), V(1,0,0), V(0,1,0), mw);
+        AF_SceneAddInstanceBox(s, V(0, hh*0.5f,  hf), V(hf, hh*0.5f, th), V(1,0,0), V(0,1,0), mw);
+        const float side = (2.0f*hf - doorW) * 0.5f;
+        AF_SceneAddInstanceBox(s, V(-(doorW*0.5f + side*0.5f), hh*0.5f, 0),
+                               V(side*0.5f, hh*0.5f, th*0.5f), V(1,0,0), V(0,1,0), mw);
+        AF_SceneAddInstanceBox(s, V( (doorW*0.5f + side*0.5f), hh*0.5f, 0),
+                               V(side*0.5f, hh*0.5f, th*0.5f), V(1,0,0), V(0,1,0), mw);
+        const float t2 = angles[k] * 3.14159265f / 180.0f;
+        const AF_Vector3 right = V(std::cos(t2), 0.0f, std::sin(t2));
+        const AF_Vector3 hinge = V(-doorW * 0.5f, hh * 0.5f, 0.0f);
+        AF_SceneAddInstanceBox(s,
+            V(hinge.x + right.x * doorW * 0.5f, hinge.y, hinge.z + right.z * doorW * 0.5f),
+            V(doorW * 0.5f, hh * 0.5f, doorT2), right, V(0,1,0), md);
+        const int pid = AF_SceneAddPortal(s, V(0, hh * 0.5f, 0), V(1, 0, 0), V(0, 1, 0),
+                                          doorW * 0.5f, hh * 0.5f);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetListenerOrientation(s, V(0,0,1), V(0,1,0));
+        AF_SceneSetSource(s, 1, Sr);
+        AF_UpdateConfig cfg{};
+        cfg.role1EveryN = 1; cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+        cfg.directWeight = 1.0f; cfg.useReflections = 1; cfg.speedOfSound = 343.0f;
+        cfg.distanceRef = 4.0f; cfg.enableReverb = 0;
+        cfg.enableDiffractionSources = 1; cfg.diffSources = 8; cfg.diffSrcEveryN = 1;
+        cfg.useEdgeCatalog = 1; cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+        cfg.catalogEveryN = 1;
+        AF_SceneSetUpdateConfig(s, &cfg);
+        for (int it = 0; it < 4; ++it) AF_SceneUpdate(s, 1.0f / 60.0f);
+
+        // 回折タップ（扉の縁を回り込む経路）が小さい角度で出ているか。
+        //   出ていないなら「開口の法則」ではなく「回折の経路が生まれていない」が問題。
+        int nDif = 0; double eDif = 0.0, eDir = 0.0;
+        {
+            AF_VoiceProgram vp{};
+            const int vi = AF_SceneSourceIndex(s, 1);
+            if (vi >= 0 && AF_SceneGetVoiceProgram(s, vi, &vp)) {
+                for (int i = 0; i < vp.count && i < AF_PROGRAM_MAX_TAPS; ++i) {
+                    double e = 0.0;
+                    for (int b = 0; b < kBands; ++b) {
+                        const double g = vp.taps[static_cast<std::size_t>(i)].gain6[b];
+                        e += g * g;
+                    }
+                    const int ty = vp.taps[static_cast<std::size_t>(i)].type;
+                    if (ty == 2) { ++nDif; eDif += e; } else if (ty == 0) eDir += e;
+                }
+            }
+        }
+        const float open = AF_SceneMeasureApertureOpenness(s, L, Sr);
+        float f6[kBands] = {}; AF_Vector3 cp = V(0,0,0);
+        AF_SceneMeasurePortal(s, pid, L, Sr, f6, &cp);
+        const float proj = 1.0f - std::cos(t2);          // 候補 A（戸口の面への射影）
+        const float wedge = std::sin(t2);                // 候補 B（自由端の楔）
+        std::printf("        %5.1f  %7.4f  %8.4f %8.4f %8.4f   %9.5f %8.4f %9.1f   %3d %8.1f %8.1f\n",
+                    angles[k], open, f6[0], f6[3], f6[5], proj, wedge, doorW * wedge * 1000.0f,
+                    nDif, 10.0 * std::log10(std::max(eDif, 1e-20)),
+                    10.0 * std::log10(std::max(eDir, 1e-20)));
+        AF_SceneDestroy(s);
+    }
+    std::printf("      ※開口率と口の帯域ゲインが、射影(1-cos) と 楔(sin) のどちらの形に近いかを見る。\n"
+                "        どちらとも似ず「平ら → 段」なら、二値の判定がどこかに残っている。\n");
+}
+
 // ==================================== 扉を開けた瞬間の音色の変化（開き始めが一番大きいか）
 // 2026-09-08 の発注者の理想:
 //   「開き始めが一番変化する。そのあとは音源に対しての開口で音が明るくなっていく」
@@ -12860,6 +12948,7 @@ int main() {
         else if (std::strcmp(only, "walk") == 0) testWalkContinuity();
         else if (std::strcmp(only, "closed") == 0) testClosedDoorTimbre();
         else if (std::strcmp(only, "open") == 0) testDoorOpenTimbre();
+        else if (std::strcmp(only, "aperture") == 0) diagnoseApertureVsAngle();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }
@@ -12912,6 +13001,7 @@ int main() {
     testWalkContinuity();
     testClosedDoorTimbre();
     testDoorOpenTimbre();
+    diagnoseApertureVsAngle();
     testAutoPortals();
     diagnosePortalLeftRightSymmetry();
     diagnosePortalWidthVsDoorCurve();
