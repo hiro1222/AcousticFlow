@@ -29,6 +29,12 @@ namespace AcousticFlow
         [Range(0f, 4f)] public float outputGain = 0.6f;
         [Tooltip("反射/回折タップの音量倍率（直接音は等倍）。IrConvolver の reflectionLevel と同じ。")]
         [Range(0f, 1f)] public float reflectionLevel = 0.35f;
+        [Tooltip("尾 IR を差し替えるときのクロスフェード(ms)。0 で即差し替え（A/B 用）。\n"
+                 + "⚠ 0 にすると、周波数領域遅延線に溜まった過去の入力が新しい IR で"
+                 + "畳み直されて +1.97dB のふくらみが 0.35 秒続きます（実測）。\n"
+                 + "混ぜ方はエンジンの中（遅延線は共有、IR スペクトルだけ 2 世代）。")]
+        [Range(0f, 200f)] public float tailCrossfadeMs = 50f;
+
         [Tooltip("後期尾の音量倍率。1.0 が物理どおり。")]
         [Range(0f, 2f)] public float tailLevel = 1.0f;
 
@@ -193,6 +199,10 @@ namespace AcousticFlow
             };
             _voice = Native.AF_VoiceCreate(ref cfg);
             if (_voice == IntPtr.Zero) { Debug.LogError("[VoiceConvolver] 音源を作れませんでした"); return; }
+
+            // 尾 IR のクロスフェード。古い DLL には無い口なので握りつぶす（既定の挙動のまま）。
+            try { Native.AF_VoiceSetTailCrossfadeMs(_voice, tailCrossfadeMs); }
+            catch (System.EntryPointNotFoundException) { }
 
             _hrtf = LoadHrtf();
             Native.AF_VoiceSetHrtf(_voice, _hrtf);

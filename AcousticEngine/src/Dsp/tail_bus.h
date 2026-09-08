@@ -2,7 +2,7 @@
  *
  * ★何のためにあるか
  *   これまで尾の畳み込みは音源 1 本につき 1 個だった（VoiceRenderer が
- *   NonUniformConvolver を 2 面ずつ持つ）。音源数に比例してオーディオスレッドの
+ *   NonUniformConvolver を持つ）。音源数に比例してオーディオスレッドの
  *   費用が増える。しかも**同じ部屋の音源は同じ IR を使う**ので、まるごと無駄。
  *
  * ★なぜ 1 本にまとめてよいか（近似ではない）
@@ -22,9 +22,13 @@
  *
  * ★スレッド
  *   add() と render() は**同じオーディオスレッドから順に**呼ばれる前提。
- *   setIr() は制御スレッドから。IR の差し替えは並走クロスフェードで行う
- *   （1 つの器で差し替えると、遅延線に溜まった過去の入力が新しい IR で畳み直されて
- *     実測 +1.97dB のふくらみが 0.35 秒続く。VoiceRenderer と同じ理由）。
+ *   setIr() は制御スレッドから。IR の差し替えは器の中でクロスフェードする
+ *   （遅延線は 1 本のまま、IR スペクトルだけ 2 世代混ぜる。partitioned_convolver.h）。
+ *   ★即差し替えにすると、遅延線に溜まった過去の入力が新しい IR で畳み直されて
+ *     実測 +1.97dB のふくらみが 0.35 秒続く。
+ *   ★2026-09-08 まではここで器を 2 つ持って並走させていた。休んでいる側の遅延線が
+ *     止まったままなので、役割を入れ替えた瞬間に**古い入力を持ったまま**鳴り出す。
+ *     世代を混ぜる形にして器を 1 つに戻した（メモリも半分）。
  */
 #pragma once
 
@@ -43,26 +47,21 @@ public:
     TailBus(int tailSamples, int firstBlock, int capBlock, int maxFrames, int sampleRate)
         : maxFrames_(maxFrames > 0 ? maxFrames : 1024),
           sampleRate_(sampleRate > 0 ? sampleRate : 48000),
-          convA_(tailSamples, 2, firstBlock, capBlock, maxFrames_),
-          convB_(tailSamples, 2, firstBlock, capBlock, maxFrames_) {
+          conv_(tailSamples, 2, firstBlock, capBlock, maxFrames_) {
         in_.assign(static_cast<size_t>(maxFrames_), 0.0f);
+        setCrossfadeMs(50.0f);   // 既定。ホストが AF_TailBusSetCrossfadeMs で上書きできる
     }
 
-    /// クロスフェードの長さ(ms)。0 で即差し替え。
+    /// クロスフェードの長さ(ms)。0 で即差し替え（＝過去の入力が新 IR で畳み直されてふくらむ）。
     void setCrossfadeMs(float ms) {
-        xfadeLen_ = std::max(0, static_cast<int>(ms * 0.001f * static_cast<float>(sampleRate_)));
+        conv_.setCrossfadeSamples(
+            std::max(0, static_cast<int>(ms * 0.001f * static_cast<float>(sampleRate_))));
     }
 
     /// 新しい尾 IR を入れる（部屋の代表音源だけが呼ぶ）。
-    ///   ★入れ替えるのはクロスフェードが有効なときだけ。無効時に入れ替えると、
-    ///     過去の入力が空の器へ切り替わって尾が無音になる（VoiceRenderer で実測 -227dB）。
+    ///   混ぜ方は器の中（遅延線は共有）。ここは渡すだけ。
     void setIr(const float* const* ir, const int* len) {
-        if (xfadeLen_ > 0 && cur().hasIr()) {
-            useB_ = !useB_;
-            xfade_ = 0;
-            xfading_ = true;
-        }
-        cur().setIr(ir, len);
+        conv_.setIr(ir, len);
         hasIr_ = true;
     }
 
@@ -104,24 +103,9 @@ public:
         std::fill(scratchL_.begin(), scratchL_.begin() + n, 0.0f);
         std::fill(scratchR_.begin(), scratchR_.begin() + n, 0.0f);
 
-        // 等振幅のクロスフェード（等パワーだと相関のある信号なので +3dB ふくらむ）。
-        float wNew = 1.0f, wOld = 0.0f;
-        if (xfading_ && xfadeLen_ > 0) {
-            const float t = static_cast<float>(xfade_) / static_cast<float>(xfadeLen_);
-            wNew = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
-            wOld = 1.0f - wNew;
-        } else {
-            xfading_ = false;
-        }
+        // 差し替えの混ぜは器の中（新旧の IR スペクトルを等振幅で。遅延線は共有）。
         float* dst[2] = { scratchL_.data(), scratchR_.data() };
-        if (cur().hasIr() && wNew > 0.0f)
-            cur().processAdd(in_.data(), 0, n, dst, 0, wNew);
-        if (xfading_ && old().hasIr() && wOld > 0.0f)
-            old().processAdd(in_.data(), 0, n, dst, 0, wOld);
-        if (xfading_) {
-            xfade_ += n;
-            if (xfade_ >= xfadeLen_) { xfading_ = false; xfade_ = 0; }
-        }
+        if (conv_.hasIr()) conv_.processAdd(in_.data(), 0, n, dst, 0, 1.0f);
         for (int i = 0; i < n; ++i) { outL[i] += scratchL_[static_cast<size_t>(i)];
                                      outR[i] += scratchR_[static_cast<size_t>(i)]; }
         // ★扉の定点用に、このブロックの尾のモノラル（左右の平均）を取っておく。
@@ -150,21 +134,13 @@ public:
         for (int i = n; i < frames; ++i) out[i] = 0.0f;
         return n;
     }
-    int partitions() const { return const_cast<TailBus*>(this)->cur().totalPartitions(); }
+    int partitions() const { return conv_.totalPartitions(); }
 
 private:
-    NonUniformConvolver& cur() { return useB_ ? convB_ : convA_; }
-    NonUniformConvolver& old() { return useB_ ? convA_ : convB_; }
-
     int maxFrames_;
     int sampleRate_;
-    NonUniformConvolver convA_;
-    NonUniformConvolver convB_;
-    bool useB_ = false;
+    NonUniformConvolver conv_;   // 器は 1 つ。差し替えの混ぜは中（遅延線は共有）
     bool hasIr_ = false;
-    bool xfading_ = false;
-    int xfade_ = 0;
-    int xfadeLen_ = 0;
     int pending_ = 0;               // このブロックで既に 0 埋め済みの長さ
     float rms_ = 0.0f;
     std::vector<float> in_;

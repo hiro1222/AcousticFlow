@@ -1101,12 +1101,13 @@ void diagnoseBandResponse() {
 //   つまり**今でも全音源が同一の尾 IR を畳んでいて**、違うのは音量(tailGain)だけ。
 //   畳み込みは線形なので Σ(gi·xi) * h == Σ(gi·(xi * h)) のはずだが、
 //   分割畳み込みはブロック処理・FFT なので、実物で確かめないと言い切れない。
-// 尾の IR を差し替えた瞬間に、出力がどれだけ飛ぶか。
-//   分割畳み込みは過去の入力ブロックを保持しているので、IR を差し替えると
-//   「もう出ている尾」が別の IR で畳み直される。クロスフェードしていないので段差が出る。
-//   部屋を移る・扉が動く場面で実際に起きる。まず何 dB かを測ってから手を選ぶ。
-void diagnoseTailSwapDiscontinuity() {
-    std::printf("\n[診断] 尾の IR を差し替えた瞬間の段差\n");
+// 尾の IR を差し替えた瞬間に、出力がどれだけ飛ぶか（不具合 #3）。
+//   分割畳み込みは過去の入力ブロックを周波数領域遅延線(FDL)に保持しているので、
+//   IR を即差し替えると「もう出ている尾」が別の IR で畳み直されて段差が出る。
+//   2026-09-08: FDL は共有のまま IR スペクトルだけ 2 世代混ぜる形にした。
+//   ここでクロスフェードの長さを振り、既定の長さで人工物が 1 dB 以下に収まることを見る。
+void testTailSwapContinuity() {
+    std::printf("\n[尾] IR を差し替えた瞬間の人工物（クロスフェードの長さを振る）\n");
     const int sr = 48000;
     const int block = 512;
     af::dsp::VoiceRenderer::Config cfg;
@@ -1169,7 +1170,7 @@ void diagnoseTailSwapDiscontinuity() {
     // 両者が一致する）。段ごとに取り込みのタイミングが違うので、尾の長さぶん追う。
     // 基準は「移った先の部屋を単独で暖機した定常値」。そこから外れたぶんが人工物。
     const int kAfter = 94;   // 1.0s ぶん ≒ 尾の全長
-    std::printf("        場面                比(尾/直接)   基準RMS  ピークdB  到達blk  収束blk  跳び/定常\n");
+    std::printf("        場面               混ぜms  比(尾/直接)   基準RMS  ピークdB  到達blk  収束blk  跳び/定常\n");
 
     // ★1 ブロック(512サンプル)の RMS 推定は誤差 ±0.27dB あり、94 ブロック中の最大を
     //   取ると偶然だけで 0.8dB に届く（対照群で実測した）。種を変えて平均し、
@@ -1178,6 +1179,14 @@ void diagnoseTailSwapDiscontinuity() {
     struct C { const char* name; bool change; };
     const C cases[] = { {"同じ内容で差し替え", false},
                         {"響く部屋→吸う部屋", true} };
+    // ★クロスフェードの長さを振る。0 = 即差し替え（2026-09-08 まではこれが既定）。
+    //   器は 1 つのままで、中で新旧の IR スペクトルを混ぜる（遅延線は共有＝新側が痩せない）。
+    const float kXfades[] = { 0.0f, 20.0f, 50.0f, 100.0f };
+    const float kDefaultXfadeMs = 50.0f;   // VoiceRenderer::Config の既定と合わせること
+    double worstAt[2] = { 0.0, 0.0 };
+    double capWorst = 0.0, capWorst2 = 0.0;
+    for (float xf : kXfades) {
+    cfg.tailCrossfadeMs = xf;
     for (const C& c : cases) {
         std::vector<double> msAfter(static_cast<std::size_t>(kAfter), 0.0);
         double stepRatio = 0.0;
@@ -1261,12 +1270,137 @@ void diagnoseTailSwapDiscontinuity() {
             settleBlk = k + 1;
         }
 
-        std::printf("        %s %7.2f→%-7.2f %8.5f %9.2f %8d %8d %10.2f\n",
-                    c.name, ratioBefore, ratioAfter, refRms, worstDb, peakBlk,
+        std::printf("        %-18s %5.0f %7.2f→%-7.2f %8.5f %9.2f %8d %8d %10.2f\n",
+                    c.name, xf, ratioBefore, ratioAfter, refRms, worstDb, peakBlk,
                     settleBlk, stepRatio);
+        if (xf == kDefaultXfadeMs && cfg.tailCapBlock == 8192) worstAt[c.change ? 1 : 0] = worstDb;
+        if (xf == kDefaultXfadeMs && cfg.tailCapBlock != 8192 && c.change) capWorst = worstDb;
     }
+    }
+    // ★切り分け: 部屋を移るときの膨らみはクロスフェードでは動かない（0→100ms で 1.97→1.86）。
+    //   非一様分割は段ごとにブロック境界が違うので、**IR の後ろの方を担う段ほど取り込みが遅い**
+    //   （最大ブロック 8192 = 170ms）。その間だけ「頭は新しい部屋・尾の後ろは古い部屋」になり、
+    //   どちらもエネルギー 1 に正規化されているので合計が増える。段差ではなく**取り込みの遅れ**。
+    //   最大ブロックを小さくすると減るはず ── ここで確かめる（費用は分割数が増えるぶん上がる）。
+    cfg.tailCapBlock = 1024;
+    cfg.tailCrossfadeMs = kDefaultXfadeMs;
+    for (const C& c : cases) {
+        if (!c.change) continue;
+        // 上と同じ手順を最大ブロック 1024 で 1 ケースだけ。
+        double ms2[94] = {};
+        for (int trial = 0; trial < kTrials; ++trial) {
+            af::dsp::VoiceRenderer voice(cfg);
+            voice.setOutputGain(1.0f); voice.setHrtfEnabled(false);
+            voice.setTailLevel(1.0f); voice.setTailEnvelope(1.0f, 1.0f);
+            af::dsp::EarlyReflectConv::Tap tap;
+            for (int b = 0; b < 6; ++b) tap.g[b] = 0.0f;
+            tap.delaySamples = 0; tap.gSpec = 1.0f; tap.gDiff = 0.0f;
+            voice.setTaps(&tap, 1);
+            for (int it = 0; it < 16; ++it)
+                voice.rebuildTail(echoA.data(), bins, 10.0f, 20.0f, 8.0f, 30.0f,
+                                  0.0f, 0.6f, 1.0f, 4.0f, nullptr, 0);
+            Rng rng; rng.s = 12345u + static_cast<unsigned int>(trial) * 7919u;
+            std::vector<float> in(static_cast<std::size_t>(block));
+            std::vector<float> ol(static_cast<std::size_t>(block)), orr(static_cast<std::size_t>(block));
+            for (int blk = 0; blk < 240; ++blk) {
+                for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = rng.next() * 0.3f;
+                voice.render(in.data(), block, ol.data(), orr.data(), nullptr);
+            }
+            voice.rebuildTail(echoB.data(), bins, 10.0f, 20.0f, 8.0f, 30.0f,
+                              0.0f, 1.0f, 1.0f, 4.0f, nullptr, 0);
+            for (int k = 0; k < 94; ++k) {
+                for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = rng.next() * 0.3f;
+                voice.render(in.data(), block, ol.data(), orr.data(), nullptr);
+                double s = 0.0;
+                for (int i = 0; i < block; ++i) {
+                    const double v = ol[static_cast<std::size_t>(i)];
+                    s += v * v;
+                }
+                ms2[k] += (s / block) / kTrials;
+            }
+        }
+        for (int k = 0; k < 94; ++k) {
+            const double r = std::sqrt(ms2[k]);
+            const double db = 20.0 * std::log10(std::max(r, 1e-12) / std::max(steadyB, 1e-12));
+            if (std::fabs(db) > std::fabs(capWorst2)) capWorst2 = db;
+        }
+        std::printf("        %-18s %5.0f （最大ブロック 1024）                  %9.2f\n",
+                    c.name, kDefaultXfadeMs, capWorst2);
+    }
+    (void)capWorst;
+    char nb[200];
+    std::snprintf(nb, sizeof(nb), "(混ぜ %.0f ms: 同じ内容 %+.2f dB / 部屋を移る %+.2f dB / 最大ブロック 1024 で %+.2f dB)",
+                  kDefaultXfadeMs, worstAt[0], worstAt[1], capWorst2);
+    check("[尾] 同じ内容で差し替えたときの人工物が 0.5 dB 以下", std::fabs(worstAt[0]) <= 0.5, nb);
+    // 部屋を移るときの膨らみは段の取り込み遅れ（上の切り分け）。段差ではないので、
+    // ここは「悪化していないこと」を見る。最大ブロックを縮めれば下がることも合わせて見る。
+    check("[尾] 部屋を移るときの膨らみが 2.5 dB 以下", std::fabs(worstAt[1]) <= 2.5, nb);
+    check("[尾] 膨らみの正体は段の取り込み遅れ（最大ブロックを縮めると減る）",
+          std::fabs(capWorst2) < std::fabs(worstAt[1]), nb);
     std::printf("      ※比(尾/直接) が動いていなければ、差し替えそのものが効いていない。\n"
                 "        跳び/定常 が 1.0 前後ならクリックは出ていない。\n");
+}
+
+// 【出荷側で効く検査】ホストは数フレームに 1 回 IR を組み直す（部屋が変わらなくても）。
+//   だから「差し替えのたびに何かが起きる」なら、それは**常時鳴り続ける人工物**になる。
+//   ★2026-09-08 まで、共有バスは器を 2 つ持って交互に使っていた（ホスト既定 60ms）。
+//     休んでいる側の周波数領域遅延線は止まったままなので、入れ替えた瞬間に
+//     **古い入力を持った状態**で鳴り出す。同じ IR を入れ直しただけで音が変わっていた。
+//   いまは遅延線を共有して IR スペクトルだけ混ぜるので、同じ IR なら
+//   混ぜても w·y + (1-w)·y = y ── 入れ直さない対照と**一致するはず**。そこを見る。
+void testTailRebuildLevelStability() {
+    std::printf("\n[尾] 同じ IR を入れ直し続けても尾が動かない（ホストは 8 フレームに 1 回組み直す）\n");
+    const int sr = 48000, block = 512, irLen = 24000;
+    Rng irRng;
+    std::vector<float> hL(static_cast<std::size_t>(irLen)), hR(static_cast<std::size_t>(irLen));
+    for (int i = 0; i < irLen; ++i) {
+        const float env = std::pow(0.9997f, static_cast<float>(i));
+        hL[static_cast<std::size_t>(i)] = irRng.next() * env * 0.01f;
+        hR[static_cast<std::size_t>(i)] = irRng.next() * env * 0.01f;
+    }
+    const float* ir[2] = { hL.data(), hR.data() };
+    const int len[2] = { irLen, irLen };
+
+    struct Case { const char* name; float xfadeMs; };
+    const Case cases[] = { {"即差し替え(0ms)", 0.0f}, {"混ぜ 60ms（ホスト既定）", 60.0f} };
+    for (const Case& cs : cases) {
+        af::dsp::TailBus a(irLen, 64, 8192, block, sr);   // 入れ直す側
+        af::dsp::TailBus b(irLen, 64, 8192, block, sr);   // 対照（入れ直さない）
+        a.setCrossfadeMs(cs.xfadeMs);
+        b.setCrossfadeMs(cs.xfadeMs);
+        a.setIr(ir, len);
+        b.setIr(ir, len);
+        Rng rng;
+        std::vector<float> in(static_cast<std::size_t>(block));
+        std::vector<float> aL(static_cast<std::size_t>(block)), aR(static_cast<std::size_t>(block));
+        std::vector<float> bL(static_cast<std::size_t>(block)), bR(static_cast<std::size_t>(block));
+        double worst = 0.0, refSq = 0.0; int nRef = 0;
+        for (int blk = 0; blk < 200; ++blk) {
+            if (blk >= 80 && blk % 8 == 0) a.setIr(ir, len);   // ホストと同じ周期で入れ直す
+            for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = rng.next() * 0.3f;
+            std::fill(aL.begin(), aL.end(), 0.0f); std::fill(aR.begin(), aR.end(), 0.0f);
+            std::fill(bL.begin(), bL.end(), 0.0f); std::fill(bR.begin(), bR.end(), 0.0f);
+            a.add(in.data(), block, 1.0f); a.render(block, aL.data(), aR.data());
+            b.add(in.data(), block, 1.0f); b.render(block, bL.data(), bR.data());
+            if (blk < 80) continue;
+            for (int i = 0; i < block; ++i) {
+                const double d = std::fabs(static_cast<double>(aL[static_cast<std::size_t>(i)])
+                                         - static_cast<double>(bL[static_cast<std::size_t>(i)]));
+                if (d > worst) worst = d;
+                refSq += static_cast<double>(bL[static_cast<std::size_t>(i)])
+                       * static_cast<double>(bL[static_cast<std::size_t>(i)]);
+                ++nRef;
+            }
+        }
+        const double refRms = std::sqrt(refSq / std::max(1, nRef));
+        const double db = 20.0 * std::log10(std::max(worst, 1e-12) / std::max(refRms, 1e-12));
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "(対照との最大差 %.3e ／ 尾の RMS %.5f ＝ %+.1f dB)",
+                      worst, refRms, db);
+        char label[128];
+        std::snprintf(label, sizeof(label), "[尾] 入れ直しが対照と一致（%s）", cs.name);
+        check(label, db < -60.0, buf);
+    }
 }
 
 void testSharedTailBusEquivalence() {
@@ -2439,7 +2573,8 @@ int main() {
     testHrtfProcessor();
     testEarlyReflectConv();
     diagnoseBandResponse();
-    diagnoseTailSwapDiscontinuity();
+    testTailSwapContinuity();
+    testTailRebuildLevelStability();
     testSharedTailBusEquivalence();
     diagnoseDspCost();
     testDiffractionHrtf();

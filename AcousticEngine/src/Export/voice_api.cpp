@@ -265,6 +265,11 @@ void AF_VoiceSetTailLevel(AF_VoiceHandle voice, float level) {
     if (v) v->setTailLevel(level);
 }
 
+void AF_VoiceSetTailCrossfadeMs(AF_VoiceHandle voice, float ms) {
+    af::dsp::VoiceRenderer* v = asVoice(voice);
+    if (v) v->setTailCrossfadeMs(ms);
+}
+
 void AF_VoiceSetScatterDiffusion(AF_VoiceHandle voice, float g) {
     af::dsp::VoiceRenderer* v = asVoice(voice);
     if (v) v->setScatterDiffusion(g);

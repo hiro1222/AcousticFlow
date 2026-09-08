@@ -122,6 +122,14 @@ public:
         return n;
     }
 
+    /// IR 差し替えのクロスフェード長（サンプル）。0 で即差し替え。制御スレッドから。
+    ///   各段の器が、共有の遅延線に対して新旧 2 世代の IR を混ぜる（器は増えない）。
+    ///   ★段ごとにブロック境界が違うので、取り込みの時刻も段ごとに違う。早い段（IR の頭）から
+    ///     順に切り替わる ── 「もう出ている尾の後ろの方は古い部屋のまま」という自然な順序になる。
+    void setCrossfadeSamples(int n) {
+        for (Stage& s : stages_) s.conv->setCrossfadeSamples(n);
+    }
+
     /// IR を差し替える（制御スレッド）。ir[c] は irLen[c] サンプル。段ごとに切り出して渡す。
     void setIr(const float* const* ir, const int* irLen) {
         if (!ir || !irLen) return;

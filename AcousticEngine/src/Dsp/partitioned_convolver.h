@@ -14,6 +14,14 @@
 // 入力はモノラル、出力は複数チャンネル（L/R）。入力 FFT は 1 回だけ行い、
 // チャンネルごとに異なる IR スペクトルと掛け合わせる（＝ステレオ化がほぼ半額）。
 //
+// IR の差し替え（クロスフェード）:
+//   周波数領域遅延線(FDL)が持っているのは**変換済みの入力**で、IR とは無関係。
+//   だから器を 2 つ並べる必要はない ── **FDL は 1 本のまま、IR スペクトルだけ 2 世代持って混ぜる**。
+//   器を 2 つにすると新しい器の FDL が空で、フェードイン中の新側が痩せる（実測 -3.26dB の凹み）。
+//   世代を混ぜる形なら新旧どちらも過去の入力を全部持ったまま鳴るので、凹みも膨らみも出ない。
+//   重みは**等振幅**（新旧は同じ入力を同じエネルギーの IR に通した相関のある信号なので、
+//   等パワーにすると混合中に +3dB 膨らむ）。
+//
 // スレッド規約:
 //   setIr()    … 制御スレッドから呼ぶ。ここでだけ確保する。
 //   processAdd() … オーディオスレッドから呼ぶ。**確保・ロック・例外なし**。
@@ -50,6 +58,7 @@ public:
         accIm_.assign(fl, 0.0f);
         inBuf_.assign(fl, 0.0f);
         outBuf_.assign(static_cast<std::size_t>(channels_) * static_cast<std::size_t>(b_), 0.0f);
+        outBufOld_.assign(static_cast<std::size_t>(channels_) * static_cast<std::size_t>(b_), 0.0f);
         // 出力キューは無音で始まる → 最初の 1 ブロックぶんは無音が出る（＝固有遅延 B）。
     }
 
@@ -57,6 +66,7 @@ public:
         delete pending_.exchange(nullptr, std::memory_order_acq_rel);
         delete retired_.exchange(nullptr, std::memory_order_acq_rel);
         delete live_;
+        delete fading_;
     }
 
     PartitionedConvolver(const PartitionedConvolver&) = delete;
@@ -73,6 +83,11 @@ public:
     bool hasIr() const {
         return live_ != nullptr || pending_.load(std::memory_order_acquire) != nullptr;
     }
+
+    /// IR 差し替えのクロスフェード長（サンプル）。0 で即差し替え（従来）。制御スレッドから。
+    ///   ★器は増やさない。FDL は共有のまま IR スペクトルだけ 2 世代持って混ぜる。
+    void setCrossfadeSamples(int n) { xfadeLen_.store(n < 0 ? 0 : n, std::memory_order_relaxed); }
+    int crossfadeSamples() const { return xfadeLen_.load(std::memory_order_relaxed); }
 
     // IR を差し替える（制御スレッドから）。ir[c] は tailSamples() 以下の長さ。
     //   実際の切替は次のブロック境界。ここでだけ確保し、オーディオスレッドは触らない。
@@ -126,10 +141,23 @@ public:
         if (!input || !outCh) return;
         for (int i = 0; i < n; ++i) {
             // 出力は「前のブロックで計算済みのぶん」を吐く。
-            for (int c = 0; c < channels_; ++c)
-                outCh[c][outOffset + i] +=
-                    outBuf_[static_cast<std::size_t>(c) * static_cast<std::size_t>(b_)
-                            + static_cast<std::size_t>(pos_)] * gain;
+            //   世代を混ぜている間は、同じ遅延線から作った新旧 2 本を等振幅で足す。
+            const std::size_t pos = static_cast<std::size_t>(pos_);
+            const std::size_t stride = static_cast<std::size_t>(b_);
+            if (xfading_) {
+                const float wNew = static_cast<float>(xfadePos_) / static_cast<float>(xfadeSpan_);
+                const float wOld = 1.0f - wNew;
+                for (int c = 0; c < channels_; ++c) {
+                    const std::size_t k = static_cast<std::size_t>(c) * stride + pos;
+                    outCh[c][outOffset + i] += (outBuf_[k] * wNew + outBufOld_[k] * wOld) * gain;
+                }
+                // 混ぜ終わり。古い世代は次の差し替えまで置いたまま（解放は制御スレッド）。
+                if (++xfadePos_ >= xfadeSpan_) xfading_ = false;
+            } else {
+                for (int c = 0; c < channels_; ++c)
+                    outCh[c][outOffset + i] +=
+                        outBuf_[static_cast<std::size_t>(c) * stride + pos] * gain;
+            }
 
             // 同じ歩幅で次ブロック用の入力を溜める。
             inBuf_[static_cast<std::size_t>(b_ + pos_)] = input[inOffset + i];
@@ -173,11 +201,27 @@ private:
     void runBlock() {
         // 保留中の IR があればここで差し替える（ブロック境界＝波形の切れ目が最小）。
         if (IrSpectra* p = pending_.exchange(nullptr, std::memory_order_acq_rel)) {
-            IrSpectra* old = live_;
+            const int xlen = xfadeLen_.load(std::memory_order_relaxed);
+            IrSpectra* drop = nullptr;
+            if (xlen > 0 && live_) {
+                // いま鳴っている世代を「古い側」に回して混ぜ始める。遅延線は共有なので、
+                // 古い側も新しい側も**過去の入力を全部持ったまま**鳴る（＝新側が痩せない）。
+                //   進行中のフェードは打ち切る（世代を 3 つは持たない）。
+                drop = fading_;
+                fading_ = live_;
+                fadingParts_ = activeParts_;
+                xfadeSpan_ = xlen;
+                xfadePos_ = 0;
+                xfading_ = true;
+            } else {
+                drop = live_;
+                fading_ = nullptr;
+                xfading_ = false;
+            }
             live_ = p;                                   // 先に差し替え、
             activeParts_ = std::min(std::max(p->activeParts, 1), numParts_);
-            // その後で退役させる。この順序なら old はもうどこからも読まれていない。
-            delete retired_.exchange(old, std::memory_order_acq_rel);
+            // その後で退役させる。この順序なら drop はもうどこからも読まれていない。
+            delete retired_.exchange(drop, std::memory_order_acq_rel);
         }
 
         const std::size_t fl = static_cast<std::size_t>(fftLen_);
@@ -194,20 +238,32 @@ private:
 
         if (!live_) {
             std::fill(outBuf_.begin(), outBuf_.end(), 0.0f);
+            xfading_ = false;
             fdlPos_ = (fdlPos_ + 1) % numParts_;
             return;
         }
 
+        convolveInto_(live_, activeParts_, outBuf_);
+        // 混ぜている間だけ、同じ遅延線に古い世代の IR も掛ける（費用はフェード中だけ倍）。
+        if (xfading_ && fading_) convolveInto_(fading_, fadingParts_, outBufOld_);
+        else                     xfading_ = false;
+
+        fdlPos_ = (fdlPos_ + 1) % numParts_;
+    }
+
+    // IR 1 世代ぶんを、共有の周波数領域遅延線(FDL)に掛けて dst へ書く。オーディオスレッド専用。
+    void convolveInto_(const IrSpectra* ir, int parts, std::vector<float>& dst) {
+        const std::size_t fl = static_cast<std::size_t>(fftLen_);
         for (int c = 0; c < channels_; ++c) {
             std::fill(accRe_.begin(), accRe_.end(), 0.0f);
             std::fill(accIm_.begin(), accIm_.end(), 0.0f);
-            for (int p = 0; p < activeParts_; ++p) {
+            for (int p = 0; p < parts; ++p) {
                 int slot = fdlPos_ - p;
                 if (slot < 0) slot += numParts_;
                 const float* xr = fdlRe_.data() + static_cast<std::size_t>(slot) * fl;
                 const float* xi = fdlIm_.data() + static_cast<std::size_t>(slot) * fl;
-                const float* hr = live_->re(c, p);
-                const float* hi = live_->im(c, p);
+                const float* hr = ir->re(c, p);
+                const float* hi = ir->im(c, p);
                 for (int k = 0; k < fftLen_; ++k) {
                     accRe_[static_cast<std::size_t>(k)] += xr[k] * hr[k] - xi[k] * hi[k];
                     accIm_[static_cast<std::size_t>(k)] += xr[k] * hi[k] + xi[k] * hr[k];
@@ -216,10 +272,8 @@ private:
             fft_.transform(accRe_.data(), accIm_.data(), true);
             // overlap-save: 有効なのは後半 B サンプル（前半は循環畳み込みの巻き込み）。
             std::copy(accRe_.begin() + b_, accRe_.end(),
-                      outBuf_.begin() + static_cast<std::size_t>(c) * static_cast<std::size_t>(b_));
+                      dst.begin() + static_cast<std::size_t>(c) * static_cast<std::size_t>(b_));
         }
-
-        fdlPos_ = (fdlPos_ + 1) % numParts_;
     }
 
     const int b_;
@@ -234,6 +288,7 @@ private:
     std::vector<float> wRe_, wIm_, accRe_, accIm_;
     std::vector<float> inBuf_;              // 直前ブロック＋今のブロック（2B）
     std::vector<float> outBuf_;             // [channel][B]
+    std::vector<float> outBufOld_;          // [channel][B] 混ぜている間の古い世代の出力
     // ブロック内の位置。入力の書き込みと出力の読み出しが同じ歩幅で進むので 1 本で足りる。
     int pos_ = 0;
 
@@ -241,6 +296,13 @@ private:
     std::atomic<IrSpectra*> pending_{nullptr};
     std::atomic<IrSpectra*> retired_{nullptr};
     int activeParts_ = 1;
+    // IR の世代の混ぜ（遅延線は共有）。fading_ は差し替え前の世代。
+    IrSpectra* fading_ = nullptr;           // オーディオスレッドだけが触る
+    int  fadingParts_ = 0;
+    std::atomic<int> xfadeLen_{0};          // 制御スレッドが決める長さ(サンプル)。0 で即差し替え
+    int  xfadeSpan_ = 0;                    // このフェードの長さ（開始時に固定）
+    int  xfadePos_ = 0;
+    bool xfading_ = false;
 };
 
 }  // namespace dsp

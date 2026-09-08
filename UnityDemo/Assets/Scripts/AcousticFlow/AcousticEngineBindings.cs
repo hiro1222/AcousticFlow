@@ -585,6 +585,8 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_TailBusDestroy(IntPtr bus);
         [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetTailCrossfadeMs(IntPtr voice, float ms);
+        [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_TailBusSetCrossfadeMs(IntPtr bus, float ms);
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_TailBusRender(IntPtr bus, int frames,

@@ -200,6 +200,10 @@ ACOUSTIC_API float AF_VoiceRebuildTail(AF_VoiceHandle voice,
 /* 音量まわり。tailLevel は 1.0 が物理どおり（好みの微調整）。 */
 ACOUSTIC_API void AF_VoiceSetOutputGain(AF_VoiceHandle voice, float gain);
 ACOUSTIC_API void AF_VoiceSetTailLevel(AF_VoiceHandle voice, float level);
+/* 尾 IR を差し替えるときのクロスフェード(ms)。既定 50。0 で即差し替え（A/B 用）。
+ *   ★0 にすると、周波数領域遅延線に溜まった過去の入力が新しい IR で畳み直されて
+ *     実測 +1.97dB のふくらみが 0.35 秒続く。差し替えは部屋を移るたびに起きる。 */
+ACOUSTIC_API void AF_VoiceSetTailCrossfadeMs(AF_VoiceHandle voice, float ms);
 ACOUSTIC_API void AF_VoiceSetScatterDiffusion(AF_VoiceHandle voice, float g);
 /* wet は開けた場所ほど小さく、srcLevel は壁裏で小さくなる（尾を絞る）。 */
 ACOUSTIC_API void AF_VoiceSetTailEnvelope(AF_VoiceHandle voice, float wet, float srcLevel);
