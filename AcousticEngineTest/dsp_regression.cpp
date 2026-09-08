@@ -2648,6 +2648,114 @@ void diagnoseTailCatchUp() {
                 "        尾の左右（方向）はさらに別の平滑を通る: directionalTailSmoothSec = 0.35 s。\n");
 }
 
+// 扉が「振れて」動くときの遅れ。上の 399 ms は 1 フレームで瞬間に開いた場合の落ち着き時間で、
+// 実際の扉は 0.5〜1 秒かけて振れる。そのとき効くのは落ち着き時間ではなく**追従の遅れ**
+//   ＝ 入力が動いているあいだ、出力が何 ms 後ろを走るか。
+// 一次遅れなら、傾斜入力に対する遅れは時定数そのものになる（τ = 刻み / −ln(1−α)）。
+// 実際にそうなるかを測る。時間平均なし（α=1）を「理想」とし、同じ高さに達する時刻の差を取る。
+void diagnoseTailTrackingLag() {
+    std::printf("\n[探り] 扉が振れて動くときの、尾の追従の遅れ\n");
+
+    const int sr = 48000, len = sr / 2, channels = 2;
+    const int bins = 100;
+    const float binMs = 10.0f;
+    const float startMs = 22.8f;
+
+    auto makeEcho = [&](float decay, std::vector<float>& echo) {
+        echo.assign(static_cast<std::size_t>(bins) * 6, 0.0f);
+        for (int k = 0; k < bins; ++k) {
+            const float e = std::pow(decay, static_cast<float>(k));
+            for (int b = 0; b < 6; ++b) echo[static_cast<std::size_t>(k) * 6 + b] = e;
+        }
+    };
+    auto lateDb = [&](const af::dsp::ReverbTailIr& t) {
+        double late = 0.0, all = 0.0;
+        const int a = static_cast<int>(0.300 * sr), b2 = static_cast<int>(0.500 * sr);
+        for (int c = 0; c < channels; ++c)
+            for (int i = 0; i < len; ++i) {
+                const double v = t.ir(c)[i]; const double e = v * v;
+                all += e;
+                if (i >= a && i < b2) late += e;
+            }
+        return 10.0 * std::log10(std::max(late / std::max(all, 1e-20), 1e-10));
+    };
+    // 曲線が height（0..1）を最初に超える時刻。線形補間で刻みより細かく出す。
+    auto crossMs = [](const float* v, int n, float lo, float hi, float height, float stepMs) {
+        const float want = lo + (hi - lo) * height;
+        for (int i = 1; i < n; ++i)
+            if ((v[i] - want) * (hi - lo) >= 0.0f) {
+                const float d = v[i] - v[i - 1];
+                const float f = (std::fabs(d) > 1e-6f) ? (want - v[i - 1]) / d : 0.0f;
+                return (i - 1 + f) * stepMs;
+            }
+        return -1.0f;
+    };
+
+    std::printf("        扉の振れ  刻み  envAlpha   25%%到達   50%%到達   75%%到達   追従の遅れ(50%%)\n");
+    const float swings[] = { 300.0f, 600.0f, 1000.0f };
+    const float stepMs = 133.0f;                 // tailRebuildEveryFrames = 8 @ 60fps
+    for (int sw = 0; sw < 3; ++sw) {
+        float ref50 = 0.0f;
+        for (int a = 1; a >= 0; --a) {           // 先に α=1（理想）を採ってから 0.6 と比べる
+            const float alpha = (a == 1) ? 1.0f : 0.6f;
+            af::dsp::ReverbTailIr tail(sr, len, channels, bins);
+            std::vector<float> e0; makeEcho(0.85f, e0);
+            for (int i = 0; i < 40; ++i)
+                tail.build(e0.data(), bins, binMs, startMs, 20.0f, 30.0f, 0.0f, alpha);
+            const float lo = static_cast<float>(lateDb(tail));
+
+            // 扉が swings[sw] ミリ秒かけて振れる。刻みごとに現在の角度のエコグラムを渡す。
+            float curve[120]; int n = 0;
+            const int N = static_cast<int>(swings[sw] / stepMs) + 24;
+            for (int i = 0; i < N && n < 120; ++i) {
+                const float t = (i + 1) * stepMs;
+                const float u = std::min(1.0f, t / swings[sw]);
+                std::vector<float> ei; makeEcho(0.85f + 0.10f * u, ei);
+                tail.build(ei.data(), bins, binMs, startMs, 20.0f, 30.0f, 0.0f, alpha);
+                curve[n++] = static_cast<float>(lateDb(tail));
+            }
+            const float hi = curve[n - 1];
+            const float t25 = crossMs(curve, n, lo, hi, 0.25f, stepMs);
+            const float t50 = crossMs(curve, n, lo, hi, 0.50f, stepMs);
+            const float t75 = crossMs(curve, n, lo, hi, 0.75f, stepMs);
+            if (a == 1) ref50 = t50;
+            std::printf("        %6.0f ms %5.0f %8.2f %9.0f %9.0f %9.0f %13.0f ms\n",
+                        swings[sw], stepMs, alpha, t25, t50, t75,
+                        (a == 1) ? 0.0f : (t50 - ref50));
+        }
+    }
+    // 尾の**方向**（左右バランス）はホスト側の一次遅れを通る。
+    //   k = 1 - exp(-dt*stride / directionalTailSmoothSec) の Lerp（AcousticFlowSceneDemo.cs）。
+    //   同じ形の入力を通して 50%% 到達の差を採る。C# と同じ式をここで回す。
+    std::printf("\n        参考: 尾の**方向**（directionalTailSmoothSec の一次遅れ）\n");
+    std::printf("        扉の振れ   時定数    50%%到達   追従の遅れ(50%%)\n");
+    for (int sw = 0; sw < 3; ++sw) {
+        const float taus[] = { 0.35f, 0.15f };
+        for (int ti = 0; ti < 2; ++ti) {
+            const float tau = taus[ti];
+            const float dt = 1.0f / 60.0f;
+            float y = 0.0f; float t50 = -1.0f, ideal50 = -1.0f;
+            const int N = static_cast<int>((swings[sw] + 2000.0f) / 1000.0f * 60.0f);
+            for (int i = 0; i < N; ++i) {
+                const float t = (i + 1) * dt * 1000.0f;
+                const float target = std::min(1.0f, t / swings[sw]);   // 扉の振れ（傾斜）
+                const float k = 1.0f - std::exp(-dt / tau);
+                y += (target - y) * k;
+                if (ideal50 < 0.0f && target >= 0.5f) ideal50 = t;
+                if (t50 < 0.0f && y >= 0.5f) t50 = t;
+            }
+            std::printf("        %6.0f ms %8.2f s %9.0f %13.0f ms%s\n",
+                        swings[sw], tau, t50, t50 - ideal50,
+                        (ti == 0) ? "   <- いまの既定" : "");
+        }
+    }
+    std::printf("      ※「追従の遅れ」は時間平均なし（α=1）との 50%% 到達時刻の差。\n"
+                "        扉が動いているあいだ、響きが何 ms 後ろを走るか。\n"
+                "        1 フレームで瞬間に開いた場合の落ち着き時間（99%% で 399 ms）とは別の量。\n"
+                "        尾の**方向**は directionalTailSmoothSec = 0.35 s の一次遅れなので、\n"
+                "        傾斜入力への遅れはそのまま 350 ms。こちらのほうが大きい。\n");
+}
+
 int main() {
     std::printf("=== DSP 数値回帰テスト（段4: C++ 移行）===\n");
     testFft();
@@ -2669,6 +2777,7 @@ int main() {
     testVoiceTailBus();
     testVoiceRenderer();
     diagnoseTailCatchUp();
+    diagnoseTailTrackingLag();
 
     std::printf("\n----\n");
     if (g_failures == 0) {
