@@ -354,6 +354,11 @@ namespace AcousticFlow
                  + "／1 = 帯域ごとのフレネル半径の環に標本点（09-02。4 点の環が階段になる）／0 = 旧（音源まわり 8 点）。"
                  + "同じビルドで聞き比べるための切り替え（Play 中に動かしてよい）。採用が固まったら 0・1 側ごと消す。")]
         [Range(0, 2)] public int directPenumbraMode = 2;
+        [Tooltip("聞き比べのラウドネス合わせ。像源レイ（earlyReflectModel=0）の反射タップに掛ける減衰(dB)。\n"
+                 + "U で模型を切り替えたときに音量が変わると「大きい方が良い」に引っ張られるので揃える。\n"
+                 + "既定 3.8 dB は回帰 [歩行] の実測（戸口をくぐる経路で 面の線 -26.2 / レイ追跡 -22.3 dB）。\n"
+                 + "★これは演出の補正であって物理ではない。0 にすれば素の差が出る。")]
+        [Range(0f, 12f)] public float earlyModelLevelMatchDb = 3.8f;
         [Tooltip("面 1 枚あたりの下位タップ数（面の線の分割数）。3〜5。")]
         [Range(1, 8)] public int earlyFaceSubTaps = 5;
         [Tooltip("ON: 起動時に静的な面のリストとセルごとの見通しを焼く（3 層構造の焼く層）。実行時は 焼いた見通し × 動いた物の遮蔽。OFF なら毎回生で解く（A/B 用。答えは同じ）。")]
@@ -1928,13 +1933,20 @@ namespace AcousticFlow
             if (!_scene.GetVoiceProgram(idx, out var pr)) return false;
             int nb = AcousticEngine.NumBands;
             int n = Mathf.Min(pr.count, SourceTaps.MaxTaps);
+            // 聞き比べのラウドネス合わせ。旧模型（像源レイ）は反射のエネルギーが多く出るので、
+            //   U で切り替えたときに音量が動く（実測 +3.8 dB）。揃えないと「大きい方が良い」に
+            //   引っ張られて比較にならない。★演出の補正なのでホスト側に置く（エンジンは触らない）。
+            float refMatch = (earlyReflectModel == 0 && earlyModelLevelMatchDb > 0.01f)
+                           ? Mathf.Pow(10f, -earlyModelLevelMatchDb / 20f) : 1f;
             for (int i = 0; i < n; i++)
             {
                 var t = pr.taps[i];
                 int o = i * nb;
-                ts.BandGain[o + 0] = t.g0; ts.BandGain[o + 1] = t.g1; ts.BandGain[o + 2] = t.g2;
-                ts.BandGain[o + 3] = t.g3; ts.BandGain[o + 4] = t.g4; ts.BandGain[o + 5] = t.g5;
-                ts.Gain[i] = (t.g0 + t.g1 + t.g2 + t.g3 + t.g4 + t.g5) / 6f;
+                // 反射タップ（type 1）だけに掛ける。直接音と回折は模型に依らないので触らない。
+                float m = (t.type == 1) ? refMatch : 1f;
+                ts.BandGain[o + 0] = t.g0 * m; ts.BandGain[o + 1] = t.g1 * m; ts.BandGain[o + 2] = t.g2 * m;
+                ts.BandGain[o + 3] = t.g3 * m; ts.BandGain[o + 4] = t.g4 * m; ts.BandGain[o + 5] = t.g5 * m;
+                ts.Gain[i] = (t.g0 + t.g1 + t.g2 + t.g3 + t.g4 + t.g5) / 6f * m;
                 ts.DelayMs[i] = t.delayMs;
                 ts.PanL[i] = t.panL; ts.PanR[i] = t.panR;
                 ts.Type[i] = (t.type == 0) ? 'D' : (t.type == 1) ? 'R' : 'F';
@@ -2753,7 +2765,7 @@ namespace AcousticFlow
             GUILayout.Label($"直接の半影: {(directPenumbraMode == 2 ? "窓の走査線" : directPenumbraMode == 1 ? "環の標本点" : "旧(8 点)")} (Inspector directPenumbraMode)   "
                             + $"タップの組み立て: {(tapsFromEngine && _scene != null && _scene.TapBuilderAvailable ? "DLL" : "ホスト")} (tapsFromEngine)", style);
             GUILayout.Label($"早期反射(IR の R タップ): {(enableEarlyReflections ? "ON" : "OFF")} (F)   "
-                            + $"模型: {(earlyReflectModel == 1 ? "面の線音源" : "像源レイ（既存）")} (U で切替)   "
+                            + $"模型: {(earlyReflectModel == 1 ? "面の線音源" : $"像源レイ（既存・音量合わせ -{earlyModelLevelMatchDb:F1} dB）")} (U で切替)   "
                             + $"回折二次音源(IR の F タップ): {(enableDiffractionSources ? "ON" : "OFF")} (V)", style);
             {
                 var tb = _portalHost != null ? _portalHost : FindFirstObjectByType<TailBusRenderer>();

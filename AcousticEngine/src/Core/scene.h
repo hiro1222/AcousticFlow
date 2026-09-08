@@ -4415,7 +4415,12 @@ public:
             }
             const Vec3 c0 = listener + dir * d1;
             constexpr float kWin = 3.0f;
-            struct SPoly { float u[8], v[8]; int n; int mat; };
+            //   ★mat だけでなく inst（実体の番号）を持つ。窓の面をまたぐ実体はリスナー側と音源側の
+            //     両方から落ちるので多角形が 2 枚できる。透過を多角形ごとに掛けると**同じ実体を
+            //     2 回数える**（実測: 閉じた扉の傾きが材質の 12 dB に対して 24 dB＝ちょうど 2 倍、
+            //     量も 22 dB 沈んだ）。材質で見分けると同じ材質の別の実体（二重壁）まで 1 回に
+            //     潰れてしまうので、**実体で**見分ける。computeTransmission の「実体 1 つに 1 回」と揃える。
+            struct SPoly { float u[8], v[8]; int n; int mat; int inst; };
             static thread_local std::vector<SPoly> spolys;
             spolys.clear();
             auto hullInto = [&](const float* px, const float* py, int m, SPoly& out) {
@@ -4442,7 +4447,7 @@ public:
             };
             // 凸な点集合（箱 8 点／三角形 3 点、辺の表）を、視点の面と窓の面でクリップして落とす。
             auto shadowConvex = [&](const Vec3* pts, int np, const int (*edges)[2], int ne,
-                                    const Vec3& eye, const Vec3& fwd, int mat) {
+                                    const Vec3& eye, const Vec3& fwd, int mat, int instIdx) {
                 const float kEps = 1e-3f;
                 float sn[8], sf[8];
                 bool allBeyond = true, allBehind = true;
@@ -4470,12 +4475,14 @@ public:
                     }
                 }
                 if (m < 3) return;
-                SPoly pg; hullInto(px, py, m, pg); pg.mat = mat;
+                SPoly pg; hullInto(px, py, m, pg); pg.mat = mat; pg.inst = instIdx;
                 if (pg.n >= 3) spolys.push_back(pg);
             };
             static const int kBoxEdge[12][2] = {{0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7}};
             static const int kTriEdge[3][2] = {{0,1},{1,2},{2,0}};
+            int instIdx = -1;
             for (const Instance& inst : instances_) {
+                ++instIdx;
                 if (!inst.active) continue;
                 const Obb& ob = inst.obb;
                 const float rad = length(ob.halfExtents);
@@ -4493,8 +4500,8 @@ public:
                     for (int ti = 0; ti < nt && spolys.size() < 2048; ++ti) {
                         const Triangle& lt = g.bvh.triangle(ti);
                         const Vec3 tv[3] = {meshLocalToWorldPoint(lt.v0, ob), meshLocalToWorldPoint(lt.v1, ob), meshLocalToWorldPoint(lt.v2, ob)};
-                        if (fromL) shadowConvex(tv, 3, kTriEdge, 3, listener, dir, inst.materialId);
-                        if (fromS) shadowConvex(tv, 3, kTriEdge, 3, source, dir * -1.0f, inst.materialId);
+                        if (fromL) shadowConvex(tv, 3, kTriEdge, 3, listener, dir, inst.materialId, instIdx);
+                        if (fromS) shadowConvex(tv, 3, kTriEdge, 3, source, dir * -1.0f, inst.materialId, instIdx);
                     }
                 } else {
                     Vec3 corner[8];
@@ -4502,8 +4509,8 @@ public:
                         const float sx = (i & 1) ? 1.0f : -1.0f, sy = (i & 2) ? 1.0f : -1.0f, sz = (i & 4) ? 1.0f : -1.0f;
                         corner[i] = ob.center + ob.axisX * (ob.halfExtents.x * sx) + ob.axisY * (ob.halfExtents.y * sy) + ob.axisZ * (ob.halfExtents.z * sz);
                     }
-                    if (fromL) shadowConvex(corner, 8, kBoxEdge, 12, listener, dir, inst.materialId);
-                    if (fromS) shadowConvex(corner, 8, kBoxEdge, 12, source, dir * -1.0f, inst.materialId);
+                    if (fromL) shadowConvex(corner, 8, kBoxEdge, 12, listener, dir, inst.materialId, instIdx);
+                    if (fromS) shadowConvex(corner, 8, kBoxEdge, 12, source, dir * -1.0f, inst.materialId, instIdx);
                 }
             }
             if (spolys.empty()) {
@@ -4514,17 +4521,20 @@ public:
                 constexpr float kV0 = 0.012f;
                 const float qr = std::pow(kWin / kV0, 1.0f / static_cast<float>(kSide - 1));
                 double numer[kNumBands] = {0, 0, 0, 0, 0, 0}, denom[kNumBands] = {0, 0, 0, 0, 0, 0};
-                struct Ev { float x; int mat; int dir; };
+                struct Ev { float x; int pi; int dir; };   // pi = spolys の番号
                 static thread_local std::vector<Ev> evs;
-                static thread_local std::vector<int> active;
+                static thread_local std::vector<int> active;   // spolys の番号
+                static thread_local std::vector<int> counted;  // すでに掛けた実体の番号
                 auto rowIntegrate = [&](float y, float hgt) {
                     evs.clear();
-                    for (const SPoly& pg : spolys) {
+                    for (std::size_t pi = 0; pi < spolys.size(); ++pi) {
+                        const SPoly& pg = spolys[pi];
                         float lo, hi;
                         if (!fresnel::polygonSpanAtY(pg.u, pg.v, pg.n, y, lo, hi)) continue;
                         lo = std::max(lo, -kWin); hi = std::min(hi, kWin);
                         if (hi <= lo) continue;
-                        evs.push_back(Ev{lo, pg.mat, +1}); evs.push_back(Ev{hi, pg.mat, -1});
+                        evs.push_back(Ev{lo, static_cast<int>(pi), +1});
+                        evs.push_back(Ev{hi, static_cast<int>(pi), -1});
                     }
                     std::sort(evs.begin(), evs.end(), [](const Ev& a, const Ev& b2) { return a.x < b2.x; });
                     // ★核はガウス exp(−(u²+y²)/r1²)（09-02 の環と同じ）。開口積分のローレンツ核 1/(1+ρ²/r1²) を
@@ -4551,14 +4561,23 @@ public:
                         if (i >= evs.size()) break;
                         const float x0 = evs[i].x;
                         while (i < evs.size() && evs[i].x == x0) {
-                            if (evs[i].dir > 0) active.push_back(evs[i].mat);
+                            if (evs[i].dir > 0) active.push_back(evs[i].pi);
                             else for (std::size_t k = 0; k < active.size(); ++k)
-                                if (active[k] == evs[i].mat) { active[k] = active.back(); active.pop_back(); break; }
+                                if (active[k] == evs[i].pi) { active[k] = active.back(); active.pop_back(); break; }
                             ++i;
                         }
                         for (int b = 0; b < kNumBands; ++b) g[b] = 1.0f;
-                        for (int mi : active) {
-                            const AcousticMaterial& mm = materialOf(mi);
+                        // ★同じ実体は 1 回だけ。窓の面をまたぐ実体は両側から落ちて多角形が 2 枚になるし、
+                        //   メッシュは三角形ごとに落ちるので表と裏で 2 枚になる。多角形ごとに掛けると
+                        //   τ が二乗される（閉じた扉の傾きが材質の 2 倍になっていた）。
+                        counted.clear();
+                        for (int pi : active) {
+                            const int ii = spolys[static_cast<std::size_t>(pi)].inst;
+                            bool dup = false;
+                            for (int c : counted) if (c == ii) { dup = true; break; }
+                            if (dup) continue;
+                            counted.push_back(ii);
+                            const AcousticMaterial& mm = materialOf(spolys[static_cast<std::size_t>(pi)].mat);
                             for (int b = 0; b < kNumBands; ++b) g[b] *= mm.transmission[b];
                         }
                     }

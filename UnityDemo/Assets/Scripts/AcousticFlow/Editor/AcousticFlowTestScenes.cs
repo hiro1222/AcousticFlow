@@ -271,11 +271,11 @@ namespace AcousticFlow.EditorTools
             //   聞き分けたい差は収録卓の 7/8/9（x = -1 / 0 / +1）でテイクを分けて出す。
             //   x = 0 は直線が戸口のど真ん中を通るので、扉が開くと直接音が抜けてくる。
             //
-            //   鳴らすのは画面収録の WAV。既定の kTestClipPath は市販楽曲なので、
-            //   収録した動画をそのまま人に見せられない（§7.6）。
+            //   ★2026-09-08: 既定（kTestClipPath）を鳴らすようにした。以前は画面収録の WAV を
+            //     名指ししていたが、それは「既定が市販楽曲だから収録に使えない」ための回避だった。
+            //     既定を差し替えたので回避は要らない。収録に使うかは権利の確認しだい。
             AddDemo(listener, new Vector3(0f, 1.6f, 3f),
-                    AcousticMaterialPreset.Concrete,
-                    names: null, clipPath: kScreenRecClipPath);
+                    AcousticMaterialPreset.Concrete);
 
             // ★収録卓。手で 5/6 を押すとテイクごとに開く速さが変わるので、
             //   開 3s → 停 2s → 閉 3s を固定で流せるようにしておく。
@@ -875,10 +875,13 @@ namespace AcousticFlow.EditorTools
         //   音色の変化は分かりにくい（DEV_LOG E-3「テスト信号を目的で使い分ける」）。
         //   定位や反射の粒を見たいときは Footstep_Asphalt.mp3 に差し替える。
         //
-        //   ※この音源は市販楽曲。**ローカルでの検証用**であって、配布物には含められない。
-        //     ビルドを配る／リポジトリを公開する段になったら差し替えが要る。
-        private const string kTestClipPath =
-            "Assets/Audio/ロクデナシ「ブリザード」 Rokudenashi - Blizzard【Official Music Video】 - Rokudenashi (128k).wav";
+        //   ★2026-09-08: 既定を英語名の videoplayback.wav にした（発注者の指示）。
+        //     ・それまでの既定（ロクデナシ「ブリザード」）は **Assets/Audio に既に無く、参照が切れていた**。
+        //       読めないと下の Tok… へ落ちるので、既定が何なのか実際には決まっていなかった。
+        //     ・日本語（全角）のファイル名はパスの取り回しで事故りやすい。英語名に寄せる。
+        //   ※音源は Assets/Audio/*.wav ごと .gitignore で追跡外。配布物に入れる前に
+        //     権利を確認すること（差し替え可能な効果音にするなら .gitignore に例外を書く）。
+        private const string kTestClipPath = "Assets/Audio/videoplayback.wav";
         private const string kTransientClipPath = "Assets/Audio/Footstep_Asphalt.mp3";
 
         // 画面収録の音声。**収録用シーンはこれを鳴らす。**

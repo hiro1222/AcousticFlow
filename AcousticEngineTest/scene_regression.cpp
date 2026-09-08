@@ -8072,6 +8072,135 @@ void testRoomSeedAndShare() {
 //     ⑥ 段の写しと同じく、非同期でも同じ答え（[非同期] で比較）
 //     ⑦ 部屋が無ければ尾の比は外形箱で当たる（ホストの予備と同じ）
 // ─────────────────────────────────────────────────────────────────────
+// ============================================ 閉じた扉ごしの音は「こもる」か（前提そのもの）
+// 2026-09-08、Unity の試聴で「ドアを閉めたときに LPF があまり掛かっていないように聞こえる」。
+// 作品の**前提**（閉じた扉ごしの音はこもって届く）が成立しているかどうかなので最優先で測る。
+//
+// ★測るのは**いま鳴っている直接タップ**（DLL のタップ組み立てが出す taps[0]）。
+//   既存の検査は AF_SceneComputeSoftOcclusion（円盤 32 点）を見ていたが、
+//   2026-09-05 の移しでホストはもうそれを使っていない。**検査が音の経路を見ていなかった。**
+//
+// 傾き ＝ 20log10(125Hz / 4kHz)。材質の透過損失が 15 → 27 dB なら、こもりは 12 dB のはず。
+void testClosedDoorTimbre() {
+    std::printf("\n[閉扉] 閉じた扉ごしの音はこもるか（直接タップの傾き）\n");
+    const float wallT[6] = {0.000398f, 0.0001585f, 0.0000398f,
+                            0.00001f, 0.00000251f, 0.000001f};    // コンクリ TL34..60
+    const float doorT[6] = {0.0316f, 0.0158f, 0.00794f, 0.00398f, 0.00251f, 0.002f};  // 木の扉 TL15..27
+    const float hh = 3.0f, th = 0.2f, hf = 7.0f, gL = -0.5f, gR = 0.5f;
+    const AF_Vector3 L = V(0, 1.6f, -3), Sr = V(0, 1.6f, 3);
+
+    auto tiltDb = [](const float* g) {
+        return 20.0f * std::log10(std::max(g[0], 1e-9f) / std::max(g[5], 1e-9f));
+    };
+    // 材質そのものの傾き（振幅）。ここへ寄っていれば「扉としてこもっている」。
+    float matAmp[kBands];
+    for (int b = 0; b < kBands; ++b) matAmp[b] = std::sqrt(doorT[b]);
+    std::printf("        材質（木の扉）の振幅   125 %.5f  4k %.5f  傾き %5.1f dB ← ここが目標\n",
+                matAmp[0], matAmp[5], tiltDb(matAmp));
+
+    float tapTilt[3] = {0, 0, 0};
+    float tap0Lo = 0.0f, tap2Lo = 0.0f;
+    for (int mode = 0; mode < 3; ++mode) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int matWall = AF_SceneAddMaterial(s, wallT, nullptr, nullptr, 6);
+        const int matDoor = AF_SceneAddMaterial(s, doorT, nullptr, nullptr, 6);
+        // ★閉じた箱にする。床・天井が無いと、低域のフレネル帯（125 Hz で半径 2 m）が
+        //   壁の上を回り込んで窓の外の「空」を拾い、傾きが嘘になる（一度踏んだ）。
+        AF_SceneAddInstanceBox(s, V(0, -th, 0),    V(hf, th, hf), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, hh+th, 0),  V(hf, th, hf), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(-hf, hh*0.5f, 0), V(th, hh*0.5f, hf), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V( hf, hh*0.5f, 0), V(th, hh*0.5f, hf), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, hh*0.5f, -hf), V(hf, hh*0.5f, th), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, hh*0.5f,  hf), V(hf, hh*0.5f, th), V(1,0,0), V(0,1,0), matWall);
+        // 仕切り（中央に幅 1 m の戸口）
+        AF_SceneAddInstanceBox(s, V((-hf + (gL + hf) * 0.5f), hh*0.5f, 0),
+                               V((gL + hf) * 0.5f, hh*0.5f, th*0.5f), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V((gR + (hf - gR) * 0.5f), hh*0.5f, 0),
+                               V((hf - gR) * 0.5f, hh*0.5f, th*0.5f), V(1,0,0), V(0,1,0), matWall);
+        AF_SceneAddInstanceBox(s, V(0, hh * 0.5f, 0), V(0.5f, hh * 0.5f, 0.03f),
+                               V(1,0,0), V(0,1,0), matDoor);       // 閉じた扉
+        AF_SceneSetDirectPenumbra(s, mode);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetListenerOrientation(s, V(0,0,1), V(0,1,0));
+        AF_SceneSetSource(s, 1, Sr);
+        AF_UpdateConfig cfg{};
+        cfg.role1EveryN = 1; cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+        cfg.directWeight = 1.0f; cfg.useReflections = 1; cfg.speedOfSound = 343.0f;
+        cfg.distanceRef = 4.0f; cfg.enableReverb = 0;
+        AF_SceneSetUpdateConfig(s, &cfg);
+        for (int k = 0; k < 6; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+
+        AF_VoiceProgram vp{};
+        const int idx = AF_SceneSourceIndex(s, 1);
+        float line[kBands] = {}, disc[kBands] = {}, occF = 0.0f;
+        AF_SceneComputeTransmissionBands(s, L, Sr, line, kBands);
+        AF_SceneComputeSoftOcclusion(s, L, Sr, disc, kBands, &occF);
+        if (idx >= 0 && AF_SceneGetVoiceProgram(s, idx, &vp) && vp.count > 0) {
+            const float* g = vp.taps[0].gain6;
+            tapTilt[mode] = tiltDb(g);
+            if (mode == 0) tap0Lo = g[0];
+            if (mode == 2) tap2Lo = g[0];
+            std::printf("        半影 %d ─ 直接タップ 125 %.5f  4k %.5f  傾き %5.1f dB"
+                        " ／ 線の透過 %5.1f dB ／ 円盤(旧) %5.1f dB\n",
+                        mode, g[0], g[5], tapTilt[mode], tiltDb(line), tiltDb(disc));
+        }
+        AF_SceneDestroy(s);
+    }
+    // ★切り分け: 仕切り**全体**を扉の材質にする。フレネル帯が全部「扉」になるので、
+    //   走査線が帯の覆い方で薄めているなら、ここでは材質どおりに戻るはず。
+    //   戻るなら「小さい扉が低域のフレネル帯を覆い切れていない」＝物理として正しい薄まり。
+    //   戻らないなら数え方の誤り。
+    float wideTap[kBands] = {};
+    {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int matDoor = AF_SceneAddMaterial(s, doorT, nullptr, nullptr, 6);
+        AF_SceneAddInstanceBox(s, V(0, -th, 0),    V(hf, th, hf), V(1,0,0), V(0,1,0), matDoor);
+        AF_SceneAddInstanceBox(s, V(0, hh+th, 0),  V(hf, th, hf), V(1,0,0), V(0,1,0), matDoor);
+        AF_SceneAddInstanceBox(s, V(-hf, hh*0.5f, 0), V(th, hh*0.5f, hf), V(1,0,0), V(0,1,0), matDoor);
+        AF_SceneAddInstanceBox(s, V( hf, hh*0.5f, 0), V(th, hh*0.5f, hf), V(1,0,0), V(0,1,0), matDoor);
+        AF_SceneAddInstanceBox(s, V(0, hh*0.5f, -hf), V(hf, hh*0.5f, th), V(1,0,0), V(0,1,0), matDoor);
+        AF_SceneAddInstanceBox(s, V(0, hh*0.5f,  hf), V(hf, hh*0.5f, th), V(1,0,0), V(0,1,0), matDoor);
+        // 仕切り全体が扉の材質（戸口も扉も無い 1 枚板）
+        AF_SceneAddInstanceBox(s, V(0, hh*0.5f, 0), V(hf, hh*0.5f, th*0.5f), V(1,0,0), V(0,1,0), matDoor);
+        AF_SceneSetDirectPenumbra(s, 2);
+        AF_SceneSetListener(s, L);
+        AF_SceneSetListenerOrientation(s, V(0,0,1), V(0,1,0));
+        AF_SceneSetSource(s, 1, Sr);
+        AF_UpdateConfig cfg2{};
+        cfg2.role1EveryN = 1; cfg2.reflectionRays = 256; cfg2.reflectionBounces = 3;
+        cfg2.directWeight = 1.0f; cfg2.useReflections = 1; cfg2.speedOfSound = 343.0f;
+        cfg2.distanceRef = 4.0f; cfg2.enableReverb = 0;
+        AF_SceneSetUpdateConfig(s, &cfg2);
+        for (int k = 0; k < 6; ++k) AF_SceneUpdate(s, 1.0f / 60.0f);
+        AF_VoiceProgram vp2{};
+        const int i2 = AF_SceneSourceIndex(s, 1);
+        if (i2 >= 0 && AF_SceneGetVoiceProgram(s, i2, &vp2) && vp2.count > 0) {
+            for (int b = 0; b < kBands; ++b) wideTap[b] = vp2.taps[0].gain6[b];
+            std::printf("        仕切り全体が扉 ─ 直接タップ 125 %.5f  4k %.5f  傾き %5.1f dB（半影 2）\n",
+                        wideTap[0], wideTap[5], tiltDb(wideTap));
+        }
+        AF_SceneDestroy(s);
+    }
+
+    char nb[260];
+    std::snprintf(nb, sizeof(nb),
+                  "(材質 %.1f dB / 半影2 %.1f・半影1 %.1f・半影0 %.1f。125Hz の量: 半影0 %.5f → 半影2 %.5f（%.1f dB 差）／仕切り全体が扉なら %.5f)",
+                  tiltDb(matAmp), tapTilt[2], tapTilt[1], tapTilt[0],
+                  tap0Lo, tap2Lo, 20.0f * std::log10(std::max(tap2Lo,1e-9f)/std::max(tap0Lo,1e-9f)), wideTap[0]);
+    // ★一様な仕切り（フレネル帯が全部 1 つの材質）なら、材質どおりのこもりになること。
+    //   ここがずれていたら数え方の誤り（実体を 2 回数える等）。2026-09-08 に 24.0 dB ＝ 材質の
+    //   ちょうど 2 倍で見つけた。直した後は 12.1 dB で、旧の円盤（半影 0）とも一致する。
+    check("[閉扉] 一様な仕切りは材質どおりのこもり（半影 2 ＝ 半影 0 ＝ 材質）",
+          std::fabs(tiltDb(wideTap) - tiltDb(matAmp)) < 1.5f, nb);
+    std::printf("      ※傾き ＝ 20log10(125Hz / 4kHz)。材質より小さいほど「こもっていない」。\n"
+                "        ⚠ 戸口に扉（穴のある壁）だと %.1f dB で、材質の %.1f dB より**こもらない**。\n"
+                "          低域のフレネル帯（125 Hz で半径 2 m）が幅 1 m の扉からはみ出して、\n"
+                "          まわりのコンクリート壁を拾うため。高域は帯が扉に収まるので扉の値のまま。\n"
+                "          建築音響の合成透過損失は面積で足すので、この重み付けは透過には過剰。\n"
+                "          **模型の変更になるので未決**（発注者に確認してから）。\n",
+                tapTilt[2], tiltDb(matAmp));
+}
+
 // ============================================================ 歩行の連続性（鳴っている音で測る）
 // ピラー S3「正しさより連続性を先に守る」を**約束（担保）**にするための物差し。
 //   2026-09-08 の決定: 聞き比べの軸は「音色の変化」と「空間印象」なので、
@@ -8113,7 +8242,7 @@ void testWalkContinuity() {
     cfg.enableDiffractionSources = 1; cfg.diffSources = 8;
     cfg.earlyFaceSubTaps = 5; cfg.echogramSkipFirstOrder = 1;
 
-    struct WalkResult { double rateAvg, rateMax, stepAvg, stepMax; };
+    struct WalkResult { double rateAvg, rateMax, stepAvg, stepMax, levelDb; };
     // path 0 = 戸口をくぐる（z 方向）／1 = 壁沿いに横切る（x 方向。戸口の縁をまたぐ）
     //   keepMask: bit0 直接／bit1 反射／bit2 回折。tailOn=false で尾を落とす（成分の切り分け用）。
     //   speedMps: 歩く速さ。**半分にして最大 dB/s が半分になるかを見ると、
@@ -8176,7 +8305,7 @@ void testWalkContinuity() {
         const int steps = (path == 2) ? 400 : static_cast<int>(span / stepMps);
         const int warm = 60;
 
-        double rateSum = 0.0, rateMax = 0.0, stepSum = 0.0, stepMax = 0.0;
+        double rateSum = 0.0, rateMax = 0.0, stepSum = 0.0, stepMax = 0.0, msSum = 0.0;
         int n = 0;
         float prevSample = 0.0f;
         double prevDb = 0.0; bool hasPrevDb = false;
@@ -8249,6 +8378,7 @@ void testWalkContinuity() {
                 prevSample = static_cast<float>(x);
             }
             const double rms = std::sqrt(sq / block);
+            msSum += sq / block;   // 腕ごとの平均レベル（ラウドネス合わせの基準）
             if (rms <= 1e-7) { hasPrevDb = false; continue; }
             const double stepRatio = maxStep / rms;
             stepSum += stepRatio; if (stepRatio > stepMax) stepMax = stepRatio;
@@ -8267,10 +8397,11 @@ void testWalkContinuity() {
         r.rateMax = rateMax;
         r.stepAvg = (n > 0) ? stepSum / (n + 1) : 0.0;
         r.stepMax = stepMax;
+        r.levelDb = (n > 0) ? 10.0 * std::log10(std::max(msSum / (n + 1), 1e-20)) : -200.0;
         return r;
     };
 
-    std::printf("        経路            反射の模型   レベル dB/s 平均   最大    段差 平均   最大   最悪/平均\n");
+    std::printf("        経路            反射の模型   レベル dB/s 平均   最大    段差 平均   最大   最悪/平均   平均レベル dB\n");
     struct Arm { const char* name; int model; bool early; };
     const Arm arms[] = {
         {"反射なし",   1, false},
@@ -8279,13 +8410,15 @@ void testWalkContinuity() {
     };
     const char* pathName[3] = { "戸口をくぐる", "壁沿いに横切る", "静止（床）" };
     double worstStepRatio = 0.0, lineRateMax = 0.0, rayRateMax = 0.0;
+    double armLevel[3] = { 0, 0, 0 };   // 戸口をくぐる経路での平均レベル（腕ごと）
     double floorRate = 0.0;
     for (int path = 2; path >= 0; --path) {   // 先に床を測る（読むときの基準になるので）
         for (const Arm& a : arms) {
             const WalkResult r = run(a.model, a.early, path);
             const double sr2 = r.stepMax / (r.stepAvg > 1e-9 ? r.stepAvg : 1.0);
-            std::printf("        %-14s %-10s %10.1f %8.1f %10.3f %8.3f %9.2f\n",
-                        pathName[path], a.name, r.rateAvg, r.rateMax, r.stepAvg, r.stepMax, sr2);
+            std::printf("        %-14s %-10s %10.1f %8.1f %10.3f %8.3f %9.2f %12.1f\n",
+                        pathName[path], a.name, r.rateAvg, r.rateMax, r.stepAvg, r.stepMax, sr2, r.levelDb);
+            if (path == 0) armLevel[&a - arms] = r.levelDb;
             if (sr2 > worstStepRatio) worstStepRatio = sr2;
             if (path == 2) { if (r.rateMax > floorRate) floorRate = r.rateMax; continue; }
             if (a.early && a.model == 1 && r.rateMax > lineRateMax) lineRateMax = r.rateMax;
@@ -8302,6 +8435,14 @@ void testWalkContinuity() {
                 "        %s\n", nb);
     // いまは「切れていないこと」だけを守る。ぐらつきの閾値は試聴で決めてから入れる。
     check("[歩行] 歩いても波形が切れない（どの模型でも）", worstStepRatio < 4.0, nb);
+
+    // ★聞き比べのラウドネス合わせ。腕を切り替えると音量が変わると「大きい方が良い」に
+    //   引っ張られるので、資料でも試聴でも揃えること。ここに補正値を出す。
+    std::printf("\n        聞き比べのラウドネス合わせ（戸口をくぐる経路の平均レベル）\n");
+    for (int i = 0; i < 3; ++i)
+        std::printf("        %-10s %7.1f dB   ← 揃えるには %+5.1f dB\n",
+                    arms[i].name, armLevel[i], armLevel[2] - armLevel[i]);
+    std::printf("      ※「面の線」を基準にした補正値。ホストの reflectionLevel か outputGain で当てる。\n");
 
     // ── 担保の天井はどこか（反射を切った腕でも最大 300 dB/s 級ある。その出どころ）──
     //   直接タップ・回折二次音源・尾 のどれがぐらつかせているかを、成分を落として見る。
@@ -12599,6 +12740,7 @@ int main() {
         else if (std::strcmp(only, "materials") == 0) testMaterialPresets();
         else if (std::strcmp(only, "door") == 0) testDoorSweepClicks();
         else if (std::strcmp(only, "walk") == 0) testWalkContinuity();
+        else if (std::strcmp(only, "closed") == 0) testClosedDoorTimbre();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }
@@ -12649,6 +12791,7 @@ int main() {
     testMaterialPresets();
     testDoorSweepClicks();
     testWalkContinuity();
+    testClosedDoorTimbre();
     testAutoPortals();
     diagnosePortalLeftRightSymmetry();
     diagnosePortalWidthVsDoorCurve();
