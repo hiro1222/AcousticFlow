@@ -8189,11 +8189,15 @@ void testDoorOpenTimbre() {
     const int nA = static_cast<int>(sizeof(angles) / sizeof(angles[0]));
 
     struct Row { float lvl, color; };
-    auto sweep = [&](float clearance, Row* out) {
+    // heavyDoor: 板の透過損失を上げた扉（TL 約 30 dB。いまの木戸は約 15 dB）。
+    //   開き始めが動かないのは「隙間の寄与が板の透過の床に埋もれる」からではないか、を切り分ける。
+    const float heavyT[6] = {0.001f, 0.0005f, 0.00025f, 0.000125f, 0.0000625f, 0.00005f};
+    auto sweep = [&](float clearance, Row* out, int law = 0, const float* leaf = nullptr) {
         for (int k = 0; k < nA; ++k) {
             AF_SceneHandle s = AF_SceneCreate();
+            AF_SceneSetApertureLaw(s, law);
             const int mw = AF_SceneAddMaterial(s, wallT, nullptr, nullptr, 6);
-            const int md = AF_SceneAddMaterial(s, doorT, nullptr, nullptr, 6);
+            const int md = AF_SceneAddMaterial(s, leaf ? leaf : doorT, nullptr, nullptr, 6);
             AF_SceneAddInstanceBox(s, V(0, -th, 0),    V(hf, th, hf), V(1,0,0), V(0,1,0), mw);
             AF_SceneAddInstanceBox(s, V(0, hh+th, 0),  V(hf, th, hf), V(1,0,0), V(0,1,0), mw);
             AF_SceneAddInstanceBox(s, V(-hf, hh*0.5f, 0), V(th, hh*0.5f, hf), V(1,0,0), V(0,1,0), mw);
@@ -8251,9 +8255,12 @@ void testDoorOpenTimbre() {
         }
     };
 
-    Row noGap[16], gap[16];
+    Row noGap[16], gap[16], gapL1[16];
     sweep(0.000f, noGap);
     sweep(0.004f, gap);
+    sweep(0.004f, gapL1, 1);            // 比較用。合否は既定の法則 0 で採る
+    Row gapHeavy[16];
+    sweep(0.004f, gapHeavy, 0, heavyT); // 板の透過損失を上げた扉（法則 0）
 
     std::printf("        角度      隙間なし: 音量 dB  色 dB      隙間 4mm: 音量 dB  色 dB     色の変化(4mm)\n");
     for (int k = 0; k < nA; ++k) {
@@ -8261,6 +8268,22 @@ void testDoorOpenTimbre() {
         std::printf("        %5.1f            %8.1f %7.1f          %8.1f %7.1f      %+8.1f\n",
                     angles[k], noGap[k].lvl, noGap[k].color, gap[k].lvl, gap[k].color, dcol);
     }
+
+    // ★扉は 45 度毎秒で振れる（SwingDoor.speedDegPerSec）。角度をそのまま経過時間に直すと、
+    //   「押してから何 ms で音が動き出すか」が読める。試聴の『開いたときに音がずれる』は
+    //   遅延ではなく**カーブが最初の数百 ms 平らなこと**かもしれないので、そこを分けて見る。
+    std::printf("\n        押してからの経過（45 度毎秒）と、閉じた状態からの変化量\n");
+    std::printf("        角度   経過ms   法則0: 音量Δ  色Δ      法則1: 音量Δ  色Δ    板TL30: 音量Δ  色Δ\n");
+    for (int k = 0; k < nA; ++k) {
+        std::printf("        %5.1f %7.0f      %8.1f %6.1f       %8.1f %6.1f      %8.1f %6.1f\n",
+                    angles[k], angles[k] / 45.0f * 1000.0f,
+                    gap[k].lvl - gap[0].lvl, gap[0].color - gap[k].color,
+                    gapL1[k].lvl - gapL1[0].lvl, gapL1[0].color - gapL1[k].color,
+                    gapHeavy[k].lvl - gapHeavy[0].lvl, gapHeavy[0].color - gapHeavy[k].color);
+    }
+    std::printf("        ※色Δは「閉より何 dB 明るくなったか」。1 dB 未満は聞こえないと見てよい。\n");
+    std::printf("          閉じた状態の音量: 木戸 %.1f dB ／ 板TL30 %.1f dB（床が下がるほど隙間が効く）\n",
+                gap[0].lvl, gapHeavy[0].lvl);
     // 理想: 角度が倍になるごとの色の変化が、前半ほど大きい。
     //   0→2° の変化と、16→64° の変化を比べる（どちらも角度は 4 倍ぶん）。
     float early = gap[0].color - gap[3].color;      // 0 → 2°
