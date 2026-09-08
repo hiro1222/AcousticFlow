@@ -1439,6 +1439,10 @@ namespace AcousticFlow
             if (Input.GetKeyDown(KeyCode.Y)) SetDspPath(!useCppDsp);
             // L：部屋の材質（AcousticSurface の無い occluder の既定）を巡る。反射・尾・Sabine の RT60 が一緒に変わる。
             if (Input.GetKeyDown(KeyCode.L)) occluderMaterial = NextRoomPreset(occluderMaterial);
+            // U：早期反射の模型を切り替える（1 = 面の線音源 ⇄ 0 = 像源をレイで拾う旧模型）。
+            //   耳で A/B するには実行中に切り替わる必要がある（Inspector だけだと手が止まる）。
+            //   設定は毎フレーム BuildUpdateConfig で押しているので、旗を返すだけで次のフレームから効く。
+            if (Input.GetKeyDown(KeyCode.U)) earlyReflectModel = 1 - earlyReflectModel;
             // HUD の出し入れ。既定 None なのでキーは奪わない（シーンで割り当てたときだけ効く）。
             if (hudToggleKey != KeyCode.None && Input.GetKeyDown(hudToggleKey)) showHud = !showHud;
 
@@ -2678,9 +2682,11 @@ namespace AcousticFlow
             GUILayout.Label($"FPS: {_fps:F0}    音響計算: {_acousticMs:F2} ms/frame    " +
                             $"空間化: {(useHrtf ? "HRTF" : "パン")} (H)    " +
                             $"方向ステア: {(useDirectionalSteering ? "ON" : "OFF")} (G)", style);
+            DrawAudioHealth(style);
             if (enableMovement)
                 GUILayout.Label("操作: WASD / 右ドラッグ / QE / Shift / Space:重ね / H:HRTF / G:ステア / R:反響経路 / C:回折候補"
-                                + " / F:早期反射(Rタップ) / V:回折二次音源(Fタップ) / Y:DSP経路(C#/C++) / B:クリップ差し替え"
+                                + " / F:早期反射(Rタップ) / U:反射の模型(面の線/像源) / L:部屋の材質"
+                                + " / V:回折二次音源(Fタップ) / Y:DSP経路(C#/C++) / B:クリップ差し替え"
                                 + " / M:音源ミュート / P:扉の定点 / 1-4:成分ソロ", style);
             GUILayout.Label($"音: {(useAltClip && altClip != null ? $"差し替え ({altClip.name})" : "各音源のクリップ")}"
                             + (_muted ? "  ミュート中 (M)" : ""), style);
@@ -2746,7 +2752,8 @@ namespace AcousticFlow
                 GUILayout.Label($"回折候補(主音源): {_diffCandCount} 本合成 (水色=最短) (C)", style);
             GUILayout.Label($"直接の半影: {(directPenumbraMode == 2 ? "窓の走査線" : directPenumbraMode == 1 ? "環の標本点" : "旧(8 点)")} (Inspector directPenumbraMode)   "
                             + $"タップの組み立て: {(tapsFromEngine && _scene != null && _scene.TapBuilderAvailable ? "DLL" : "ホスト")} (tapsFromEngine)", style);
-            GUILayout.Label($"早期反射(IR の R タップ・{(earlyReflectModel == 1 ? "面の線" : "像源レイ")}): {(enableEarlyReflections ? "ON" : "OFF")} (F)   "
+            GUILayout.Label($"早期反射(IR の R タップ): {(enableEarlyReflections ? "ON" : "OFF")} (F)   "
+                            + $"模型: {(earlyReflectModel == 1 ? "面の線音源" : "像源レイ（既存）")} (U で切替)   "
                             + $"回折二次音源(IR の F タップ): {(enableDiffractionSources ? "ON" : "OFF")} (V)", style);
             {
                 var tb = _portalHost != null ? _portalHost : FindFirstObjectByType<TailBusRenderer>();
@@ -2818,6 +2825,50 @@ namespace AcousticFlow
                 GUILayout.Label(BandLine("主音源 回折", _diffBands), style);
             }
             GUILayout.EndArea();
+        }
+
+        // 【ぷつぷつの切り分け】音が飛ぶとき、原因は 3 つのどれか。1 行で見分けられるようにする。
+        //   ① ドロップアウト  … 音声スレッドが間に合っていない → 「負荷」が 100% に近い／超える
+        //   ② 波形の不連続    … タップや IR の差し替えで波形が切れている → 「段差」が平常の何倍にも跳ねる
+        //   ③ 音色の変化      … 上の 2 つがどちらも動かないのに聞こえ方が変わる → それは連続な変化
+        // ★段差＝隣り合うサンプルの最大差 ÷ そのブロックの RMS。クリックは必ずここに出る。
+        //   平常値は信号の種類で変わる（正弦なら小さく、雑音なら大きい）ので、絶対値ではなく
+        //   **平常との比**で見ること。扉を止めた状態を平常、動かした瞬間の跳ねを見るのが使い方。
+        // ★計器を書いているのは C++ 経路（VoiceConvolver）の音源 0 だけ。Y で C# 経路にすると止まる。
+        private int _spikePrev;
+        private float _spikeTimer;
+        private int _spikeRate;
+        private void DrawAudioHealth(GUIStyle style)
+        {
+            float blockMs = IrConvolver.Scope.BlockDurMs;
+            if (blockMs <= 0f) return;
+            float total = 0f; int voices = 0;
+            int maxIdx = Mathf.Min(IrConvolver.Scope.MeteredMax, IrConvolver.Scope.MaxMeteredSources - 1);
+            for (int i = 0; i <= maxIdx; i++)
+            {
+                float ms = IrConvolver.Scope.BlockMs[i];
+                if (ms <= 0f) continue;
+                total += ms; voices++;
+            }
+            // 跳ねは累計なので、1 秒ごとの本数に直す（累計だと増えたのか止まったのか読めない）。
+            _spikeTimer += Time.unscaledDeltaTime;
+            if (_spikeTimer >= 1f)
+            {
+                _spikeRate = IrConvolver.Scope.StepSpikes - _spikePrev;
+                _spikePrev = IrConvolver.Scope.StepSpikes;
+                _spikeTimer = 0f;
+            }
+            float load = total / blockMs * 100f;
+            float calm = IrConvolver.Scope.StepRatioCalm;
+            float now = IrConvolver.Scope.StepRatio;
+            float times = calm > 1e-6f ? now / calm : 0f;
+            GUILayout.Label(
+                $"音声スレッド: 負荷 {load:F0}%（音源 {voices} 本 計 {total:F2} ms / バッファ {blockMs:F1} ms）"
+                + $"   波形の段差 {now:F2} ÷ 平常 {calm:F2} ＝ {times:F1} 倍   跳ね {_spikeRate}/秒", style);
+            if (load >= 85f)
+                GUILayout.Label("  ⚠ 負荷が高い。ぷつぷつはドロップアウトの可能性（段の予算・音源数を下げる）", style);
+            else if (_spikeRate > 0)
+                GUILayout.Label("  ⚠ 波形が切れている（負荷ではない）。差し替えの継ぎ目を疑う", style);
         }
 
         private static string BandLine(string label, float[] g)

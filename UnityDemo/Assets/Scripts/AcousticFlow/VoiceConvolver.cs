@@ -81,6 +81,7 @@ namespace AcousticFlow
         private int _tailShapeIndex = -1;    // 最後に尾の形を引いた代表音源の index
         private IntPtr _tailBus = IntPtr.Zero;   // 預けている共有バス（Zero=自前で畳む）
         private int _tailBusFrames = 0;
+        private float _lastOutSample = 0f;   // 段差の計器。ブロックの継ぎ目を見るため持ち越す
         private bool _tailWasVirtual = false;   // 直前がバーチャル段だったか（戻すため）
 
         // 尾の畳み込みを共有バスへ預ける。**メインスレッドからだけ呼ぶこと。**
@@ -483,6 +484,39 @@ namespace AcousticFlow
                     for (int c = 2; c < channels; c++) data[b + c] = (_outL[f] + _outR[f]) * 0.5f;
                 }
                 else data[b] = (_outL[f] + _outR[f]) * 0.5f;
+            }
+
+            // 【道具 ぷつぷつの切り分け】波形の段差を測る。ブロックをまたぐので前ブロックの
+            //   最後のサンプルを持ち越す（持ち越さないと、いちばん出やすい継ぎ目を見逃す）。
+            //   ★音源 0 だけが書く。全音源が同じ静的枠へ書くと最後に書いた者勝ちになり、
+            //     どの音源の段差を見ているのか分からなくなる。
+            if (sourceIndex == 0)
+            {
+                float maxStep = 0f, sumSq = 0f, prev = _lastOutSample;
+                for (int f = 0; f < frames; f++)
+                {
+                    float v = _outL[f];
+                    float d = v - prev; if (d < 0f) d = -d;
+                    if (d > maxStep) maxStep = d;
+                    sumSq += v * v;
+                    prev = v;
+                }
+                _lastOutSample = prev;
+                float blkRms = Mathf.Sqrt(sumSq / Mathf.Max(1, frames));
+                // 無音のブロックは比が暴れるので数えない（0 割りも避ける）。
+                if (blkRms > 1e-5f)
+                {
+                    float ratio = maxStep / blkRms;
+                    IrConvolver.Scope.StepRatio = ratio;
+                    float calm = IrConvolver.Scope.StepRatioCalm;
+                    if (calm <= 0f) calm = ratio;
+                    // 平常値はゆっくり追う（跳ねを平常に取り込まないよう、上がるときだけ鈍く）。
+                    float a = (ratio > calm) ? 0.002f : 0.02f;
+                    IrConvolver.Scope.StepRatioCalm = calm + (ratio - calm) * a;
+                    if (ratio > calm * 4f) IrConvolver.Scope.StepSpikes++;
+                }
+                IrConvolver.Scope.BlockDurMs = _sampleRate > 0
+                    ? frames * 1000f / _sampleRate : 0f;
             }
 
             if (sourceIndex >= 0 && sourceIndex < IrConvolver.Scope.MaxMeteredSources)

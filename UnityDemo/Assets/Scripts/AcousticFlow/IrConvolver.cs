@@ -62,6 +62,16 @@ namespace AcousticFlow
             //   「どれが実際に大きいか」がそれでは割れない。添字は sourceIndex。
             //   ★ミュート中も「鳴っていたはずの量」を出す（消した音の大きさが見えないと比べられない）。
             public static readonly float[] OutRms = new float[MaxMeteredSources];
+
+            // 【道具 ぷつぷつの切り分け】出力波形の「隣り合うサンプルの最大差 ÷ そのブロックの RMS」。
+            //   ★これで「切れている（不連続）」と「音色が変わっただけ」を分けられる。
+            //     クリック（波形の飛び）は必ずここに出る。音色の変化なら平常値のまま動かない。
+            //   ★ドロップアウト（バッファが間に合わない）は別物で、負荷（BlockMs の合計 ÷
+            //     ブロックの実時間）で見る。段差が平常のまま音が途切れるならそちら。
+            public static volatile float StepRatio;      // このブロックの値
+            public static volatile float StepRatioCalm;  // 平常値（遅い平均。比べる基準）
+            public static volatile int   StepSpikes;     // 平常の 4 倍を超えたブロックの累計
+            public static volatile float BlockDurMs;     // 1 ブロックの実時間(ms) = frames / sampleRate
         }
 
         /// 【道具A ソロ／ミュート】Editor が書き、メインスレッドの RebuildIr が読む。
