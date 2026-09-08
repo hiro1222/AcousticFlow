@@ -84,6 +84,45 @@ namespace AcousticFlow
         private int _sampleRate = 48000;
         private float _tailSeconds = 1f;
 
+        // ── 尾の FDN（tailModel=1、docs/TAIL_FDN_PLAN.md 手順 4）──
+        //   部屋ごとの FDN を 1 つの器（AF_FdnMix）に持ち、AudioListener で 1 回回す（尾のバスと同じ場所）。
+        //   作り直し（部屋グラフが変わった）は新しい器を作って差し替え、古い器は 1 秒おいてから壊す
+        //   （オーディオスレッドが古い器の中にいるのは高々 1 ブロック。1 秒止まっていたら音はもう壊れている）。
+        //   部屋を足すのは呼び手（AcousticFlowSceneDemo.UpdateFdnTail: 部屋番号 ＝ 部屋グラフの部屋番号）。
+        private System.IntPtr _fdn = System.IntPtr.Zero;
+        private readonly List<KeyValuePair<float, System.IntPtr>> _fdnRetired = new List<KeyValuePair<float, System.IntPtr>>();
+        public System.IntPtr FdnMixHandle => _fdn;
+        public float FdnRms => (_fdn != System.IntPtr.Zero) ? Native.AF_FdnMixRms(_fdn) : 0f;
+        public int FdnRoomCount => (_fdn != System.IntPtr.Zero) ? Native.AF_FdnMixRoomCount(_fdn) : 0;
+
+        /// 新しい器を作って差し替える（部屋を足すのは呼び手）。**メインスレッドからだけ。**
+        public System.IntPtr ReplaceFdnMix(int maxFrames)
+        {
+            System.IntPtr mix;
+            try { mix = Native.AF_FdnMixCreate(_sampleRate, Mathf.Max(maxFrames, 2048), 0.6f); }
+            catch (System.EntryPointNotFoundException) { return System.IntPtr.Zero; }
+            RetireFdnMix();
+            _fdn = mix;   // 参照の書き換えは原子的。オーディオスレッドは古い器か新しい器のどちらかを見る
+            return mix;
+        }
+        /// 今の器を引退させる（音源を外し、1 秒後に壊す）。
+        public void RetireFdnMix()
+        {
+            if (_fdn == System.IntPtr.Zero) return;
+            foreach (var v in FindObjectsByType<VoiceConvolver>(FindObjectsSortMode.None)) v.DetachFdnMix();
+            _fdnRetired.Add(new KeyValuePair<float, System.IntPtr>(Time.unscaledTime, _fdn));
+            _fdn = System.IntPtr.Zero;
+        }
+        private void Update()
+        {
+            for (int i = _fdnRetired.Count - 1; i >= 0; i--)
+            {
+                if (Time.unscaledTime - _fdnRetired[i].Key < 1f) continue;
+                Native.AF_FdnMixDestroy(_fdnRetired[i].Value);
+                _fdnRetired.RemoveAt(i);
+            }
+        }
+
         // 音源側から引く。無ければ作る。**メインスレッドからだけ呼ぶこと。**
         public System.IntPtr GetOrCreateBus(int shapeIndex, float tailSeconds, int maxFrames)
         {
@@ -122,6 +161,10 @@ namespace AcousticFlow
                     Native.AF_TailBusDestroy(kv.Value);
             _buses.Clear();
             if (_dirBus != System.IntPtr.Zero) { Native.AF_DirectionBusDestroy(_dirBus); _dirBus = System.IntPtr.Zero; }
+            // 尾の FDN。音源は上で外した。引退中の器も一緒に壊す。
+            if (_fdn != System.IntPtr.Zero) { Native.AF_FdnMixDestroy(_fdn); _fdn = System.IntPtr.Zero; }
+            foreach (var kv in _fdnRetired) Native.AF_FdnMixDestroy(kv.Value);
+            _fdnRetired.Clear();
         }
 
         // ★全音源のミックス後に呼ばれる。ここで各バスを 1 回ずつ畳んで足す。
@@ -129,7 +172,7 @@ namespace AcousticFlow
         //     次に送りが来たときに尾が飛ぶ（無音を入れて進めるのが正しい）。
         private void OnAudioFilterRead(float[] data, int channels)
         {
-            if ((_buses.Count == 0 && _dirBus == System.IntPtr.Zero) || channels < 1) return;
+            if ((_buses.Count == 0 && _dirBus == System.IntPtr.Zero && _fdn == System.IntPtr.Zero) || channels < 1) return;
             int frames = data.Length / channels;
             if (_l == null || _l.Length < frames) { _l = new float[frames]; _r = new float[frames]; }
 
@@ -153,6 +196,27 @@ namespace AcousticFlow
                 else
                 {
                     for (int i = 0; i < frames; i++) data[i * channels] += 0.5f * (_l[i] + _r[i]) * w;
+                }
+            }
+
+            // 尾の FDN（tailModel=1）。器 1 つで全部屋を回す。送りが無いブロックでも回す（遅延線を進める）。
+            var fdn = _fdn;
+            if (fdn != System.IntPtr.Zero)
+            {
+                System.Array.Clear(_l, 0, frames);
+                System.Array.Clear(_r, 0, frames);
+                Native.AF_FdnMixRender(fdn, frames, _l, _r);
+                if (channels >= 2)
+                {
+                    for (int i = 0; i < frames; i++)
+                    {
+                        data[i * channels] += _l[i];
+                        data[i * channels + 1] += _r[i];
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < frames; i++) data[i * channels] += 0.5f * (_l[i] + _r[i]);
                 }
             }
 

@@ -350,6 +350,13 @@ namespace AcousticFlow
         [Tooltip("早期反射の模型。0 = 像源をレイで拾う（旧。像が見えた/消えたの二値でタップが跳ぶ）"
                  + "1 = 面ごとの線音源（2026-09-03 決定。鏡面点にピークを持つ下位タップの線。低域は点、高域は面いっぱいに広がる）")]
         [Range(0, 1)] public int earlyReflectModel = 1;
+        [Tooltip("後期の尾の作り方（docs/TAIL_FDN_PLAN.md）。\n"
+                 + "0 = 畳み込み（既定。エコグラムから IR を焼いて畳む。従来）\n"
+                 + "1 = 部屋ごとの FDN（帯域別 RT60 は部屋グラフの Sabine を毎フレーム。開口の吸音率を扉の開き具合で動かし、"
+                 + "扉の開口率で隣室の FDN を配線する。IR もエコグラムも使わない）\n"
+                 + "同じビルドで聞き比べるための切り替え（Play 中に動かしてよい。K キー）。量は同じ規約（tailGain）で揃えてある。"
+                 + "採用が固まったら畳み込み側を消す。")]
+        [Range(0, 1)] public int tailModel = 0;
         [Tooltip("直接経路の半影の作り方。\n"
                  + "3 = 走査線 ＋ 透過の重みを帯域に依らせない（2026-09-08 既定。閉じた扉が材質どおりこもる）\n"
                  + "2 = 窓の走査線積分（09-05。戸口の扉だと低域の帯が周りの壁を拾って明るくなる）\n"
@@ -648,6 +655,7 @@ namespace AcousticFlow
             public static float Fps;
             public static float AcousticMs;
             public static float RoomShare = 1f;   // まわりの空間のうち部屋の中である割合（残響の量の重み）
+            public static int TailModel;          // 後期の尾: 0 畳み込み／1 部屋ごとの FDN（VoiceConvolver が預け先を選ぶ）
             public static bool UseHrtf;
             public static bool UseSteer;
             public static string[] SourceNames;   // 音源ごとの表示名（クリップ名）
@@ -768,6 +776,10 @@ namespace AcousticFlow
             public float TailRatioPhysical = 0f;
             public float MixingTimeMs = -1f;
             public float RoomShare = 1f;
+            // 【尾の FDN】この音源の送り先（部屋番号）と重み（振幅、帯域の平均）。UpdateFdnTail が毎フレーム書く。
+            public int FdnCount = 0;
+            public readonly int[] FdnRooms = new int[4];
+            public readonly float[] FdnGains = new float[4];
 
             // 【B1】HRTF に載せる回折タップ。-1 = 無し（＝見通せている／回折が無い）。
             //   遮蔽されると直接音タップは材質の透過まで落ちるので、実際に耳へ届く
@@ -1470,6 +1482,8 @@ namespace AcousticFlow
             //   耳で A/B するには実行中に切り替わる必要がある（Inspector だけだと手が止まる）。
             //   設定は毎フレーム BuildUpdateConfig で押しているので、旗を返すだけで次のフレームから効く。
             if (Input.GetKeyDown(KeyCode.U)) earlyReflectModel = 1 - earlyReflectModel;
+            // K：後期の尾の作り方を切り替える（0 = 畳み込み ⇄ 1 = 部屋ごとの FDN）。耳で A/B するため実行中に切り替わる。
+            if (Input.GetKeyDown(KeyCode.K)) tailModel = 1 - tailModel;
             // HUD の出し入れ。既定 None なのでキーは奪わない（シーンで割り当てたときだけ効く）。
             if (hudToggleKey != KeyCode.None && Input.GetKeyDown(hudToggleKey)) showHud = !showHud;
 
@@ -1669,6 +1683,7 @@ namespace AcousticFlow
                 BuildAllSourceTaps();
                 UpdateDirectionalTail();
             }
+            UpdateFdnTail();   // 尾の FDN（tailModel=1）: 部屋の生きた RT60・リスナーの重み・音源の送り先を**毎フレーム**（扉の実時間性）
 
             // 6) 残響（低レートでエコグラム→RT60/wet。畳み込み器が Status 経由で読む）。
             if (enableReverb && _echogram != null)
@@ -2399,6 +2414,105 @@ namespace AcousticFlow
         private readonly float[] _ptGain = new float[AcousticEngine.NumBands];
         private int _ptFrame;
 
+        // ── 尾の FDN（tailModel=1、docs/TAIL_FDN_PLAN.md 手順 3・4）──
+        //   部屋グラフの部屋番号 ＝ FDN の番号。部屋グラフが作り直されたら器ごと作り直す（TailBusRenderer が差し替える）。
+        //   毎フレーム: 各部屋の生きた RT60（手順 3。0.5% 以上変わった部屋だけ置く）／リスナーの重み／音源ごとの送り先。
+        //   リスナーの重みと音源の送りは**同じ式**（AF_SceneFdnRoomWeights）。リスナーは正規化（尾の比が
+        //   「部屋の中である割合」を既に持つ）、音源はそのまま（注ぐ量そのもの）。
+        private int _fdnBuild = -1;
+        private readonly int[] _fdnRoomBuf = new int[8];
+        private readonly float[] _fdnW6 = new float[48];
+        private readonly float[] _fdnW6One = new float[6];
+        private readonly float[] _fdnRt = new float[6];
+        private readonly float[] _fdnAb = new float[6];
+        private readonly float[] _fdnZero = new float[6];
+        private float[] _fdnLastRt;         // 前回置いた RT60（変わった時だけ置く）
+        private bool[] _fdnHeard;           // 前フレームに重みを置いた部屋（消えた部屋だけ 0 にする。全部 0 にしてから置き直すと 1 ブロック抜ける）
+        private float _fdnHudRt, _fdnHudOpen;
+        private void UpdateFdnTail()
+        {
+            Status.TailModel = tailModel;
+            if (_portalHost == null) _portalHost = FindFirstObjectByType<TailBusRenderer>();
+            bool on = tailModel == 1 && _audioReady && _scene != null && _scene.IsValid && listener != null && _portalHost != null;
+            if (!on)
+            {
+                if (_portalHost != null && _portalHost.FdnMixHandle != System.IntPtr.Zero) _portalHost.RetireFdnMix();
+                _fdnBuild = -1;
+                return;
+            }
+            int nr = _scene.RoomCount;
+            int build = _scene.RoomBuildCount;
+            var mix = _portalHost.FdnMixHandle;
+            if (mix == System.IntPtr.Zero || build != _fdnBuild || _portalHost.FdnRoomCount != nr)
+            {
+                if (nr <= 0) return;
+                AudioSettings.GetDSPBufferSize(out int bufLen, out _);
+                mix = _portalHost.ReplaceFdnMix(bufLen);
+                if (mix == System.IntPtr.Zero) return;
+                _fdnLastRt = new float[nr * 6];
+                _fdnHeard = new bool[nr];
+                for (int r = 0; r < nr; r++)
+                {
+                    _scene.GetRoomInfo(r, out float vol, out _, out _, out _);
+                    _scene.GetRoomAcoustics(r, out float surf, out _, _fdnAb, _fdnRt);
+                    // 線の長さは平均自由行程なり（4V/S ÷ 音速 ÷ 基準 12 ms）。
+                    float mfp = 4f * vol / Mathf.Max(surf, 1e-3f);
+                    float lineScale = (mfp / 343f) / 0.012f;
+                    Native.AF_FdnMixAddRoom(mix, lineScale, _fdnRt, 1);   // 色あり（√(RT60_b/T̄)。量の規約は畳み込みと同じ）
+                    for (int b = 0; b < 6; b++) _fdnLastRt[r * 6 + b] = _fdnRt[b];
+                }
+                _fdnBuild = build;
+            }
+            // 1) 生きた RT60（開口の吸音率を扉の開き具合で動かした Sabine）。
+            float hudRt = 0f, hudOpen = 0f; int hudN = 0;
+            for (int r = 0; r < nr; r++)
+            {
+                if (!_scene.GetRoomRt60Live(r, _fdnRt, out float open)) continue;
+                bool changed = false;
+                for (int b = 0; b < 6; b++)
+                    if (Mathf.Abs(_fdnRt[b] - _fdnLastRt[r * 6 + b]) > 0.005f * Mathf.Max(_fdnLastRt[r * 6 + b], 1e-3f)) changed = true;
+                if (changed)
+                {
+                    Native.AF_FdnMixSetRoomRt60(mix, r, _fdnRt, 1);
+                    for (int b = 0; b < 6; b++) _fdnLastRt[r * 6 + b] = _fdnRt[b];
+                }
+                hudRt += _fdnRt[2]; hudOpen += open; hudN++;
+            }
+            if (hudN > 0) { _fdnHudRt = hudRt / hudN; _fdnHudOpen = hudOpen / hudN; }
+            // 2) リスナーの重み（正規化）。今回置かない部屋のうち前回置いた物だけ 0 にする。
+            int n = _scene.GetFdnRoomWeights(listener.position, roomBlendRadius, true, _fdnRoomBuf, _fdnW6);
+            for (int r = 0; r < nr; r++)
+            {
+                bool now = false;
+                for (int k = 0; k < n; k++) if (_fdnRoomBuf[k] == r) { now = true; break; }
+                if (!now && _fdnHeard[r]) Native.AF_FdnMixSetListenerWeight(mix, r, _fdnZero);
+                _fdnHeard[r] = now;
+            }
+            for (int k = 0; k < n; k++)
+            {
+                if (_fdnRoomBuf[k] < 0 || _fdnRoomBuf[k] >= nr) continue;
+                System.Array.Copy(_fdnW6, k * 6, _fdnW6One, 0, 6);
+                Native.AF_FdnMixSetListenerWeight(mix, _fdnRoomBuf[k], _fdnW6One);
+            }
+            // 3) 音源ごとの送り先（そのまま）。重みは帯域の平均（送りはモノラルなので色は付けない。色はリスナー側の重みが持つ）。
+            if (_taps == null || _srcPos == null || _taps.Length != _srcPos.Length) return;
+            for (int si = 0; si < _srcPos.Length; si++)
+            {
+                var ts = _taps[si];
+                if (ts == null) continue;
+                int ns = _scene.GetFdnRoomWeights(_srcPos[si], roomBlendRadius, false, _fdnRoomBuf, _fdnW6);
+                ns = Mathf.Min(ns, ts.FdnRooms.Length);
+                for (int k = 0; k < ns; k++)
+                {
+                    float m = 0f;
+                    for (int b = 0; b < 6; b++) m += _fdnW6[k * 6 + b];
+                    ts.FdnRooms[k] = _fdnRoomBuf[k];
+                    ts.FdnGains[k] = m / 6f;
+                }
+                ts.FdnCount = ns;
+            }
+        }
+
         private float PortalRoomWeight(int room, int n, float outsideW)
         {
             if (room < 0) return outsideW;
@@ -2809,6 +2923,13 @@ namespace AcousticFlow
                 var tb = _portalHost != null ? _portalHost : FindFirstObjectByType<TailBusRenderer>();
                 if (tb != null)
                     GUILayout.Label($"方向バス: {(tb.enableDirectionBus && tb.DirectionBusHandle != System.IntPtr.Zero ? $"{tb.directionLanes} 方向 × 2 耳（RMS {20f * Mathf.Log10(Mathf.Max(tb.DirectionBusRms, 1e-6f)):F1} dB）" : "OFF（タップごとの両耳化）")}", style);
+                // 後期の尾の作り方（docs/TAIL_FDN_PLAN.md 手順 4 の切り替え）。
+                string fdnInfo = "";
+                if (tailModel == 1 && tb != null && tb.FdnMixHandle != System.IntPtr.Zero)
+                    fdnInfo = $"（部屋 {tb.FdnRoomCount} 本・RMS {20f * Mathf.Log10(Mathf.Max(tb.FdnRms, 1e-6f)):F1} dB・生きた RT60 500Hz {_fdnHudRt:F2} s・口の素通し {_fdnHudOpen:F2}）";
+                else if (tailModel == 1)
+                    fdnInfo = "（器を作れていません: 部屋グラフが無いか DLL が古い）";
+                GUILayout.Label($"尾: {(tailModel == 1 ? "FDN（部屋ごとの帰還遅延網）" : "畳み込み（エコグラム → IR）")} (K / tailModel){fdnInfo}", style);
             }
             if (_sources != null && _scene != null && _scene.IsValid)
             {

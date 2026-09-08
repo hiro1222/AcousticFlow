@@ -325,7 +325,10 @@ public:
             if (!in.active) continue;
             // ★動くもの（扉など）は入れない。入れると閉扉時に戸口が塞がって
             //   「そこに開口がある」という情報が幾何から消える。
-            if (in.moved) continue;
+            //   ★印（dynamicTag）も外す（2026-09-09、docs/TAIL_FDN_PLAN.md 手順 3）。moved は観測なので、
+            //     最初に動くまでは扉が壁として塗られ、戸口が出るのが「最初に開けた時」だった。
+            //     制作時の宣言（動かせる物）があるなら最初から外す。
+            if (in.moved || in.dynamicTag) continue;
             rooms::SolidBox sb;
             sb.obb = in.obb;
             // 吸音率も渡す。部屋の残響時間を形と材質から出す（Sabine）ため。
@@ -338,6 +341,8 @@ public:
     void setRoomCellSize(float m) { roomBuilder_.setCell(m); }
     /// 要求したセル（実際に使われた値は roomGraph().grid.cell）。
     float roomCellRequested() const { return roomBuilder_.cell(); }
+    /// 部屋グラフの作り直し回数。ホストが「部屋が変わった」を見る印（尾の FDN を部屋ごとに作り直す鍵）。
+    int roomBuildCount() const { roomGraph(); return roomBuilds_; }
     std::size_t roomMaxVoxels() const { return roomBuilder_.maxVoxels(); }
     void setRoomBrick(int voxels) { roomBuilder_.setBrick(voxels); }
     void setRoomSeedRadius(float m) { roomBuilder_.setSeedRadius(m); }
@@ -430,6 +435,8 @@ public:
         if (in.dynamicTag == dynamic) return;
         in.dynamicTag = dynamic;
         if (faceBake_.valid) faceBakeStale_ = true;
+        // 静的な塗り分けから出入りするので、触れた所を塗り直す（roomGraph は印の付いた物を入れない）。
+        if (in.active) roomBuilder_.touch(rooms::obbBounds(in.obb));
     }
 
     // インスタンスの有効/無効を切り替える。
@@ -581,8 +588,10 @@ public:
 
     // 直線 from->to が通る壁の帯域別透過ゲイン(0..1)を outGain に書く。BVH で加速。
     //   壁なし → 全帯域 1.0 / 壁を通るほど（材質次第で高域が）小さくなる。
+    //   staticOnly: 動く物（moved / dynamicTag）を見ない。焼く層が使う（動く物は実行時に dynamicBlock で掛けるので、
+    //   焼きに入れると二重になる。2026-09-09 の [焼き] 8c: 閉じた扉が焼きに凍り、開けた後も 1.5 dB 低かった）。
     void computeTransmission(const Vec3& from, const Vec3& to,
-                             float outGain[kNumBands]) const {
+                             float outGain[kNumBands], bool staticOnly = false) const {
         for (int b = 0; b < kNumBands; ++b) outGain[b] = 1.0f;
         ensureBvh();
         if (bvhNodes_.empty()) return;
@@ -596,6 +605,7 @@ public:
                 for (int k = 0; k < node.count; ++k) {
                     const int i = bvhOrder_[node.leftFirst + k];
                     const Instance& inst = instances_[i];
+                    if (staticOnly && (inst.moved || inst.dynamicTag)) continue;   // 焼く層: 動く物は実行時の層
                     if (!instanceOccludes(inst, from, to)) continue;
                     const AcousticMaterial& m = materialOf(inst.materialId);
                     for (int b = 0; b < kNumBands; ++b) outGain[b] *= m.transmission[b];
@@ -1361,6 +1371,11 @@ public:
         //   ★回折・エコグラムの経路生成では**使わない**（従来の数値を変えないため）。
         //     「扉の定点」（隣の空間の響きをこの位置から鳴らす）だけが使う。
         bool toOutside = false;
+        // 面の位置の不確かさ(m)。ボクセルの部屋グラフから作った矩形は、口のセルの面に置かれるので
+        //   壁の面から最大 半セル（0.25 m 格子なら 0.125 m）ずれる。「ポータルより奥にある物体は塞いでいない」の
+        //   判定にこの余裕を持たせないと、**閉じた扉（厚さ 3 cm）が片側から見ると「奥の物体」になって素通し**になる
+        //   （実測 2026-09-09: 0° で開口率 1.000、10° で 0.009。手順 3 の検査で捕まえた）。手置きは 0。
+        float planeSlack = 0.0f;
     };
 
     int addPortal(const Vec3& center, const Vec3& axisU, const Vec3& axisV,
@@ -1659,9 +1674,187 @@ public:
             p.roomA = ap.roomA;
             p.roomB = ap.roomB;
             p.toOutside = ap.toOutside;
+            p.planeSlack = rr.grid.cell;   // ボクセルの面なので壁の面から最大 半セル ずれる（Portal::planeSlack）
             portals_.push_back(p);
             ++autoPortalCount_;
         }
+    }
+
+    // ── 開口（戸口）の状態と、尾の FDN の配線（docs/TAIL_FDN_PLAN.md 手順 3・4、2026-09-09）──
+    //
+    //   矩形（ポータル）に入り込んでいる箱か。portalOpenBands の「参加者の選び方」と同じ物差し
+    //   （矩形の座標系での広がりが矩形と重なるか。枠は縁で接するだけなので余裕ぶん外れる）。
+    static bool obbEntersRect(const Obb& ob, const Portal& pt, float margin) {
+        float uMin = 1e30f, uMax = -1e30f, vMin = 1e30f, vMax = -1e30f;
+        for (int i = 0; i < 8; ++i) {
+            const float sx = (i & 1) ? 1.0f : -1.0f;
+            const float sy = (i & 2) ? 1.0f : -1.0f;
+            const float sz = (i & 4) ? 1.0f : -1.0f;
+            const Vec3 q = ob.center + ob.axisX * (ob.halfExtents.x * sx)
+                                     + ob.axisY * (ob.halfExtents.y * sy)
+                                     + ob.axisZ * (ob.halfExtents.z * sz);
+            const float qu = dot(q - pt.center, pt.axisU), qv = dot(q - pt.center, pt.axisV);
+            uMin = std::min(uMin, qu); uMax = std::max(uMax, qu);
+            vMin = std::min(vMin, qv); vMax = std::max(vMax, qv);
+        }
+        const float hu = pt.halfU - margin, hv = pt.halfV - margin;
+        return (uMax > -hu && uMin < hu) && (vMax > -hv && vMin < hv);
+    }
+
+    //   開口（部屋グラフの口）を代表するポータル。自動ポータルは口から作られる。手置きが覆っている口は
+    //   その手置き（rebuildAutoPortals の coveredByManual と同じ物差し）。無ければ -1（小さすぎて捨てた口）。
+    int portalForAperture(const rooms::Aperture& ap) const {
+        const Vec3 na = normalized(cross(ap.axisU, ap.axisV));
+        int best = -1; float bestD = 1e30f;
+        for (int i = 0; i < static_cast<int>(portals_.size()); ++i) {
+            const Portal& m = portals_[static_cast<std::size_t>(i)];
+            if (!m.active || m.fresnelSized) continue;
+            const Vec3 nm = normalized(cross(m.axisU, m.axisV));
+            if (std::fabs(dot(nm, na)) < 0.7f) continue;                 // 面の向きが違えば別の口
+            const Vec3 d = ap.rectCenter - m.center;
+            const float dn = std::fabs(dot(d, nm));
+            if (dn > autoPortalDedupDist_) continue;                       // 面から離れている
+            if (std::fabs(dot(d, m.axisU)) > m.halfU + autoPortalDedupDist_ ||
+                std::fabs(dot(d, m.axisV)) > m.halfV + autoPortalDedupDist_) continue;
+            if (dn < bestD) { bestD = dn; best = i; }
+        }
+        return best;
+    }
+
+    //   ポータルが繋いでいる部屋。自動は自分で持つ（roomA/roomB）。手置きは覆っている口から引く。
+    //   どちらも -1 なら部屋グラフに無い口（稜線の一時ポータルなど）。
+    void portalRooms(int portalId, int& ra, int& rb, bool& toOutside) const {
+        ra = -1; rb = -1; toOutside = false;
+        if (portalId < 0 || portalId >= portalCount()) return;
+        const Portal& pt = portals_[static_cast<std::size_t>(portalId)];
+        if (pt.roomA >= 0 || pt.roomB >= 0 || pt.toOutside) { ra = pt.roomA; rb = pt.roomB; toOutside = pt.toOutside; return; }
+        const rooms::Result& rr = roomGraph();
+        for (const rooms::Aperture& ap : rr.apertures)
+            if (portalForAperture(ap) == portalId) { ra = ap.roomA; rb = ap.roomB; toOutside = ap.toOutside; return; }
+    }
+
+    //   戸口の板（動く物）の材質。矩形に入り込んでいる moved / dynamicTag の実体の先頭。無ければ -1（＝穴）。
+    int portalLeafMaterial(const Portal& pt) const {
+        for (const Instance& in : instances_) {
+            if (!in.active || !(in.moved || in.dynamicTag)) continue;
+            if (obbEntersRect(in.obb, pt, 0.01f)) return in.materialId;
+        }
+        return -1;
+    }
+
+    //   開口そのものの開き具合（音源にも聴者にも依らない）。面の正面 20 m の点（≒平行投影）から板だけを
+    //   矩形へ落とし、帯域に依らない素通しの面積率を採る（portalOpenBands の area ＝ 射影の法則そのもの）。
+    //   板が無ければ 1。★開口の法則 2（弦）を採用したら、ここも弦に合わせること（答えを 1 つに保つ）。
+    float portalAreaOpen(const Portal& pt) const {
+        const Vec3 n = normalized(cross(pt.axisU, pt.axisV));
+        float f6[kNumBands]; float areaFrac = 1.0f;
+        portalOpenBands(pt, pt.center + n * 20.0f, pt.center - n * 20.0f, f6, nullptr, &areaFrac, true);
+        return areaFrac;
+    }
+
+    //   【手順 3】帯域別の残響時間(s)を、開口の吸音率を扉の開き具合で動かして出す。
+    //   部屋グラフは開口を吸音率 1（穴）で数える。閉まった扉は穴でなく板なので、
+    //       開口の吸音率 = a·1 + (1 − a)·(板の吸音 + 透過)、a = 素通しの面積率
+    //   面積は固定、係数だけ動く（扉のたびに部屋グラフを作り直さない）。板の無い口（戸口だけ）は穴のまま。
+    //   これで閉めたときの自分の Sabine が伸び、FDN の RT60 が追う（08-24 の連成の片方。もう片方は配線）。
+    //   outOpenFrac: この部屋の口の面積で重み付けした a（HUD 用）。
+    bool roomRt60Live(int room, float* outRt60_6, float* outOpenFrac = nullptr) const {
+        const rooms::Result& rr = roomGraph();
+        if (room < 0 || room >= static_cast<int>(rr.rooms.size()) || !outRt60_6) return false;
+        const rooms::Room& rm = rr.rooms[static_cast<std::size_t>(room)];
+        const double c = rr.grid.cell;
+        const double vol = static_cast<double>(rm.voxels) * c * c * c;
+        double A[kNumBands];
+        for (int b = 0; b < kNumBands; ++b) A[b] = static_cast<double>(rm.absorb[b]) * rm.surface;   // 開口は 1 で入っている
+        double openW = 0.0, openA = 0.0;
+        for (const rooms::Aperture& ap : rr.apertures) {
+            if (ap.roomA != room && ap.roomB != room) continue;
+            openA += ap.area;
+            const int pid = portalForAperture(ap);
+            if (pid < 0) { openW += ap.area; continue; }                  // ポータルの無い小さな口: 穴のまま
+            const Portal& pt = portals_[static_cast<std::size_t>(pid)];
+            const int leaf = portalLeafMaterial(pt);
+            if (leaf < 0) { openW += ap.area; continue; }                 // 板が無い: 穴のまま
+            const double a = portalAreaOpen(pt);
+            openW += a * ap.area;
+            const AcousticMaterial& mat = materialOf(leaf);
+            for (int b = 0; b < kNumBands; ++b) {
+                const double aLeaf = std::min(1.0, static_cast<double>(mat.absorption[b]) + static_cast<double>(mat.transmission[b]));
+                const double eff = a + (1.0 - a) * aLeaf;
+                A[b] -= static_cast<double>(ap.area) * (1.0 - eff);
+            }
+        }
+        for (int b = 0; b < kNumBands; ++b) {
+            const double mAir = rooms::kAirDbPerM[b] * 0.1151;
+            const double denom = std::max(A[b], 1e-3) + 4.0 * mAir * vol;
+            outRt60_6[b] = static_cast<float>(0.161 * vol / denom);
+        }
+        if (outOpenFrac) *outOpenFrac = (openA > 1e-9) ? static_cast<float>(openW / openA) : 1.0f;
+        return true;
+    }
+
+    //   【手順 4】点 p のまわりで、各部屋の FDN との結び付き（帯域別の振幅）。
+    //   リスナーの重みも音源の送りも**同じ式**（答えは 1 つ）:
+    //       E_r,b = s_r + (1 − s_r) · Σ_口 gate_口 · α_口,b² · min(1/2, S_口 / 4πd²)
+    //         s_r     : p のまわりで部屋 r が占める割合（空間版。normalizeOwn なら部屋どうしで正規化）
+    //         gate_口 : 口の向こう側に p がいる割合（向こうが部屋なら s_向こう、外なら 1 − Σs）
+    //         α_口,b  : 口の開口率。portalOpenBands を「p と部屋 r の重心」の組で回す
+    //                   ＝早期の開口の色と同じ関数（扉の α が早期には色、後期には配線の重みとして効く）
+    //         S/4πd² : 口の立体角の割合（エネルギー）。面の上では半空間 ＝ 1/2 で頭打ち
+    //       w_r,b = √E_r,b（部屋の FDN どうしは無相関なので、足すのはエネルギー、掛けるのは振幅）
+    //   normalizeOwn: リスナー側は true ── 尾の比 tailRatio が「部屋の中である割合」を既に持つので二重に掛けない。
+    //                 音源側は false ── 注ぐ量そのもの。外にいる音源は口からしか入らない。
+    //   戸口の中では両側の部屋が 0.5 + 0.5·α²·(1/2)·0.5 ≒ 0.63 ずつ（合計 +1 dB）。段は無い。
+    //   書けた数を返す（E の大きい順、outW6[k*6+b]）。
+    int fdnRoomWeights(const Vec3& p, float radius, bool normalizeOwn, int* outRooms, float* outW6, int maxOut) const {
+        if (!outRooms || !outW6 || maxOut <= 0) return 0;
+        const rooms::Result& rr = roomGraph();
+        const int nr = std::min(static_cast<int>(rr.rooms.size()), 64);
+        if (nr <= 0) return 0;
+        float s[64] = {};
+        int ids[8]; float w[8];
+        const int n = roomShare(p, radius, ids, w, 8);
+        float sum = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            const float wi = std::max(0.0f, w[i]);
+            if (ids[i] >= 0 && ids[i] < 64) s[ids[i]] = wi;
+            sum += wi;
+        }
+        const float outside = std::max(0.0f, 1.0f - sum);
+        float own[64] = {};
+        for (int r = 0; r < nr; ++r) own[r] = (normalizeOwn && sum > 1e-6f) ? std::min(1.0f, s[r] / sum) : s[r];
+        double E[64][kNumBands];
+        for (int r = 0; r < nr; ++r) for (int b = 0; b < kNumBands; ++b) E[r][b] = own[r];
+        for (int pid = 0; pid < portalCount(); ++pid) {
+            const Portal& pt = portals_[static_cast<std::size_t>(pid)];
+            if (!pt.active || pt.fresnelSized) continue;
+            int ra, rb; bool toOut;
+            portalRooms(pid, ra, rb, toOut);
+            if (ra < 0 && rb < 0) continue;
+            const float S = 4.0f * pt.halfU * pt.halfV;
+            const Vec3 dp = p - pt.center;
+            const float solid = std::min(0.5f, S / (4.0f * 3.14159265f * std::max(dot(dp, dp), 1e-4f)));
+            for (int side = 0; side < 2; ++side) {
+                const int r = (side == 0) ? ra : rb;
+                const int far = (side == 0) ? rb : ra;
+                if (r < 0 || r >= nr) continue;
+                const float gate = (far >= 0 && far < nr) ? own[far] : outside;
+                if (gate <= 1e-6f || own[r] >= 1.0f - 1e-6f) continue;    // 向こう側にいない／もう中にいる
+                float f6[kNumBands];
+                portalOpenBands(pt, p, rr.rooms[static_cast<std::size_t>(r)].centroid, f6, nullptr);
+                for (int b = 0; b < kNumBands; ++b)
+                    E[r][b] += (1.0 - own[r]) * gate * static_cast<double>(f6[b]) * f6[b] * solid;
+            }
+        }
+        int order[64]; int cnt = 0;
+        for (int r = 0; r < nr; ++r) { double m = 0.0; for (int b = 0; b < kNumBands; ++b) m = std::max(m, E[r][b]); if (m > 1e-9) order[cnt++] = r; }
+        std::sort(order, order + cnt, [&](int a, int b2) { return E[a][3] > E[b2][3]; });
+        const int written = std::min(cnt, maxOut);
+        for (int k = 0; k < written; ++k) {
+            outRooms[k] = order[k];
+            for (int b = 0; b < kNumBands; ++b) outW6[k * kNumBands + b] = static_cast<float>(std::sqrt(std::min(1.0, E[order[k]][b])));
+        }
+        return written;
     }
 
     // ポータルがどれだけ開いているかを帯域別に測る。
@@ -1673,9 +1866,13 @@ public:
     //   よく通り、低域はゾーンが大きいので塞がれた部分に掛かる ＝「開くと明るくなる」。
     //   ゾーンの中心は直線と矩形面の交点（連続に動く）。**矩形で切られるので暴走しない** ──
     //   ここが従来との決定的な違いで、中心の置き方に答えが無い問題が消える。
+    //   outAreaFrac : 帯域に依らない素通しの面積率（射影の法則そのもの）。部屋の Sabine の開口はこれで動かす。
+    //   leafOnly    : 板（moved / dynamicTag）だけを遮蔽物にする。開口そのものの状態を測るとき（roomRt60Live）。
     bool portalOpenBands(const Portal& pt, const Vec3& listener, const Vec3& source,
-                         float* outFrac6, Vec3* outPoint) const {
+                         float* outFrac6, Vec3* outPoint, float* outAreaFrac = nullptr,
+                         bool leafOnly = false) const {
         for (int b = 0; b < kNumBands; ++b) outFrac6[b] = 1.0f;
+        if (outAreaFrac) *outAreaFrac = 1.0f;
         if (!pt.active) return false;
 
         Vec3 n = normalized(cross(pt.axisU, pt.axisV));
@@ -1755,7 +1952,7 @@ public:
             const float ext = std::fabs(dot(ob.axisX, n)) * ob.halfExtents.x
                             + std::fabs(dot(ob.axisY, n)) * ob.halfExtents.y
                             + std::fabs(dot(ob.axisZ, n)) * ob.halfExtents.z;
-            return (d + ext) < -0.01f;      // 完全に奥側
+            return (d + ext) < -(0.01f + pt.planeSlack);      // 完全に奥側（ボクセル由来の矩形は面の不確かさぶん余裕）
         };
         // ★開口に**入り込んでいる物だけ**が塞ぐ。矩形の外にしか無い物は参加させない。
         //
@@ -1773,24 +1970,10 @@ public:
         //   ★却下済みの「断面で測る」とは別物。あれは**量の測り方**の話（斜めの薄い板が
         //     断面に現れない）で、こちらは**参加者の選び方**。入った物の量は従来どおり影で測る。
         const float kEdgeMargin = 0.01f;
-        auto entersAperture = [&](const Obb& ob) {
-            float uMin = 1e30f, uMax = -1e30f, vMin = 1e30f, vMax = -1e30f;
-            for (int i = 0; i < 8; ++i) {
-                const float sx = (i & 1) ? 1.0f : -1.0f;
-                const float sy = (i & 2) ? 1.0f : -1.0f;
-                const float sz = (i & 4) ? 1.0f : -1.0f;
-                const Vec3 q = ob.center + ob.axisX * (ob.halfExtents.x * sx)
-                                         + ob.axisY * (ob.halfExtents.y * sy)
-                                         + ob.axisZ * (ob.halfExtents.z * sz);
-                const float qu = dot(q - pt.center, u), qv = dot(q - pt.center, v);
-                uMin = std::min(uMin, qu); uMax = std::max(uMax, qu);
-                vMin = std::min(vMin, qv); vMax = std::max(vMax, qv);
-            }
-            const float hu = pt.halfU - kEdgeMargin, hv = pt.halfV - kEdgeMargin;
-            return (uMax > -hu && uMin < hu) && (vMax > -hv && vMin < hv);
-        };
+        auto entersAperture = [&](const Obb& ob) { return obbEntersRect(ob, pt, kEdgeMargin); };
         for (const Instance& inst : instances_) {
             if (!inst.active || beyondPortal(inst.obb)) continue;
+            if (leafOnly && !(inst.moved || inst.dynamicTag)) continue;   // 開口そのものの状態: 板だけ
             // bit8 で切れる（計測用）。どのゲートが扉を塞いでいるかの切り分けに使う。
             if (!(diffGateMask_ & 8) && !entersAperture(inst.obb)) continue;
             if (inst.geomId >= 0 && inst.geomId < static_cast<int>(meshes_.size())
@@ -1921,6 +2104,10 @@ public:
             outBegin[kRows] = static_cast<int>(outRow.size());
         };
         buildRows(false, openRow, begin_, true);
+        if (outAreaFrac) {
+            const double full = 4.0 * static_cast<double>(pt.halfU) * static_cast<double>(pt.halfV);
+            *outAreaFrac = (full > 1e-12) ? static_cast<float>(std::min(1.0, std::max(0.0, area / full))) : 1.0f;
+        }
         // 出ていった遮蔽物があるときだけ 2 本目を作る（費用の増分をそこに限る）。
         double swungSum = 0.0; int swungN = 0;
         double swungFoot = 0.0;    // 出ていった遮蔽物が矩形に落とす足跡の幅（u 方向）。法則 2 の弦に使う
@@ -5928,9 +6115,10 @@ public:
         for (int b = 0; b < kNumBands; ++b) out6[b] *= (1.0f / 9.0f);
     }
     // 全インスタンスに対する見通し（生）。
-    void softTransmissionDisc(const Vec3& from, const Vec3& to, float radius, float out6[kNumBands]) const {
+    void softTransmissionDisc(const Vec3& from, const Vec3& to, float radius, float out6[kNumBands],
+                              bool staticOnly = false) const {
         discAverage(from, to, radius,
-                    [&](const Vec3& a, const Vec3& p, float* g) { computeTransmission(a, p, g); }, out6);
+                    [&](const Vec3& a, const Vec3& p, float* g) { computeTransmission(a, p, g, staticOnly); }, out6);
     }
 
     // ── 焼く層: 静的な面のリストと、セルごとの見通し ──────────────────────────────
@@ -5998,7 +6186,11 @@ public:
                     if (!front) continue;                       // 裏側のセルからは見えない（0 のまま）
                     const float si = -f.hL + pitch * (static_cast<float>(i) + 0.5f);
                     const Vec3 q = f.c + f.aL * si + f.nrm * 0.02f;
-                    softTransmissionDisc(q, cc, kFaceDiscRadius, dst);
+                    // ★静的な物だけで焼く。動く物（moved / dynamicTag）は実行時に dynamicBlock が掛けるので、ここで見ると二重になる。
+                    //   これまで見えなかったのは、閉じた扉が部屋グラフでも壁だったため戸口の面が部屋を持たず（roomAt = -1）
+                    //   常に生で解かれていたから。部屋グラフが印の付いた物を外すようになって（2026-09-09）、戸口の面が
+                    //   部屋を持ち焼きが使われ、凍った閉扉の遮蔽が開けた後も残った（[焼き] 8c: 13.19 対 生 14.68 dB）。
+                    softTransmissionDisc(q, cc, kFaceDiscRadius, dst, true);
                 }
             }
         }

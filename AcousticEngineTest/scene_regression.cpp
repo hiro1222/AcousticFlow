@@ -4310,6 +4310,9 @@ void testFaceReflections() {
                 const float th = deg * 3.14159265f / 180.0f, cs = std::cos(th), sn = std::sin(th);
                 const int d = AF_SceneAddInstanceBox(s, V(-0.5f + 0.5f * cs, 1.5f, 0.5f * sn), V(0.5f, 1.5f, 0.03f),
                                                      V(cs, 0, sn), V(0,1,0), m);
+                // 扉は両方の場面で「音響的に動く物」の印を付ける（焼きにも部屋グラフにも入れない。2026-09-09 から
+                // 部屋グラフも印を見るので、片方だけ印を付けると戸口の有無が違う場面どうしを比べることになる）。
+                AF_SceneSetInstanceDynamic(s, d, 1);
                 if (outDoorId) *outDoorId = d;
                 AF_UpdateConfig c = cfgFor(1, 5, 0);
                 AF_SceneSetUpdateConfig(s, &c);
@@ -4327,9 +4330,11 @@ void testFaceReflections() {
             AF_SceneUpdateInstance(sb, doorId, V(-0.5f + 0.5f * cs, 1.5f, 0.5f * sn), V(0.5f, 1.5f, 0.03f),
                                    V(cs, 0, sn), V(0,1,0));
             const double eBakeOpen = total(sb, Ld, Sd);
+            std::printf("      [診断 8c] 焼き側: 部屋 %d 個、リスナー=部屋%d、音源=部屋%d、口 %d\n", AF_SceneRoomCount(sb), AF_SceneRoomAt(sb, Ld), AF_SceneRoomAt(sb, Sd), AF_SceneApertureCount(sb));
             AF_SceneDestroy(sb);
             AF_SceneHandle so = doorScene(90.0f, nullptr);
             const double eLiveOpen = total(so, Ld, Sd);
+            std::printf("      [診断 8c] 生側:   部屋 %d 個、リスナー=部屋%d、音源=部屋%d、口 %d\n", AF_SceneRoomCount(so), AF_SceneRoomAt(so, Ld), AF_SceneRoomAt(so, Sd), AF_SceneApertureCount(so));
             AF_SceneDestroy(so);
             std::snprintf(buf, sizeof(buf), "(閉: 生 %.2f / 焼き %.2f dB)", dB(eLiveClosed), dB(eBakeClosed));
             check("[焼き] 閉扉で焼いた答えが生と 0.5 dB 以内", std::fabs(dB(eLiveClosed) - dB(eBakeClosed)) < 0.5, buf);
@@ -8483,8 +8488,9 @@ void testWalkContinuity() {
     //   speedMps: 歩く速さ。**半分にして最大 dB/s が半分になるかを見ると、
     //   「本当に速い変化」と「空間の不連続」を分けられる**（滑らかなら変化率は速さに比例し、
     //   段があるなら速さを落としても段は消えないので比例しない）。
+    //   tailModel: 0 畳み込み（既定）／1 尾＝部屋ごとの FDN（docs/TAIL_FDN_PLAN.md 手順 4。扉に印を付ける）。
     auto run = [&](int earlyModel, bool early, int path, int keepMask = 7, bool tailOn = true,
-                   float speedMps = 1.4f) {
+                   float speedMps = 1.4f, int tailModel = 0) {
         const float stepMps = speedMps * dt;   // 1 ブロックの移動距離
         AF_SceneHandle s = AF_SceneCreate();
         const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
@@ -8502,8 +8508,10 @@ void testWalkContinuity() {
             const float th = 60.0f * 3.14159265f / 180.0f;
             const AF_Vector3 right = V(std::cos(th), 0.0f, std::sin(th));
             const AF_Vector3 hinge = V(-doorW * 0.5f, h * 0.5f, 0.0f);
-            AF_SceneAddInstanceBox(s, V(hinge.x + right.x * doorW * 0.5f, hinge.y, hinge.z + right.z * doorW * 0.5f),
+            const int doorIdW = AF_SceneAddInstanceBox(s, V(hinge.x + right.x * doorW * 0.5f, hinge.y, hinge.z + right.z * doorW * 0.5f),
                                    V(doorW * 0.5f, h * 0.5f, doorT), right, V(0,1,0), mat);
+            // 尾＝FDN の腕では扉に印を付ける（部屋グラフから外して戸口を出す）。他の腕は従来どおり触らない。
+            if (tailModel == 1) AF_SceneSetInstanceDynamic(s, doorIdW, 1);
         }
         AF_SceneSetListenerOrientation(s, V(0,0,1), V(0,1,0));
         AF_SceneSetSource(s, 1, V(0, 1.6f, 3));
@@ -8520,6 +8528,8 @@ void testWalkContinuity() {
         AF_VoiceSetHrtfEnabled(v, 0);     // 腕の間で共通なので切る（HRTF の混ぜを混入させない）
         AF_VoiceSetTailLevel(v, tailOn ? 1.0f : 0.0f);
         AF_VoiceSetTailEnvelope(v, 1.0f, 1.0f);
+        AF_FdnMixHandle fdn = nullptr;   // 尾＝FDN の腕でだけ作る
+        const AF_Vector3 Sp = V(0, 1.6f, 3);
 
         std::vector<float> in(static_cast<std::size_t>(block));
         std::vector<float> oL(static_cast<std::size_t>(block)), oR(static_cast<std::size_t>(block));
@@ -8577,6 +8587,36 @@ void testWalkContinuity() {
                 AF_VoiceSetDirection(v, V(vp.directDirX, vp.directDirY, vp.directDirZ), 57.0f);
                 if (vp.hrtfTapIndex >= 0)
                     AF_VoiceSetDiffractionDirection(v, V(vp.hrtfDirX, vp.hrtfDirY, vp.hrtfDirZ), 57.0f);
+                if (tailModel == 1) {
+                    const int nr = AF_SceneRoomCount(s);
+                    if (!fdn && nr > 0) {
+                        fdn = AF_FdnMixCreate(sr, block, 0.6f);
+                        for (int r = 0; r < nr; ++r) {
+                            float vol = 0, surf = 0, open = 0, ab[6] = {}, rts[6] = {};
+                            AF_SceneRoomInfo(s, r, &vol, nullptr, nullptr, nullptr);
+                            AF_SceneRoomAcoustics(s, r, &surf, &open, ab, rts);
+                            const float mfp = 4.0f * vol / std::max(surf, 1e-3f);
+                            AF_FdnMixAddRoom(fdn, (mfp / 343.0f) / 0.012f, rts, 1);
+                        }
+                        AF_VoiceSetFdnMix(v, fdn);
+                    }
+                    if (fdn) {
+                        for (int r = 0; r < nr; ++r) {
+                            float rt[6] = {}, surf = 0, open = 0, ab[6] = {}, rts[6] = {};
+                            AF_SceneRoomAcoustics(s, r, &surf, &open, ab, rts);
+                            AF_SceneRoomRt60Live(s, r, rt, nullptr);
+                            AF_FdnMixSetRoomRt60(fdn, r, rt, 1);
+                        }
+                        int rooms[8]; float w6[48]; const float zero[6] = {};
+                        for (int r = 0; r < nr; ++r) AF_FdnMixSetListenerWeight(fdn, r, zero);
+                        const int nl = AF_SceneFdnRoomWeights(s, L, 2.0f, 1, rooms, w6, 8);
+                        for (int k = 0; k < nl; ++k) AF_FdnMixSetListenerWeight(fdn, rooms[k], w6 + k * 6);
+                        const int ns = AF_SceneFdnRoomWeights(s, Sp, 2.0f, 0, rooms, w6, 4);
+                        float g[4] = {};
+                        for (int k = 0; k < ns; ++k) { float mm = 0; for (int b = 0; b < 6; ++b) mm += w6[k * 6 + b]; g[k] = mm / 6.0f; }
+                        AF_VoiceSetFdnSends(v, rooms, g, ns);
+                    }
+                }
                 if (f % 8 == 0) {
                     const int bins = AF_SceneGetEchogramBands(s, idx, echo.data(), cfg.echogramBins);
                     if (bins > 0 && nt > 0) {
@@ -8584,6 +8624,8 @@ void testWalkContinuity() {
                         for (int b = 0; b < 6; ++b) dg += vp.taps[0].gain6[b];
                         dg /= 6.0f;
                         const float splitMs = vp.mixingTimeMs > 20.0f ? vp.mixingTimeMs : 20.0f;
+                        if (fdn) AF_VoiceSetTailAmount(v, dg, vp.tailRatio);   // FDN: 量だけ
+                        else
                         AF_VoiceRebuildTail(v, echo.data(), bins, cfg.echogramBinSeconds * 1000.0f,
                                             splitMs, 20.0f, 30.0f, 0.0f, 0.6f,
                                             dg, vp.tailRatio, nullptr, 0);
@@ -8602,6 +8644,7 @@ void testWalkContinuity() {
             }
             AF_VoiceMetering m{};
             AF_VoiceRender(v, in.data(), block, oL.data(), oR.data(), &m);
+            if (fdn) AF_FdnMixRender(fdn, block, oL.data(), oR.data());
             if (f < warm) { prevSample = oL[static_cast<std::size_t>(block - 1)]; continue; }
 
             double maxStep = 0.0, sq = 0.0;
@@ -8625,6 +8668,7 @@ void testWalkContinuity() {
             }
             prevDb = db; hasPrevDb = true;
         }
+        if (fdn) { AF_VoiceSetFdnMix(v, nullptr); AF_FdnMixDestroy(fdn); }
         AF_VoiceDestroy(v);
         AF_SceneDestroy(s);
         WalkResult r;
@@ -8670,6 +8714,18 @@ void testWalkContinuity() {
                 "        %s\n", nb);
     // いまは「切れていないこと」だけを守る。ぐらつきの閾値は試聴で決めてから入れる。
     check("[歩行] 歩いても波形が切れない（どの模型でも）", worstStepRatio < 4.0, nb);
+
+    // ── 尾＝FDN（tailModel=1）。面の線・戸口をくぐる経路を同じ台本で ──
+    {
+        const WalkResult rf = run(1, true, 0, 7, true, 1.4f, 1);
+        const double srF = rf.stepMax / (rf.stepAvg > 1e-9 ? rf.stepAvg : 1.0);
+        std::printf("        %-14s %-10s %10.1f %8.1f %10.3f %8.3f %9.2f %12.1f\n",
+                    pathName[0], "面の線+FDN", rf.rateAvg, rf.rateMax, rf.stepAvg, rf.stepMax, srF, rf.levelDb);
+        char nf[200];
+        std::snprintf(nf, sizeof(nf), "(尾＝FDN: 最大 %.1f dB/s、段差の最悪 %.2f 倍。畳み込み（面の線）は %.1f dB/s / %.2f 倍)",
+                      rf.rateMax, srF, lineRateMax, worstStepRatio);
+        check("[歩行] 歩いても波形が切れない（尾＝FDN）", srF < 4.0, nf);
+    }
 
     // ★聞き比べのラウドネス合わせ。腕を切り替えると音量が変わると「大きい方が良い」に
     //   引っ張られるので、資料でも試聴でも揃えること。ここに補正値を出す。
@@ -8756,8 +8812,9 @@ void testDoorSweepClicks() {
     //   環境音なので、正弦（平常値 0.04）で測るのが実機に近い。雑音は対照として残す。
     //   keepMask: bit0 直接／bit1 反射／bit2 回折。tailOn=false で尾を落とす。成分の切り分け用。
     //   tailMode: 0 そのまま／1 尾の量（directGain と目標比）を固定／2 尾を最初に 1 回だけ組む。
+    //   tailModel: 0 畳み込み（既定）／1 尾＝部屋ごとの FDN（docs/TAIL_FDN_PLAN.md 手順 4）。
     auto run = [&](int earlyModel, float tailXfadeMs, bool moveDoor, bool sine,
-                   int keepMask, bool tailOn, int tailMode = 0) {
+                   int keepMask, bool tailOn, int tailMode = 0, int tailModel = 0) {
         AF_SceneHandle s = AF_SceneCreate();
         const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
         AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(half+t, t, half+t), V(1,0,0), V(0,1,0), mat);
@@ -8788,6 +8845,8 @@ void testDoorSweepClicks() {
         AF_VoiceSetTailLevel(v, tailOn ? 1.0f : 0.0f);
         AF_VoiceSetTailEnvelope(v, 1.0f, 1.0f);
         AF_VoiceSetTailCrossfadeMs(v, tailXfadeMs);
+        AF_FdnMixHandle fdn = nullptr;   // 尾＝FDN の腕でだけ作る（部屋グラフが確定してから）
+        const AF_Vector3 Lp = V(0, 1.6f, -3), Sp = V(0, 1.6f, 3);
 
         std::vector<float> in(static_cast<std::size_t>(block));
         std::vector<float> oL(static_cast<std::size_t>(block)), oR(static_cast<std::size_t>(block));
@@ -8847,6 +8906,37 @@ void testDoorSweepClicks() {
                 AF_VoiceSetDirection(v, V(vp.directDirX, vp.directDirY, vp.directDirZ), 57.0f);
                 if (vp.hrtfTapIndex >= 0)
                     AF_VoiceSetDiffractionDirection(v, V(vp.hrtfDirX, vp.hrtfDirY, vp.hrtfDirZ), 57.0f);
+                // 尾＝FDN: ホストと同じ配線（部屋ごとの FDN、生きた RT60、配線の重みを毎フレーム）。
+                if (tailModel == 1) {
+                    const int nr = AF_SceneRoomCount(s);
+                    if (!fdn && nr > 0) {
+                        fdn = AF_FdnMixCreate(sr, block, 0.6f);
+                        for (int r = 0; r < nr; ++r) {
+                            float vol = 0, surf = 0, open = 0, ab[6] = {}, rts[6] = {};
+                            AF_SceneRoomInfo(s, r, &vol, nullptr, nullptr, nullptr);
+                            AF_SceneRoomAcoustics(s, r, &surf, &open, ab, rts);
+                            const float mfp = 4.0f * vol / std::max(surf, 1e-3f);
+                            AF_FdnMixAddRoom(fdn, (mfp / 343.0f) / 0.012f, rts, 1);
+                        }
+                        AF_VoiceSetFdnMix(v, fdn);
+                    }
+                    if (fdn) {
+                        for (int r = 0; r < nr; ++r) {
+                            float rt[6] = {}, surf = 0, open = 0, ab[6] = {}, rts[6] = {};
+                            AF_SceneRoomAcoustics(s, r, &surf, &open, ab, rts);
+                            AF_SceneRoomRt60Live(s, r, rt, nullptr);
+                            AF_FdnMixSetRoomRt60(fdn, r, rt, 1);
+                        }
+                        int rooms[8]; float w6[48]; const float zero[6] = {};
+                        for (int r = 0; r < nr; ++r) AF_FdnMixSetListenerWeight(fdn, r, zero);
+                        const int nl = AF_SceneFdnRoomWeights(s, Lp, 2.0f, 1, rooms, w6, 8);
+                        for (int k = 0; k < nl; ++k) AF_FdnMixSetListenerWeight(fdn, rooms[k], w6 + k * 6);
+                        const int ns = AF_SceneFdnRoomWeights(s, Sp, 2.0f, 0, rooms, w6, 4);
+                        float g[4] = {};
+                        for (int k = 0; k < ns; ++k) { float mm = 0; for (int b = 0; b < 6; ++b) mm += w6[k * 6 + b]; g[k] = mm / 6.0f; }
+                        AF_VoiceSetFdnSends(v, rooms, g, ns);
+                    }
+                }
                 // 尾はホストと同じく 8 フレームに 1 回組み直す。
                 const bool doRebuild = (tailMode == 2) ? (f == 0) : (f % 8 == 0);
                 if (doRebuild) {
@@ -8858,6 +8948,8 @@ void testDoorSweepClicks() {
                         float ratio = vp.tailRatio;
                         if (tailMode == 1) { dg = 0.05f; ratio = 4.0f; }   // 尾の量を固定
                         const float splitMs = vp.mixingTimeMs > 20.0f ? vp.mixingTimeMs : 20.0f;
+                        if (fdn) AF_VoiceSetTailAmount(v, dg, ratio);   // FDN: 量だけ
+                        else
                         AF_VoiceRebuildTail(v, echo.data(), bins, cfg.echogramBinSeconds * 1000.0f,
                                             splitMs, 20.0f, 30.0f, 0.0f, 0.6f,
                                             dg, ratio, nullptr, 0);
@@ -8868,6 +8960,7 @@ void testDoorSweepClicks() {
             for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = sample() * 0.3f;
             AF_VoiceMetering m{};
             AF_VoiceRender(v, in.data(), block, oL.data(), oR.data(), &m);
+            if (fdn) AF_FdnMixRender(fdn, block, oL.data(), oR.data());
             if (f < warm) { prev = oL[static_cast<std::size_t>(block - 1)]; continue; }
             double maxStep = 0.0, sq = 0.0;
             for (int i = 0; i < block; ++i) {
@@ -8884,6 +8977,7 @@ void testDoorSweepClicks() {
                 sum += ratio; ++n;
             }
         }
+        if (fdn) { AF_VoiceSetFdnMix(v, nullptr); AF_FdnMixDestroy(fdn); }
         AF_VoiceDestroy(v);
         AF_SceneDestroy(s);
         Result r; r.calm = (n > 0) ? sum / n : 0.0; r.worst = worst;
@@ -8926,6 +9020,19 @@ void testDoorSweepClicks() {
     //   混ぜ 0 の行は「IR の差し替えの混ぜも要る」ことを見るために残してある。
     check("[扉] 動かしても波形が切れない（面の線・既定）", moveRatioFixed < 2.5, nb);
     check("[扉] 動かしても波形が切れない（像源レイ・既定）", moveRatioIsm < 2.5, nb);
+
+    // ── 尾＝FDN（tailModel=1、docs/TAIL_FDN_PLAN.md 手順 4）。畳み込みと同じ台本で ──
+    {
+        const Result stillF = run(1, 50.0f, false, true, 7, true, 0, 1);
+        const Result moveF  = run(1, 50.0f, true,  true, 7, true, 0, 1);
+        const double rsF = stillF.worst / (stillF.calm > 1e-9 ? stillF.calm : 1.0);
+        const double rmF = moveF.worst / (moveF.calm > 1e-9 ? moveF.calm : 1.0);
+        std::printf("        %-6s %-10s %5s    止め  %10.3f  %10.3f  %9.2f\n", "正弦", "面の線+FDN", "-", stillF.calm, stillF.worst, rsF);
+        std::printf("        %-6s %-10s %5s    動かす%10.3f  %10.3f  %9.2f\n", "正弦", "面の線+FDN", "-", moveF.calm, moveF.worst, rmF);
+        char nf[200];
+        std::snprintf(nf, sizeof(nf), "(尾＝FDN: 止め %.2f 倍 / 動かす %.2f 倍。畳み込みは %.2f 倍)", rsF, rmF, moveRatioFixed);
+        check("[扉] 動かしても波形が切れない（尾＝FDN）", rmF < 2.5, nf);
+    }
 
     // ── どの成分が飛ばしているか（正弦・扉を動かす・面の線・尾の混ぜ 50ms 固定）──
     std::printf("\n        成分の切り分け（正弦・扉を動かす・面の線）\n");
@@ -9149,6 +9256,289 @@ void testMaterialPresets() {
         check("[材質] 実体 1 つの材質を付け替えても追いつく（setInstanceMaterial）", c[2] < b[2] * 0.9f, note);
         AF_SceneDestroy(s);
     }
+}
+
+// ================================ [尾・FDN] 開口の吸音率を扉で動かした Sabine と、配線の重み、畳み込みとの量（AF_ONLY=fdn）
+//   docs/TAIL_FDN_PLAN.md の手順 3・4。
+//   ・手順 3: 部屋グラフは開口を吸音率 1（穴）で数える。閉めた扉は板なので、開口の吸音率を
+//             a·1 + (1−a)·(板の吸音+透過)、a = 板の素通しの面積率 で動かす（面積は固定、係数だけ動く）。
+//   ・手順 4: リスナーの重みと音源の送りを 1 つの式（fdnRoomWeights）で出し、畳み込みの尾と量を比べる。
+namespace fdnwire {
+struct Bq {
+    float b0 = 0, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
+    void setLowpass(float fc, float fs) {
+        const float w0 = 2.0f * 3.14159265358979323846f * fc / fs;
+        const float cw = std::cos(w0), sw = std::sin(w0);
+        const float alpha = sw / (2.0f * 0.70710678f);
+        b0 = (1.0f - cw) * 0.5f; b1 = 1.0f - cw; b2 = (1.0f - cw) * 0.5f;
+        const float a0 = 1.0f + alpha; a1 = -2.0f * cw; a2 = 1.0f - alpha;
+        b0 /= a0; b1 /= a0; b2 /= a0; a1 /= a0; a2 /= a0;
+    }
+    float process(float x) { const float y = b0 * x + z1; z1 = b1 * x - a1 * y + z2; z2 = b2 * x - a2 * y; return y; }
+};
+// 6 帯域のエネルギー(dB)。LR4（dsp_regression の fdntest::split6 と同じ）。
+void bandEnergyDb(const float* src, int n, int fs, double* out6) {
+    static const float kCrossHz[5] = {177.0f, 354.0f, 707.0f, 1414.0f, 2828.0f};
+    Bq lp[5][2];
+    for (int c = 0; c < 5; ++c) for (int s = 0; s < 2; ++s) lp[c][s].setLowpass(kCrossHz[c], static_cast<float>(fs));
+    double e[6] = {};
+    for (int i = 0; i < n; ++i) {
+        float rest = src[i];
+        for (int c = 0; c < 5; ++c) {
+            const float lo = lp[c][1].process(lp[c][0].process(rest));
+            e[c] += static_cast<double>(lo) * lo; rest -= lo;
+        }
+        e[5] += static_cast<double>(rest) * rest;
+    }
+    for (int b = 0; b < 6; ++b) out6[b] = 10.0 * std::log10(std::max(e[b] / std::max(n, 1), 1e-30));
+}
+}  // namespace fdnwire
+
+void testFdnWiring() {
+    std::printf("\n[尾・FDN] 開口の吸音率を扉で動かした Sabine ／ 配線の重み ／ 畳み込みとの量（docs/TAIL_FDN_PLAN.md 手順 3・4）\n");
+    const int sr = 48000, block = 512;
+    const float t = 0.2f, h = 3.0f, half = 7.0f, doorW = 1.0f, doorT = 0.03f;
+    const float dt = static_cast<float>(block) / static_cast<float>(sr);
+
+    AF_UpdateConfig cfg{};
+    cfg.role1EveryN = 1;   cfg.role2EveryN = 4;   cfg.earlyEveryN = 3;
+    cfg.diffSrcEveryN = 2; cfg.catalogEveryN = 3;
+    cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+    cfg.directWeight = 1.0f;  cfg.useReflections = 1;
+    cfg.useEdgeCatalog = 1;   cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+    cfg.enableReverb = 1;     cfg.echogramBins = 100;  cfg.echogramBinSeconds = 0.01f;
+    cfg.echogramRays = 512;   cfg.echogramBounces = 24;
+    cfg.speedOfSound = 343.0f; cfg.distanceRef = 4.0f;
+    cfg.enableEarlyReflections = 1; cfg.earlyTaps = 48;
+    cfg.earlyRays = 512; cfg.earlyBounces = 2;
+    cfg.enableDiffractionSources = 1; cfg.diffSources = 8;
+    cfg.earlyFaceSubTaps = 5; cfg.echogramSkipFirstOrder = 1;
+    cfg.earlyModel = 1;
+
+    // [扉] と同じ 2 部屋（14 m 角を仕切って戸口 1 m）。扉の板は木の扉なり（透過 TL 15〜36 dB、吸音 0.1）。
+    AF_SceneHandle s = AF_SceneCreate();
+    const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+    const float leafTr[6] = { 0.0316f, 0.0126f, 0.00398f, 0.00126f, 0.000501f, 0.000251f };
+    const float leafAb[6] = { 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f };
+    const float leafSc[6] = { 0.10f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f };
+    const int leafMat = AF_SceneAddMaterial(s, leafTr, leafAb, leafSc, 6);
+    AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(half+t, t, half+t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(half+t, t, half+t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(-half-t, h*0.5f, 0), V(t, h*0.5f, half+t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V( half+t, h*0.5f, 0), V(t, h*0.5f, half+t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f, -half-t), V(half+t, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V(0, h*0.5f,  half+t), V(half+t, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+    const float side = (2.0f*half - doorW) * 0.5f;
+    AF_SceneAddInstanceBox(s, V(-(doorW*0.5f + side*0.5f), h*0.5f, 0), V(side*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+    AF_SceneAddInstanceBox(s, V( (doorW*0.5f + side*0.5f), h*0.5f, 0), V(side*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+    const int doorId = AF_SceneAddInstanceBox(s, V(0, h*0.5f, 0), V(doorW*0.5f, h*0.5f, doorT), V(1,0,0), V(0,1,0), leafMat);
+    AF_SceneSetInstanceDynamic(s, doorId, 1);   // 印: 最初から部屋グラフに入れない（戸口が最初からある）
+    const AF_Vector3 Lp = V(0, 1.6f, -3), Sp = V(0, 1.6f, 3);
+    AF_SceneSetListener(s, Lp);
+    AF_SceneSetListenerOrientation(s, V(0,0,1), V(0,1,0));
+    AF_SceneSetSource(s, 1, Sp);
+    AF_SceneSetUpdateConfig(s, &cfg);
+    auto setDoor = [&](float deg) {
+        const float th = deg * 3.14159265f / 180.0f;
+        const AF_Vector3 right = V(std::cos(th), 0.0f, std::sin(th));
+        const AF_Vector3 hinge = V(-doorW * 0.5f, h * 0.5f, 0.0f);
+        AF_SceneUpdateInstance(s, doorId, V(hinge.x + right.x * doorW * 0.5f, hinge.y, hinge.z + right.z * doorW * 0.5f),
+                               V(doorW * 0.5f, h * 0.5f, doorT), right, V(0,1,0));
+    };
+    setDoor(0.0f);
+    for (int i = 0; i < 4; ++i) AF_SceneUpdate(s, dt);
+    const int nr = AF_SceneRoomCount(s);
+    const int roomL = AF_SceneRoomAt(s, Lp), roomS = AF_SceneRoomAt(s, Sp);
+    char buf[300];
+    std::snprintf(buf, sizeof(buf), "(部屋 %d 個、リスナー=部屋%d、音源=部屋%d)", nr, roomL, roomS);
+    check("[尾・FDN] 印の付いた扉は最初から部屋グラフに入らず、閉じていても 2 部屋", nr == 2 && roomL >= 0 && roomS >= 0 && roomL != roomS, buf);
+
+    // ── 手順 3: 開口の吸音率を扉で動かした RT60 ──
+    std::printf("      手順 3: 部屋の RT60（Sabine）。開口 = a·穴 + (1−a)·板、a = 板の素通しの面積率\n");
+    std::printf("        角度   部屋   a(素通し)   RT60 125/500/4k (生きた値)   固定の Sabine 500   差 500\n");
+    const float degs[5] = { 0.0f, 10.0f, 30.0f, 60.0f, 90.0f };
+    float rtLive500[5][2] = {}, openFrac[5][2] = {};
+    float rtStatic500[2] = {};
+    for (int di = 0; di < 5; ++di) {
+        setDoor(degs[di]);
+        for (int i = 0; i < 2; ++i) AF_SceneUpdate(s, dt);
+        for (int r = 0; r < 2 && r < nr; ++r) {
+            float rt[6] = {}, a = 1.0f, surf = 0, open = 0, ab[6] = {}, rts[6] = {};
+            AF_SceneRoomRt60Live(s, r, rt, &a);
+            AF_SceneRoomAcoustics(s, r, &surf, &open, ab, rts);
+            rtLive500[di][r] = rt[2]; openFrac[di][r] = a; rtStatic500[r] = rts[2];
+            std::printf("        %4.0f°   %d     %6.3f      %5.2f / %5.2f / %5.2f              %5.2f          %+5.2f\n",
+                        degs[di], r, a, rt[0], rt[2], rt[5], rts[2], rt[2] - rts[2]);
+        }
+    }
+    {
+        bool mono = true, closedLonger = true, openEqualsStatic = true;
+        for (int r = 0; r < 2 && r < nr; ++r) {
+            for (int di = 1; di < 5; ++di) if (rtLive500[di][r] > rtLive500[di - 1][r] * 1.001f) mono = false;
+            if (!(rtLive500[0][r] > rtLive500[4][r] * 1.02f)) closedLonger = false;
+            if (std::fabs(rtLive500[4][r] - rtStatic500[r]) > 0.05f * std::max(rtStatic500[r], 1e-3f)) openEqualsStatic = false;
+        }
+        std::snprintf(buf, sizeof(buf), "(閉 %.2f/%.2f s → 全開 %.2f/%.2f s、固定 %.2f/%.2f s)",
+                      rtLive500[0][0], rtLive500[0][1], rtLive500[4][0], rtLive500[4][1], rtStatic500[0], rtStatic500[1]);
+        check("[尾・FDN] 閉めると両部屋の RT60 が伸び、開けるほど単調に縮む", mono && closedLonger, buf);
+        check("[尾・FDN] 全開では固定の Sabine と一致（±5%）", openEqualsStatic, buf);
+        check("[尾・FDN] 閉じた扉の素通しは 0、全開は 0.95 以上", openFrac[0][0] < 0.02f && openFrac[4][0] > 0.95f, buf);
+    }
+
+    // ── 手順 4: 配線の重み（リスナー側・音源側が同じ式）──
+    std::printf("      手順 4: 配線の重み w = √E（125 / 1k / 4k 帯）。リスナー(部屋%d, 正規化) と 音源(部屋%d, そのまま)\n", roomL, roomS);
+    std::printf("        角度   リスナー: 自室    隣室 125/1k/4k          音源: 自室    隣室 125/1k/4k\n");
+    float nbL[5] = {}, nbS[5] = {}, ownL[5] = {};
+    for (int di = 0; di < 5; ++di) {
+        setDoor(degs[di]);
+        for (int i = 0; i < 2; ++i) AF_SceneUpdate(s, dt);
+        int rooms[8]; float w6[48];
+        float lo = 0, ln[3] = {}, so = 0, sn[3] = {};
+        const int nl = AF_SceneFdnRoomWeights(s, Lp, 2.0f, 1, rooms, w6, 8);
+        for (int k = 0; k < nl; ++k) {
+            if (rooms[k] == roomL) lo = w6[k * 6 + 3];
+            else if (rooms[k] == roomS) { ln[0] = w6[k * 6 + 0]; ln[1] = w6[k * 6 + 3]; ln[2] = w6[k * 6 + 5]; }
+        }
+        const int ns = AF_SceneFdnRoomWeights(s, Sp, 2.0f, 0, rooms, w6, 8);
+        for (int k = 0; k < ns; ++k) {
+            if (rooms[k] == roomS) so = w6[k * 6 + 3];
+            else if (rooms[k] == roomL) { sn[0] = w6[k * 6 + 0]; sn[1] = w6[k * 6 + 3]; sn[2] = w6[k * 6 + 5]; }
+        }
+        nbL[di] = ln[1]; nbS[di] = sn[1]; ownL[di] = lo;
+        std::printf("        %4.0f°   %6.3f           %5.3f / %5.3f / %5.3f       %6.3f           %5.3f / %5.3f / %5.3f\n",
+                    degs[di], lo, ln[0], ln[1], ln[2], so, sn[0], sn[1], sn[2]);
+    }
+    {
+        bool mono = true;
+        // 0.005 未満の凸凹は見ない（ボクセル由来の矩形は板より半セル大きいことがあり、閉でも縁に 0.3% の隙が数える）。
+        for (int di = 1; di < 5; ++di) if (nbL[di] < nbL[di - 1] - 5e-3f || nbS[di] < nbS[di - 1] - 5e-3f) mono = false;
+        std::snprintf(buf, sizeof(buf), "(隣室の重み 1k: リスナー 閉 %.3f → 全開 %.3f、音源 閉 %.3f → 全開 %.3f。自室 %.3f)",
+                      nbL[0], nbL[4], nbS[0], nbS[4], ownL[4]);
+        check("[尾・FDN] 自室の重みは 1、隣室の重みは閉で 0.05 未満・開けるほど単調に増える", ownL[4] > 0.99f && nbL[0] < 0.05f && nbL[4] > nbL[0] && mono, buf);
+    }
+    // 戸口をくぐるときの連続性（全開・1k 帯・5 cm 刻み）。
+    {
+        setDoor(90.0f);
+        for (int i = 0; i < 2; ++i) AF_SceneUpdate(s, dt);
+        float prevA = -1.0f, prevB = -1.0f, maxStep = 0.0f, maxSum = 0.0f, minSum = 9.0f;
+        for (float z = -3.0f; z <= 3.0f + 1e-4f; z += 0.05f) {
+            int rooms[8]; float w6[48];
+            const int n = AF_SceneFdnRoomWeights(s, V(0, 1.6f, z), 2.0f, 1, rooms, w6, 8);
+            float wa = 0, wb = 0;
+            for (int k = 0; k < n; ++k) { if (rooms[k] == roomL) wa = w6[k * 6 + 3]; else if (rooms[k] == roomS) wb = w6[k * 6 + 3]; }
+            if (prevA >= 0.0f) maxStep = std::max(maxStep, std::max(std::fabs(wa - prevA), std::fabs(wb - prevB)));
+            prevA = wa; prevB = wb;
+            const float e = wa * wa + wb * wb;
+            maxSum = std::max(maxSum, e); minSum = std::min(minSum, e);
+        }
+        std::snprintf(buf, sizeof(buf), "(1 歩 5 cm の最大変化 %.3f、エネルギーの合計 %.2f〜%.2f = %+.1f dB)",
+                      maxStep, minSum, maxSum, 10.0f * std::log10(std::max(maxSum, 1e-6f) / std::max(minSum, 1e-6f)));
+        check("[尾・FDN] 戸口をくぐっても重みが 1 歩 5 cm で 0.1 以上跳ばない", maxStep < 0.1f, buf);
+        check("[尾・FDN] 戸口の中でもエネルギーの合計が ±2 dB に収まる", maxSum / std::max(minSum, 1e-6f) < 1.585f, buf);
+    }
+
+    // ── 畳み込みの尾との量の比較（白色雑音 4 秒、最後の 2 秒の RMS）──
+    //   同じ部屋: 量の規約（tailGain = 自由音場の直接 × √目標比、IR のエネルギー 1）が両方に同じに載るので揃うはず。
+    //   扉越し（60°）: 畳み込みは tailSrcLevel（反射込みの生存）で減らし、FDN は配線（開口率² × 立体角）で減らす。
+    //     ここでは tailSrcLevel を 1 にしてあるので畳み込みは減らず、FDN だけが配線ぶん減る＝差は配線の量そのもの（合否なし）。
+    std::printf("      量の比較（尾だけ。直接タップは 0、量は両方とも tailGain = 自由音場の直接 × √目標比）\n");
+    auto compareLevels = [&](const AF_Vector3& srcPos, const char* label, bool doCheck) {
+        AF_SceneSetSource(s, 1, srcPos);
+        setDoor(60.0f);
+        for (int i = 0; i < 12; ++i) AF_SceneUpdate(s, dt);   // エコグラムを確定させる
+        const int idx = AF_SceneSourceIndex(s, 1);
+        AF_VoiceProgram vp{};
+        AF_SceneGetVoiceProgram(s, idx, &vp);
+        float dg = 0.0f; for (int b = 0; b < 6; ++b) dg += vp.taps[0].gain6[b]; dg /= 6.0f;
+        const float ratio = vp.tailRatio;
+        const float splitMs = vp.mixingTimeMs > 20.0f ? vp.mixingTimeMs : 20.0f;
+        std::vector<float> echo(static_cast<std::size_t>(cfg.echogramBins) * 6, 0.0f);
+        const int bins = AF_SceneGetEchogramBands(s, idx, echo.data(), cfg.echogramBins);
+        auto runTail = [&](bool fdnMode, double* eDb6, double* totalDb) {
+            AF_VoiceConfig vc{};
+            vc.sampleRate = sr; vc.maxFrames = block; vc.tailSeconds = 2.0f;
+            vc.tapCrossfadeMs = 30.0f; vc.hrtfCrossfadeMs = 12.0f;
+            vc.tailFirstBlock = 64; vc.tailCapBlock = 8192;
+            AF_VoiceHandle v = AF_VoiceCreate(&vc);
+            AF_VoiceSetOutputGain(v, 1.0f);
+            AF_VoiceSetHrtfEnabled(v, 0);
+            AF_VoiceSetTailLevel(v, 1.0f);
+            AF_VoiceSetTailEnvelope(v, 1.0f, 1.0f);
+            AF_VoiceTap tap{};                       // 直接タップは 0（尾だけを測る）
+            AF_VoiceSetTaps(v, &tap, 1);
+            AF_FdnMixHandle fdn = nullptr;
+            if (fdnMode) {
+                fdn = AF_FdnMixCreate(sr, block, 0.6f);
+                for (int r = 0; r < nr; ++r) {
+                    float vol = 0, surf = 0, open = 0, ab[6] = {}, rts[6] = {};
+                    AF_SceneRoomInfo(s, r, &vol, nullptr, nullptr, nullptr);
+                    AF_SceneRoomAcoustics(s, r, &surf, &open, ab, rts);
+                    const float mfp = 4.0f * vol / std::max(surf, 1e-3f);
+                    AF_FdnMixAddRoom(fdn, (mfp / 343.0f) / 0.012f, rts, 1);
+                    float rt[6] = {};
+                    AF_SceneRoomRt60Live(s, r, rt, nullptr);
+                    AF_FdnMixSetRoomRt60(fdn, r, rt, 1);
+                }
+                AF_VoiceSetFdnMix(v, fdn);
+                int rooms[8]; float w6[48];
+                const int nl = AF_SceneFdnRoomWeights(s, Lp, 2.0f, 1, rooms, w6, 8);
+                for (int k = 0; k < nl; ++k) AF_FdnMixSetListenerWeight(fdn, rooms[k], w6 + k * 6);
+                const int ns = AF_SceneFdnRoomWeights(s, srcPos, 2.0f, 0, rooms, w6, 4);
+                float g[4] = {};
+                for (int k = 0; k < ns; ++k) { float m = 0; for (int b = 0; b < 6; ++b) m += w6[k * 6 + b]; g[k] = m / 6.0f; }
+                AF_VoiceSetFdnSends(v, rooms, g, ns);
+                AF_VoiceSetTailAmount(v, dg, ratio);
+            } else {
+                AF_VoiceRebuildTail(v, echo.data(), bins, cfg.echogramBinSeconds * 1000.0f,
+                                    splitMs, 20.0f, 30.0f, 0.0f, 0.6f, dg, ratio, nullptr, 0);
+            }
+            const int total = sr * 4, keepFrom = sr * 2;
+            std::vector<float> in(static_cast<std::size_t>(block)), oL(static_cast<std::size_t>(block)), oR(static_cast<std::size_t>(block));
+            std::vector<float> kept; kept.reserve(static_cast<std::size_t>(total - keepFrom));
+            unsigned int rs = 20260909u;
+            for (int p = 0; p < total; p += block) {
+                for (int i = 0; i < block; ++i) { rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5; in[static_cast<std::size_t>(i)] = static_cast<int>(rs) * (0.3f / 2147483648.0f); }
+                AF_VoiceRender(v, in.data(), block, oL.data(), oR.data(), nullptr);
+                if (fdn) AF_FdnMixRender(fdn, block, oL.data(), oR.data());
+                if (p >= keepFrom) kept.insert(kept.end(), oL.begin(), oL.end());
+            }
+            fdnwire::bandEnergyDb(kept.data(), static_cast<int>(kept.size()), sr, eDb6);
+            double e = 0.0; for (float x : kept) e += static_cast<double>(x) * x;
+            *totalDb = 10.0 * std::log10(std::max(e / std::max<std::size_t>(kept.size(), 1), 1e-30));
+            if (fdn) { AF_VoiceSetFdnMix(v, nullptr); AF_FdnMixDestroy(fdn); }
+            AF_VoiceDestroy(v);
+        };
+        double eConv[6], eFdn[6], tConv = 0, tFdn = 0;
+        runTail(false, eConv, &tConv);
+        runTail(true, eFdn, &tFdn);
+        static const char* kName[6] = { "125", "250", "500", "1k", "2k", "4k" };
+        std::printf("        %s（音源 部屋%d、リスナー 部屋%d）\n", label, AF_SceneRoomAt(s, srcPos), roomL);
+        std::printf("        帯域   畳み込み(dB)   FDN(dB)   差\n");
+        for (int b = 0; b < 6; ++b) std::printf("        %-5s %10.1f   %9.1f   %+5.1f\n", kName[b], eConv[b], eFdn[b], eFdn[b] - eConv[b]);
+        std::printf("        合計 %10.1f   %9.1f   %+5.1f   （尾の比 %.3f、直接 %.4f、mixing %.0f ms）\n", tConv, tFdn, tFdn - tConv, ratio, dg, splitMs);
+        if (doCheck) {
+            std::snprintf(buf, sizeof(buf), "(合計 畳み込み %.1f dB / FDN %.1f dB、差 %+.1f dB)", tConv, tFdn, tFdn - tConv);
+            check("[尾・FDN] 同じ部屋では畳み込みの尾との量の差が 3 dB 以内（同じ tailGain の規約）", std::fabs(tFdn - tConv) <= 3.0, buf);
+        }
+    };
+    compareLevels(V(2.0f, 1.6f, -4.5f), "同じ部屋", true);
+    compareLevels(Sp, "扉 60° 越し（畳み込みは tailSrcLevel=1 のまま。差 ＝ 配線の量。合否なし）", false);
+    AF_SceneSetSource(s, 1, Sp);
+
+    // ── 費用（主スレッドで毎フレーム呼ぶ物）──
+    {
+        using clk = std::chrono::steady_clock;
+        int rooms[8]; float w6[48]; float rt[6];
+        const auto t0 = clk::now();
+        for (int i = 0; i < 100; ++i) AF_SceneFdnRoomWeights(s, Lp, 2.0f, 1, rooms, w6, 8);
+        const auto t1 = clk::now();
+        for (int i = 0; i < 100; ++i) for (int r = 0; r < nr; ++r) AF_SceneRoomRt60Live(s, r, rt, nullptr);
+        const auto t2 = clk::now();
+        const double usW = std::chrono::duration<double, std::micro>(t1 - t0).count() / 100.0;
+        const double usR = std::chrono::duration<double, std::micro>(t2 - t1).count() / 100.0;
+        std::printf("      費用: 配線の重み 1 点 %.1f µs／部屋 %d 個の生きた RT60 %.1f µs（毎フレームの主スレッド。参考値）\n", usW, nr, usR);
+    }
+    AF_SceneDestroy(s);
 }
 
 // 【探り】既知の不具合の現状を数字で採る（AF_ONLY=issues でだけ走る。合否は付けない）
@@ -13650,6 +14040,8 @@ int main() {
         else if (std::strcmp(only, "depth") == 0) diagnoseSpatialDepth();
         else if (std::strcmp(only, "lag") == 0) diagnoseDoorLag();
         else if (std::strcmp(only, "step") == 0) diagnoseDoorStaircase();
+        else if (std::strcmp(only, "fdn") == 0) testFdnWiring();
+        else if (std::strcmp(only, "faces") == 0) testFaceReflections();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }
@@ -13757,6 +14149,7 @@ int main() {
     diagnoseCorridorDiffractionLevel();
     testApertureOpenness();
     testDoorContinuity();
+    testFdnWiring();
     testPerInstanceMaterial();
     testVoiceApi();
     testRobustness();

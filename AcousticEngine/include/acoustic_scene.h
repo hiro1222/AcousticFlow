@@ -765,6 +765,19 @@ ACOUSTIC_API int AF_SceneRoomAcoustics(AF_SceneHandle scene, int room,
                                        float* outSurface, float* outOpenArea,
                                        float* outAbsorb6, float* outRt60_6);
 
+/* ── 尾の FDN（docs/TAIL_FDN_PLAN.md 手順 3・4、2026-09-09）──
+ * 部屋グラフの作り直し回数。ホストはこれが変わったら部屋ごとの FDN を作り直す。 */
+ACOUSTIC_API int  AF_SceneRoomBuildCount(AF_SceneHandle scene);
+/* 【手順 3】帯域別の残響時間(s)。開口の吸音率を扉の開き具合で動かした Sabine
+ *   （開口 = a·穴 + (1−a)·板の吸音+透過、a = 板の素通しの面積率）。面積は固定、係数だけ動く。
+ *   outOpenFrac は口の面積で重み付けした a（HUD 用、null 可）。成功で 1。 */
+ACOUSTIC_API int  AF_SceneRoomRt60Live(AF_SceneHandle scene, int room, float* outRt60_6, float* outOpenFrac);
+/* 【手順 4】点 p のまわりで各部屋の FDN との結び付き（帯域別の振幅、outW6[k*6+b]）。
+ *   リスナーの重み（normalizeOwn=1）と音源の送り（normalizeOwn=0）の両方がこの 1 つの式。
+ *   E_r,b = s_r + (1−s_r)·Σ口 gate·α_口,b²·min(1/2, S/4πd²)、w = √E。書けた数を返す（大きい順）。 */
+ACOUSTIC_API int  AF_SceneFdnRoomWeights(AF_SceneHandle scene, AF_Vector3 p, float radius, int normalizeOwn,
+                                         int* outRooms, float* outW6, int maxOut);
+
 ACOUSTIC_API int  AF_SceneApertureCount(AF_SceneHandle scene);
 
 /* 開口 index の情報。各出力は null 可。成功で 1。

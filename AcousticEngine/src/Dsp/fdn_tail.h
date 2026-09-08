@@ -56,6 +56,10 @@
 //     費用は 1 本あたり数十 ms（部屋を作るときだけ）。拡散の係数は T60 で頭打ちになるので、表は
 //     その帯域の T60 で決まる拡散を含む（1 kHz 以外の帯域では拡散が 1 kHz の T60 で決まるぶん、
 //     ±1 dB 程度の残りがある。検査で ±2 dB）。
+//   ★測る出力は L/R（Hadamard の行 1・2 ＝ 実際に聞く出力）。M（全部足す行）で測ると +2.3 dB 違う
+//     （線どうしが帰還で相関しているので、符号を混ぜた行と全部足す行で量が違う。2026-09-09 の実測）。
+//     目標は片耳 0.5 ＝ 両耳の合計で 1。ReverbTailIr が「全チャンネル合計でエネルギー 1」なので同じ規約
+//     （直接音は等パワーのパンで片耳 0.5 なので、片耳どうしの比が tailRatio になる）。
 //
 // ■ 連続性
 //   setRt60 は目標を置くだけ。render が 1 ブロックの中で係数を線形に目標へ寄せる。
@@ -140,14 +144,16 @@ public:
     // ── 制御スレッド ──
 
     /// 帯域別の残響時間(s)。部屋グラフの Sabine から毎フレーム渡してよい（目標を置くだけ）。
-    void setRt60(const float* rt60Sec6) {
+    ///   bandScale6: 帯域ごとの入力の倍率（振幅）。null で 1。エネルギー 1 の正規化の**上に**掛かる
+    ///   （部屋の色。FdnRoomMix が √(RT60_b / 基準) を渡す。校正の表は触らない）。
+    void setRt60(const float* rt60Sec6, const float* bandScale6 = nullptr) {
         if (!rt60Sec6) return;
         float g[kNumBands][kLines]; float ig[kNumBands];
         computeGains(rt60Sec6, g, ig);
         // 目標を書いてから版を上げる。render は版を見て取り込む。
         for (int b = 0; b < kNumBands; ++b) {
             for (int i = 0; i < kLines; ++i) pendGain_[b][i] = g[b][i];
-            pendInGain_[b] = ig[b];
+            pendInGain_[b] = ig[b] * ((bandScale6 && bandScale6[b] > 0.0f) ? bandScale6[b] : 1.0f);
             rt60_[b] = rt60Sec6[b];
         }
         pendDiff_ = diffusionFor(rt60Sec6);
@@ -354,7 +360,13 @@ private:
         const int lmax = longestLine();
         const int nRun = std::max(lmax * 3, fs_ / 10);            // 3 周か 100 ms の長いほう
         const int nAvg = std::max(1, fs_ / 50);                    // 最後の 20 ms
-        std::vector<float> in(static_cast<std::size_t>(nRun), 0.0f), out(static_cast<std::size_t>(nRun), 0.0f);
+        std::vector<float> in(static_cast<std::size_t>(nRun), 0.0f);
+        std::vector<float> bufL(static_cast<std::size_t>(nRun) * kNumBands, 0.0f), bufR(static_cast<std::size_t>(nRun) * kNumBands, 0.0f);
+        float* pl[kNumBands]; float* pr[kNumBands];
+        for (int b = 0; b < kNumBands; ++b) {
+            pl[b] = bufL.data() + static_cast<std::size_t>(b) * nRun;
+            pr[b] = bufR.data() + static_cast<std::size_t>(b) * nRun;
+        }
         in[0] = 1.0f;
         for (int k = 0; k < kCal; ++k) {
             calT60_[k] = 0.1f * std::pow(2.0f, static_cast<float>(k));   // 0.1, 0.2, … 6.4 s
@@ -364,14 +376,21 @@ private:
             computeGains(rt, g, ig);                                // 表は未完成なので解析式そのまま
             for (int b = 0; b < kNumBands; ++b) { for (int i = 0; i < kLines; ++i) { gainCur_[b][i] = g[b][i]; gainTgt_[b][i] = g[b][i]; } inGainCur_[b] = ig[b]; inGainTgt_[b] = ig[b]; }
             diffCur_ = diffTgt_ = diffusionFor(rt);
-            renderImpl(in.data(), nRun, out.data(), nullptr, nullptr, nullptr);
+            // 実際に聞く出力（L/R）で測る。M は線どうしの相関で量が違う（上の■）。
+            renderImpl(in.data(), nRun, nullptr, nullptr, pl, pr);
             double e = 0.0, tail = 0.0;
-            for (int i = 0; i < nRun; ++i) e += static_cast<double>(out[static_cast<std::size_t>(i)]) * out[static_cast<std::size_t>(i)];
-            for (int i = nRun - nAvg; i < nRun; ++i) tail += static_cast<double>(out[static_cast<std::size_t>(i)]) * out[static_cast<std::size_t>(i)];
+            for (int i = 0; i < nRun; ++i) {
+                float l = 0.0f, r = 0.0f;
+                for (int b = 0; b < kNumBands; ++b) { l += pl[b][static_cast<std::size_t>(i)]; r += pr[b][static_cast<std::size_t>(i)]; }
+                const double p = 0.5 * (static_cast<double>(l) * l + static_cast<double>(r) * r);   // 片耳の平均パワー
+                e += p;
+                if (i >= nRun - nAvg) tail += p;
+            }
             const double pEnd = tail / nAvg;                          // 最後の 20 ms の平均パワー（1 サンプルあたり）
             const double tau = static_cast<double>(calT60_[k]) * fs_ / 13.8155;   // ∫10^(−6t/T60)dt（サンプル）
             e += pEnd * tau;
-            calDb_[k] = static_cast<float>(10.0 * std::log10(std::max(e, 1e-30)));
+            // 表は「解析式のままだと目標より何 dB 大きいか」。目標は片耳 0.5（両耳の合計で 1）。
+            calDb_[k] = static_cast<float>(10.0 * std::log10(std::max(e, 1e-30) / 0.5));
         }
         reset();
         calibrated_ = true;

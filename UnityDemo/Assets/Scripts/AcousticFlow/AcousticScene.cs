@@ -730,6 +730,36 @@ namespace AcousticFlow
                                                 absorb6, rt60_6) != 0;
         }
 
+        // ── 尾の FDN（docs/TAIL_FDN_PLAN.md 手順 3・4）──
+        /// 部屋グラフの作り直し回数。変わったら部屋ごとの FDN を作り直す。
+        public int RoomBuildCount
+        {
+            get
+            {
+                if (_handle == IntPtr.Zero) return 0;
+                try { return Native.AF_SceneRoomBuildCount(_handle); }
+                catch (System.Exception) { return 0; }
+            }
+        }
+        /// 【手順 3】開口の吸音率を扉の開き具合で動かした Sabine（帯域別 6 要素）。openFrac は口の素通しの面積率。
+        public bool GetRoomRt60Live(int room, float[] rt60_6, out float openFrac)
+        {
+            openFrac = 1f;
+            if (_handle == IntPtr.Zero || rt60_6 == null || rt60_6.Length < 6) return false;
+            try { return Native.AF_SceneRoomRt60Live(_handle, room, rt60_6, out openFrac) != 0; }
+            catch (System.Exception) { return false; }
+        }
+        /// 【手順 4】点のまわりの各部屋の FDN との結び付き（帯域別の振幅 outW6[k*6+b]）。
+        ///   normalizeOwn: リスナーは true（尾の比が「部屋の中である割合」を既に持つ）／音源は false（注ぐ量そのもの）。
+        public int GetFdnRoomWeights(Vector3 p, float radius, bool normalizeOwn, int[] outRooms, float[] outW6)
+        {
+            if (_handle == IntPtr.Zero || outRooms == null || outW6 == null) return 0;
+            int cap = Mathf.Min(outRooms.Length, outW6.Length / 6);
+            if (cap <= 0) return 0;
+            try { return Native.AF_SceneFdnRoomWeights(_handle, new AFVector3(p), radius, normalizeOwn ? 1 : 0, outRooms, outW6, cap); }
+            catch (System.Exception) { return 0; }
+        }
+
         public int ApertureCount
         {
             get { return _handle == IntPtr.Zero ? 0 : Native.AF_SceneApertureCount(_handle); }

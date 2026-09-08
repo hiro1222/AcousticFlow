@@ -315,6 +315,18 @@ namespace AcousticFlow
                                                        [Out] float[] outAbsorb6,
                                                        [Out] float[] outRt60_6);
 
+        // ── 尾の FDN（docs/TAIL_FDN_PLAN.md 手順 3・4、2026-09-09）──
+        // 部屋グラフの作り直し回数。変わったら部屋ごとの FDN を作り直す。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneRoomBuildCount(IntPtr scene);
+        // 【手順 3】開口の吸音率を扉の開き具合で動かした Sabine（帯域別 6 要素）。outOpenFrac は口の素通しの面積率。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneRoomRt60Live(IntPtr scene, int room, [Out] float[] outRt60_6, out float outOpenFrac);
+        // 【手順 4】点のまわりの各部屋の FDN との結び付き（帯域別の振幅 outW6[k*6+b]）。normalizeOwn=1 はリスナー、0 は音源。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_SceneFdnRoomWeights(IntPtr scene, AFVector3 p, float radius, int normalizeOwn,
+                                                        [Out] int[] outRooms, [Out] float[] outW6, int maxOut);
+
         // 部屋どうしを繋ぐ開口（戸口・窓・壊れた壁の穴）。面積の大きい順。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneApertureCount(IntPtr scene);
@@ -620,6 +632,35 @@ namespace AcousticFlow
         public static extern int AF_ScenePortalDiffuseCoupling(IntPtr scene, int id, [Out] float[] out6);
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_VoiceSetTailBus(IntPtr voice, IntPtr bus, int isOwner);
+
+        // ── 尾の FDN（tailModel=1、docs/TAIL_FDN_PLAN.md 手順 4）: 部屋ごとの帰還遅延網。IR もエコグラムも使わない ──
+        //   器は 1 つ（部屋番号 ＝ 部屋グラフの部屋番号）。Render は AudioListener 側で 1 回（尾のバスと同じ）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern IntPtr AF_FdnMixCreate(int sampleRate, int maxFrames, float diffusion);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_FdnMixDestroy(IntPtr mix);
+        // 部屋を足す（確保と校正: 数十 ms）。lineScale = (4V/S ÷ 343) ÷ 12 ms。colour=1 で帯域の色 √(RT60_b/T̄)（量は畳み込みと同じ規約のまま）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_FdnMixAddRoom(IntPtr mix, float lineScale, [In] float[] rt60_6, int colour);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern int AF_FdnMixRoomCount(IntPtr mix);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_FdnMixSetRoomRt60(IntPtr mix, int room, [In] float[] rt60_6, int colour);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_FdnMixSetListenerWeight(IntPtr mix, int room, [In] float[] w6);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_FdnMixRender(IntPtr mix, int frames, float[] outL, float[] outR);
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern float AF_FdnMixRms(IntPtr mix);
+        // この音源の尾を FDN へ預ける（Zero で畳み込みに戻る）。預けている間 RebuildTail は量だけ置く。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetFdnMix(IntPtr voice, IntPtr mix);
+        // 送り先の部屋と重み（最大 4 本）。毎フレーム置いてよい。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetFdnSends(IntPtr voice, [In] int[] rooms, [In] float[] gains, int n);
+        // 尾の量だけを置く（IR を組まない道）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetTailAmount(IntPtr voice, float directGain, float targetRatio);
 
         // ── 方向バス（2026-09-04）: 反射・回折タップをリスナー座標で固定したレーンへ振り、レーンごとに固定の HRIR で畳む ──
         [DllImport(Dll, CallingConvention = Cc)]

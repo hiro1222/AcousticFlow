@@ -138,6 +138,57 @@ void AF_VoiceSetTailBus(AF_VoiceHandle voice, AF_TailBusHandle bus, int isOwner)
         v->setTailBus(asBus(bus), isOwner != 0);
 }
 
+// ── 尾の FDN（docs/TAIL_FDN_PLAN.md 手順 4、2026-09-09）──
+namespace {
+af::dsp::FdnRoomMix* asFdn(AF_FdnMixHandle h) { return static_cast<af::dsp::FdnRoomMix*>(h); }
+}  // namespace
+
+AF_FdnMixHandle AF_FdnMixCreate(int sampleRate, int maxFrames, float diffusion) {
+    return new (std::nothrow) af::dsp::FdnRoomMix(orDefault(sampleRate, 48000), orDefault(maxFrames, 4096),
+                                                  orDefault(diffusion, 0.6f));
+}
+
+void AF_FdnMixDestroy(AF_FdnMixHandle mix) { delete asFdn(mix); }
+
+int AF_FdnMixAddRoom(AF_FdnMixHandle mix, float lineScale, const float* rt60_6, int colour) {
+    af::dsp::FdnRoomMix* m = asFdn(mix);
+    return m ? m->addRoom((lineScale > 0.0f) ? lineScale : 1.0f, rt60_6, colour != 0) : -1;
+}
+
+int AF_FdnMixRoomCount(AF_FdnMixHandle mix) {
+    af::dsp::FdnRoomMix* m = asFdn(mix);
+    return m ? m->roomCount() : 0;
+}
+
+void AF_FdnMixSetRoomRt60(AF_FdnMixHandle mix, int room, const float* rt60_6, int colour) {
+    if (af::dsp::FdnRoomMix* m = asFdn(mix)) m->setRoomRt60(room, rt60_6, colour != 0);
+}
+
+void AF_FdnMixSetListenerWeight(AF_FdnMixHandle mix, int room, const float* w6) {
+    if (af::dsp::FdnRoomMix* m = asFdn(mix)) m->setListenerWeight(room, w6);
+}
+
+void AF_FdnMixRender(AF_FdnMixHandle mix, int frames, float* outL, float* outR) {
+    if (af::dsp::FdnRoomMix* m = asFdn(mix)) m->render(frames, outL, outR);
+}
+
+float AF_FdnMixRms(AF_FdnMixHandle mix) {
+    af::dsp::FdnRoomMix* m = asFdn(mix);
+    return m ? m->rms() : 0.0f;
+}
+
+void AF_VoiceSetFdnMix(AF_VoiceHandle voice, AF_FdnMixHandle mix) {
+    if (af::dsp::VoiceRenderer* v = asVoice(voice)) v->setFdnMix(asFdn(mix));
+}
+
+void AF_VoiceSetFdnSends(AF_VoiceHandle voice, const int* rooms, const float* gains, int n) {
+    if (af::dsp::VoiceRenderer* v = asVoice(voice)) v->setFdnSends(rooms, gains, n);
+}
+
+void AF_VoiceSetTailAmount(AF_VoiceHandle voice, float directGain, float targetRatio) {
+    if (af::dsp::VoiceRenderer* v = asVoice(voice)) v->setTailAmount(directGain, targetRatio);
+}
+
 AF_DirectionBusHandle AF_DirectionBusCreate(int sampleRate, int lanes, int maxFrames) {
     return new (std::nothrow) af::dsp::DirectionBus(orDefault(sampleRate, 48000), orDefault(lanes, 8),
                                                     orDefault(maxFrames, 1024));

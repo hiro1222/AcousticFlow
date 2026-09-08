@@ -2836,6 +2836,7 @@ void testFdnTail() {
 
     // ── 1. 帯域ごとの減衰が与えた RT60 に乗るか（±5% ＝ RT60 の弁別閾）──
     float lastInGain = 0.0f;
+    double lastEarDb = 0.0;   // 両耳（L+R）の IR のエネルギー dB（目標 0 ＝ 片耳 0.5）
     // t60loop : 帯域ごとの輪の出力を直接測った T60（仕組みの検査。これが ±5% の合否）
     // t60mix2 : 混ぜた出力を 2 次の分析で測った T60（系の帯域での見え方。隣の帯域が漏れる）
     // t60mix4 : 混ぜた出力を 4 次の分析で測った T60（耳の帯域幅に近い見え方）
@@ -2847,8 +2848,27 @@ void testFdnTail() {
         in[0] = 1.0f;
         {
             af::dsp::FdnTail fdn(fs); fdn.setRt60(rt60);
-            for (int p = 0; p < n; p += blk) fdn.render(in.data() + p, std::min(blk, n - p), outIr.data() + p);
+            // M（全部足す行）を IR に、L/R（Hadamard の行 1・2 ＝ 実際に聞く出力）の両耳のエネルギーを別に取る。
+            std::vector<float> bm(static_cast<std::size_t>(6) * blk), bl(static_cast<std::size_t>(6) * blk), br(static_cast<std::size_t>(6) * blk);
+            float* pm[6]; float* pl[6]; float* pr[6];
+            for (int b = 0; b < 6; ++b) {
+                pm[b] = bm.data() + static_cast<std::size_t>(b) * blk;
+                pl[b] = bl.data() + static_cast<std::size_t>(b) * blk;
+                pr[b] = br.data() + static_cast<std::size_t>(b) * blk;
+            }
+            double eEar = 0.0;
+            for (int p = 0; p < n; p += blk) {
+                const int m = std::min(blk, n - p);
+                fdn.renderBandsMLR(in.data() + p, m, pm, pl, pr);
+                for (int i = 0; i < m; ++i) {
+                    float sm = 0.0f, sl = 0.0f, sr = 0.0f;
+                    for (int b = 0; b < 6; ++b) { sm += pm[b][i]; sl += pl[b][i]; sr += pr[b][i]; }
+                    outIr[static_cast<std::size_t>(p + i)] = sm;
+                    eEar += static_cast<double>(sl) * sl + static_cast<double>(sr) * sr;
+                }
+            }
             lastInGain = fdn.inputGain();
+            lastEarDb = 10.0 * std::log10(std::max(eEar, 1e-30));
         }
         {
             af::dsp::FdnTail fdn(fs); fdn.setRt60(rt60);
@@ -2884,12 +2904,12 @@ void testFdnTail() {
         std::snprintf(buf, sizeof(buf), "(最大のずれ %.1f %%)", worst * 100.0f);
         check("[FDN] 6 帯域とも減衰の傾きが与えた RT60 に ±5% で乗る（高域ほど短い設定）", ok, buf);
 
-        // 量: インパルス応答のエネルギーが 1（±2 dB）。ReverbTailIr と同じ規約。
-        double e = 0.0; for (float v : ir) e += static_cast<double>(v) * v;
-        const double eDb = 10.0 * std::log10(std::max(e, 1e-30));
-        std::snprintf(buf, sizeof(buf), "(エネルギー %.2f dB、入力ゲイン %.3f)", eDb, lastInGain);
-        check("[FDN] インパルス応答のエネルギーが 1（±2 dB）", std::fabs(eDb) <= 2.0, buf);
-        std::printf("        インパルス応答のエネルギー %.2f dB\n", eDb);
+        // 量: 両耳（L+R）のインパルス応答のエネルギーが 1（±2 dB）。ReverbTailIr と同じ規約（全チャンネル合計で 1）。
+        //   ★M（全部足す行）で測ると +2.3 dB 違う（線どうしが Hadamard の帰還で相関している）。校正も L/R でしている。
+        const double eDb = lastEarDb;
+        std::snprintf(buf, sizeof(buf), "(両耳のエネルギー %.2f dB、入力ゲイン %.3f)", eDb, lastInGain);
+        check("[FDN] インパルス応答の両耳のエネルギーが 1（±2 dB）", std::fabs(eDb) <= 2.0, buf);
+        std::printf("        インパルス応答の両耳のエネルギー %.2f dB\n", eDb);
     }
     {
         const float rt[6] = { 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f };   // 短く平ら
@@ -2911,16 +2931,15 @@ void testFdnTail() {
         //   手順 2 で、乾いた小部屋について改めて見る。
         std::snprintf(buf, sizeof(buf), "(0.4 s 平ら: 最大のずれ %.1f %%。低域のモードがまばらな分)", worst * 100.0f);
         check("[FDN] 短く平らな RT60 でも 6 帯域が ±10% で乗る（低域のモード分散込み）", ok, buf);
-        double e = 0.0; for (float v : ir) e += static_cast<double>(v) * v;
-        const double eDb = 10.0 * std::log10(std::max(e, 1e-30));
-        std::snprintf(buf, sizeof(buf), "(エネルギー %.2f dB)", eDb);
-        check("[FDN] 短い RT60 でもエネルギーが 1（±2 dB）＝ 量が長さに引きずられない", std::fabs(eDb) <= 2.0, buf);
+        const double eDb = lastEarDb;
+        std::snprintf(buf, sizeof(buf), "(両耳のエネルギー %.2f dB)", eDb);
+        check("[FDN] 短い RT60 でも両耳のエネルギーが 1（±2 dB）＝ 量が長さに引きずられない", std::fabs(eDb) <= 2.0, buf);
     }
 
     // ── 1b. 量の正規化のずれの形（診断）: RT60（平ら）と線の倍率と拡散を振って IR のエネルギーを見る ──
     //   √(1 − ḡ²) の近似がどこでどれだけ外れるかを知るため。表を見て正規化の直し方を決める。
     {
-        std::printf("        量の正規化のずれ（IR のエネルギー dB。0 が理想）\n");
+        std::printf("        量の正規化のずれ（両耳の IR のエネルギー dB。0 が理想）\n");
         std::printf("        倍率  拡散     T60=0.15  0.3    0.6    1.2    2.4\n");
         const float t60s[5] = { 0.15f, 0.3f, 0.6f, 1.2f, 2.4f };
         const float scales[2] = { 1.0f, 0.49f };
@@ -2933,8 +2952,19 @@ void testFdnTail() {
                 const int n = static_cast<int>(std::min(6.0f, t60s[ti] * 2.5f) * fs);
                 std::vector<float> in(static_cast<std::size_t>(n), 0.0f), out(static_cast<std::size_t>(n), 0.0f);
                 in[0] = 1.0f;
-                for (int p = 0; p < n; p += blk) fdn.render(in.data() + p, std::min(blk, n - p), out.data() + p);
-                double e = 0.0; for (float v : out) e += static_cast<double>(v) * v;
+                std::vector<float> bl(static_cast<std::size_t>(6) * blk), br(static_cast<std::size_t>(6) * blk);
+                float* pl[6]; float* pr[6];
+                for (int b = 0; b < 6; ++b) { pl[b] = bl.data() + static_cast<std::size_t>(b) * blk; pr[b] = br.data() + static_cast<std::size_t>(b) * blk; }
+                double e = 0.0;
+                for (int p = 0; p < n; p += blk) {
+                    const int m = std::min(blk, n - p);
+                    fdn.renderBandsMLR(in.data() + p, m, nullptr, pl, pr);
+                    for (int i = 0; i < m; ++i) {
+                        float sl = 0.0f, sr = 0.0f;
+                        for (int b = 0; b < 6; ++b) { sl += pl[b][i]; sr += pr[b][i]; }
+                        e += static_cast<double>(sl) * sl + static_cast<double>(sr) * sr;
+                    }
+                }
                 std::printf("%6.2f ", 10.0 * std::log10(std::max(e, 1e-30)));
             }
             std::printf("\n");
@@ -3126,6 +3156,59 @@ void testFdnRoomMix() {
     }
 }
 
+// ================================ [FDN・色] 帯域の色 √(RT60_b / 基準)（手順 4）
+//   FdnRoomMix::setRoomRt60(room, rt60, rt60Ref) は帯域 b の入口を √(RT60_b / rt60Ref) 倍する。
+//   拡散音場の定常エネルギーは RT60_b に比例するので、平ら（rt60Ref = 0）との差は 10·log10(RT60_b / 基準) dB になるはず。
+void testFdnColour() {
+    std::printf("\n[FDN・色] 帯域の色 √(RT60_b / 基準)（部屋ごとの FDN の入口の倍率）\n");
+    const int fs = 48000, blk = 512;
+    const float rt[6] = { 1.2f, 1.0f, 0.8f, 0.6f, 0.4f, 0.25f };   // 低域が長く高域が短い。基準は 500 Hz 帯（rt[2]）
+    auto energyBands = [&](float ref, double* eDb6) {
+        af::dsp::FdnRoomMix mix(fs, blk, 0.6f);
+        const int r = mix.addRoom(1.0f, rt, ref > 0.0f);
+        const float one[6] = { 1, 1, 1, 1, 1, 1 };
+        mix.setListenerWeight(r, one);
+        const int n = fs * 3;
+        std::vector<float> in(static_cast<std::size_t>(blk), 0.0f), L(static_cast<std::size_t>(n), 0.0f), R(static_cast<std::size_t>(n), 0.0f);
+        for (int p = 0; p < n; p += blk) {
+            const int m = std::min(blk, n - p);
+            std::fill(in.begin(), in.end(), 0.0f);
+            if (p == 0) in[0] = 1.0f;
+            mix.add(r, in.data(), m, 1.0f);
+            mix.render(m, L.data() + p, R.data() + p);
+        }
+        std::vector<float> bands;
+        fdntest::split6(L.data(), n, fs, bands, 2);
+        for (int b = 0; b < 6; ++b) {
+            double e = 0.0;
+            for (int i = 0; i < n; ++i) { const double v = bands[static_cast<std::size_t>(b) * n + i]; e += v * v; }
+            eDb6[b] = 10.0 * std::log10(std::max(e, 1e-30));
+        }
+    };
+    double flat[6], col[6];
+    energyBands(0.0f, flat);
+    energyBands(rt[2], col);
+    // 期待は 10log10(T_b / T̄)、T̄ は帯域幅で重み付けした平均（白色の入力で IR 全体のエネルギーが 1 のまま）。
+    const float bw[6] = { 177.0f, 177.0f, 353.0f, 707.0f, 1414.0f, 0.5f * fs - 2828.0f };
+    double num = 0.0, den = 0.0;
+    for (int b = 0; b < 6; ++b) { num += static_cast<double>(bw[b]) * rt[b]; den += bw[b]; }
+    const double tbar = num / den;
+    std::printf("        帯域   平ら(dB)  色付き(dB)  差      期待 10log10(T_b/T̄)   （T̄ = %.3f s）\n", tbar);
+    float worst = 0.0f;
+    static const char* kName[6] = { "125", "250", "500", "1k", "2k", "4k" };
+    for (int b = 0; b < 6; ++b) {
+        const double expect = 10.0 * std::log10(rt[b] / tbar);
+        const double diff = col[b] - flat[b];
+        worst = std::max(worst, static_cast<float>(std::fabs(diff - expect)));
+        std::printf("        %-5s %8.2f  %9.2f  %+6.2f  %+6.2f\n", kName[b], flat[b], col[b], diff, expect);
+    }
+    char buf[120];
+    std::snprintf(buf, sizeof(buf), "(期待との差の最大 %.2f dB)", worst);
+    // ★±1.5 dB なのは物差しの帯域が重なるため: 解析の LR4 は隣の帯域の裾を含み、隣の倍率が ±3 dB 違うと
+    //   2 kHz 帯で 1.2 dB ずれて見える（実測。同じ倍率なら 0）。倍率そのものは入口に掛かる 1 つの数で、ずれる余地が無い。
+    check("[FDN・色] 帯域の色が 10log10(RT60_b/T̄) に ±1.5 dB で乗る", worst <= 1.5f, buf);
+}
+
 int main() {
     std::printf("=== DSP 数値回帰テスト（段4: C++ 移行）===\n");
     testFft();
@@ -3150,6 +3233,7 @@ int main() {
     diagnoseTailTrackingLag();
     testFdnTail();
     testFdnRoomMix();
+    testFdnColour();
 
     std::printf("\n----\n");
     if (g_failures == 0) {

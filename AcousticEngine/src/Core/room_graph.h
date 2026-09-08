@@ -193,6 +193,10 @@ struct Grid {
     }
 };
 
+// 空気吸収（dB/m）。Sabine の 4mV に使う（1 dB/m = 0.1151 Np/m）。ホスト側の空気吸収の表と同じ値。
+//   ★scene.h の roomRt60Live（開口の吸音率を扉の開き具合で動かす）も同じ表を引く。答えを 1 つにするため、ここに 1 か所。
+inline constexpr double kAirDbPerM[kNumBands] = {0.0003, 0.0008, 0.0017, 0.003, 0.0085, 0.025};
+
 struct Room {
     int   voxels = 0;          // 体積（ボクセル数）
     Vec3  centroid{0, 0, 0};
@@ -876,9 +880,7 @@ private:
         //   A は境界の吸音面積(m2 sabins)、4mV は空気そのものが吸うぶん。
         //   ★4mV を落としてはいけない。広い部屋・長い残響・高域ほど効き、実測では
         //     4kHz で RT60 が半分近くになる。これが無いと高域だけ不自然に長く伸びる。
-        //     m の値はホスト側の空気吸収 dB/m と同じ表から換算（1 dB/m = 0.1151 Np/m）。
-        static const double kAirDbPerM[kNumBands] =
-            {0.0003, 0.0008, 0.0017, 0.003, 0.0085, 0.025};
+        //     m の値はホスト側の空気吸収 dB/m と同じ表から換算（1 dB/m = 0.1151 Np/m）。表は rooms::kAirDbPerM。
         for (std::size_t u = 0; u < nr; ++u) {
             Room& rm = res_.rooms[u];
             rm.surface = static_cast<float>(area[u]);

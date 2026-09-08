@@ -108,6 +108,7 @@ namespace AcousticFlow
         private int _tailShapeIndex = -1;    // 最後に尾の形を引いた代表音源の index
         private IntPtr _tailBus = IntPtr.Zero;   // 預けている共有バス（Zero=自前で畳む）
         private int _tailBusFrames = 0;
+        private IntPtr _fdnMix = IntPtr.Zero;    // 尾の FDN に預けているか（tailModel=1。Zero=畳み込み）
         private float _lastOutSample = 0f;   // 段差の計器。ブロックの継ぎ目を見るため持ち越す
         private bool _tailWasVirtual = false;   // 直前がバーチャル段だったか（戻すため）
 
@@ -154,6 +155,17 @@ namespace AcousticFlow
             _tailBus = IntPtr.Zero;
             _tailShapeIndex = -1;   // 次のフレームで組み直させる（自前の器には IR が無い）
             _tailEchoVersion = -1;
+        }
+
+        /// 尾の FDN から外して畳み込みに戻す（器を壊す前に TailBusRenderer が呼ぶ）。**メインスレッドからだけ。**
+        public void DetachFdnMix()
+        {
+            if (_voice != IntPtr.Zero && _fdnMix != IntPtr.Zero)
+            {
+                try { Native.AF_VoiceSetFdnMix(_voice, IntPtr.Zero); } catch (System.Exception) { }
+            }
+            _fdnMix = IntPtr.Zero;
+            _tailEchoVersion = -1;   // 畳み込みに戻ったら IR を組み直す
         }
 
         private TailBusRenderer _tailBusHost;
@@ -365,6 +377,25 @@ namespace AcousticFlow
             //   C# 経路(IrConvolver)には最初からこのガードがあったが、こちらには無かった。
             //   エンジンはエコグラムを内部レートでしか作り直さないので、版が同じなら
             //   差し替える理由が無い。
+            // ── 尾の FDN（tailModel=1、docs/TAIL_FDN_PLAN.md 手順 4）: 預け先と送り先を毎フレーム置く ──
+            //   預けている間は下の畳み込みの道が IR を組まず、量（tailGain）だけを置く。
+            //   送り先（自分の部屋＋戸口越しの隣室）と重みは AcousticFlowSceneDemo.UpdateFdnTail が
+            //   音源ごとに出す（ts.FdnRooms/FdnGains。リスナーの重みと同じ式）。
+            {
+                var host = TailBusHost;
+                var fdnHandle = (AcousticFlowSceneDemo.Status.TailModel == 1 && host != null) ? host.FdnMixHandle : IntPtr.Zero;
+                if (fdnHandle != _fdnMix)
+                {
+                    if (fdnHandle != IntPtr.Zero && _tailBus != IntPtr.Zero) DetachTailBus();
+                    try { Native.AF_VoiceSetFdnMix(_voice, fdnHandle); }
+                    catch (System.EntryPointNotFoundException) { fdnHandle = IntPtr.Zero; }
+                    _fdnMix = fdnHandle;
+                    _tailEchoVersion = -1;   // 預けたら量を置き直す／戻ったら IR を組み直す
+                }
+                if (_fdnMix != IntPtr.Zero)
+                    Native.AF_VoiceSetFdnSends(_voice, ts.FdnRooms, ts.FdnGains, ts.FdnCount);
+            }
+
             if (++_frameCounter >= Mathf.Max(1, tailRebuildEveryFrames))
             {
                 _frameCounter = 0;
@@ -398,14 +429,16 @@ namespace AcousticFlow
                 int shapeNow = ts.TailShapeIndex >= 0 ? ts.TailShapeIndex : ts.EngineIndex;
                 bool shapeChanged = (shapeNow != _tailShapeIndex);
                 if (scene != null && scene.IsValid
-                    && (echoVer != _tailEchoVersion || earChanged || shapeChanged))
+                    && (echoVer != _tailEchoVersion || earChanged || shapeChanged
+                        // 尾の FDN に預けている間は版に依らず量を置き直す（tailRatio は距離で動く。エコグラムを止めても追う）
+                        || _fdnMix != IntPtr.Zero))
                 {
                     _tailEchoVersion = echoVer;
                     // ★尾の形が変わったら、預ける共有バスも張り替える（形＝バスの鍵）。
                     //   IR が違う音源を同じバスへ入れると、片方の部屋の響きがもう片方に付く。
                     //   代表（TailShapeIndex == 自分の EngineIndex）だけが IR をバスへ入れる。
                     //   0 本だとバスに IR が入らず尾が丸ごと鳴らないので、ここを間違えないこと。
-                    if (shapeChanged || _tailBus == System.IntPtr.Zero) AttachTailBus(shapeNow, ts);
+                    if (_fdnMix == IntPtr.Zero && (shapeChanged || _tailBus == System.IntPtr.Zero)) AttachTailBus(shapeNow, ts);
                     _tailShapeIndex = shapeNow;
                     // ★自分が担当する音源のエコグラムを引く。以前は全音源の和しか無かったので、
                     //   別の部屋の音源も同じ尾で鳴っていた。
@@ -415,8 +448,9 @@ namespace AcousticFlow
                     //     形（200→600ms の傾き） 同室 1.3dB 以内 / 隣室 2.6〜3.9dB ずれ
                     //     量（オフセット）        同室でも 3〜4dB 開く
                     int shapeIdx = ts.TailShapeIndex >= 0 ? ts.TailShapeIndex : ts.EngineIndex;
-                    int bins = scene.GetEchogramBands(shapeIdx, _echo, _echo.Length / nb);
-                    if (bins > 0)
+                    // 尾の FDN に預けているときはエコグラムを引かない（形は部屋の FDN が持つ。ここは量だけ）。
+                    int bins = (_fdnMix == IntPtr.Zero) ? scene.GetEchogramBands(shapeIdx, _echo, _echo.Length / nb) : 0;
+                    if (bins > 0 || _fdnMix != IntPtr.Zero)
                     {
                         // 尾の絶対レベルの基準になる直接音ゲイン。
                         //
@@ -452,15 +486,23 @@ namespace AcousticFlow
                         // ★耳ごとの帯域ゲイン（後期残響の左右バランス）を渡す。
                         //   これを null にしていたので C++ 経路の尾は**方向づけなしの均一**で、
                         //   C# 経路（渡している）と比べて定位が弱く聞こえていた。
-                        var ear = AcousticFlowSceneDemo.Status.TailEarBandGain;
-                        Native.AF_VoiceRebuildTail(
-                            _voice, _echo, bins, AcousticFlowSceneDemo.Status.EchogramBinMs,
-                            _splitMs, tailFadeMs,
-                            tailSmoothMs, tailSmoothGrowth, tailEnvSmoothing, dg,
-                            tailRatio,
-                            ear, ear != null ? ear.Length : 0);
-                        tailPartitions = Native.AF_VoiceTailPartitions(_voice);
-                        tailLatencySamples = Native.AF_VoiceTailLatency(_voice);
+                        if (_fdnMix != IntPtr.Zero)
+                        {
+                            // 尾の FDN: 量だけ（同じ規約 tailGain = 自由音場の直接 × √目標比。畳み込みと量が揃う）。
+                            Native.AF_VoiceSetTailAmount(_voice, dg, tailRatio);
+                        }
+                        else
+                        {
+                            var ear = AcousticFlowSceneDemo.Status.TailEarBandGain;
+                            Native.AF_VoiceRebuildTail(
+                                _voice, _echo, bins, AcousticFlowSceneDemo.Status.EchogramBinMs,
+                                _splitMs, tailFadeMs,
+                                tailSmoothMs, tailSmoothGrowth, tailEnvSmoothing, dg,
+                                tailRatio,
+                                ear, ear != null ? ear.Length : 0);
+                            tailPartitions = Native.AF_VoiceTailPartitions(_voice);
+                            tailLatencySamples = Native.AF_VoiceTailLatency(_voice);
+                        }
                     }
                 }
             }

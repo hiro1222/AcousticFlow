@@ -1226,6 +1226,24 @@ int AF_SceneRt60At(AF_SceneHandle scene, AF_Vector3 p, float radius, float* out,
     return s->rt60At(toVec3(p), radius, out, count);
 }
 
+int AF_SceneRoomBuildCount(AF_SceneHandle scene) {
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
+    return s ? s->roomBuildCount() : 0;
+}
+
+int AF_SceneRoomRt60Live(AF_SceneHandle scene, int room, float* outRt60_6, float* outOpenFrac) {
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
+    if (!s || !outRt60_6) return 0;
+    return s->roomRt60Live(room, outRt60_6, outOpenFrac) ? 1 : 0;
+}
+
+int AF_SceneFdnRoomWeights(AF_SceneHandle scene, AF_Vector3 p, float radius, int normalizeOwn,
+                           int* outRooms, float* outW6, int maxOut) {
+    ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
+    if (!s || !outRooms || !outW6 || maxOut <= 0) return 0;
+    return s->fdnRoomWeights(toVec3(p), radius, normalizeOwn != 0, outRooms, outW6, maxOut);
+}
+
 int AF_SceneRoomAcoustics(AF_SceneHandle scene, int room, float* outSurface,
                           float* outOpenArea, float* outAbsorb6, float* outRt60_6) {
     ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();

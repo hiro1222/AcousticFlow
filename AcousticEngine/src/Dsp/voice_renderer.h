@@ -32,6 +32,8 @@
 #include "reverb_tail_ir.h"
 #include "tail_bus.h"
 #include "direction_bus.h"
+#include "fdn_room_mix.h"   // 尾の FDN（tailModel=1、docs/TAIL_FDN_PLAN.md 手順 4）
+#include <atomic>
 
 namespace af {
 namespace dsp {
@@ -244,6 +246,11 @@ public:
             tailGain_ = ReverbTailIr::calibrateGain(directGain, targetRatio);
             return 1.0f;
         }
+        // ★尾の FDN に預けているなら IR を組まない（形は部屋の FDN が持つ。ここは量だけ）。
+        if (fdnMix_) {
+            tailGain_ = ReverbTailIr::calibrateGain(directGain, targetRatio);
+            return 1.0f;
+        }
         const float ratio = tailIr_.build(echoBands, binCount, binMs, startMs, fadeMs,
                                           smoothMs, smoothGrowth, envAlpha,
                                           earBandGain, earBandGainLen);
@@ -284,6 +291,27 @@ public:
         tailBusOwner_ = isOwner;
     }
     const TailBus* tailBus() const { return tailBus_; }
+
+    // ── 尾の FDN（tailModel=1、docs/TAIL_FDN_PLAN.md 手順 4）──
+    /// 部屋ごとの FDN へ預ける。null で畳み込みに戻る（既定）。**制御スレッド**。
+    ///   差すと、この音源は IR を組まず（rebuildTail は量だけ）、送るだけになる。畳み込みの器はそのまま眠る。
+    void setFdnMix(FdnRoomMix* mix) { fdnMix_ = mix; }
+    const FdnRoomMix* fdnMix() const { return fdnMix_; }
+    /// 送り先の部屋と重み（振幅、最大 kMaxFdnSends 本）。ホストが毎フレーム置く（scene の fdnRoomWeights）。
+    ///   重みは render がチャンク内で線形に繋ぐ。並びが変わっても同じ部屋への送りは前の値から繋ぐ。
+    void setFdnSends(const int* rooms, const float* gains, int n) {
+        n = std::max(0, std::min(n, kMaxFdnSends));
+        for (int k = 0; k < kMaxFdnSends; ++k) {
+            pendFdnRoom_[k] = (k < n && rooms) ? rooms[k] : -1;
+            pendFdnGain_[k] = (k < n && gains) ? std::max(0.0f, gains[k]) : 0.0f;
+        }
+        fdnVersion_.fetch_add(1, std::memory_order_release);
+    }
+    /// 尾の量だけを置く（IR を組まない道）。tailGain = 自由音場の直接 × √目標比（rebuildTail と同じ規約）。
+    void setTailAmount(float directGain, float targetRatio) {
+        tailGain_ = ReverbTailIr::calibrateGain(directGain, targetRatio);
+    }
+    static constexpr int kMaxFdnSends = 4;
 
     /// 反射・回折のタップを方向バスへ預ける。bus=NULL で自前の両耳化（軽量両耳化／パン）に戻る。
     ///   ★次の setTaps から効く（レーンの割り当てはタップを受け取るときに決める）。
@@ -351,7 +379,10 @@ private:
         // 尾の絶対レベル ＝ tailGain(= 自由音場の直接 × √target) × 好みの倍率 × 部屋への注入量。
         //   ★ここに tailWet_ を掛けてはいけない。残響/直接比は tailGain の √target で
         //     既に決まっており二重計上になる（C# 経路は掛けていなかったので 3.9dB 差が出た）。
-        const float lvl = tailLevel_ * tailSrcLevel_;
+        //   ★尾の FDN に預けているときは tailSrcLevel_（反射込みの生存＝遮蔽）を掛けない。
+        //     部屋をまたぐ減りは配線（開口率² × 立体角）が持つので、ここでも掛けると二重になる
+        //     （実測 2026-09-09: 扉 60° 越しで畳み込みより −21 dB。配線ぶんがそのまま出ていた）。
+        const float lvl = tailLevel_ * (fdnMix_ ? 1.0f : tailSrcLevel_);
         // 差し替えの混ぜは器の中（新旧の IR スペクトルを等振幅で。遅延線は共有）。
         // 【尾の量の傾斜】tailGain_ は組み直し（ホストは 8 フレームに 1 回）でしか動かない。
         //   チャンク境界でそのまま掛けると**段差**になり、扉が動くと量が速く動くので
@@ -368,7 +399,41 @@ private:
         //   ⚠ IR が違う音源を同じバスへ入れてはいけない。部屋ごとに 1 本。
         //   ⚠ クロスフェードもバスが持つ（IR がバス側にあるので）。
         //   ⚠ この音源の rmsTail は 0 になる。計器はバス側の rms() を見ること。
-        if (tailBus_) {
+        if (fdnMix_) {
+            // 【尾の FDN】部屋ごとの FDN へ**送るだけ**（tailModel=1）。IR も器も無い。
+            //   送り先と重みはホストが毎フレーム置く（fdnRoomWeights: 自分の部屋＝占め方、戸口越しの隣室＝開口率²×立体角）。
+            //   量の傾斜は共有バスと同じ（tgStart → tgEnd をチャンク内で線形）。送りの重みも前のチャンクの値から繋ぐ。
+            //   outputGain_ もここで掛ける（バスと同じ理由: リスナー側で足されるので最後の 1 回を通らない）。
+            const int v = fdnVersion_.load(std::memory_order_acquire);
+            if (v != fdnSeen_) {
+                int room[kMaxFdnSends]; float tgt[kMaxFdnSends], cur[kMaxFdnSends];
+                for (int k = 0; k < kMaxFdnSends; ++k) {
+                    room[k] = pendFdnRoom_[k]; tgt[k] = pendFdnGain_[k]; cur[k] = 0.0f;
+                    // 同じ部屋への送りが前からあれば、その重みから繋ぐ（並びが変わっても段にしない）。
+                    for (int j = 0; j < kMaxFdnSends; ++j)
+                        if (room[k] >= 0 && fdnRoom_[j] == room[k]) cur[k] = fdnGainCur_[j];
+                }
+                // 消えた送りは 1 チャンクかけて 0 へ繋ぐ（空きがあれば）。
+                for (int j = 0; j < kMaxFdnSends; ++j) {
+                    if (fdnRoom_[j] < 0 || fdnGainCur_[j] <= 0.0f) continue;
+                    bool present = false;
+                    for (int k = 0; k < kMaxFdnSends; ++k) if (room[k] == fdnRoom_[j]) present = true;
+                    if (present) continue;
+                    for (int k = 0; k < kMaxFdnSends; ++k)
+                        if (room[k] < 0) { room[k] = fdnRoom_[j]; tgt[k] = 0.0f; cur[k] = fdnGainCur_[j]; break; }
+                }
+                for (int k = 0; k < kMaxFdnSends; ++k) { fdnRoom_[k] = room[k]; fdnGainTgt_[k] = tgt[k]; fdnGainCur_[k] = cur[k]; }
+                fdnSeen_ = v;
+            }
+            for (int k = 0; k < kMaxFdnSends; ++k) {
+                if (fdnRoom_[k] < 0) continue;
+                const float gS = tgStart * outputGain_ * fdnGainCur_[k];
+                const float gE = tgEnd * outputGain_ * fdnGainTgt_[k];
+                if (gS > 0.0f || gE > 0.0f) fdnMix_->add(fdnRoom_[k], input, n, gS, gE, dstOffset);
+                fdnGainCur_[k] = fdnGainTgt_[k];
+                if (fdnGainTgt_[k] <= 0.0f) fdnRoom_[k] = -1;   // 繋ぎ終えた送りは片付ける
+            }
+        } else if (tailBus_) {
             // 送るだけ。tailOutL_/R_ は上で 0 埋め済みなので、この音源からは尾が出ない。
             //
             // ★★ outputGain_ を**ここで掛ける** ★★
@@ -510,6 +575,15 @@ private:
     int laneStride_ = 0;
     int laneCarry_ = 0;                 // 前のチャンクの長さ（持ち越しの読み出し位置）
     bool tailBusOwner_ = false;    // この音源が IR をバスへ入れる係か（部屋の代表）
+    // 尾の FDN（tailModel=1）。null なら従来（畳み込み）。差すと IR を組まず、部屋ごとの FDN へ送るだけ。
+    FdnRoomMix* fdnMix_ = nullptr;
+    int   fdnRoom_[kMaxFdnSends] = { -1, -1, -1, -1 };      // オーディオスレッドの写し
+    float fdnGainTgt_[kMaxFdnSends] = {};
+    float fdnGainCur_[kMaxFdnSends] = {};                   // 直前のチャンクの終わりの重み（傾斜の出発点）
+    int   pendFdnRoom_[kMaxFdnSends] = { -1, -1, -1, -1 };  // 制御スレッドが書く（版で受け渡す）
+    float pendFdnGain_[kMaxFdnSends] = {};
+    std::atomic<int> fdnVersion_{0};
+    int   fdnSeen_ = 0;
     // 器は 1 つ。差し替えの混ぜは中（遅延線は共有、IR スペクトルだけ 2 世代）。
     NonUniformConvolver tailConv_;
     ReverbTailIr tailIr_;

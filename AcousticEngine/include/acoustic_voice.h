@@ -140,6 +140,40 @@ ACOUSTIC_API int AF_TailBusLastMono(AF_TailBusHandle bus, float* out, int frames
 /* この音源の尾を共有バスへ預ける。bus=NULL で自前の畳み込みに戻る（既定）。 */
 ACOUSTIC_API void AF_VoiceSetTailBus(AF_VoiceHandle voice, AF_TailBusHandle bus, int isOwner);
 
+/* ── 尾の FDN（docs/TAIL_FDN_PLAN.md 手順 4、2026-09-09。切り替え tailModel=1）──
+ *   後期の尾を「部屋ごとの帰還遅延網（FDN）」で作る。IR もエコグラムも要らない。
+ *   部屋ごとに 1 本（部屋グラフの部屋番号 ＝ FDN の番号にして作る）、帯域別 RT60 は部屋グラフの Sabine
+ *   （AF_SceneRoomRt60Live: 開口の吸音率を扉の開き具合で動かした物）を毎フレーム置く。
+ *   音源は AF_VoiceSetFdnMix で預け、送り先と重みを AF_VoiceSetFdnSends で毎フレーム置く
+ *   （AF_SceneFdnRoomWeights を音源の位置で、normalizeOwn=0）。リスナーの重みは同じ関数を
+ *   リスナーの位置で（normalizeOwn=1）→ AF_FdnMixSetListenerWeight。
+ *   量は畳み込みと同じ規約（IR のエネルギー 1、tailGain = 自由音場の直接 × √目標比）なので、
+ *   AF_VoiceSetTailAmount で量だけ置けば A/B の量が揃う。
+ *   Render は AudioListener 側で 1 回（TailBus と同じ。送りが無いブロックでも呼ぶ）。 */
+typedef void* AF_FdnMixHandle;
+
+/* diffusion ≤ 0 で既定 0.6。maxFrames は 1 ブロックの上限。 */
+ACOUSTIC_API AF_FdnMixHandle AF_FdnMixCreate(int sampleRate, int maxFrames, float diffusion);
+ACOUSTIC_API void AF_FdnMixDestroy(AF_FdnMixHandle mix);
+/* 部屋を足す（確保と校正: 数十 ms。オーディオが回っていてもよい）。戻り値は部屋の番号、満杯（16）なら -1。
+ *   lineScale は平均自由行程なり: (4V/S ÷ 343) ÷ 12 ms。colour=1 なら帯域の色 √(RT60_b / T̄)
+ *   （T̄ は帯域幅で重み付けした平均。白色の入力で IR 全体のエネルギーが 1 のまま形だけ Sabine の色）。0 なら平ら。 */
+ACOUSTIC_API int  AF_FdnMixAddRoom(AF_FdnMixHandle mix, float lineScale, const float* rt60_6, int colour);
+ACOUSTIC_API int  AF_FdnMixRoomCount(AF_FdnMixHandle mix);
+ACOUSTIC_API void AF_FdnMixSetRoomRt60(AF_FdnMixHandle mix, int room, const float* rt60_6, int colour);
+/* リスナーがその部屋の FDN をどれだけ聞くか（帯域別の振幅 6 要素）。 */
+ACOUSTIC_API void AF_FdnMixSetListenerWeight(AF_FdnMixHandle mix, int room, const float* w6);
+/* 【オーディオスレッド】溜めた送りを回して outL/outR へ**足す**（上書きしない）。 */
+ACOUSTIC_API void AF_FdnMixRender(AF_FdnMixHandle mix, int frames, float* outL, float* outR);
+/* 直前ブロックの尾の RMS（左）。計器用。 */
+ACOUSTIC_API float AF_FdnMixRms(AF_FdnMixHandle mix);
+/* この音源の尾を FDN へ預ける。mix=NULL で畳み込みに戻る（既定）。預けている間 AF_VoiceRebuildTail は量だけ置く。 */
+ACOUSTIC_API void AF_VoiceSetFdnMix(AF_VoiceHandle voice, AF_FdnMixHandle mix);
+/* 送り先の部屋と重み（振幅、最大 4 本）。毎フレーム置いてよい（チャンク内で線形に繋ぐ）。 */
+ACOUSTIC_API void AF_VoiceSetFdnSends(AF_VoiceHandle voice, const int* rooms, const float* gains, int n);
+/* 尾の量だけを置く（IR を組まない道）。directGain / targetRatio は AF_VoiceRebuildTail と同じ意味。 */
+ACOUSTIC_API void AF_VoiceSetTailAmount(AF_VoiceHandle voice, float directGain, float targetRatio);
+
 /* ── 方向バス（2026-09-04）──
  *   反射・回折のタップを 1 本ずつ両耳化せず、リスナー座標で固定した N 本のレーン（水平の環）へ隣り合う
  *   2 本の等パワーで振り、レーンごとに固定の HRIR で畳む。費用が O(タップ) → O(レーン) になり音源数に依らない。
