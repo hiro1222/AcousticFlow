@@ -54,8 +54,35 @@ namespace AcousticFlow
                  + "  A/B したとき尾の始まりがずれて別の音に聞こえる。")]
         [Range(1f, 60f)] public float minSplitMs = 3f;
         [Range(0.2f, 3f)] public float tailSeconds = 1.0f;
-        [Tooltip("尾を組み直す間隔（フレーム）。重いので数フレームに1回で十分（部屋は緩変）。")]
-        public int tailRebuildEveryFrames = 8;
+        [Tooltip("尾を組み直す間隔（フレーム）。重いので数フレームに1回で十分（部屋は緩変）。\n"
+                 + "★扉を動かしてから響きが追い付くまでの刻みはここで決まる（60fps で 8 = 133 ms）。\n"
+                 + "  エンジンがエコグラムを作り直す間隔（実測 83 ms）より遅いほうが効く。")]
+        [Range(1, 30)] public int tailRebuildEveryFrames = 8;
+
+        [Header("尾の追従の速さ（扉を動かしてから響きが追い付くまで）")]
+        // ★ここの 5 つは以前このファイルに直書きされていて、C# 経路(IrConvolver)だけが
+        //   欄を持っていた。同じ音を A/B するのに片方しか動かせないのは事故のもとなので出した。
+        //   既定値は直書きだった値そのままなので、触らなければ音は変わらない。
+        [Tooltip("尾の立ち上がりの幅(ms)。境目付近をなめらかにする。\n"
+                 + "※C# 経路(IrConvolver)の tailFadeMs と同じ値にすること。")]
+        [Range(0f, 60f)] public float tailFadeMs = 20f;
+        [Tooltip("包絡の平滑幅(ms)。山彦を均す。0 で無効。\n"
+                 + "※C# 経路(IrConvolver)の tailSmoothMs と同じ値にすること。")]
+        [Range(0f, 200f)] public float tailSmoothMs = 30f;
+        [Tooltip("平滑幅を時間とともに広げる量。0 で一定。\n"
+                 + "※C# 経路(IrConvolver)の tailSmoothGrowth と同じ値にすること。")]
+        [Range(0f, 0.6f)] public float tailSmoothGrowth = 0f;
+        [Tooltip("包絡を組み直しのたびに新しい測定へ寄せる割合。1.0 で時間平均なし＝最速。\n"
+                 + "実測（形の変化 11.4 dB・組み直し 133 ms 刻み・99% 到達）:\n"
+                 + "  0.6（既定） 399 ms ／ 0.9  133 ms ／ 1.0  133 ms\n"
+                 + "小さいほど分散が下がり IR 差し替えの段差も減るが、部屋の変化への追従が遅れる。\n"
+                 + "※C# 経路(IrConvolver)の tailEnvSmoothing と同じ値にすること。")]
+        [Range(0.05f, 1f)] public float tailEnvSmoothing = 0.6f;
+        [Tooltip("早期↔後期の境目が目標へ寄る速さ（組み直し 1 回あたりの割合）。1 で即座。\n"
+                 + "ここが動くと『早期タップの打ち切り』と『尾の開始』が同時にずれる。\n"
+                 + "尾側はブロック境界でハードスワップなので、急に動かすと段差として聞こえる。\n"
+                 + "※C# 経路(IrConvolver)の tailSplitFollow と同じ値にすること。")]
+        [Range(0.02f, 1f)] public float tailSplitFollow = 0.15f;
 
         [Header("診断（読み取り専用）")]
         public int tapCount;
@@ -420,7 +447,7 @@ namespace AcousticFlow
                         if (mixT <= 0f) mixT = 120f;
                         // ★尾の比は音源ごと（不具合 #4）。以前は音源 0 の距離だけで全音源の比を決めていた。
                         float tailRatio = (ts.TailRatio >= 0f) ? ts.TailRatio : AcousticFlowSceneDemo.Status.ReverbTargetRatio;
-                        _splitMs = Mathf.Lerp(_splitMs, Mathf.Max(minSplitMs, mixT), 0.15f);
+                        _splitMs = Mathf.Lerp(_splitMs, Mathf.Max(minSplitMs, mixT), tailSplitFollow);
 
                         // ★耳ごとの帯域ゲイン（後期残響の左右バランス）を渡す。
                         //   これを null にしていたので C++ 経路の尾は**方向づけなしの均一**で、
@@ -428,8 +455,8 @@ namespace AcousticFlow
                         var ear = AcousticFlowSceneDemo.Status.TailEarBandGain;
                         Native.AF_VoiceRebuildTail(
                             _voice, _echo, bins, AcousticFlowSceneDemo.Status.EchogramBinMs,
-                            _splitMs, 20f,
-                            30f, 0f, 0.6f, dg,
+                            _splitMs, tailFadeMs,
+                            tailSmoothMs, tailSmoothGrowth, tailEnvSmoothing, dg,
                             tailRatio,
                             ear, ear != null ? ear.Length : 0);
                         tailPartitions = Native.AF_VoiceTailPartitions(_voice);

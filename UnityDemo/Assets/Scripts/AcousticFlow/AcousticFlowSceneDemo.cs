@@ -1357,6 +1357,9 @@ namespace AcousticFlow
         //   同じ GameObject に両方載せておき、**片方だけ enabled にする**。
         //   Unity は無効な MonoBehaviour の OnAudioFilterRead を呼ばないので、
         //   これだけで経路が入れ替わる（AudioSource は共有のまま＝再生位置がズレない）。
+        private IrConvolver _hudIr;       // HUD 表示用（音には使わない）
+        private VoiceConvolver _hudVoice; // HUD 表示用（音には使わない）
+
         private void SetDspPath(bool cpp)
         {
             useCppDsp = cpp;
@@ -1369,6 +1372,10 @@ namespace AcousticFlow
             int nIr = irs.Length, nVoice = voices.Length;
             foreach (var c in irs) c.enabled = !cpp;
             foreach (var c in voices) c.enabled = cpp;
+            // HUD で追従の定数を出すのに使う。欄が別のコンポーネントに散っているので、
+            //   ここで拾っておく（毎フレーム Find すると重い）。
+            _hudIr = (irs.Length > 0) ? irs[0] : null;
+            _hudVoice = (voices.Length > 0) ? voices[0] : null;
 
             if (cpp && nVoice == 0)
             {
@@ -2777,6 +2784,20 @@ namespace AcousticFlow
             GUILayout.Label($"早期反射(IR の R タップ): {(enableEarlyReflections ? "ON" : "OFF")} (F)   "
                             + $"模型: {(earlyReflectModel == 1 ? "面の線音源" : $"像源レイ（既存・音量合わせ -{earlyModelLevelMatchDb:F1} dB）")} (U で切替)   "
                             + $"回折二次音源(IR の F タップ): {(enableDiffractionSources ? "ON" : "OFF")} (V)", style);
+            // 扉を動かしてから響きが追い付くまでの内訳（docs/DOOR_LAG.md）。
+            //   実測: タップは 50 ms で追い付くが、尾の形は 399 ms、尾の向きは 90% で 806 ms。
+            //   欄が VoiceConvolver / IrConvolver / ここ に散っているので 1 行にまとめて出す。
+            //   ※出しているのは「つまみの値」であって到達時刻ではない。到達時刻は上の実測。
+            {
+                float alpha = (_hudVoice != null) ? _hudVoice.tailEnvSmoothing
+                            : (_hudIr != null ? _hudIr.tailEnvSmoothing : 0.6f);
+                int nf = (_hudVoice != null) ? _hudVoice.tailRebuildEveryFrames : 8;
+                float stepMs = nf * (1000f / 60f);
+                float xfMs = (_hudVoice != null) ? _hudVoice.tailCrossfadeMs : 0f;
+                GUILayout.Label($"追従: タップ {tapSmoothTime * 1000f:F0}ms  向き {directionSmoothTime * 1000f:F0}ms  "
+                                + $"尾の形 a{alpha:F2}x{stepMs:F0}ms刻み  尾の向き {directionalTailSmoothSec * 1000f:F0}ms  "
+                                + $"渡り {xfMs:F0}ms", style);
+            }
             {
                 var tb = _portalHost != null ? _portalHost : FindFirstObjectByType<TailBusRenderer>();
                 if (tb != null)

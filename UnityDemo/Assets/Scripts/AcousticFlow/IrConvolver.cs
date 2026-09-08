@@ -228,6 +228,13 @@ namespace AcousticFlow
                  + "本来拡散として扱うべき反射を少数の離散タップで表現することになる"
                  + "（コムフィルタ＝箱っぽく高い音の原因）。")]
         [Range(2f, 120f)] public float minSplitMs = 3f;
+        [Tooltip("尾の立ち上がりの幅(ms)。境目付近をなめらかにする。\n"
+                 + "※C++ 経路(VoiceConvolver)の tailFadeMs と同じ値にすること。")]
+        [Range(0f, 60f)] public float tailFadeMs = 20f;
+        [Tooltip("早期↔後期の境目が目標へ寄る速さ（更新 1 回あたりの割合）。1 で即座。\n"
+                 + "ここが動くと『早期タップの打ち切り』と『尾の開始』が同時にずれる。\n"
+                 + "※C++ 経路(VoiceConvolver)の tailSplitFollow と同じ値にすること。")]
+        [Range(0.02f, 1f)] public float tailSplitFollow = 0.15f;
         [Tooltip("尾の包絡の平滑幅(ms)。0=平滑なし。"
                  + "レイが有限本数なのでエコグラムには平均自由行程ごとの塊が残り、"
                  + "そのままだと『なめらかな尾』でなく『山彦』に聞こえる。減衰カーブ自体は保たれる。")]
@@ -603,7 +610,7 @@ namespace AcousticFlow
                 float mix = AcousticFlowSceneDemo.Status.MixingTimeMs;
                 if (mix <= 0f) mix = 120f;   // 未計算時のフォールバック
                 float targetSplit = Mathf.Clamp(mix, minSplitMs, maxIrMs);
-                _splitMs = Mathf.Lerp(_splitMs, targetSplit, 0.15f);
+                _splitMs = Mathf.Lerp(_splitMs, targetSplit, tailSplitFollow);
                 RebuildIr();
                 UpdateFdnParams();
                 RebuildTailIr();
@@ -681,7 +688,7 @@ namespace AcousticFlow
                                         AcousticFlowSceneDemo.Status.EchogramBinCount,
                                         AcousticFlowSceneDemo.Status.EchogramBinMs,
                                         _splitMs,
-                                        20f,
+                                        tailFadeMs,
                                         tailSmoothMs,
                                         tailSmoothGrowth,
                                         tailEnvSmoothing,

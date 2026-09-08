@@ -2578,7 +2578,11 @@ void diagnoseTailCatchUp() {
     const int bins = 100;
     const float binMs = 10.0f;                 // ホストの既定（echogramBinSeconds = 0.01）
     const float startMs = 22.8f;               // Test_SwingDoor の尾の開始（√V）
-    const float rebuildMs = 83.0f;             // エコグラムが 1 周する実測値（AF_ONLY=lag）
+    // 作り直しの間隔は 2 つの門で決まる。
+    //   ・エコグラムの版が変わる  … 実測 83 ms（AF_ONLY=lag）
+    //   ・tailRebuildEveryFrames  … VoiceConvolver の既定 8 フレーム = 133 ms
+    // 遅いほうが効くので、いまは 133 ms が実際の刻み。両方振って効きを見る。
+    const float periods[] = { 83.0f, 133.0f, 267.0f };
 
     // 扉が開くと、隣の部屋が繋がって尾の**減衰が遅くなる**。量ではなく形が変わる。
     //   （量＝尾の比は扉の開閉でほとんど動かない。AF_ONLY=lag の実測で −0.20 dB。
@@ -2608,8 +2612,10 @@ void diagnoseTailCatchUp() {
     };
 
     std::printf("        envAlpha  作り直し   形の変化 dB   63%%      90%%      99%%\n");
-    const float alphas[] = { 0.6f, 1.0f };
-    for (int a = 0; a < 2; ++a) {
+    const float alphas[] = { 0.6f, 0.9f, 1.0f };
+    for (int pi = 0; pi < 3; ++pi) {
+    const float rebuildMs = periods[pi];
+    for (int a = 0; a < 3; ++a) {
         af::dsp::ReverbTailIr tail(sr, len, channels, bins);
         // 閉じた状態で落ち着かせる。
         for (int i = 0; i < 40; ++i)
@@ -2631,8 +2637,11 @@ void diagnoseTailCatchUp() {
             if (t90 < 0 && f >= 0.90f) t90 = (i + 1) * rebuildMs;
             if (t99 < 0 && f >= 0.99f) t99 = (i + 1) * rebuildMs;
         }
-        std::printf("        %8.2f %7.0f ms %9.1f %8.0f %8.0f %8.0f\n",
-                    alphas[a], rebuildMs, span, t63, t90, t99);
+        std::printf("        %8.2f %7.0f ms %9.1f %8.0f %8.0f %8.0f%s\n",
+                    alphas[a], rebuildMs, span, t63, t90, t99,
+                    (std::fabs(rebuildMs - 133.0f) < 1.0f && std::fabs(alphas[a] - 0.6f) < 0.01f)
+                        ? "   <- いまの既定" : "");
+    }
     }
     std::printf("      ※ envAlpha = 0.6 がホストの既定（VoiceConvolver.cs）。1.0 は時間平均なし。\n"
                 "        これに非同期の写し 16.7 ms・IR 差し替えの渡り 50 ms・Unity の DSP バッファが乗る。\n"
