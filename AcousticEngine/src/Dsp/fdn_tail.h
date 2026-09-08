@@ -28,16 +28,34 @@
 //     帯域ごとに輪を分ければ漏れは入口の 1 回だけで、各輪の減衰は厳密に g_b になる。
 //     費用は遅延線が 6 倍になるが、輪の中のフィルタ（16 本 × 5 段の biquad）が消えるので同程度。
 //
+// ■ 入力の拡散（allpass）は部屋なりに
+//   allpass 1 段は係数 g で鳴り続け、T60_ap = −3·L/(fs·log10 g)。g = 0.6・L = 15 ms で **0.2 秒**もある。
+//   乾いた小部屋（RT60 0.12 s）に入れると、部屋より拡散器のほうが長く鳴り、閉めた小部屋の減衰が
+//   +80% 長く出た（実測、手順 2 の検査）。そこで
+//     ・長さは線の倍率に合わせる（小部屋ほど短い）
+//     ・係数は T60_ap ≤ RT60（1 kHz）/4 になるよう頭打ちにする（setRt60 で更新。係数なので実行時に変えてよい）
+//   響く部屋では 0.6 のまま、乾いた部屋では自然に軽くなる。
+//
 // ■ 減衰の係数（Jot）
 //   線 i（長さ L_i サンプル）が 1 周するごとに g = 10^(−3·L_i / (fs·T60_b))。T60_b 秒で 60 dB 落ちる。
 //   線ごとに長さに比例した減衰を与えるので、混合後の全モードが同じ速さで減る（Jot の条件）。
 //   ★「高域が先に減る」は係数で捏造しない。T60_b は部屋グラフの Sabine（材質＋空気吸収）から来る。
 //
-// ■ 量の正規化
-//   帯域ごとに、その帯域のインパルス応答のエネルギーが約 1 になる入力ゲイン √(1 − ḡ_b²)。
-//   これで尾の**スペクトルは入力のスペクトルのまま**（帯域ごとに量が 1）で、RT60 の違いは
-//   減衰の速さにだけ出る。ReverbTailIr と同じ「エネルギー 1」の規約なので、尾の量の規則
-//   freeFieldDirect × √tailRatio × tailSrcLevel がそのまま載る。検査で ±2 dB を確かめる。
+// ■ 量の正規化 ── 解析式 ＋ 作るときに自分で測った補正
+//   狙いは「帯域ごとにインパルス応答のエネルギーが 1」。これで尾のスペクトルは入力のまま、RT60 の違いは
+//   減衰の速さにだけ出る。ReverbTailIr と同じ規約なので尾の量の規則 freeFieldDirect × √tailRatio × tailSrcLevel
+//   がそのまま載る。
+//   ★解析式 √(1 − ḡ²) だけでは足りなかった（実測、平らな RT60 で 0.15 → 2.4 s を振って）:
+//       拡散 0.6 で +1.9〜+3.0 dB、拡散なしで −3.3〜+5.8 dB。T60 と拡散で大きく動く。
+//     式は「エネルギーが線の長さに比例して分布し、混合がそれを保つ」を仮定するが、16 本・長さ 5 倍の
+//     網では成り立たない。入口の重みを √(L_i/L̄) にして分布を揃えても −0.4 dB しか動かなかった
+//     （退けた書き方。混合後の分布は入口では決まらない）。
+//   → 作るときに自分で測る。平らな T60 を 7 点（0.1〜6.4 s、対数等間隔）置き、それぞれインパルスを
+//     入れて線の最長の 3 周まで回し、残りは設計の減衰で外挿してエネルギーを出す。ずれを dB で表に持ち、
+//     setRt60 では帯域ごとの T60 で表を引いて（対数で線形補間）入力ゲインに掛ける。
+//     費用は 1 本あたり数十 ms（部屋を作るときだけ）。拡散の係数は T60 で頭打ちになるので、表は
+//     その帯域の T60 で決まる拡散を含む（1 kHz 以外の帯域では拡散が 1 kHz の T60 で決まるぶん、
+//     ±1 dB 程度の残りがある。検査で ±2 dB）。
 //
 // ■ 連続性
 //   setRt60 は目標を置くだけ。render が 1 ブロックの中で係数を線形に目標へ寄せる。
@@ -65,8 +83,13 @@ public:
     static constexpr int kAllpass = 4;
 
     /// diffusion : 入力 allpass の係数（0 で無効。0.5〜0.7 が定番）
-    explicit FdnTail(int sampleRate, float diffusion = 0.6f)
-        : fs_(std::max(8000, sampleRate)), diffusion_(clampf(diffusion, 0.0f, 0.95f)) {
+    /// lineScale : 遅延線の長さの倍率（0.3〜2.5）。部屋ごとの器を作るときに平均自由行程 4V/S なりに決める。
+    ///             基準（1.0）は 15〜78 ms で、平均自由行程 12 ms（14 m 角・高 3 m の部屋）に当たる。
+    ///             小さい乾いた部屋で長いままだと、混ざり切る（線の最長の約 3 周）前に減衰が終わる。
+    ///             ★実行時には変えない（変えると音程が動く）。
+    explicit FdnTail(int sampleRate, float diffusion = 0.6f, float lineScale = 1.0f)
+        : fs_(std::max(8000, sampleRate)), diffusion_(clampf(diffusion, 0.0f, 0.95f)),
+          lineScale_(clampf(lineScale, 0.3f, 2.5f)) {
         // 遅延線の長さ（ms）。C# 旧版（IrConvolver）で 4 ＝ 金属的／8／16 と詰めた値。互いに素っぽく広く分散。
         static const float kLineMs[kLines] = {
             15.3f, 18.1f, 21.7f, 25.3f, 29.1f, 33.7f, 37.9f, 42.3f,
@@ -74,19 +97,21 @@ public:
         static const float kApMs[kAllpass] = { 7.3f, 9.9f, 12.7f, 15.1f };
         static const float kCrossHz[kNumBands - 1] = { 177.0f, 354.0f, 707.0f, 1414.0f, 2828.0f };
 
-        std::size_t total = 0;
+        std::size_t total = 0; double lenSum = 0.0;
         for (int i = 0; i < kLines; ++i) {
-            lineLen_[i] = std::max(1, static_cast<int>(std::lround(kLineMs[i] * 0.001f * fs_)));
+            lineLen_[i] = std::max(1, static_cast<int>(std::lround(kLineMs[i] * lineScale_ * 0.001f * fs_)));
             lineOff_[i] = total; total += static_cast<std::size_t>(lineLen_[i]);
+            lenSum += static_cast<double>(lineLen_[i]);
         }
         bandStride_ = total;                                   // 帯域ごとに同じ並びの遅延線
+        for (int i = 0; i < kLines; ++i) injW_[i] = static_cast<float>(std::sqrt(static_cast<double>(lineLen_[i]) / (lenSum / kLines)));
         lineBuf_.assign(bandStride_ * kNumBands, 0.0f);
         for (int b = 0; b < kNumBands; ++b)
             for (int i = 0; i < kLines; ++i) linePos_[b][i] = 0;
 
         total = 0;
         for (int k = 0; k < kAllpass; ++k) {
-            apLen_[k] = std::max(1, static_cast<int>(std::lround(kApMs[k] * 0.001f * fs_)));
+            apLen_[k] = std::max(1, static_cast<int>(std::lround(kApMs[k] * lineScale_ * 0.001f * fs_)));
             apOff_[k] = total; total += static_cast<std::size_t>(apLen_[k]);
             apPos_[k] = 0;
         }
@@ -94,8 +119,10 @@ public:
         for (int c = 0; c < kNumBands - 1; ++c)
             for (int s = 0; s < 2; ++s) split_[c][s].setLowpass(kCrossHz[c], static_cast<float>(fs_));
 
+        calibrate();                                           // 量の校正（数十 ms。部屋を作るときだけ）
         float rt[kNumBands] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
         computeGains(rt, gainCur_, inGainCur_);
+        diffCur_ = diffTgt_ = pendDiff_ = diffusionFor(rt);
         for (int b = 0; b < kNumBands; ++b) {
             for (int i = 0; i < kLines; ++i) gainTgt_[b][i] = gainCur_[b][i];
             inGainTgt_[b] = inGainCur_[b];
@@ -106,6 +133,9 @@ public:
     }
 
     int sampleRate() const { return fs_; }
+    float lineScale() const { return lineScale_; }
+    /// 遅延線の最長（サンプル）。混ざり切るまでの目安はこの約 3 倍。
+    int longestLine() const { int m = 0; for (int i = 0; i < kLines; ++i) m = std::max(m, lineLen_[i]); return m; }
 
     // ── 制御スレッド ──
 
@@ -120,6 +150,7 @@ public:
             pendInGain_[b] = ig[b];
             rt60_[b] = rt60Sec6[b];
         }
+        pendDiff_ = diffusionFor(rt60Sec6);
         version_.fetch_add(1, std::memory_order_release);
     }
 
@@ -137,18 +168,31 @@ public:
         return gainCur_[band][line];
     }
     float rt60(int band) const { return (band >= 0 && band < kNumBands) ? rt60_[band] : 0.0f; }
+    float diffusion() const { return diffCur_; }
+    /// 診断: 量の校正の表（解析式のままだと何 dB ずれるか）。
+    int   calibrationPoints() const { return kCal; }
+    float calibrationT60(int k) const { return (k >= 0 && k < kCal) ? calT60_[k] : 0.0f; }
+    float calibrationDb(int k) const { return (k >= 0 && k < kCal) ? calDb_[k] : 0.0f; }
 
     // ── オーディオスレッド ──
 
     /// in をモノラルで frames サンプル入れ、尾を out に**上書き**する。in と out は別の配列。
     ///   係数は 1 ブロックの中で目標へ線形に寄る（連続性の担保はここ）。
-    void render(const float* in, int frames, float* out) { renderImpl(in, frames, out, nullptr); }
+    void render(const float* in, int frames, float* out) { renderImpl(in, frames, out, nullptr, nullptr, nullptr); }
     /// 診断: 帯域ごとの輪の出力を別々に書く（outBands[b][n]）。減衰の検査が輪を直接測るのに使う。
-    void renderBands(const float* in, int frames, float* const* outBands) { renderImpl(in, frames, nullptr, outBands); }
+    void renderBands(const float* in, int frames, float* const* outBands) { renderImpl(in, frames, nullptr, outBands, nullptr, nullptr); }
+    /// 帯域ごとに M/L/R の 3 本を書く（部屋ごとの配線用。FdnRoomMix が使う）。
+    ///   M = 全線の和（隣室への結合に使う）、L/R = Hadamard の別の行（bit0 / bit1）の符号で足した 2 本。
+    ///   M・L・R は互いに直交する符号なので拡散状態では無相関＝尾が広がる（畳み込みの尾の L/R 独立ノイズと同じ性質）。
+    ///   エネルギーは 3 本とも同じ（各行の符号は ±1 が 16 個）。どれも nullptr 可。
+    void renderBandsMLR(const float* in, int frames, float* const* outM, float* const* outL, float* const* outR) {
+        renderImpl(in, frames, nullptr, outM, outL, outR);
+    }
 
 private:
-    void renderImpl(const float* in, int frames, float* out, float* const* outBands) {
-        if ((!out && !outBands) || frames <= 0) return;
+    void renderImpl(const float* in, int frames, float* out, float* const* outBands,
+                    float* const* outBandsL, float* const* outBandsR) {
+        if ((!out && !outBands && !outBandsL && !outBandsR) || frames <= 0) return;
         // 版が変わっていれば目標を取り込む（浮動小数の書きは版の release より前、読みは acquire の後）。
         const int v = version_.load(std::memory_order_acquire);
         if (v != seen_) {
@@ -156,6 +200,7 @@ private:
                 for (int i = 0; i < kLines; ++i) gainTgt_[b][i] = pendGain_[b][i];
                 inGainTgt_[b] = pendInGain_[b];
             }
+            diffTgt_ = pendDiff_;
             seen_ = v;
         }
         // ブロック内の線形ランプ。
@@ -166,17 +211,19 @@ private:
             igStep[b] = (inGainTgt_[b] - inGainCur_[b]) * inv;
         }
         const float oNorm = 1.0f / std::sqrt(static_cast<float>(kLines));
+        const float dStep = (diffTgt_ - diffCur_) * inv;
 
         for (int n = 0; n < frames; ++n) {
             for (int b = 0; b < kNumBands; ++b) {
                 for (int i = 0; i < kLines; ++i) gainCur_[b][i] += gStep[b][i];
                 inGainCur_[b] += igStep[b];
             }
+            diffCur_ += dStep;
 
             // 入力の拡散（直列 allpass）→ 6 帯域へ。
             float x = in ? in[n] : 0.0f;
-            if (diffusion_ > 0.0f)
-                for (int k = 0; k < kAllpass; ++k) x = allpass(k, x);
+            if (diffCur_ > 1e-4f)
+                for (int k = 0; k < kAllpass; ++k) x = allpass(k, x, diffCur_);
             float xb[kNumBands];
             {
                 float rest = x;
@@ -190,14 +237,18 @@ private:
             float sum = 0.0f;
             for (int b = 0; b < kNumBands; ++b) {
                 float* base = lineBuf_.data() + bandStride_ * static_cast<std::size_t>(b);
-                float f[kLines]; float bsum = 0.0f;
+                float f[kLines]; float bsum = 0.0f, bL = 0.0f, bR = 0.0f;
                 for (int i = 0; i < kLines; ++i) {
                     const float y = base[lineOff_[i] + static_cast<std::size_t>(linePos_[b][i])];
                     bsum += y;
+                    bL += (i & 1) ? -y : y;              // Hadamard の行 1（bit0）
+                    bR += (i & 2) ? -y : y;              // Hadamard の行 2（bit1）
                     f[i] = y * gainCur_[b][i];
                 }
                 sum += bsum;
-                if (outBands) outBands[b][n] = bsum * oNorm;
+                if (outBands)  outBands[b][n]  = bsum * oNorm;
+                if (outBandsL) outBandsL[b][n] = bL * oNorm;
+                if (outBandsR) outBandsR[b][n] = bR * oNorm;
                 // 高速 Walsh–Hadamard（無損失の混合）。
                 for (int len = 1; len < kLines; len <<= 1)
                     for (int j = 0; j < kLines; j += len << 1)
@@ -207,7 +258,7 @@ private:
                         }
                 const float xin = xb[b] * inGainCur_[b];
                 for (int i = 0; i < kLines; ++i) {
-                    base[lineOff_[i] + static_cast<std::size_t>(linePos_[b][i])] = xin + f[i] * oNorm;
+                    base[lineOff_[i] + static_cast<std::size_t>(linePos_[b][i])] = xin * injW_[i] + f[i] * oNorm;
                     if (++linePos_[b][i] >= lineLen_[i]) linePos_[b][i] = 0;
                 }
             }
@@ -218,6 +269,7 @@ private:
             for (int i = 0; i < kLines; ++i) gainCur_[b][i] = gainTgt_[b][i];
             inGainCur_[b] = inGainTgt_[b];
         }
+        diffCur_ = diffTgt_;
     }
 
     // RBJ バイカッド（直接形II転置）。EarlyReflectConv / ReverbTailIr と同じ物。
@@ -244,11 +296,18 @@ private:
 
     static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+    // 拡散の係数を RT60 で頭打ちにする: 最長の allpass が RT60(1 kHz)/4 で 60 dB 落ちる g より大きくしない。
+    float diffusionFor(const float* rt60) const {
+        const double t60 = std::min(30.0, std::max(0.05, static_cast<double>(rt60[3])));
+        int lmax = 1; for (int k = 0; k < kAllpass; ++k) lmax = std::max(lmax, apLen_[k]);
+        const double gCap = std::pow(10.0, -3.0 * static_cast<double>(lmax) / (static_cast<double>(fs_) * t60 * 0.25));
+        return static_cast<float>(std::min(static_cast<double>(diffusion_), gCap));
+    }
+
     // Schroeder allpass 1 段。位相だけ撹拌して振幅特性は平坦。
-    float allpass(int k, float x) {
+    float allpass(int k, float x, float g) {
         float* buf = apBuf_.data() + apOff_[k];
         const float d = buf[apPos_[k]];
-        const float g = diffusion_;
         const float v = x - g * d;
         buf[apPos_[k]] = v;
         if (++apPos_[k] >= apLen_[k]) apPos_[k] = 0;
@@ -269,17 +328,64 @@ private:
                 sumG2 += gv * gv;
             }
             const double meanG2 = sumG2 / static_cast<double>(kLines);
-            inGain[b] = static_cast<float>(std::sqrt(std::max(1.0 - meanG2, 1e-3)));
+            double ig = std::sqrt(std::max(1.0 - meanG2, 1e-3));
+            if (calibrated_) ig *= std::pow(10.0, -corrDbFor(static_cast<float>(t60)) / 20.0);
+            inGain[b] = static_cast<float>(ig);
         }
+    }
+
+    // 校正の表を T60 で引く（対数で線形補間、端は端の値）。
+    float corrDbFor(float t60) const {
+        if (!calibrated_) return 0.0f;
+        const float x = std::log(std::max(t60, 1e-3f));
+        if (x <= std::log(calT60_[0])) return calDb_[0];
+        if (x >= std::log(calT60_[kCal - 1])) return calDb_[kCal - 1];
+        for (int k = 1; k < kCal; ++k) {
+            const float x0 = std::log(calT60_[k - 1]), x1 = std::log(calT60_[k]);
+            if (x <= x1) { const float u = (x - x0) / (x1 - x0); return calDb_[k - 1] + (calDb_[k] - calDb_[k - 1]) * u; }
+        }
+        return calDb_[kCal - 1];
+    }
+
+    // 作るときに自分で測る。平らな T60 でインパルス応答のエネルギーを出し、解析式とのずれを表に置く。
+    //   線の最長の 3 周まで実際に回し、残りは設計の減衰 10^(−6t/T60) で外挿（最後の 20 ms の平均パワー × T60·fs/13.8）。
+    void calibrate() {
+        calibrated_ = false;
+        const int lmax = longestLine();
+        const int nRun = std::max(lmax * 3, fs_ / 10);            // 3 周か 100 ms の長いほう
+        const int nAvg = std::max(1, fs_ / 50);                    // 最後の 20 ms
+        std::vector<float> in(static_cast<std::size_t>(nRun), 0.0f), out(static_cast<std::size_t>(nRun), 0.0f);
+        in[0] = 1.0f;
+        for (int k = 0; k < kCal; ++k) {
+            calT60_[k] = 0.1f * std::pow(2.0f, static_cast<float>(k));   // 0.1, 0.2, … 6.4 s
+            float rt[kNumBands]; for (int b = 0; b < kNumBands; ++b) rt[b] = calT60_[k];
+            reset();
+            float g[kNumBands][kLines]; float ig[kNumBands];
+            computeGains(rt, g, ig);                                // 表は未完成なので解析式そのまま
+            for (int b = 0; b < kNumBands; ++b) { for (int i = 0; i < kLines; ++i) { gainCur_[b][i] = g[b][i]; gainTgt_[b][i] = g[b][i]; } inGainCur_[b] = ig[b]; inGainTgt_[b] = ig[b]; }
+            diffCur_ = diffTgt_ = diffusionFor(rt);
+            renderImpl(in.data(), nRun, out.data(), nullptr, nullptr, nullptr);
+            double e = 0.0, tail = 0.0;
+            for (int i = 0; i < nRun; ++i) e += static_cast<double>(out[static_cast<std::size_t>(i)]) * out[static_cast<std::size_t>(i)];
+            for (int i = nRun - nAvg; i < nRun; ++i) tail += static_cast<double>(out[static_cast<std::size_t>(i)]) * out[static_cast<std::size_t>(i)];
+            const double pEnd = tail / nAvg;                          // 最後の 20 ms の平均パワー（1 サンプルあたり）
+            const double tau = static_cast<double>(calT60_[k]) * fs_ / 13.8155;   // ∫10^(−6t/T60)dt（サンプル）
+            e += pEnd * tau;
+            calDb_[k] = static_cast<float>(10.0 * std::log10(std::max(e, 1e-30)));
+        }
+        reset();
+        calibrated_ = true;
     }
 
     const int fs_;
     const float diffusion_;
+    const float lineScale_;
 
     std::vector<float> lineBuf_;          // [帯域][線][時間]
     std::size_t bandStride_ = 0;
     std::size_t lineOff_[kLines] = {};
     int lineLen_[kLines] = {};
+    float injW_[kLines] = {};
     int linePos_[kNumBands][kLines] = {};
 
     std::vector<float> apBuf_;
@@ -294,6 +400,11 @@ private:
     float pendGain_[kNumBands][kLines] = {};
     float inGainCur_[kNumBands] = {}, inGainTgt_[kNumBands] = {}, pendInGain_[kNumBands] = {};
     float rt60_[kNumBands] = {};
+    float diffCur_ = 0.6f, diffTgt_ = 0.6f, pendDiff_ = 0.6f;
+    static constexpr int kCal = 7;
+    float calT60_[kCal] = {};          // 校正点の T60（s、対数等間隔）
+    float calDb_[kCal] = {};           // その T60 で解析式のままだと何 dB ずれるか（正なら大きすぎる）
+    bool  calibrated_ = false;
     std::atomic<int> version_{0};
     int seen_ = 0;
 };

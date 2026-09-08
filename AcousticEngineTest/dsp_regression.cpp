@@ -22,6 +22,7 @@
 #include "../AcousticEngine/src/Dsp/early_reflect_conv.h"
 #include "../AcousticEngine/src/Dsp/voice_renderer.h"
 #include "../AcousticEngine/src/Dsp/fdn_tail.h"
+#include "../AcousticEngine/src/Dsp/fdn_room_mix.h"
 
 namespace {
 
@@ -2796,7 +2797,7 @@ void split6(const float* src, int n, int fs, std::vector<float>& out /*[6][n]*/,
 //     密度が上がる「立ち上がり」を減衰として拾い、傾きが 30〜80% 浅く出た。
 //     エネルギーは 1 に合っていた（±1.5 dB）ので減衰は合っていて、物差しが外れていた。
 //     EDC は定義から単調なので立ち上がりに騙されない。
-float fitT60(const float* x, int n, int fs, float* outSlopeDbPerSec = nullptr) {
+float fitT60(const float* x, int n, int fs, float startSec = 0.25f, float* outSlopeDbPerSec = nullptr) {
     std::vector<double> edc(static_cast<std::size_t>(n) + 1, 0.0);
     for (int i = n - 1; i >= 0; --i) edc[static_cast<std::size_t>(i)] = edc[static_cast<std::size_t>(i) + 1] + static_cast<double>(x[i]) * x[i];
     const double e0 = edc[0];
@@ -2811,7 +2812,7 @@ float fitT60(const float* x, int n, int fs, float* outSlopeDbPerSec = nullptr) {
     //   ★これは器の性質でもある: 線が 15〜78 ms だと混ざり切るのに約 200 ms 掛かり、RT60 0.3 s の
     //     乾いた小部屋では減衰の大半がその前に終わる。**線の長さは部屋ごとの器を作るときに
     //     mixing time なりに決める**（手順 2。実行時には変えない）。
-    const int i0 = std::min(n - 1, static_cast<int>(0.250 * fs));
+    const int i0 = std::min(n - 1, static_cast<int>(startSec * fs));   // 既定 250 ms（基準の線の最長 78 ms の約 3 周）
     const double d0 = 10.0 * std::log10(std::max(edc[static_cast<std::size_t>(i0)] / e0, 1e-30));
     double sx = 0, sy = 0, sxx = 0, sxy = 0; int m = 0;
     for (int i = i0; i < n; i += step) {
@@ -2916,6 +2917,30 @@ void testFdnTail() {
         check("[FDN] 短い RT60 でもエネルギーが 1（±2 dB）＝ 量が長さに引きずられない", std::fabs(eDb) <= 2.0, buf);
     }
 
+    // ── 1b. 量の正規化のずれの形（診断）: RT60（平ら）と線の倍率と拡散を振って IR のエネルギーを見る ──
+    //   √(1 − ḡ²) の近似がどこでどれだけ外れるかを知るため。表を見て正規化の直し方を決める。
+    {
+        std::printf("        量の正規化のずれ（IR のエネルギー dB。0 が理想）\n");
+        std::printf("        倍率  拡散     T60=0.15  0.3    0.6    1.2    2.4\n");
+        const float t60s[5] = { 0.15f, 0.3f, 0.6f, 1.2f, 2.4f };
+        const float scales[2] = { 1.0f, 0.49f };
+        const float diffs[2] = { 0.6f, 0.0f };
+        for (int si = 0; si < 2; ++si) for (int di = 0; di < 2; ++di) {
+            std::printf("        %4.2f  %4.2f   ", scales[si], diffs[di]);
+            for (int ti = 0; ti < 5; ++ti) {
+                float rt[6]; for (int b = 0; b < 6; ++b) rt[b] = t60s[ti];
+                af::dsp::FdnTail fdn(fs, diffs[di], scales[si]); fdn.setRt60(rt);
+                const int n = static_cast<int>(std::min(6.0f, t60s[ti] * 2.5f) * fs);
+                std::vector<float> in(static_cast<std::size_t>(n), 0.0f), out(static_cast<std::size_t>(n), 0.0f);
+                in[0] = 1.0f;
+                for (int p = 0; p < n; p += blk) fdn.render(in.data() + p, std::min(blk, n - p), out.data() + p);
+                double e = 0.0; for (float v : out) e += static_cast<double>(v) * v;
+                std::printf("%6.2f ", 10.0 * std::log10(std::max(e, 1e-30)));
+            }
+            std::printf("\n");
+        }
+    }
+
     // ── 2. 決定性: 同じ入力で 2 回作ってビット一致（実行時に乱数を引かない）──
     {
         const float rt[6] = { 0.8f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f };
@@ -2972,6 +2997,135 @@ void testFdnTail() {
     }
 }
 
+// ================================ [FDN・配線] 部屋ごとの FDN と戸口の結合 ── 扉を閉めると部屋が乾くか（手順 2）
+// 08-24 の場面を数値で組む: 響く大部屋（14 m 角・高 3 m）と吸う小部屋（4×3×2.5 m）を 0.9 m の戸口でつなぎ、
+// 音源とリスナーを小部屋に置く。実測（レイ）では扉を閉めると減衰 181 → 447 dB/s、RT60 0.33 → 0.13 s、
+// 量は 0.1 dB しか動かなかった。配線で同じ向きが出るかを見る。
+void testFdnRoomMix() {
+    std::printf("\n[FDN・配線] 部屋ごとの FDN ＋ 戸口の結合 ── 扉を閉めると部屋が乾くか\n");
+    const int fs = 48000, blk = 256;
+
+    // 部屋。平均自由行程 4V/S を 12 ms（基準）で割って線の長さの倍率にする。
+    const float V_B = 14.0f * 14.0f * 3.0f, S_B = 2.0f * (14.0f * 14.0f + 14.0f * 3.0f * 2.0f);   // 588 / 560
+    const float V_S = 4.0f * 3.0f * 2.5f,   S_S = 2.0f * (4.0f * 3.0f + 4.0f * 2.5f + 3.0f * 2.5f); // 30 / 59
+    const float mfp_B = 4.0f * V_B / S_B, mfp_S = 4.0f * V_S / S_S;                                   // 4.2 m / 2.0 m
+    const float scale_B = (mfp_B / 343.0f) / 0.012f, scale_S = (mfp_S / 343.0f) / 0.012f;              // 1.02 / 0.49
+    const float rtB[6] = { 1.2f, 1.1f, 1.0f, 0.9f, 0.75f, 0.6f };
+    const float rtS[6] = { 0.16f, 0.15f, 0.13f, 0.12f, 0.11f, 0.10f };
+    const float doorArea = 0.9f * 2.0f;
+    // 幾何: 音源とリスナーは戸口から 1.5 m。戸口の立体角 ≈ A/d² → /4π がエネルギーの割合、振幅はその平方根。
+    const float geo = std::sqrt((doorArea / (1.5f * 1.5f)) / (4.0f * 3.14159265f));                   // ≈ 0.25
+
+    // 開口率 α で 1 場面を組み、インパルス応答（L）を作って返す。
+    auto run = [&](float alpha, float seconds, std::vector<float>& outL, float* t60out, double* energyDb, af::dsp::FdnRoomMix** keep, float fitStart = 0.06f) {
+        auto* mix = new af::dsp::FdnRoomMix(fs, blk);
+        const int B = mix->addRoom(scale_B, rtB);
+        const int S = mix->addRoom(scale_S, rtS);
+        float one[6] = { 1, 1, 1, 1, 1, 1 };
+        float wB[6]; for (int b = 0; b < 6; ++b) wB[b] = alpha * geo;      // リスナー←大部屋: 開口率 × 幾何
+        mix->setListenerWeight(S, one);                                    // 自分の部屋
+        mix->setListenerWeight(B, wB);
+        const int n = static_cast<int>(seconds * fs);
+        outL.assign(static_cast<std::size_t>(n), 0.0f);
+        std::vector<float> outR(static_cast<std::size_t>(n), 0.0f), in(static_cast<std::size_t>(blk), 0.0f);
+        for (int p = 0; p < n; p += blk) {
+            const int m = std::min(blk, n - p);
+            std::fill(in.begin(), in.end(), 0.0f);
+            if (p == 0) in[0] = 1.0f;                                      // インパルスを 1 回
+            mix->add(S, in.data(), m, 1.0f);                               // 音源→自分の部屋
+            mix->add(B, in.data(), m, alpha * geo);                        // 音源→戸口越しの大部屋
+            mix->render(m, outL.data() + p, outR.data() + p);
+        }
+        // 小部屋の線は短い（倍率 0.49、最長 38 ms）。当てはめは 60 ms から（RT60 0.12 s の部屋で聞こえるのは
+        // 最初の 30 dB ＝ 60 ms まで。250 ms では −120 dB で、拡散器や遅いモードの残りを測ってしまう）。
+        std::vector<float> bands;
+        fdntest::split6(outL.data(), n, fs, bands, 2);
+        for (int b = 0; b < 6; ++b) t60out[b] = fdntest::fitT60(bands.data() + static_cast<std::size_t>(b) * n, n, fs, fitStart);
+        double e = 0.0; for (float v : outL) e += static_cast<double>(v) * v;
+        *energyDb = 10.0 * std::log10(std::max(e, 1e-30));
+        if (keep) *keep = mix; else delete mix;
+    };
+
+    std::vector<float> irClosed, irOpen, irHalf;
+    float tC[6], tO[6], tH[6]; double eC, eO, eH;
+    // 閉は 60 ms から（RT60 0.12 s で聞こえる最初の 30 dB）。開・半開は 150 ms から
+    // ＝小部屋の速い減衰が 75 dB 落ちて消えたあと。「後半の減衰が隣室の速さになる」を測る。
+    run(0.0f, 3.0f, irClosed, tC, &eC, nullptr, 0.06f);
+    run(1.0f, 3.0f, irOpen,   tO, &eO, nullptr, 0.15f);
+    run(0.3f, 3.0f, irHalf,   tH, &eH, nullptr, 0.15f);
+
+    std::printf("        線の倍率: 大部屋 %.2f（平均自由行程 %.1f m）／小部屋 %.2f（%.1f m）。戸口の幾何（振幅） %.2f\n",
+                scale_B, mfp_B, scale_S, mfp_S, geo);
+    std::printf("        帯域   小部屋の RT60   閉(α=0)     半開(α=0.3)  開(α=1)     大部屋の RT60   （閉は 60 ms から、開・半開は 150 ms から当てる）\n");
+    static const char* nm[6] = { "125", "250", "500", "1k", "2k", "4k" };
+    for (int b = 0; b < 6; ++b)
+        std::printf("        %-5s %10.2f s %10.2f s %10.2f s %10.2f s %10.2f s\n", nm[b], rtS[b], tC[b], tH[b], tO[b], rtB[b]);
+    std::printf("        量（IR のエネルギー）: 閉 %.2f dB ／ 半開 %.2f dB ／ 開 %.2f dB\n", eC, eH, eO);
+
+    char buf[160];
+    // 閉: 小部屋の自分の RT60（1 kHz で ±15%。低域はモードがまばらなので 1 kHz で見る）
+    const float errC = (tC[3] - rtS[3]) / rtS[3];
+    std::snprintf(buf, sizeof(buf), "(1 kHz: 閉 %.2f s 対 小部屋 %.2f s、%+.0f%%)", tC[3], rtS[3], errC * 100.0f);
+    check("[FDN・配線] 閉めると小部屋の自分の RT60 で減る（1 kHz ±15%）", std::fabs(errC) <= 0.15f, buf);
+    // 開: 減衰が明らかに遅くなる（≥ 2 倍）＝ 08-24 の 447 → 181 dB/s の向き
+    std::snprintf(buf, sizeof(buf), "(1 kHz: 閉 %.2f s → 開 %.2f s、%.1f 倍)", tC[3], tO[3], tO[3] / std::max(tC[3], 1e-3f));
+    check("[FDN・配線] 開けると減衰が 2 倍以上遅くなる（連成: 隣室の遅い尾が後半を支配する）", tO[3] >= 2.0f * tC[3], buf);
+    // 量: 開閉で 1.5 dB 以内（08-24 は 0.1 dB）
+    std::snprintf(buf, sizeof(buf), "(閉 %.2f dB → 開 %.2f dB、差 %.2f dB)", eC, eO, eO - eC);
+    check("[FDN・配線] 開閉で量は 1.5 dB 以内しか動かない（形が変わり、量は変わらない）", std::fabs(eO - eC) <= 1.5, buf);
+    // 半開: 遅い尾の量が α で単調（500 ms 時点の EDC の高さ）
+    auto edcAt = [&](const std::vector<float>& x, float sec) {
+        double tot = 0.0, tail = 0.0; const int i0 = static_cast<int>(sec * fs);
+        for (int i = 0; i < static_cast<int>(x.size()); ++i) { const double v = static_cast<double>(x[static_cast<std::size_t>(i)]) * x[static_cast<std::size_t>(i)]; tot += v; if (i >= i0) tail += v; }
+        return 10.0 * std::log10(std::max(tail, 1e-30) / std::max(tot, 1e-30));
+    };
+    const double lC = edcAt(irClosed, 0.5f), lH = edcAt(irHalf, 0.5f), lO = edcAt(irOpen, 0.5f);
+    std::snprintf(buf, sizeof(buf), "(500 ms 以降の残りエネルギー: 閉 %.1f dB ／ 半開 %.1f dB ／ 開 %.1f dB)", lC, lH, lO);
+    check("[FDN・配線] 遅い尾の量が開口率で単調に増える（閉 < 半開 < 開、3 dB 以上ずつ）", lH >= lC + 3.0 && lO >= lH + 3.0, buf);
+
+    // 連続性: 鳴らしながら扉を 0.3 秒で閉める（α 1 → 0）。隣り合うブロックの段差を正弦で測る。
+    {
+        af::dsp::FdnRoomMix* mix = nullptr;
+        std::vector<float> dummy; float tt[6]; double ee;
+        run(1.0f, 0.02f, dummy, tt, &ee, &mix);      // 器を作るだけ（短く回す）
+        const int S = 1, B = 0;
+        const int n = fs * 2;
+        std::vector<float> in(static_cast<std::size_t>(blk)), L(static_cast<std::size_t>(n)), R(static_cast<std::size_t>(n));
+        float maxRatioDb = 0.0f; double prev = -1.0;
+        for (int p = 0; p < n; p += blk) {
+            const int m = std::min(blk, n - p);
+            for (int i = 0; i < m; ++i) in[static_cast<std::size_t>(i)] = 0.1f * std::sin(2.0f * 3.14159265f * 220.0f * (p + i) / fs);
+            // 1.0 秒から 0.3 秒かけて閉める。
+            float alpha = 1.0f;
+            if (p >= fs) alpha = std::max(0.0f, 1.0f - (p - fs) / (0.3f * fs));
+            float wB[6]; for (int b = 0; b < 6; ++b) wB[b] = alpha * geo;
+            mix->setListenerWeight(B, wB);
+            mix->add(S, in.data(), m, 1.0f);
+            mix->add(B, in.data(), m, alpha * geo);
+            mix->render(m, L.data() + p, R.data() + p);
+            if (p >= fs - blk) {
+                double e = 0.0; for (int i = 0; i < m; ++i) e += static_cast<double>(L[static_cast<std::size_t>(p + i)]) * L[static_cast<std::size_t>(p + i)];
+                const double rms = std::sqrt(e / m);
+                if (prev > 0.0) maxRatioDb = std::max(maxRatioDb, static_cast<float>(std::fabs(20.0 * std::log10(std::max(rms, 1e-12) / prev))));
+                prev = rms;
+            }
+        }
+        delete mix;
+        std::snprintf(buf, sizeof(buf), "(隣り合うブロックの RMS 比の最大 %.2f dB)", maxRatioDb);
+        check("[FDN・配線] 鳴らしながら扉を 0.3 秒で閉めても隣り合うブロックの段差が 3 dB 以下", maxRatioDb <= 3.0f, buf);
+    }
+
+    // 安定: 開けたまま 4 秒回して膨らまない（結合の往復の利得 < 1）。
+    {
+        std::vector<float> ir; float tt[6]; double ee;
+        run(1.0f, 4.0f, ir, tt, &ee, nullptr);
+        auto rmsOf = [&](int from, int to) { double e = 0.0; for (int i = from; i < to; ++i) e += static_cast<double>(ir[static_cast<std::size_t>(i)]) * ir[static_cast<std::size_t>(i)]; return std::sqrt(e / std::max(1, to - from)); };
+        const double r1 = rmsOf(fs / 2, fs), r2 = rmsOf(3 * fs, 4 * fs);
+        std::snprintf(buf, sizeof(buf), "(0.5〜1 s の RMS %.5f → 3〜4 s %.5f)", r1, r2);
+        check("[FDN・配線] 開けたまま 4 秒回しても膨らまない（配線は前向きだけ）", r2 < r1, buf);
+    }
+}
+
 int main() {
     std::printf("=== DSP 数値回帰テスト（段4: C++ 移行）===\n");
     testFft();
@@ -2995,6 +3149,7 @@ int main() {
     diagnoseTailCatchUp();
     diagnoseTailTrackingLag();
     testFdnTail();
+    testFdnRoomMix();
 
     std::printf("\n----\n");
     if (g_failures == 0) {
