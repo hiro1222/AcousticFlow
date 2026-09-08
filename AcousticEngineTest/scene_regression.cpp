@@ -13413,7 +13413,7 @@ void placeDoor(Scn& u, float deg) {
         V(kDoorW * 0.5f, kHh * 0.5f, kDoorT * 0.5f), right, V(0, 1, 0));
 }
 
-void build(Scn& u, int doorPreset, int apertureLaw = 0) {
+void build(Scn& u, int doorPreset, int apertureLaw = 0, float listenerX = 0.0f) {
     u.s = AF_SceneCreate();
     AF_SceneSetApertureLaw(u.s, apertureLaw);
     float ct[6], ca[6], cs[6], dt2[6], da[6], ds[6];
@@ -13444,7 +13444,7 @@ void build(Scn& u, int doorPreset, int apertureLaw = 0) {
                            V(kDoorW * 0.5f, kHh * 0.5f, kDoorT * 0.5f), V(1,0,0), V(0,1,0), md);
     AF_SceneSetInstanceDynamic(u.s, u.doorInst, 1);
 
-    AF_SceneSetListener(u.s, V(0, 1.6f, -3));
+    AF_SceneSetListener(u.s, V(listenerX, 1.6f, -3));
     AF_SceneSetListenerOrientation(u.s, V(0,0,1), V(0,1,0));
     AF_SceneSetSource(u.s, 1, V(0, 1.6f, 3));
 
@@ -13509,9 +13509,17 @@ void diagnoseDoorStaircase() {
     // 理想は「開き始めが一番動き、そのあと変化が小さくなる」。実測がそうなっているかを見る。
     //   参照として、射影の開口 (1−cosθ) だけで決まるなら段ごとの増分は
     //   6.0 / 3.5 / 2.4 / 1.8 / 1.5 / 1.2 / 1.0 / 0.8 dB と単調に減る。
-    static float dLvl[2][10], dCol[2][10], fLvl[2][10], fCol[2][10];
-    for (int law = 0; law <= 1; ++law) {
-    doorstep::Scn u; doorstep::build(u, 4, law);       // 4 = WoodDoor
+    // ★3 通り測る。正面（扉が見通し線を横切る配置）と、横へ 2 m ずれた配置。
+    //   正面は扉が物理的に目の前を通るので、直接音が後半で跳ぶのは幾何として正しい。
+    //   横へずれれば扉は見通し線を塞がないので、そこで分かれれば「模型の問題」ではなく
+    //   「試験の置き方の問題」と切り分けられる。
+    static float dLvl[3][10], dCol[3][10], fLvl[3][10], fCol[3][10];
+    const int   caseLaw[3] = { 0, 1, 0 };
+    const float caseX[3]   = { 0.0f, 0.0f, -2.0f };
+    const char* caseName[3] = { "正面・法則0", "正面・法則1", "横2m・法則0" };
+    for (int ci = 0; ci < 3; ++ci) {
+    const int law = ci;
+    doorstep::Scn u; doorstep::build(u, 4, caseLaw[ci], caseX[ci]);   // 4 = WoodDoor
     const float dt = 1.0f / 60.0f;
     const int rampN = 12;                              // 0.2 秒
     const int holdN = 300;                             // 5 秒
@@ -13524,7 +13532,7 @@ void diagnoseDoorStaircase() {
     std::printf("        閉じた状態: 音量 %.1f dB / 色 %.1f dB   （直接 %.1f / 反射 %.1f / 回折 %.1f）\n\n",
                 lvl0, col0, by0[0], by0[1], by0[2]);
 
-    std::printf("        [開口の法則 %d]\n", law);
+    std::printf("        [%s]  リスナー x = %.1f\n", caseName[ci], caseX[ci]);
     std::printf("        段  角度      到達    音が止まる     差    止まった音量  前段からの差   色    直接   反射   回折\n");
     static float lv[400], cl[400];
     float prevLvl = lvl0;
@@ -13564,17 +13572,38 @@ void diagnoseDoorStaircase() {
     std::printf("        段ごとの増分（理想は左ほど大きい）\n");
     std::printf("        段            1     2     3     4     5     6     7     8     9\n");
     std::printf("        角度        10    20    30    40    50    60    70    80    90\n");
-    const char* nm[2] = { "法則0 音量  ", "法則1 音量  " };
-    for (int law = 0; law <= 1; ++law) {
-        std::printf("        %s", nm[law]);
-        for (int k = 1; k <= 9; ++k) std::printf("%6.1f", dLvl[law][k]);
-        std::printf("\n        %s", (law == 0) ? "法則0 色    " : "法則1 色    ");
-        for (int k = 1; k <= 9; ++k) std::printf("%6.1f", dCol[law][k]);
+    for (int ci = 0; ci < 3; ++ci) {
+        std::printf("        %s 音量", caseName[ci]);
+        for (int k = 1; k <= 9; ++k) std::printf("%6.1f", dLvl[ci][k]);
+        std::printf("\n        %s 色  ", caseName[ci]);
+        for (int k = 1; k <= 9; ++k) std::printf("%6.1f", dCol[ci][k]);
         std::printf("\n");
     }
     std::printf("        射影の参照  ");
     for (int k = 1; k <= 9; ++k) std::printf("%6.1f", projInc[k]);
     std::printf("   ← 開口 (1-cosθ) だけならこう減る\n");
+
+    // ★試聴で出た目標の形（2026-09-08）:
+    //     0〜10 度で 7 割 ／ 10〜30 度で 2 割 ／ 30〜90 度で 1 割。
+    //   「開いた瞬間が一番大きく、そこからどんどん小さくなって、あとはこもりだけが変わる」。
+    //   ★この配分は楔（開口が角度に比例）の形とほぼ一致する。開口 ∝ sinθ なら
+    //     10 度から先の増分は 2.9 / 1.7 / 1.1 / 0.8 / 0.5 / 0.4 / 0.2 / 0.1 dB で、
+    //     10〜30 度が 4.6 dB・30〜90 度が 3.0 dB。0〜10 度が 18 dB あれば 70/18/12 になる。
+    //     射影（開口 ∝ 1−cosθ）だと 10 度から先が 18.5 dB もあるので、この配分にならない。
+    std::printf("\n        配分（試聴の目標: 0-10 度 70%% ／ 10-30 度 20%% ／ 30-90 度 10%%）\n");
+    std::printf("        量           0-10 度   10-30 度   30-90 度   合計\n");
+    for (int ci = 0; ci < 3; ++ci) {
+        for (int which = 0; which < 2; ++which) {
+            const float* d = which ? dCol[ci] : dLvl[ci];
+            float a = d[1], b = d[2] + d[3], c = 0.0f;
+            for (int k = 4; k <= 9; ++k) c += d[k];
+            const float tot = a + b + c;
+            const float sc = (std::fabs(tot) > 1e-3f) ? 100.0f / tot : 0.0f;
+            std::printf("        %s %s %7.0f%%  %8.0f%%  %8.0f%%  %6.1f dB\n",
+                        caseName[ci], which ? "色  " : "音量", a * sc, b * sc, c * sc, tot);
+        }
+    }
+    std::printf("        ※目標に近いほど左が大きい。音量は直接音と反射が後ろで跳ぶので後ろ重い。\n");
     std::printf("      ※「音が止まる」＝ 最終値から %.1f dB 以上ずれた最後の時刻の次。\n"
                 "        差が正なら、扉が止まったあとも音が動いている（追い付いてくる）。\n"
                 "        ここに出ていない遅れ: 非同期の写し 16.7 ms・DSP バッファ 21.3 ms・出力の待ち約 43 ms。\n", 0.1f);
