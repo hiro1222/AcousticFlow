@@ -29,6 +29,13 @@ namespace AcousticFlow
         [Tooltip("扉の幅(m)。蝶番から自由端まで。戸口の幅と一致させること。")]
         public float width = 1.0f;
 
+        [Tooltip("枠との隙間(m)。実際の扉には 3〜5 mm ある。\n"
+                 + "0 だと戸口をぴったり塞ぐので、閉じた状態の開口が数値としてゼロになり\n"
+                 + "「隙間から高域だけが漏れる」（作品の前提）が形として存在しなくなる。\n"
+                 + "自由端と上下に付ける。蝶番側は密着したまま。\n"
+                 + "実測（閉扉の傾き 125Hz-4kHz）: 0mm 12.0 dB / 5mm 11.1 / 10mm 7.3 / 20mm 5.0。")]
+        [Range(0f, 0.02f)] public float clearance = 0.004f;
+
         [Tooltip("扉の高さ(m)。戸口と同じにすること（低いと上に隙間が残る）。")]
         public float height = 3.0f;
 
@@ -101,9 +108,14 @@ namespace AcousticFlow
 
             // localScale=(厚み, 高さ, 幅) なので、扉の長辺はローカル +Z。
             // したがって LookRotation の forward に along を渡す。
-            transform.position = hinge.position + along * (width * 0.5f);
+            // 枠との隙間を引く。自由端と上下に付け、蝶番側は密着させる
+            //   （実際の扉と同じ。蝶番側に隙間を作ると、閉じていても常に漏れ続ける）。
+            float c = Mathf.Max(0f, clearance);
+            float w = Mathf.Max(0.01f, width - c);
+            float h = Mathf.Max(0.01f, height - 2f * c);
+            transform.position = hinge.position + along * (w * 0.5f);
             transform.rotation = Quaternion.LookRotation(along, Vector3.up);
-            transform.localScale = new Vector3(thickness, height, width);
+            transform.localScale = new Vector3(thickness, h, w);
         }
 
         // ★選択していなくても出す。扉がどこにあって何度開いているかは、

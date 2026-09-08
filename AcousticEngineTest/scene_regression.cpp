@@ -8098,9 +8098,9 @@ void testClosedDoorTimbre() {
     std::printf("        材質（木の扉）の振幅   125 %.5f  4k %.5f  傾き %5.1f dB ← ここが目標\n",
                 matAmp[0], matAmp[5], tiltDb(matAmp));
 
-    float tapTilt[3] = {0, 0, 0};
+    float tapTilt[4] = {0, 0, 0, 0};
     float tap0Lo = 0.0f, tap2Lo = 0.0f;
-    for (int mode = 0; mode < 3; ++mode) {
+    for (int mode = 0; mode < 4; ++mode) {
         AF_SceneHandle s = AF_SceneCreate();
         const int matWall = AF_SceneAddMaterial(s, wallT, nullptr, nullptr, 6);
         const int matDoor = AF_SceneAddMaterial(s, doorT, nullptr, nullptr, 6);
@@ -8139,7 +8139,7 @@ void testClosedDoorTimbre() {
             const float* g = vp.taps[0].gain6;
             tapTilt[mode] = tiltDb(g);
             if (mode == 0) tap0Lo = g[0];
-            if (mode == 2) tap2Lo = g[0];
+            if (mode == 3) tap2Lo = g[0];
             std::printf("        半影 %d ─ 直接タップ 125 %.5f  4k %.5f  傾き %5.1f dB"
                         " ／ 線の透過 %5.1f dB ／ 円盤(旧) %5.1f dB\n",
                         mode, g[0], g[5], tapTilt[mode], tiltDb(line), tiltDb(disc));
@@ -8162,7 +8162,7 @@ void testClosedDoorTimbre() {
         AF_SceneAddInstanceBox(s, V(0, hh*0.5f,  hf), V(hf, hh*0.5f, th), V(1,0,0), V(0,1,0), matDoor);
         // 仕切り全体が扉の材質（戸口も扉も無い 1 枚板）
         AF_SceneAddInstanceBox(s, V(0, hh*0.5f, 0), V(hf, hh*0.5f, th*0.5f), V(1,0,0), V(0,1,0), matDoor);
-        AF_SceneSetDirectPenumbra(s, 2);
+        AF_SceneSetDirectPenumbra(s, 3);
         AF_SceneSetListener(s, L);
         AF_SceneSetListenerOrientation(s, V(0,0,1), V(0,1,0));
         AF_SceneSetSource(s, 1, Sr);
@@ -8184,21 +8184,21 @@ void testClosedDoorTimbre() {
 
     char nb[260];
     std::snprintf(nb, sizeof(nb),
-                  "(材質 %.1f dB / 半影2 %.1f・半影1 %.1f・半影0 %.1f。125Hz の量: 半影0 %.5f → 半影2 %.5f（%.1f dB 差）／仕切り全体が扉なら %.5f)",
-                  tiltDb(matAmp), tapTilt[2], tapTilt[1], tapTilt[0],
+                  "(材質 %.1f dB / 半影3 %.1f・半影2 %.1f・半影1 %.1f・半影0 %.1f。125Hz の量: 半影0 %.5f → 半影3 %.5f（%.1f dB 差）／仕切り全体が扉なら %.5f)",
+                  tiltDb(matAmp), tapTilt[3], tapTilt[2], tapTilt[1], tapTilt[0],
                   tap0Lo, tap2Lo, 20.0f * std::log10(std::max(tap2Lo,1e-9f)/std::max(tap0Lo,1e-9f)), wideTap[0]);
     // ★一様な仕切り（フレネル帯が全部 1 つの材質）なら、材質どおりのこもりになること。
     //   ここがずれていたら数え方の誤り（実体を 2 回数える等）。2026-09-08 に 24.0 dB ＝ 材質の
     //   ちょうど 2 倍で見つけた。直した後は 12.1 dB で、旧の円盤（半影 0）とも一致する。
-    check("[閉扉] 一様な仕切りは材質どおりのこもり（半影 2 ＝ 半影 0 ＝ 材質）",
+    check("[閉扉] 一様な仕切りは材質どおりのこもり（半影 3 ＝ 半影 0 ＝ 材質）",
           std::fabs(tiltDb(wideTap) - tiltDb(matAmp)) < 1.5f, nb);
+    // ★戸口に扉（穴のある壁）でも材質どおりこもること。前提「閉じた扉ごしの音はこもる」そのもの。
+    check("[閉扉] 戸口の扉も材質どおりこもる（半影 3）",
+          tapTilt[3] > tiltDb(matAmp) * 0.75f, nb);
     std::printf("      ※傾き ＝ 20log10(125Hz / 4kHz)。材質より小さいほど「こもっていない」。\n"
-                "        ⚠ 戸口に扉（穴のある壁）だと %.1f dB で、材質の %.1f dB より**こもらない**。\n"
-                "          低域のフレネル帯（125 Hz で半径 2 m）が幅 1 m の扉からはみ出して、\n"
-                "          まわりのコンクリート壁を拾うため。高域は帯が扉に収まるので扉の値のまま。\n"
-                "          建築音響の合成透過損失は面積で足すので、この重み付けは透過には過剰。\n"
-                "          **模型の変更になるので未決**（発注者に確認してから）。\n",
-                tapTilt[2], tiltDb(matAmp));
+                "        戸口に扉（穴のある壁）: 半影 2 は %.1f dB（帯域ごとの核が周りの壁を拾って明るい）、\n"
+                "          半影 3 は %.1f dB（透過の重みを帯域に依らせない。2026-09-08 の既定）。材質は %.1f dB。\n",
+                tapTilt[2], tapTilt[3], tiltDb(matAmp));
 }
 
 // ============================================================ 歩行の連続性（鳴っている音で測る）

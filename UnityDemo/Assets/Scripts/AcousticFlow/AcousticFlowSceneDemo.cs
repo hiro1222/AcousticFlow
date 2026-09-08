@@ -350,10 +350,13 @@ namespace AcousticFlow
         [Tooltip("早期反射の模型。0 = 像源をレイで拾う（旧。像が見えた/消えたの二値でタップが跳ぶ）"
                  + "1 = 面ごとの線音源（2026-09-03 決定。鏡面点にピークを持つ下位タップの線。低域は点、高域は面いっぱいに広がる）")]
         [Range(0, 1)] public int earlyReflectModel = 1;
-        [Tooltip("直接経路の半影の作り方。2 = 窓の走査線積分（2026-09-05 既定。影の区間を解析的に積むので扉の隙間で跳ばない）"
-                 + "／1 = 帯域ごとのフレネル半径の環に標本点（09-02。4 点の環が階段になる）／0 = 旧（音源まわり 8 点）。"
-                 + "同じビルドで聞き比べるための切り替え（Play 中に動かしてよい）。採用が固まったら 0・1 側ごと消す。")]
-        [Range(0, 2)] public int directPenumbraMode = 2;
+        [Tooltip("直接経路の半影の作り方。\n"
+                 + "3 = 走査線 ＋ 透過の重みを帯域に依らせない（2026-09-08 既定。閉じた扉が材質どおりこもる）\n"
+                 + "2 = 窓の走査線積分（09-05。戸口の扉だと低域の帯が周りの壁を拾って明るくなる）\n"
+                 + "1 = 帯域ごとのフレネル半径の環に標本点（09-02。4 点の環が階段になる）\n"
+                 + "0 = 旧（音源まわり 8 点）\n"
+                 + "同じビルドで聞き比べるための切り替え（Play 中に動かしてよい）。採用が固まったら下側を消す。")]
+        [Range(0, 3)] public int directPenumbraMode = 3;
         [Tooltip("聞き比べのラウドネス合わせ。像源レイ（earlyReflectModel=0）の反射タップに掛ける減衰(dB)。\n"
                  + "U で模型を切り替えたときに音量が変わると「大きい方が良い」に引っ張られるので揃える。\n"
                  + "既定 3.8 dB は回帰 [歩行] の実測（戸口をくぐる経路で 面の線 -26.2 / レイ追跡 -22.3 dB）。\n"
@@ -2762,7 +2765,7 @@ namespace AcousticFlow
                 : "主音源の回折: なし", style);
             if (showDiffractionCandidates)
                 GUILayout.Label($"回折候補(主音源): {_diffCandCount} 本合成 (水色=最短) (C)", style);
-            GUILayout.Label($"直接の半影: {(directPenumbraMode == 2 ? "窓の走査線" : directPenumbraMode == 1 ? "環の標本点" : "旧(8 点)")} (Inspector directPenumbraMode)   "
+            GUILayout.Label($"直接の半影: {(directPenumbraMode == 3 ? "走査線+透過は帯域非依存" : directPenumbraMode == 2 ? "窓の走査線" : directPenumbraMode == 1 ? "環の標本点" : "旧(8 点)")} (Inspector directPenumbraMode)   "
                             + $"タップの組み立て: {(tapsFromEngine && _scene != null && _scene.TapBuilderAvailable ? "DLL" : "ホスト")} (tapsFromEngine)", style);
             GUILayout.Label($"早期反射(IR の R タップ): {(enableEarlyReflections ? "ON" : "OFF")} (F)   "
                             + $"模型: {(earlyReflectModel == 1 ? "面の線音源" : $"像源レイ（既存・音量合わせ -{earlyModelLevelMatchDb:F1} dB）")} (U で切替)   "

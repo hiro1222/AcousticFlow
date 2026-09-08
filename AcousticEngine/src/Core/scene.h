@@ -2986,7 +2986,7 @@ public:
     ///   ON にすると前川の δ 減衰も開口率も使わず、BTM の値がそのまま帯域ゲインになる。
     void setUseBtm(int on) { useBtm_ = (on != 0); }
     void setDirectPenumbra(int mode) {
-        directPenumbraMode_ = (mode < 0) ? 0 : (mode > 2 ? 2 : mode);
+        directPenumbraMode_ = (mode < 0) ? 0 : (mode > 3 ? 3 : mode);
         directPenumbraFresnel_ = (directPenumbraMode_ != 0);
     }
     int directPenumbraMode() const { return directPenumbraMode_; }
@@ -4393,7 +4393,7 @@ public:
         const float syq[4] = { +1.0f, +1.0f, -1.0f, -1.0f };
         float softE[kNumBands];            // 帯域別の滑らかな直接透過（エネルギー）
 
-        if (directPenumbraMode_ == 2) {
+        if (directPenumbraMode_ >= 2) {
             // ★2026-09-05: 窓の**走査線積分**（標本点をやめる）。
             //   点で撒くと、扉の細い隙間は「点を含むか含まないか」の二値になり、蝶番側の音源が 1° で 9〜11 dB 跳んだ
             //   （表ツール 1.5 m: 内開き 5→6° −37→−28、8→9° −27→−16、外開き 53→54° −25→−12。環 4 点の階段。
@@ -4521,6 +4521,12 @@ public:
                 constexpr float kV0 = 0.012f;
                 const float qr = std::pow(kWin / kV0, 1.0f / static_cast<float>(kSide - 1));
                 double numer[kNumBands] = {0, 0, 0, 0, 0, 0}, denom[kNumBands] = {0, 0, 0, 0, 0, 0};
+                // 半影 3 の透過ぶん（基準帯の核で重み付ける）。
+                //   ★基準帯は 1 kHz（添字 3）。この場面で第 1 フレネル帯の半径は 0.72 m で、
+                //     幅 1 m の扉の中にほぼ収まる。4 kHz（0.36 m）だと見通し線の一点しか見ず
+                //     「線の透過」に戻ってしまい、125 Hz（2.03 m）だと周りの壁を拾う。その中間。
+                constexpr int kRefBand = 3;
+                double numerTrans[kNumBands] = {0, 0, 0, 0, 0, 0}, denomRef = 0.0;
                 struct Ev { float x; int pi; int dir; };   // pi = spolys の番号
                 static thread_local std::vector<Ev> evs;
                 static thread_local std::vector<int> active;   // spolys の番号
@@ -4548,6 +4554,12 @@ public:
                     }
                     auto I = [&](int b, float a, float c) { return static_cast<double>(aB[b]) * (std::erf(c * invR[b]) - std::erf(a * invR[b])); };
                     for (int b = 0; b < kNumBands; ++b) denom[b] += hgt * I(b, -kWin, kWin);
+                    // 【半影 3】透過の空間の重みだけ**帯域に依らせない**（開口はこれまでどおり帯域ごと）。
+                    //   板は面として再放射するので、どの帯域も同じ面が担う。帯域ごとの核で重み付けると、
+                    //   低域のフレネル帯（125 Hz で半径 2 m）が幅 1 m の扉からはみ出して周りの壁を拾い、
+                    //   閉扉が材質よりも**明るく**なる（実測 5.6 dB 対 材質 12.0 dB）＝前提が崩れる。
+                    //   素通しの区間（開口）は帯域ごとのままなので「狭い隙間は高域から通る」は残る。
+                    if (directPenumbraMode_ >= 3) denomRef += hgt * I(kRefBand, -kWin, kWin);
                     active.clear();
                     float g[kNumBands] = {1, 1, 1, 1, 1, 1};
                     float cursor = -kWin;
@@ -4555,7 +4567,13 @@ public:
                     for (;;) {
                         const float next = (i < evs.size()) ? evs[i].x : kWin;
                         if (next > cursor) {
-                            for (int b = 0; b < kNumBands; ++b) numer[b] += hgt * g[b] * I(b, cursor, next);
+                            if (directPenumbraMode_ >= 3 && !active.empty()) {
+                                // 塞がっている区間＝透過。基準帯の核で重み付ける（帯域に依らない面）。
+                                const double w = I(kRefBand, cursor, next);
+                                for (int b = 0; b < kNumBands; ++b) numerTrans[b] += hgt * g[b] * w;
+                            } else {
+                                for (int b = 0; b < kNumBands; ++b) numer[b] += hgt * g[b] * I(b, cursor, next);
+                            }
                             cursor = next;
                         }
                         if (i >= evs.size()) break;
@@ -4590,8 +4608,11 @@ public:
                     rowIntegrate(-yc, hgt);
                     e0 = e1;
                 }
-                for (int b = 0; b < kNumBands; ++b)
-                    softE[b] = (denom[b] > 1e-12) ? clamp01(static_cast<float>(numer[b] / denom[b])) : 1.0f;
+                for (int b = 0; b < kNumBands; ++b) {
+                    const double open = (denom[b] > 1e-12) ? (numer[b] / denom[b]) : 1.0;
+                    const double tr = (denomRef > 1e-12) ? (numerTrans[b] / denomRef) : 0.0;
+                    softE[b] = clamp01(static_cast<float>(open + tr));
+                }
             }
         } else if (directPenumbraFresnel_) {
             // ★2026-09-02: 縁の半影を**帯域ごとのフレネル半径**で作る。
@@ -7994,7 +8015,9 @@ private:
     //   ★戻せるように残してある切り替え。新旧を同じビルドで聞き比べるためのもので、
     //     採用が固まったら OFF 側ごと消す（同じ問いに 2 つの答えを常設しない）。
     bool  directPenumbraFresnel_ = true;
-    int  directPenumbraMode_ = 2;             // 直接経路の半影: 0 旧（音源まわり 8 点）／1 環（09-02、標本点）／2 窓の走査線積分（既定）
+    // 直接経路の半影: 0 旧（音源まわり 8 点）／1 環（09-02、標本点）／2 窓の走査線積分／
+    //   3 走査線＋透過の重みを帯域に依らせない（2026-09-08 既定。閉扉が材質どおりこもる）
+    int  directPenumbraMode_ = 3;
     float btmWedgeAngle_ = 4.712389f;      // 1.5π＝箱の凸稜線
 
     float slitWidthRef_ = 0.35f;         // これより広ければ素通り(m)。500Hz の半波長あたり
