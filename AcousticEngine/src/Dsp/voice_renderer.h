@@ -129,6 +129,7 @@ public:
         diffR_.init(scatR, 3, sampleRate_);
 
         const std::size_t mf = static_cast<std::size_t>(std::max(64, cfg.maxFrames));
+        tailIn_.assign(mf, 0.0f);
         tailOutL_.assign(mf, 0.0f);
         tailOutR_.assign(mf, 0.0f);
         maxFrames_ = static_cast<int>(mf);
@@ -352,6 +353,14 @@ private:
         //     既に決まっており二重計上になる（C# 経路は掛けていなかったので 3.9dB 差が出た）。
         const float lvl = tailLevel_ * tailSrcLevel_;
         // 差し替えの混ぜは器の中（新旧の IR スペクトルを等振幅で。遅延線は共有）。
+        // 【尾の量の傾斜】tailGain_ は組み直し（ホストは 8 フレームに 1 回）でしか動かない。
+        //   チャンク境界でそのまま掛けると**段差**になり、扉が動くと量が速く動くので
+        //   それが「ぷつぷつ」になる（実測: 段差が平常の 51.8 倍。傾斜にすると 1.03 倍）。
+        //   タップの差し替えと同じ考え方 ── 量は必ず時間方向に繋ぐ。ここはチャンク内で線形。
+        //   ★tailSrcLevel_ の変化もここで一緒に飲む（掛けた後の値を持ち越しているため）。
+        const float tgEnd = tailGain_ * lvl;
+        const float tgStart = tailAppliedGain_;
+        tailAppliedGain_ = tgEnd;
         // ★★ 共有バスがあるなら、自前では畳まず**送るだけ** ★★
         //   畳み込みは線形なので conv(IR, Σ gᵢ·xᵢ) = Σ conv(IR, gᵢ·xᵢ)。
         //   音源ごとのレベル（tailGain_ × lvl）は足す前に掛けるので、
@@ -372,12 +381,22 @@ private:
             //     **等倍だと掛け忘れが見えない。**検査側は音源ごとに違う値にしてある。
             //   ⚠ AudioSource の volume はホスト側で OnAudioFilterRead の後に掛かるので、
             //     ここでは拾えない。音源ごとに volume を変えるなら outputGain に寄せること。
-            if (tailGain_ > 0.0f)
-                tailBus_->add(input, n, tailGain_ * lvl * outputGain_, dstOffset);
+            if (tgStart > 0.0f || tgEnd > 0.0f)
+                tailBus_->add(input, n, tgStart * outputGain_, tgEnd * outputGain_, dstOffset);
         } else {
             float* dst[2] = { tailOutL_.data(), tailOutR_.data() };
-            if (tailGain_ > 0.0f && tailConv_.hasIr())
-                tailConv_.processAdd(input, 0, n, dst, 0, tailGain_ * lvl);
+            // ★量は**入力側**で渡す。共有バスは全音源を足してから畳むので入力側でしか掛けられず、
+            //   ここで出力側に掛けると、量が動いている間だけバスと結果が食い違う
+            //   （回帰 [尾②]「バスに差しても出力が変わらない」が -8.1dB でこれを捕まえた）。
+            if ((tgStart > 0.0f || tgEnd > 0.0f) && tailConv_.hasIr()) {
+                const float step = (n > 1) ? (tgEnd - tgStart) / static_cast<float>(n - 1) : 0.0f;
+                float g = (n > 1) ? tgStart : tgEnd;
+                for (int i = 0; i < n; ++i) {
+                    tailIn_[static_cast<std::size_t>(i)] = input[i] * g;
+                    g += step;
+                }
+                tailConv_.processAdd(tailIn_.data(), 0, n, dst, 0, 1.0f);
+            }
         }
 
         // ② HRTF はブロック境界で HRIR を取り込む（方向変化のクロスフェード開始）。
@@ -496,6 +515,7 @@ private:
     ReverbTailIr tailIr_;
     AllpassChain diffL_, diffR_;
 
+    std::vector<float> tailIn_;             // 量の傾斜を掛けた入力（バスと同じ扱いにするため）
     std::vector<float> tailOutL_, tailOutR_;
 
     bool hrtfEnabled_ = true;
@@ -507,6 +527,9 @@ private:
     float difNorm_ = 1.0f;      // 回折バスをパンと同音量に揃える係数（setHrtfSet で決まる）
     float outputGain_ = 0.6f;
     float tailGain_ = 0.0f;
+    // 直前のチャンクの終わりで実際に掛けた量（＝次のチャンクの傾斜の出発点）。
+    //   これが無いと、組み直しのたびに量がチャンク境界で飛ぶ。
+    float tailAppliedGain_ = 0.0f;
     float tailLevel_ = 1.0f;
     float tailWet_ = 1.0f;
     float tailSrcLevel_ = 1.0f;

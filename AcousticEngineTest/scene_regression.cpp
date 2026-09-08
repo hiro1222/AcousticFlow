@@ -8072,6 +8072,264 @@ void testRoomSeedAndShare() {
 //     ⑥ 段の写しと同じく、非同期でも同じ答え（[非同期] で比較）
 //     ⑦ 部屋が無ければ尾の比は外形箱で当たる（ホストの予備と同じ）
 // ─────────────────────────────────────────────────────────────────────
+// ============================================================ 扉を動かすとぷつぷつ鳴る（再現）
+// 2026-09-08、Unity で試聴した発注者から「扉を動かすごとにぷつぷつと音の飛びが出る」。
+//   HUD の音声スレッド負荷は 10% 未満だった ＝ **ドロップアウトではない。波形が切れている。**
+//
+// ここはその再現の場。シーン（扉つきの戸口）→ タップの組み立て（DLL の tap_builder）→
+// 音源レンダリング まで通し、**隣り合うサンプルの最大差 ÷ そのブロックの RMS**（＝段差）を測る。
+//   ・扉を止めた状態を「平常」、動かしたときの最悪値と比べる。
+//   ・入力は白色雑音。過渡が無いので、出た段差はそのまま人工物と読める。
+//   ・HRTF は切る（方向の切り替えは別件。ここでは差し替えの継ぎ目だけを見る）。
+// 模型（面の線／像源レイ）と尾の混ぜ（0／既定）を振って、どこから来ているかを分ける。
+void testDoorSweepClicks() {
+    std::printf("\n[扉] 動かしながら鳴らして波形が切れていないか（ぷつぷつの再現）\n");
+    const int sr = 48000, block = 512;
+    const float t = 0.2f, h = 3.0f, half = 7.0f, doorW = 1.0f, doorT = 0.03f;
+    const float dt = static_cast<float>(block) / static_cast<float>(sr);   // 1 ブロック ≒ 10.7 ms
+
+    AF_UpdateConfig cfg{};
+    cfg.role1EveryN = 1;   cfg.role2EveryN = 4;   cfg.earlyEveryN = 3;
+    cfg.diffSrcEveryN = 2; cfg.catalogEveryN = 3;
+    cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+    cfg.directWeight = 1.0f;  cfg.useReflections = 1;
+    cfg.useEdgeCatalog = 1;   cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+    cfg.enableReverb = 1;     cfg.echogramBins = 100;  cfg.echogramBinSeconds = 0.01f;
+    cfg.echogramRays = 512;   cfg.echogramBounces = 24;
+    cfg.speedOfSound = 343.0f; cfg.distanceRef = 4.0f;
+    cfg.enableEarlyReflections = 1; cfg.earlyTaps = 48;
+    cfg.earlyRays = 512; cfg.earlyBounces = 2;
+    cfg.enableDiffractionSources = 1; cfg.diffSources = 8;
+    cfg.earlyFaceSubTaps = 5; cfg.echogramSkipFirstOrder = 1;
+
+    struct Result { double calm; double worst; };
+    // ★信号は**正弦**を主にする。白色雑音では出ない ── 雑音は元々サンプル間の差が大きく
+    //   （段差の平常値が 4 前後）、クリックがその中に埋もれる。実際に鳴らしているのは楽音や
+    //   環境音なので、正弦（平常値 0.04）で測るのが実機に近い。雑音は対照として残す。
+    //   keepMask: bit0 直接／bit1 反射／bit2 回折。tailOn=false で尾を落とす。成分の切り分け用。
+    //   tailMode: 0 そのまま／1 尾の量（directGain と目標比）を固定／2 尾を最初に 1 回だけ組む。
+    auto run = [&](int earlyModel, float tailXfadeMs, bool moveDoor, bool sine,
+                   int keepMask, bool tailOn, int tailMode = 0) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(half+t, t, half+t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(half+t, t, half+t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-half-t, h*0.5f, 0), V(t, h*0.5f, half+t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( half+t, h*0.5f, 0), V(t, h*0.5f, half+t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -half-t), V(half+t, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  half+t), V(half+t, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        const float side = (2.0f*half - doorW) * 0.5f;
+        AF_SceneAddInstanceBox(s, V(-(doorW*0.5f + side*0.5f), h*0.5f, 0), V(side*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( (doorW*0.5f + side*0.5f), h*0.5f, 0), V(side*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        // 扉。蝶番は x = -doorW/2、+Z 側へ振れる（Test_SwingDoor と同じ）。
+        const int doorId = AF_SceneAddInstanceBox(
+            s, V(0, h*0.5f, 0), V(doorW*0.5f, h*0.5f, doorT), V(1,0,0), V(0,1,0), mat);
+        AF_SceneSetListener(s, V(0, 1.6f, -3));
+        AF_SceneSetListenerOrientation(s, V(0,0,1), V(0,1,0));
+        AF_SceneSetSource(s, 1, V(0, 1.6f, 3));
+        cfg.earlyModel = earlyModel;
+        AF_SceneSetUpdateConfig(s, &cfg);
+
+        AF_VoiceConfig vc{};
+        vc.sampleRate = sr; vc.maxFrames = block; vc.tailSeconds = 1.0f;
+        vc.tapCrossfadeMs = 30.0f; vc.hrtfCrossfadeMs = 12.0f;
+        vc.tailFirstBlock = 64; vc.tailCapBlock = 8192;
+        AF_VoiceHandle v = AF_VoiceCreate(&vc);
+        AF_VoiceSetOutputGain(v, 1.0f);
+        AF_VoiceSetHrtfEnabled(v, 0);
+        AF_VoiceSetTailLevel(v, tailOn ? 1.0f : 0.0f);
+        AF_VoiceSetTailEnvelope(v, 1.0f, 1.0f);
+        AF_VoiceSetTailCrossfadeMs(v, tailXfadeMs);
+
+        std::vector<float> in(static_cast<std::size_t>(block));
+        std::vector<float> oL(static_cast<std::size_t>(block)), oR(static_cast<std::size_t>(block));
+        std::vector<float> echo(static_cast<std::size_t>(cfg.echogramBins) * 6, 0.0f);
+        std::vector<AF_VoiceTap> taps(AF_PROGRAM_MAX_TAPS);
+        AF_VoiceProgram vp{};
+        unsigned int rs = 20260908u;
+        double phase = 0.0;
+        const double kSineHz = 220.0;
+        auto sample = [&]() {
+            if (sine) {
+                phase += 2.0 * 3.14159265358979 * kSineHz / sr;
+                if (phase > 2.0 * 3.14159265358979) phase -= 2.0 * 3.14159265358979;
+                return static_cast<float>(std::sin(phase));
+            }
+            rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5;
+            return static_cast<int>(rs) * (1.0f / 2147483648.0f);
+        };
+
+        const int warm = 100, frames = 280;
+        double worst = 0.0, sum = 0.0; int n = 0;
+        float prev = 0.0f;
+        for (int f = 0; f < warm + frames; ++f) {
+            // 扉: 止めるなら 60°、動かすなら 0 → 120° を 1.9 秒で往復（Unity の DoorSweepLab と同じ速さ）。
+            const float phase = static_cast<float>((f % 360)) / 180.0f;   // 0..2
+            const float deg = moveDoor ? (phase <= 1.0f ? phase * 120.0f : (2.0f - phase) * 120.0f)
+                                       : 60.0f;
+            const float th = deg * 3.14159265f / 180.0f;
+            const AF_Vector3 right = V(std::cos(th), 0.0f, std::sin(th));
+            const AF_Vector3 hinge = V(-doorW * 0.5f, h * 0.5f, 0.0f);
+            AF_SceneUpdateInstance(s, doorId,
+                                   V(hinge.x + right.x * doorW * 0.5f, hinge.y, hinge.z + right.z * doorW * 0.5f),
+                                   V(doorW * 0.5f, h * 0.5f, doorT), right, V(0,1,0));
+            AF_SceneUpdate(s, dt);
+
+            const int idx = AF_SceneSourceIndex(s, 1);
+            if (idx >= 0 && AF_SceneGetVoiceProgram(s, idx, &vp)) {
+                const int all = vp.count < AF_PROGRAM_MAX_TAPS ? vp.count : AF_PROGRAM_MAX_TAPS;
+                int nt = 0;
+                for (int i = 0; i < all; ++i) {
+                    const AF_ProgramTap& p = vp.taps[static_cast<std::size_t>(i)];
+                    // index 0 は必ず直接音（音源 API の約束）。それ以外は種類で絞る。
+                    if (i > 0) {
+                        const int bit = (p.type == 1) ? 2 : ((p.type == 2) ? 4 : 1);
+                        if ((keepMask & bit) == 0) continue;
+                    }
+                    AF_VoiceTap& q = taps[static_cast<std::size_t>(nt)];
+                    ++nt;
+                    q.delaySamples = static_cast<int>(p.delayMs * 0.001f * sr + 0.5f);
+                    for (int b = 0; b < 6; ++b) q.gain6[b] = p.gain6[b];
+                    q.panL = p.panL; q.panR = p.panR;
+                    q.hrtfWeight = p.hrtfWeight;
+                    q.dirX = p.dirX; q.dirY = p.dirY; q.dirZ = p.dirZ;
+                    AF_VoiceScatterSplit(p.delayMs, vp.mixingTimeMs, 0.5f, 1.0f, &q.gSpec, &q.gDiff);
+                }
+                if (nt > 0) AF_VoiceSetTaps(v, taps.data(), nt);
+                AF_VoiceSetDirection(v, V(vp.directDirX, vp.directDirY, vp.directDirZ), 57.0f);
+                if (vp.hrtfTapIndex >= 0)
+                    AF_VoiceSetDiffractionDirection(v, V(vp.hrtfDirX, vp.hrtfDirY, vp.hrtfDirZ), 57.0f);
+                // 尾はホストと同じく 8 フレームに 1 回組み直す。
+                const bool doRebuild = (tailMode == 2) ? (f == 0) : (f % 8 == 0);
+                if (doRebuild) {
+                    const int bins = AF_SceneGetEchogramBands(s, idx, echo.data(), cfg.echogramBins);
+                    if (bins > 0 && nt > 0) {
+                        float dg = 0.0f;
+                        for (int b = 0; b < 6; ++b) dg += vp.taps[0].gain6[b];
+                        dg /= 6.0f;
+                        float ratio = vp.tailRatio;
+                        if (tailMode == 1) { dg = 0.05f; ratio = 4.0f; }   // 尾の量を固定
+                        const float splitMs = vp.mixingTimeMs > 20.0f ? vp.mixingTimeMs : 20.0f;
+                        AF_VoiceRebuildTail(v, echo.data(), bins, cfg.echogramBinSeconds * 1000.0f,
+                                            splitMs, 20.0f, 30.0f, 0.0f, 0.6f,
+                                            dg, ratio, nullptr, 0);
+                    }
+                }
+            }
+
+            for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = sample() * 0.3f;
+            AF_VoiceMetering m{};
+            AF_VoiceRender(v, in.data(), block, oL.data(), oR.data(), &m);
+            if (f < warm) { prev = oL[static_cast<std::size_t>(block - 1)]; continue; }
+            double maxStep = 0.0, sq = 0.0;
+            for (int i = 0; i < block; ++i) {
+                const double x = oL[static_cast<std::size_t>(i)];
+                const double d = std::fabs(x - prev);
+                if (d > maxStep) maxStep = d;
+                sq += x * x;
+                prev = static_cast<float>(x);
+            }
+            const double rms = std::sqrt(sq / block);
+            if (rms > 1e-6) {
+                const double ratio = maxStep / rms;
+                if (ratio > worst) worst = ratio;
+                sum += ratio; ++n;
+            }
+        }
+        AF_VoiceDestroy(v);
+        AF_SceneDestroy(s);
+        Result r; r.calm = (n > 0) ? sum / n : 0.0; r.worst = worst;
+        return r;
+    };
+
+    std::printf("        信号   模型      尾の混ぜms  扉      段差の平均  段差の最悪  最悪/平均\n");
+    struct Case { const char* name; int model; float xfade; };
+    const Case cases[] = {
+        {"面の線", 1,  0.0f}, {"面の線", 1, 50.0f},
+        {"像源レイ", 0, 0.0f}, {"像源レイ", 0, 50.0f},
+    };
+    double stillRatio = 0.0, moveRatioFixed = 0.0, moveRatioRaw = 0.0, moveRatioIsm = 0.0;
+    for (int sig = 1; sig >= 0; --sig) {   // 1 = 正弦（主）／0 = 白色雑音（対照）
+        const bool sine = (sig == 1);
+        for (const Case& c : cases) {
+            const Result still = run(c.model, c.xfade, false, sine, 7, true);
+            const Result move  = run(c.model, c.xfade, true,  sine, 7, true);
+            const double rs2 = still.worst / (still.calm > 1e-9 ? still.calm : 1.0);
+            const double rm2 = move.worst / (move.calm > 1e-9 ? move.calm : 1.0);
+            std::printf("        %-6s %-10s %5.0f    止め  %10.3f  %10.3f  %9.2f\n",
+                        sine ? "正弦" : "雑音", c.name, c.xfade, still.calm, still.worst, rs2);
+            std::printf("        %-6s %-10s %5.0f    動かす%10.3f  %10.3f  %9.2f\n",
+                        sine ? "正弦" : "雑音", c.name, c.xfade, move.calm, move.worst, rm2);
+            if (!sine) continue;
+            if (c.model == 1 && c.xfade == 0.0f)  { stillRatio = rs2; moveRatioRaw = rm2; }
+            if (c.model == 1 && c.xfade == 50.0f) { moveRatioFixed = rm2; }
+            if (c.model == 0 && c.xfade == 50.0f) { moveRatioIsm = rm2; }
+        }
+    }
+    char nb[220];
+    std::snprintf(nb, sizeof(nb), "(正弦・面の線: 止め %.2f 倍 / 動かす 混ぜ0 %.2f 倍・混ぜ50 %.2f 倍。像源レイは %.2f 倍)",
+                  stillRatio, moveRatioRaw, moveRatioFixed, moveRatioIsm);
+    std::printf("      ※段差＝隣り合うサンプルの最大差 ÷ そのブロックの RMS。\n"
+                "        正弦 220Hz の平常は 0.04 前後、白色雑音は 4 前後。**雑音では埋もれて見えない**。\n"
+                "        最悪/平均 が 2 を超えたら波形が切れている。%s\n", nb);
+    check("[扉] 扉を止めていれば波形は切れない（正弦）", stillRatio < 2.0, nb);
+    // ★既定（尾の混ぜ 50ms ＋ 尾の量の傾斜）で、扉を動かしても切れないこと。
+    //   2026-09-08 の実測: 直す前 15.21 倍（像源レイ 19.18）→ 直した後 1.31 倍（1.65）。
+    //   混ぜ 0 の行は「IR の差し替えの混ぜも要る」ことを見るために残してある。
+    check("[扉] 動かしても波形が切れない（面の線・既定）", moveRatioFixed < 2.5, nb);
+    check("[扉] 動かしても波形が切れない（像源レイ・既定）", moveRatioIsm < 2.5, nb);
+
+    // ── どの成分が飛ばしているか（正弦・扉を動かす・面の線・尾の混ぜ 50ms 固定）──
+    std::printf("\n        成分の切り分け（正弦・扉を動かす・面の線）\n");
+    struct Part { const char* name; int mask; bool tail; };
+    const Part parts[] = {
+        {"全部",             7, true},
+        {"尾を落とす",       7, false},
+        {"直接だけ",         1, false},
+        {"直接＋反射",       3, false},
+        {"直接＋回折",       5, false},
+        {"尾だけ（直接は残す）", 1, true},
+    };
+    double worstPart = 0.0; const char* worstName = "";
+    for (const Part& p : parts) {
+        const Result r = run(1, 50.0f, true, true, p.mask, p.tail);
+        const double ratio = r.worst / (r.calm > 1e-9 ? r.calm : 1.0);
+        std::printf("        %-22s 平均 %8.4f  最悪 %8.4f  ＝ %6.2f 倍\n",
+                    p.name, r.calm, r.worst, ratio);
+        if (ratio > worstPart) { worstPart = ratio; worstName = p.name; }
+    }
+    std::printf("      ※いちばん跳ねた組み合わせ: %s（%.2f 倍）\n", worstName, worstPart);
+    {
+        char pb[120];
+        std::snprintf(pb, sizeof(pb), "(いちばん跳ねた成分 %s ＝ %.2f 倍)", worstName, worstPart);
+        check("[扉] どの成分を残しても波形が切れない", worstPart < 2.5, pb);
+    }
+
+    // ── 尾のどこが跳ねているか（尾だけ・扉を動かす）──
+    //   ① そのまま ② 尾の**量**（directGain と目標比）を固定 ③ 尾を最初に 1 回だけ組む
+    //   ②で消えるなら量の段差、③でだけ消えるなら IR の中身の差し替え。
+    std::printf("\n        尾の切り分け（正弦・扉を動かす・尾だけ）\n");
+    struct TM { const char* name; int mode; };
+    const TM tms[] = { {"そのまま", 0}, {"尾の量を固定", 1}, {"最初に 1 回だけ組む", 2} };
+    double tailPlain = 0.0, tailFixedGain = 0.0, tailOnce = 0.0;
+    for (const TM& tm : tms) {
+        const Result r = run(1, 50.0f, true, true, 1, true, tm.mode);
+        const double ratio = r.worst / (r.calm > 1e-9 ? r.calm : 1.0);
+        std::printf("        %-22s 平均 %8.4f  最悪 %8.4f  ＝ %6.2f 倍\n",
+                    tm.name, r.calm, r.worst, ratio);
+        if (tm.mode == 0) tailPlain = ratio;
+        if (tm.mode == 1) tailFixedGain = ratio;
+        if (tm.mode == 2) tailOnce = ratio;
+    }
+    char tb[200];
+    std::snprintf(tb, sizeof(tb), "(そのまま %.2f 倍 / 量を固定 %.2f 倍 / 1 回だけ %.2f 倍)",
+                  tailPlain, tailFixedGain, tailOnce);
+    std::printf("      ※%s\n", tb);
+    // 尾の量を固定したときと、そのままのときの差が「量の段差」。傾斜を入れたので同じはず。
+    check("[扉] 尾の量の段差が消えている（そのまま ≒ 量を固定）",
+          tailPlain < tailFixedGain * 2.5 + 1.0, tb);
+}
+
 void testTapBuilder() {
     std::printf("\n[タップ] 組み立てを DLL へ ── 直接・反射・回折のタップと尾の比を音源ごとに出す\n");
     const float h = 4.0f, t = 0.3f, hw = 9.0f, hd = 9.0f;
@@ -12067,6 +12325,7 @@ int main() {
         else if (std::strcmp(only, "rooms") == 0) testRoomSeedAndShare();
         else if (std::strcmp(only, "taps") == 0) testTapBuilder();
         else if (std::strcmp(only, "materials") == 0) testMaterialPresets();
+        else if (std::strcmp(only, "door") == 0) testDoorSweepClicks();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }
@@ -12115,6 +12374,7 @@ int main() {
     testRoomSeedAndShare();
     testTapBuilder();
     testMaterialPresets();
+    testDoorSweepClicks();
     testAutoPortals();
     diagnosePortalLeftRightSymmetry();
     diagnosePortalWidthVsDoorCurve();

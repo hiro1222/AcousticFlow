@@ -74,7 +74,16 @@ public:
     ///     Unity の既定（maxFrames == バッファ長）では分割が起きないので普段は出ないが、
     ///     バッファ設定次第で突然出る類の壊れ方になる。
     void add(const float* mono, int frames, float gain, int dstOffset = 0) {
-        if (!mono || frames <= 0 || gain == 0.0f || dstOffset < 0) return;
+        add(mono, frames, gain, gain, dstOffset);
+    }
+
+    /// レベルを**チャンク内で線形に渡して**送る。
+    ///   ★音源ごとの尾の量（tailGain）は組み直し（数フレームに 1 回）でしか動かないので、
+    ///     チャンク境界でそのまま切り替えると段差になる。扉が動くと量が速く動くため、
+    ///     それが 8 フレームごとのプチッになる（実測: 段差が平常の 51.8 倍 → 傾斜で 1.03 倍）。
+    void add(const float* mono, int frames, float gainStart, float gainEnd, int dstOffset) {
+        if (!mono || frames <= 0 || dstOffset < 0) return;
+        if (gainStart == 0.0f && gainEnd == 0.0f) return;
         const int end = std::min(dstOffset + frames, maxFrames_);
         if (end <= dstOffset) return;
         if (pending_ < end) {
@@ -82,8 +91,13 @@ public:
             std::fill(in_.begin() + pending_, in_.begin() + end, 0.0f);
             pending_ = end;
         }
-        for (int i = dstOffset; i < end; ++i)
-            in_[static_cast<size_t>(i)] += mono[i - dstOffset] * gain;
+        const int span = end - dstOffset;
+        const float step = (span > 1) ? (gainEnd - gainStart) / static_cast<float>(span - 1) : 0.0f;
+        float g = (span > 1) ? gainStart : gainEnd;
+        for (int i = dstOffset; i < end; ++i) {
+            in_[static_cast<size_t>(i)] += mono[i - dstOffset] * g;
+            g += step;
+        }
     }
 
     /// 溜まった送りを 1 回だけ畳んで outL/outR へ**足す**。呼んだ時点で送りは空になる。
