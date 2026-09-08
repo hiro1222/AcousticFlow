@@ -8072,6 +8072,217 @@ void testRoomSeedAndShare() {
 //     ⑥ 段の写しと同じく、非同期でも同じ答え（[非同期] で比較）
 //     ⑦ 部屋が無ければ尾の比は外形箱で当たる（ホストの予備と同じ）
 // ─────────────────────────────────────────────────────────────────────
+// ============================================================ 歩行の連続性（鳴っている音で測る）
+// ピラー S3「正しさより連続性を先に守る」を**約束（担保）**にするための物差し。
+//   2026-09-08 の決定: 聞き比べの軸は「音色の変化」と「空間印象」なので、
+//   担保するのは**リスナーが動いたときの連続性**にする。
+//
+// ★測る場所は「エンジンが出す答え」ではなく「鳴っている音」。
+//   答えの段差はタップの補間（30 ms）で均されるので、両者は一致しない。
+//   約束は耳に届く側にかけるものなので、シーン → タップの組み立て → 音源レンダリング
+//   まで通してから測る（[診断] 歩行の連続性 は答えの側を見る別の物差し）。
+//
+// 2 つの量を採る:
+//   ① レベルの変化率(dB/s) … 「ぐらつき」。約束の文はこれで書く
+//   ② 波形の段差          … 「切れ」。クリックはここに出る（[扉] と同じ定義）
+//
+// ★信号は 5 つの正弦の和。白色雑音では段差が埋もれて見えず（[扉] で実証）、
+//   単一の正弦だと経路長の変化で櫛が立ってレベルが暴れる。和なら両方を避けられる。
+//
+// 3 本の腕を同じ台本で鳴らす（反射なし／レイ追跡＝既存技術／面の線）。
+// 反射なしを入れるのは、この機能が何を買っているかを出すため。
+void testWalkContinuity() {
+    std::printf("\n[歩行] リスナーが動くときの連続性（1.4 m/s・5 音の和・鳴っている音で測る）\n");
+    const int sr = 48000, block = 512;
+    const float t = 0.2f, h = 3.0f, half = 7.0f, doorW = 1.0f, doorT = 0.03f;
+    const float dt = static_cast<float>(block) / static_cast<float>(sr);
+    const float speed = 1.4f;                       // 歩行速度(m/s)
+    const float stepM = speed * dt;                 // 1 ブロックの移動距離 ≒ 1.5 cm
+
+    AF_UpdateConfig cfg{};
+    cfg.role1EveryN = 1;   cfg.role2EveryN = 4;   cfg.earlyEveryN = 3;
+    cfg.diffSrcEveryN = 2; cfg.catalogEveryN = 3;
+    cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+    cfg.directWeight = 1.0f;  cfg.useReflections = 1;
+    cfg.useEdgeCatalog = 1;   cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+    cfg.enableReverb = 1;     cfg.echogramBins = 100;  cfg.echogramBinSeconds = 0.01f;
+    cfg.echogramRays = 512;   cfg.echogramBounces = 24;
+    cfg.speedOfSound = 343.0f; cfg.distanceRef = 4.0f;
+    cfg.enableEarlyReflections = 1; cfg.earlyTaps = 48;
+    cfg.earlyRays = 512; cfg.earlyBounces = 2;
+    cfg.enableDiffractionSources = 1; cfg.diffSources = 8;
+    cfg.earlyFaceSubTaps = 5; cfg.echogramSkipFirstOrder = 1;
+
+    struct WalkResult { double rateAvg, rateMax, stepAvg, stepMax; };
+    // path 0 = 戸口をくぐる（z 方向）／1 = 壁沿いに横切る（x 方向。戸口の縁をまたぐ）
+    auto run = [&](int earlyModel, bool early, int path) {
+        AF_SceneHandle s = AF_SceneCreate();
+        const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
+        AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(half+t, t, half+t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h+t, 0), V(half+t, t, half+t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(-half-t, h*0.5f, 0), V(t, h*0.5f, half+t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( half+t, h*0.5f, 0), V(t, h*0.5f, half+t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f, -half-t), V(half+t, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V(0, h*0.5f,  half+t), V(half+t, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        const float side = (2.0f*half - doorW) * 0.5f;
+        AF_SceneAddInstanceBox(s, V(-(doorW*0.5f + side*0.5f), h*0.5f, 0), V(side*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        AF_SceneAddInstanceBox(s, V( (doorW*0.5f + side*0.5f), h*0.5f, 0), V(side*0.5f, h*0.5f, t), V(1,0,0), V(0,1,0), mat);
+        // 扉は 60° で止めておく（ここで見るのはリスナーの移動）。
+        {
+            const float th = 60.0f * 3.14159265f / 180.0f;
+            const AF_Vector3 right = V(std::cos(th), 0.0f, std::sin(th));
+            const AF_Vector3 hinge = V(-doorW * 0.5f, h * 0.5f, 0.0f);
+            AF_SceneAddInstanceBox(s, V(hinge.x + right.x * doorW * 0.5f, hinge.y, hinge.z + right.z * doorW * 0.5f),
+                                   V(doorW * 0.5f, h * 0.5f, doorT), right, V(0,1,0), mat);
+        }
+        AF_SceneSetListenerOrientation(s, V(0,0,1), V(0,1,0));
+        AF_SceneSetSource(s, 1, V(0, 1.6f, 3));
+        cfg.enableEarlyReflections = early ? 1 : 0;
+        cfg.earlyModel = earlyModel;
+        AF_SceneSetUpdateConfig(s, &cfg);
+
+        AF_VoiceConfig vc{};
+        vc.sampleRate = sr; vc.maxFrames = block; vc.tailSeconds = 1.0f;
+        vc.tapCrossfadeMs = 30.0f; vc.hrtfCrossfadeMs = 12.0f;
+        vc.tailFirstBlock = 64; vc.tailCapBlock = 8192;
+        AF_VoiceHandle v = AF_VoiceCreate(&vc);
+        AF_VoiceSetOutputGain(v, 1.0f);
+        AF_VoiceSetHrtfEnabled(v, 0);     // 腕の間で共通なので切る（HRTF の混ぜを混入させない）
+        AF_VoiceSetTailLevel(v, 1.0f);
+        AF_VoiceSetTailEnvelope(v, 1.0f, 1.0f);
+
+        std::vector<float> in(static_cast<std::size_t>(block));
+        std::vector<float> oL(static_cast<std::size_t>(block)), oR(static_cast<std::size_t>(block));
+        std::vector<float> echo(static_cast<std::size_t>(cfg.echogramBins) * 6, 0.0f);
+        std::vector<AF_VoiceTap> taps(AF_PROGRAM_MAX_TAPS);
+        AF_VoiceProgram vp{};
+        // 5 音の和（互いに素に近い比。櫛の谷が重ならない）。
+        const double hz[5] = { 110.0, 233.0, 494.0, 1047.0, 2217.0 };
+        double ph[5] = { 0, 0, 0, 0, 0 };
+
+        const float startZ = -4.0f, endZ = 2.0f;      // 戸口をくぐる
+        const float startX = -3.0f, endX = 3.0f;      // 壁沿いに横切る
+        const float span = (path == 0) ? (endZ - startZ) : (endX - startX);
+        const int steps = static_cast<int>(span / stepM);
+        const int warm = 60;
+
+        double rateSum = 0.0, rateMax = 0.0, stepSum = 0.0, stepMax = 0.0;
+        int n = 0;
+        float prevSample = 0.0f;
+        double prevDb = 0.0; bool hasPrevDb = false;
+        for (int f = 0; f < warm + steps; ++f) {
+            const int k = (f < warm) ? 0 : (f - warm);
+            const float u = static_cast<float>(k) * stepM;
+            const AF_Vector3 L = (path == 0) ? V(0.0f, 1.6f, startZ + u)
+                                             : V(startX + u, 1.6f, -1.0f);
+            AF_SceneSetListener(s, L);
+            AF_SceneUpdate(s, dt);
+
+            const int idx = AF_SceneSourceIndex(s, 1);
+            if (idx >= 0 && AF_SceneGetVoiceProgram(s, idx, &vp)) {
+                const int all = vp.count < AF_PROGRAM_MAX_TAPS ? vp.count : AF_PROGRAM_MAX_TAPS;
+                for (int i = 0; i < all; ++i) {
+                    const AF_ProgramTap& p = vp.taps[static_cast<std::size_t>(i)];
+                    AF_VoiceTap& q = taps[static_cast<std::size_t>(i)];
+                    q.delaySamples = static_cast<int>(p.delayMs * 0.001f * sr + 0.5f);
+                    for (int b = 0; b < 6; ++b) q.gain6[b] = p.gain6[b];
+                    q.panL = p.panL; q.panR = p.panR;
+                    q.hrtfWeight = p.hrtfWeight;
+                    q.dirX = p.dirX; q.dirY = p.dirY; q.dirZ = p.dirZ;
+                    AF_VoiceScatterSplit(p.delayMs, vp.mixingTimeMs, 0.5f, 1.0f, &q.gSpec, &q.gDiff);
+                }
+                if (all > 0) AF_VoiceSetTaps(v, taps.data(), all);
+                AF_VoiceSetDirection(v, V(vp.directDirX, vp.directDirY, vp.directDirZ), 57.0f);
+                if (vp.hrtfTapIndex >= 0)
+                    AF_VoiceSetDiffractionDirection(v, V(vp.hrtfDirX, vp.hrtfDirY, vp.hrtfDirZ), 57.0f);
+                if (f % 8 == 0) {
+                    const int bins = AF_SceneGetEchogramBands(s, idx, echo.data(), cfg.echogramBins);
+                    if (bins > 0 && all > 0) {
+                        float dg = 0.0f;
+                        for (int b = 0; b < 6; ++b) dg += vp.taps[0].gain6[b];
+                        dg /= 6.0f;
+                        const float splitMs = vp.mixingTimeMs > 20.0f ? vp.mixingTimeMs : 20.0f;
+                        AF_VoiceRebuildTail(v, echo.data(), bins, cfg.echogramBinSeconds * 1000.0f,
+                                            splitMs, 20.0f, 30.0f, 0.0f, 0.6f,
+                                            dg, vp.tailRatio, nullptr, 0);
+                    }
+                }
+            }
+
+            for (int i = 0; i < block; ++i) {
+                double acc = 0.0;
+                for (int j = 0; j < 5; ++j) {
+                    ph[j] += 2.0 * 3.14159265358979 * hz[j] / sr;
+                    if (ph[j] > 2.0 * 3.14159265358979) ph[j] -= 2.0 * 3.14159265358979;
+                    acc += std::sin(ph[j]);
+                }
+                in[static_cast<std::size_t>(i)] = static_cast<float>(acc * 0.04);   // 5 音の和で振幅 ±0.2
+            }
+            AF_VoiceMetering m{};
+            AF_VoiceRender(v, in.data(), block, oL.data(), oR.data(), &m);
+            if (f < warm) { prevSample = oL[static_cast<std::size_t>(block - 1)]; continue; }
+
+            double maxStep = 0.0, sq = 0.0;
+            for (int i = 0; i < block; ++i) {
+                const double x = oL[static_cast<std::size_t>(i)];
+                const double d = std::fabs(x - prevSample);
+                if (d > maxStep) maxStep = d;
+                sq += x * x;
+                prevSample = static_cast<float>(x);
+            }
+            const double rms = std::sqrt(sq / block);
+            if (rms <= 1e-7) { hasPrevDb = false; continue; }
+            const double stepRatio = maxStep / rms;
+            stepSum += stepRatio; if (stepRatio > stepMax) stepMax = stepRatio;
+            const double db = 20.0 * std::log10(rms);
+            if (hasPrevDb) {
+                const double rate = std::fabs(db - prevDb) / dt;   // dB/s
+                rateSum += rate; if (rate > rateMax) rateMax = rate;
+                ++n;
+            }
+            prevDb = db; hasPrevDb = true;
+        }
+        AF_VoiceDestroy(v);
+        AF_SceneDestroy(s);
+        WalkResult r;
+        r.rateAvg = (n > 0) ? rateSum / n : 0.0;
+        r.rateMax = rateMax;
+        r.stepAvg = (n > 0) ? stepSum / (n + 1) : 0.0;
+        r.stepMax = stepMax;
+        return r;
+    };
+
+    std::printf("        経路            反射の模型   レベル dB/s 平均   最大    段差 平均   最大   最悪/平均\n");
+    struct Arm { const char* name; int model; bool early; };
+    const Arm arms[] = {
+        {"反射なし",   1, false},
+        {"レイ追跡",   0, true},
+        {"面の線",     1, true},
+    };
+    const char* pathName[2] = { "戸口をくぐる", "壁沿いに横切る" };
+    double worstStepRatio = 0.0, lineRateMax = 0.0, rayRateMax = 0.0;
+    for (int path = 0; path < 2; ++path) {
+        for (const Arm& a : arms) {
+            const WalkResult r = run(a.model, a.early, path);
+            const double sr2 = r.stepMax / (r.stepAvg > 1e-9 ? r.stepAvg : 1.0);
+            std::printf("        %-14s %-10s %10.1f %8.1f %10.3f %8.3f %9.2f\n",
+                        pathName[path], a.name, r.rateAvg, r.rateMax, r.stepAvg, r.stepMax, sr2);
+            if (sr2 > worstStepRatio) worstStepRatio = sr2;
+            if (a.early && a.model == 1 && r.rateMax > lineRateMax) lineRateMax = r.rateMax;
+            if (a.early && a.model == 0 && r.rateMax > rayRateMax)  rayRateMax  = r.rateMax;
+        }
+    }
+    char nb[220];
+    std::snprintf(nb, sizeof(nb),
+                  "(レベルの変化率の最大: 面の線 %.1f dB/s / レイ追跡 %.1f dB/s。段差の最悪 %.2f 倍)",
+                  lineRateMax, rayRateMax, worstStepRatio);
+    std::printf("      ※レベルの変化率が「ぐらつき」、段差が「切れ」。約束の文はレベルの変化率で書く。\n"
+                "        閾値はまだ決めない ── まず数字を採り、耳で決めてからここに入れる（決めごと: 絶対値は耳）。\n"
+                "        %s\n", nb);
+    // いまは「切れていないこと」だけを守る。ぐらつきの閾値は試聴で決めてから入れる。
+    check("[歩行] 歩いても波形が切れない（どの模型でも）", worstStepRatio < 4.0, nb);
+}
+
 // ============================================================ 扉を動かすとぷつぷつ鳴る（再現）
 // 2026-09-08、Unity で試聴した発注者から「扉を動かすごとにぷつぷつと音の飛びが出る」。
 //   HUD の音声スレッド負荷は 10% 未満だった ＝ **ドロップアウトではない。波形が切れている。**
@@ -12326,6 +12537,7 @@ int main() {
         else if (std::strcmp(only, "taps") == 0) testTapBuilder();
         else if (std::strcmp(only, "materials") == 0) testMaterialPresets();
         else if (std::strcmp(only, "door") == 0) testDoorSweepClicks();
+        else if (std::strcmp(only, "walk") == 0) testWalkContinuity();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }
@@ -12375,6 +12587,7 @@ int main() {
     testTapBuilder();
     testMaterialPresets();
     testDoorSweepClicks();
+    testWalkContinuity();
     testAutoPortals();
     diagnosePortalLeftRightSymmetry();
     diagnosePortalWidthVsDoorCurve();
