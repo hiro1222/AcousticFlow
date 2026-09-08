@@ -13384,6 +13384,173 @@ void diagnoseDoorLag() {
                 "        わざと入れた物で、消せば追従は速くなるが歩いたときのぐらつきが戻る。\n");
 }
 
+// ================================ 【探り】扉を階段状に開けたときの、到達と音の追い付きの差（AF_ONLY=step）
+// 2026-09-08 の依頼:
+//   「0.2 秒かけて 10 度開いて 5 秒停止、そのあと次の 10 度。
+//     開いた到達時間と音の変化が止まった時の時間の差、止まった場所の音量をまとめて。
+//     部屋構造は Test_SwingDoor そっくりに」
+//
+// 部屋は Test_SwingDoor（AcousticFlowTestScenes.SwingDoorScene）と同じに組む:
+//   14 × 14 m・高さ 3 m・壁厚 0.4（Concrete）／Z=0 の仕切り（厚 0.2）に幅 1 m の戸口
+//   ／戸口そのものがポータル（法線 +Z）／扉は X=−0.5 を蝶番に +Z へ振れる（厚 0.06・WoodDoor）
+//   ／リスナー (0,1.6,−3)・音源 (0,1.6,+3)
+// 更新の周期とつまみもホストの既定に合わせる（そうしないと Unity で聞く音の数字にならない）。
+namespace doorstep {
+
+struct Scn {
+    AF_SceneHandle s = nullptr;
+    int doorInst = -1;
+};
+
+const float kDoorW = 1.0f, kHh = 3.0f, kDoorT = 0.06f;
+
+void placeDoor(Scn& u, float deg) {
+    const float t = deg * 3.14159265f / 180.0f;
+    const AF_Vector3 right = V(std::cos(t), 0.0f, std::sin(t));
+    const float hx = -kDoorW * 0.5f;                    // 蝶番の x
+    AF_SceneUpdateInstance(u.s, u.doorInst,
+        V(hx + right.x * kDoorW * 0.5f, kHh * 0.5f, right.z * kDoorW * 0.5f),
+        V(kDoorW * 0.5f, kHh * 0.5f, kDoorT * 0.5f), right, V(0, 1, 0));
+}
+
+void build(Scn& u, int doorPreset) {
+    u.s = AF_SceneCreate();
+    float ct[6], ca[6], cs[6], dt2[6], da[6], ds[6];
+    AF_MaterialPresetBands(1, ct, ca, cs);              // Concrete
+    AF_MaterialPresetBands(doorPreset, dt2, da, ds);    // 既定は WoodDoor(4)
+    const int mw = AF_SceneAddMaterial(u.s, ct, ca, cs, 6);
+    const int md = AF_SceneAddMaterial(u.s, dt2, da, ds, 6);
+
+    const float hf = 7.0f, shell = 0.4f, part = 0.2f;
+    // 部屋の殻
+    AF_SceneAddInstanceBox(u.s, V(0, -shell * 0.5f, 0),        V(hf, shell * 0.5f, hf), V(1,0,0), V(0,1,0), mw);
+    AF_SceneAddInstanceBox(u.s, V(0, kHh + shell * 0.5f, 0),   V(hf, shell * 0.5f, hf), V(1,0,0), V(0,1,0), mw);
+    AF_SceneAddInstanceBox(u.s, V(-hf - shell * 0.5f, kHh * 0.5f, 0), V(shell * 0.5f, kHh * 0.5f, hf), V(1,0,0), V(0,1,0), mw);
+    AF_SceneAddInstanceBox(u.s, V( hf + shell * 0.5f, kHh * 0.5f, 0), V(shell * 0.5f, kHh * 0.5f, hf), V(1,0,0), V(0,1,0), mw);
+    AF_SceneAddInstanceBox(u.s, V(0, kHh * 0.5f, -hf - shell * 0.5f), V(hf, kHh * 0.5f, shell * 0.5f), V(1,0,0), V(0,1,0), mw);
+    AF_SceneAddInstanceBox(u.s, V(0, kHh * 0.5f,  hf + shell * 0.5f), V(hf, kHh * 0.5f, shell * 0.5f), V(1,0,0), V(0,1,0), mw);
+    // Z=0 の仕切り。中央に幅 1 m の戸口（X = −0.5 〜 +0.5）
+    const float gapL = -0.5f, gapR = 0.5f;
+    const float leftW = gapL - (-hf), rightW = hf - gapR;
+    AF_SceneAddInstanceBox(u.s, V(-hf + leftW * 0.5f, kHh * 0.5f, 0),
+                           V(leftW * 0.5f, kHh * 0.5f, part * 0.5f), V(1,0,0), V(0,1,0), mw);
+    AF_SceneAddInstanceBox(u.s, V(gapR + rightW * 0.5f, kHh * 0.5f, 0),
+                           V(rightW * 0.5f, kHh * 0.5f, part * 0.5f), V(1,0,0), V(0,1,0), mw);
+    // 戸口そのものがポータル（法線 +Z）
+    AF_SceneAddPortal(u.s, V(0, kHh * 0.5f, 0), V(1, 0, 0), V(0, 1, 0), kDoorW * 0.5f, kHh * 0.5f);
+    // 扉
+    u.doorInst = AF_SceneAddInstanceBox(u.s, V(0, kHh * 0.5f, 0),
+                           V(kDoorW * 0.5f, kHh * 0.5f, kDoorT * 0.5f), V(1,0,0), V(0,1,0), md);
+    AF_SceneSetInstanceDynamic(u.s, u.doorInst, 1);
+
+    AF_SceneSetListener(u.s, V(0, 1.6f, -3));
+    AF_SceneSetListenerOrientation(u.s, V(0,0,1), V(0,1,0));
+    AF_SceneSetSource(u.s, 1, V(0, 1.6f, 3));
+
+    AF_UpdateConfig cfg{};
+    cfg.role1EveryN = 1; cfg.diffSrcEveryN = 2; cfg.earlyEveryN = 3;
+    cfg.catalogEveryN = 3; cfg.role2EveryN = 4;
+    cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+    cfg.directWeight = 1.0f; cfg.useReflections = 1; cfg.speedOfSound = 343.0f;
+    cfg.distanceRef = 4.0f;
+    cfg.enableReverb = 1; cfg.echogramBins = 100; cfg.echogramBinSeconds = 0.01f;
+    cfg.echogramRays = 512; cfg.echogramBounces = 24;
+    cfg.enableEarlyReflections = 1; cfg.earlyTaps = 48;
+    cfg.earlyRays = 512; cfg.earlyBounces = 2;
+    cfg.earlyModel = 1; cfg.earlyFaceSubTaps = 5; cfg.echogramSkipFirstOrder = 1;
+    cfg.enableDiffractionSources = 1; cfg.diffSources = 8;
+    cfg.useEdgeCatalog = 1; cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+    AF_SceneSetUpdateConfig(u.s, &cfg);
+
+    AF_TapParams tp{};
+    tp.distanceRef = 1.5f; tp.diffractionDistancePower = 1.0f; tp.airAbsorptionScale = 1.0f;
+    tp.transmissionTilt = 1.0f; tp.diffractionGainDb = 6.0f; tp.diffractionDistanceOnly = 1;
+    tp.tapSmoothTime = 0.08f; tp.directionSmoothTime = 0.18f;
+    tp.steerThreshold = 0.2f; tp.diffractionHrtf = 1; tp.diffractionHrtfMarginDb = 2.0f;
+    tp.reverbRatioExponent = 0.5f; tp.reverbRatioCeiling = 150.0f;
+    tp.roomBlendRadius = 2.0f; tp.reverbShareFade = 1; tp.fallbackRt60 = 0.5f;
+    tp.maxTaps = 64; tp.diffractionTapReserve = 8;
+    AF_SceneSetTapParams(u.s, &tp);
+}
+
+// 耳に届く量。全タップの帯域エネルギー和（音量）と、125Hz/4kHz の比（色）。
+//   byType が非 null なら 種類ごと（0 直接／1 反射／2 回折）の dB も書く。
+void readLevel(AF_SceneHandle s, float* outLvl, float* outCol, float* byType = nullptr) {
+    AF_VoiceProgram vp{};
+    const int idx = AF_SceneSourceIndex(s, 1);
+    double e[kBands] = {0, 0, 0, 0, 0, 0};
+    double et[3] = {0, 0, 0};
+    if (idx >= 0 && AF_SceneGetVoiceProgram(s, idx, &vp))
+        for (int i = 0; i < vp.count && i < AF_PROGRAM_MAX_TAPS; ++i) {
+            const AF_ProgramTap& tp = vp.taps[static_cast<std::size_t>(i)];
+            double se = 0.0;
+            for (int b = 0; b < kBands; ++b) {
+                const double g = tp.gain6[b];
+                e[b] += g * g; se += g * g;
+            }
+            if (tp.type >= 0 && tp.type < 3) et[tp.type] += se;
+        }
+    double tot = 0.0;
+    for (int b = 0; b < kBands; ++b) tot += e[b];
+    *outLvl = static_cast<float>(10.0 * std::log10(std::max(tot, 1e-20)));
+    *outCol = static_cast<float>(10.0 * std::log10(std::max(e[0], 1e-20) / std::max(e[5], 1e-20)));
+    if (byType)
+        for (int t = 0; t < 3; ++t)
+            byType[t] = static_cast<float>(10.0 * std::log10(std::max(et[t], 1e-20)));
+}
+
+}  // namespace doorstep
+
+void diagnoseDoorStaircase() {
+    std::printf("\n[階段] 扉を 0.2 秒で 10 度開いて 5 秒停止、を繰り返す（部屋は Test_SwingDoor と同じ）\n");
+    std::printf("        リスナー (0,1.6,-3) / 音源 (0,1.6,3) / 戸口 幅 1 m / 扉 WoodDoor / 部屋 Concrete\n");
+
+    doorstep::Scn u; doorstep::build(u, 4);            // 4 = WoodDoor
+    const float dt = 1.0f / 60.0f;
+    const int rampN = 12;                              // 0.2 秒
+    const int holdN = 300;                             // 5 秒
+    const float eps = 0.1f;                            // これ以下の揺れは「止まった」とみなす
+
+    // 閉じた状態で落ち着かせる。
+    doorstep::placeDoor(u, 0.0f);
+    for (int i = 0; i < 180; ++i) AF_SceneUpdate(u.s, dt);
+    float lvl0, col0, by0[3]; doorstep::readLevel(u.s, &lvl0, &col0, by0);
+    std::printf("        閉じた状態: 音量 %.1f dB / 色 %.1f dB   （直接 %.1f / 反射 %.1f / 回折 %.1f）\n\n",
+                lvl0, col0, by0[0], by0[1], by0[2]);
+
+    std::printf("        段  角度      到達    音が止まる     差    止まった音量  前段からの差   色    直接   反射   回折\n");
+    static float lv[400], cl[400];
+    float prevLvl = lvl0;
+    for (int stp = 1; stp <= 9; ++stp) {
+        const float a0 = (stp - 1) * 10.0f, a1 = stp * 10.0f;
+        int n = 0;
+        for (int i = 0; i < rampN; ++i) {              // 0.2 秒で 10 度
+            doorstep::placeDoor(u, a0 + (a1 - a0) * (i + 1) / static_cast<float>(rampN));
+            AF_SceneUpdate(u.s, dt);
+            doorstep::readLevel(u.s, &lv[n], &cl[n]); ++n;
+        }
+        for (int i = 0; i < holdN; ++i) {              // 5 秒停止
+            AF_SceneUpdate(u.s, dt);
+            doorstep::readLevel(u.s, &lv[n], &cl[n]); ++n;
+        }
+        // 「止まった」＝ 最終値から eps 以上ずれた最後の時刻。そこを過ぎたら以後動かない。
+        const float fin = lv[n - 1], finC = cl[n - 1];
+        float byF[3]; doorstep::readLevel(u.s, &lv[n - 1], &cl[n - 1], byF);
+        int last = -1;
+        for (int i = 0; i < n; ++i) if (std::fabs(lv[i] - fin) > eps) last = i;
+        const float tSettle = (last + 2) * dt * 1000.0f;      // 次のフレームで止まっている
+        const float tDoor = rampN * dt * 1000.0f;             // 扉が目標角に着く時刻
+        std::printf("        %2d %5.0f°  %6.0f ms  %7.0f ms %7.0f ms   %8.1f dB   %+8.1f dB %6.1f %6.1f %6.1f %6.1f\n",
+                    stp, a1, tDoor, tSettle, tSettle - tDoor, fin, fin - prevLvl, finC,
+                    byF[0], byF[1], byF[2]);
+        prevLvl = fin;
+    }
+    AF_SceneDestroy(u.s);
+    std::printf("      ※「音が止まる」＝ 最終値から %.1f dB 以上ずれた最後の時刻の次。\n"
+                "        差が正なら、扉が止まったあとも音が動いている（追い付いてくる）。\n"
+                "        ここに出ていない遅れ: 非同期の写し 16.7 ms・DSP バッファ 21.3 ms・出力の待ち約 43 ms。\n", eps);
+}
+
 int main() {
     std::printf("=== AF_Scene* 数値回帰テスト ===\n");
     std::printf("（期待値は絶対値でなく「関係」で書いている。詳細は冒頭コメント参照）\n");
@@ -13398,7 +13565,8 @@ int main() {
     //             materials 材質のプリセット／door 扉のプツプツ／walk 歩いたときの連続性／
     //             closed 閉じた扉の音色／open 開いた扉の音色
     //   合否なし（数字を採るだけ）: issues 既知の不具合／aperture 開口と角度／depth 空間の奥行き／
-    //                               lag 扉を動かしてから音が追い付くまで
+    //                               lag 扉を動かしてから音が追い付くまで／
+    //                               step 扉を階段状に開けたときの到達と追い付きの差
     if (const char* only = std::getenv("AF_ONLY")) {
         if (std::strcmp(only, "async") == 0) testAsyncUpdate();
         else if (std::strcmp(only, "tier") == 0) testTierBudget();
@@ -13413,6 +13581,7 @@ int main() {
         else if (std::strcmp(only, "aperture") == 0) diagnoseApertureVsAngle();
         else if (std::strcmp(only, "depth") == 0) diagnoseSpatialDepth();
         else if (std::strcmp(only, "lag") == 0) diagnoseDoorLag();
+        else if (std::strcmp(only, "step") == 0) diagnoseDoorStaircase();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }
