@@ -8090,9 +8090,12 @@ void diagnoseApertureVsAngle() {
                              8.0f, 12.0f, 16.0f, 24.0f, 32.0f, 45.0f, 90.0f };
     const int nA = static_cast<int>(sizeof(angles) / sizeof(angles[0]));
 
-    std::printf("        角度   開口率   口の125Hz  口の1k   口の4k   射影(1-cos)  楔(sin)  自由端mm 回折本 回折dB  直接dB\n");
+    std::printf("        法則 角度   開口率   口の125Hz  口の1k   口の4k   射影(1-cos)  楔(sin)  自由端mm 回折本 回折dB  直接dB\n");
+    for (int law = 0; law <= 1; ++law) {
     for (int k = 0; k < nA; ++k) {
         AF_SceneHandle s = AF_SceneCreate();
+        // 0 = 戸口の面への射影（既定に差し戻した側）／1 = 出ていった遮蔽物は蓋でなくなる。
+        AF_SceneSetApertureLaw(s, law);
         const int mw = AF_SceneAddMaterial(s, wallT, nullptr, nullptr, 6);
         const int md = AF_SceneAddMaterial(s, doorT, nullptr, nullptr, 6);
         AF_SceneAddInstanceBox(s, V(0, -th, 0),    V(hf, th, hf), V(1,0,0), V(0,1,0), mw);
@@ -8150,14 +8153,17 @@ void diagnoseApertureVsAngle() {
         AF_SceneMeasurePortal(s, pid, L, Sr, f6, &cp);
         const float proj = 1.0f - std::cos(t2);          // 候補 A（戸口の面への射影）
         const float wedge = std::sin(t2);                // 候補 B（自由端の楔）
-        std::printf("        %5.1f  %7.4f  %8.4f %8.4f %8.4f   %9.5f %8.4f %9.1f   %3d %8.1f %8.1f\n",
-                    angles[k], open, f6[0], f6[3], f6[5], proj, wedge, doorW * wedge * 1000.0f,
+        std::printf("        %4d %5.1f  %7.4f  %8.4f %8.4f %8.4f   %9.5f %8.4f %9.1f   %3d %8.1f %8.1f\n",
+                    law, angles[k], open, f6[0], f6[3], f6[5], proj, wedge, doorW * wedge * 1000.0f,
                     nDif, 10.0 * std::log10(std::max(eDif, 1e-20)),
                     10.0 * std::log10(std::max(eDir, 1e-20)));
         AF_SceneDestroy(s);
     }
+    std::printf("\n");
+    }
     std::printf("      ※開口率と口の帯域ゲインが、射影(1-cos) と 楔(sin) のどちらの形に近いかを見る。\n"
-                "        どちらとも似ず「平ら → 段」なら、二値の判定がどこかに残っている。\n");
+                "        どちらとも似ず「平ら → 段」なら、二値の判定がどこかに残っている。\n"
+                "        法則 0 が既定（2026-09-08 に差し戻し。1 は高域が抜けすぎると判断された）。\n");
 }
 
 // ==================================== 扉を開けた瞬間の音色の変化（開き始めが一番大きいか）
