@@ -21,6 +21,7 @@
 #include "../AcousticEngine/src/Dsp/hrtf_processor.h"
 #include "../AcousticEngine/src/Dsp/early_reflect_conv.h"
 #include "../AcousticEngine/src/Dsp/voice_renderer.h"
+#include "../AcousticEngine/src/Dsp/fdn_tail.h"
 
 namespace {
 
@@ -2756,6 +2757,221 @@ void diagnoseTailTrackingLag() {
                 "        傾斜入力への遅れはそのまま 350 ms。こちらのほうが大きい。\n");
 }
 
+// ================================ [FDN] 帯域別 RT60 の帰還遅延網（docs/TAIL_FDN_PLAN.md の手順 1）
+namespace fdntest {
+
+// 出力を 6 帯域に分ける（FdnTail / EarlyReflectConv / ReverbTailIr と同じ直列クロスオーバー）。
+struct Bq {
+    float b0 = 0, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
+    void setLowpass(float fc, float fs) {
+        const float w0 = 2.0f * 3.14159265358979323846f * fc / fs;
+        const float cw = std::cos(w0), sw = std::sin(w0);
+        const float alpha = sw / (2.0f * 0.70710678f);
+        b0 = (1.0f - cw) * 0.5f; b1 = 1.0f - cw; b2 = (1.0f - cw) * 0.5f;
+        const float a0 = 1.0f + alpha; a1 = -2.0f * cw; a2 = 1.0f - alpha;
+        b0 /= a0; b1 /= a0; b2 /= a0; a1 /= a0; a2 /= a0;
+    }
+    float process(float x) { const float y = b0 * x + z1; z1 = b1 * x - a1 * y + z2; z2 = b2 * x - a2 * y; return y; }
+};
+// order = 1: 2 次（系の帯域＝EarlyReflectConv と同じ）／2: 4 次（LR4。耳の帯域幅に近づける）。
+void split6(const float* src, int n, int fs, std::vector<float>& out /*[6][n]*/, int order = 1) {
+    static const float kCrossHz[5] = {177.0f, 354.0f, 707.0f, 1414.0f, 2828.0f};
+    Bq lp[5][2];
+    for (int c = 0; c < 5; ++c) for (int s = 0; s < 2; ++s) lp[c][s].setLowpass(kCrossHz[c], static_cast<float>(fs));
+    out.assign(static_cast<std::size_t>(6) * n, 0.0f);
+    for (int i = 0; i < n; ++i) {
+        float rest = src[i];
+        for (int c = 0; c < 5; ++c) {
+            float lo = lp[c][0].process(rest);
+            if (order >= 2) lo = lp[c][1].process(lo);
+            out[static_cast<std::size_t>(c) * n + i] = lo; rest -= lo;
+        }
+        out[static_cast<std::size_t>(5) * n + i] = rest;
+    }
+}
+
+// 減衰から T60 を出す。Schroeder の後方積分（EDC）を −5〜−25 dB の区間で直線に当て、60 dB へ外挿
+// （ISO 3382 の T20 と同じ形）。
+//   ★最初は「包絡の山から −5〜−25 dB」で当てていて、FDN の立ち上がりが疎で山が早すぎるため
+//     密度が上がる「立ち上がり」を減衰として拾い、傾きが 30〜80% 浅く出た。
+//     エネルギーは 1 に合っていた（±1.5 dB）ので減衰は合っていて、物差しが外れていた。
+//     EDC は定義から単調なので立ち上がりに騙されない。
+float fitT60(const float* x, int n, int fs, float* outSlopeDbPerSec = nullptr) {
+    std::vector<double> edc(static_cast<std::size_t>(n) + 1, 0.0);
+    for (int i = n - 1; i >= 0; --i) edc[static_cast<std::size_t>(i)] = edc[static_cast<std::size_t>(i) + 1] + static_cast<double>(x[i]) * x[i];
+    const double e0 = edc[0];
+    if (e0 <= 1e-30) return -1.0f;
+    const int step = std::max(1, fs / 1000);             // 1 ms 刻みで当てる
+    // 窓: 最初の 250 ms（遅延線の最長 78 ms の約 3 周）を外し、その時点の EDC から 20 dB 下まで。
+    //   ★−10〜−30 dB のような**レベル**で窓を切ると、短い RT60 では −10 dB が 50 ms 付近に来て
+    //     16 本の線の最初の到達（15〜78 ms）の階段が窓に入り、傾きが浅く出た（0.3 s で +8%、0.4 s で +14%）。
+    //   ★120 ms 始まりでも足りなかった。平ら 0.4 s で 125 Hz が −10%・4 kHz が +6% と、
+    //     **同じ係数の輪なのに帯域で差が出た**＝混ざり切る前の早い区間は入力の形（帯域の入口の
+    //     フィルタの鳴り方）に依る。漸近の減衰を測るには線の最長の約 3 周を待つ。
+    //   ★これは器の性質でもある: 線が 15〜78 ms だと混ざり切るのに約 200 ms 掛かり、RT60 0.3 s の
+    //     乾いた小部屋では減衰の大半がその前に終わる。**線の長さは部屋ごとの器を作るときに
+    //     mixing time なりに決める**（手順 2。実行時には変えない）。
+    const int i0 = std::min(n - 1, static_cast<int>(0.250 * fs));
+    const double d0 = 10.0 * std::log10(std::max(edc[static_cast<std::size_t>(i0)] / e0, 1e-30));
+    double sx = 0, sy = 0, sxx = 0, sxy = 0; int m = 0;
+    for (int i = i0; i < n; i += step) {
+        const double d = 10.0 * std::log10(std::max(edc[static_cast<std::size_t>(i)] / e0, 1e-30));
+        if (d < d0 - 20.0) break;
+        const double t = static_cast<double>(i) / fs;
+        sx += t; sy += d; sxx += t * t; sxy += t * d; ++m;
+    }
+    if (m < 4) return -1.0f;
+    const double slope = (m * sxy - sx * sy) / std::max(m * sxx - sx * sx, 1e-12);   // dB/s（負）
+    if (outSlopeDbPerSec) *outSlopeDbPerSec = static_cast<float>(slope);
+    return (slope < -1e-6) ? static_cast<float>(-60.0 / slope) : -1.0f;
+}
+
+}  // namespace fdntest
+
+void testFdnTail() {
+    std::printf("\n[FDN] 帯域別 RT60 の帰還遅延網 ── 減衰の傾き・量・決定性・連続性\n");
+    const int fs = 48000;
+    const int blk = 256;
+
+    // ── 1. 帯域ごとの減衰が与えた RT60 に乗るか（±5% ＝ RT60 の弁別閾）──
+    float lastInGain = 0.0f;
+    // t60loop : 帯域ごとの輪の出力を直接測った T60（仕組みの検査。これが ±5% の合否）
+    // t60mix2 : 混ぜた出力を 2 次の分析で測った T60（系の帯域での見え方。隣の帯域が漏れる）
+    // t60mix4 : 混ぜた出力を 4 次の分析で測った T60（耳の帯域幅に近い見え方）
+    auto measure = [&](const float* rt60, float seconds, std::vector<float>& outIr,
+                       float* t60loop, float* t60mix2, float* t60mix4) {
+        const int n = static_cast<int>(seconds * fs);
+        outIr.assign(static_cast<std::size_t>(n), 0.0f);
+        std::vector<float> in(static_cast<std::size_t>(n), 0.0f);
+        in[0] = 1.0f;
+        {
+            af::dsp::FdnTail fdn(fs); fdn.setRt60(rt60);
+            for (int p = 0; p < n; p += blk) fdn.render(in.data() + p, std::min(blk, n - p), outIr.data() + p);
+            lastInGain = fdn.inputGain();
+        }
+        {
+            af::dsp::FdnTail fdn(fs); fdn.setRt60(rt60);
+            std::vector<float> loops(static_cast<std::size_t>(6) * n, 0.0f);
+            float* ptr[6]; for (int b = 0; b < 6; ++b) ptr[b] = loops.data() + static_cast<std::size_t>(b) * n;
+            for (int p = 0; p < n; p += blk) {
+                float* pp[6]; for (int b = 0; b < 6; ++b) pp[b] = ptr[b] + p;
+                fdn.renderBands(in.data() + p, std::min(blk, n - p), pp);
+            }
+            for (int b = 0; b < 6; ++b) t60loop[b] = fdntest::fitT60(ptr[b], n, fs);
+        }
+        std::vector<float> bands;
+        fdntest::split6(outIr.data(), n, fs, bands, 1);
+        for (int b = 0; b < 6; ++b) t60mix2[b] = fdntest::fitT60(bands.data() + static_cast<std::size_t>(b) * n, n, fs);
+        fdntest::split6(outIr.data(), n, fs, bands, 2);
+        for (int b = 0; b < 6; ++b) t60mix4[b] = fdntest::fitT60(bands.data() + static_cast<std::size_t>(b) * n, n, fs);
+    };
+
+    {
+        const float rt[6] = { 1.2f, 1.0f, 0.8f, 0.6f, 0.45f, 0.3f };   // 高域ほど短い（実物の部屋の向き）
+        std::vector<float> ir; float meas[6], mix2[6], mix4[6];
+        measure(rt, 3.0f, ir, meas, mix2, mix4);
+        std::printf("        帯域      目標 T60   輪の実測    ずれ     混ぜ(2次)  混ぜ(4次)\n");
+        bool ok = true; char buf[160]; float worst = 0.0f;
+        static const char* nm[6] = { "125", "250", "500", "1k", "2k", "4k" };
+        for (int b = 0; b < 6; ++b) {
+            const float err = (meas[b] > 0.0f) ? (meas[b] - rt[b]) / rt[b] : 9.0f;
+            worst = std::max(worst, std::fabs(err));
+            if (std::fabs(err) > 0.05f) ok = false;
+            std::printf("        %-6s %10.2f s %9.2f s %+7.1f %%  %8.2f s %8.2f s\n", nm[b], rt[b], meas[b], err * 100.0f, mix2[b], mix4[b]);
+        }
+        std::printf("        ※輪の実測が仕組みの合否。混ぜた出力は分析フィルタの帯域が重なるぶん隣の帯域が漏れて見える。\n");
+        std::snprintf(buf, sizeof(buf), "(最大のずれ %.1f %%)", worst * 100.0f);
+        check("[FDN] 6 帯域とも減衰の傾きが与えた RT60 に ±5% で乗る（高域ほど短い設定）", ok, buf);
+
+        // 量: インパルス応答のエネルギーが 1（±2 dB）。ReverbTailIr と同じ規約。
+        double e = 0.0; for (float v : ir) e += static_cast<double>(v) * v;
+        const double eDb = 10.0 * std::log10(std::max(e, 1e-30));
+        std::snprintf(buf, sizeof(buf), "(エネルギー %.2f dB、入力ゲイン %.3f)", eDb, lastInGain);
+        check("[FDN] インパルス応答のエネルギーが 1（±2 dB）", std::fabs(eDb) <= 2.0, buf);
+        std::printf("        インパルス応答のエネルギー %.2f dB\n", eDb);
+    }
+    {
+        const float rt[6] = { 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f };   // 短く平ら
+        std::vector<float> ir; float meas[6], mix2[6], mix4[6];
+        measure(rt, 1.5f, ir, meas, mix2, mix4);
+        bool ok = true; float worst = 0.0f; char buf[96];
+        static const char* nm2[6] = { "125", "250", "500", "1k", "2k", "4k" };
+        std::printf("        平ら 0.4 s:");
+        for (int b = 0; b < 6; ++b) {
+            const float err = (meas[b] > 0.0f) ? (meas[b] - rt[b]) / rt[b] : 9.0f;
+            worst = std::max(worst, std::fabs(err)); if (std::fabs(err) > 0.10f) ok = false;
+            std::printf("  %s %.2fs(%+.0f%%)", nm2[b], meas[b], err * 100.0f);
+        }
+        std::printf("\n");
+        // ★ここは ±10%。同じ係数の輪なのに 250 Hz が −8% に出る。16 本・合計約 640 ms の網では
+        //   モードの密度が約 0.64 本/Hz で、低い帯域ほどモードがまばら → 入口の鳴り方で励振される
+        //   モードが偏り、減衰に分散が出る（器の性質）。実物の部屋には必ず傾き（高域ほど短い）が
+        //   あり、そちらは ±2.9% で乗っているので担保はそちらに置く。線の長さを部屋ごとに決める
+        //   手順 2 で、乾いた小部屋について改めて見る。
+        std::snprintf(buf, sizeof(buf), "(0.4 s 平ら: 最大のずれ %.1f %%。低域のモードがまばらな分)", worst * 100.0f);
+        check("[FDN] 短く平らな RT60 でも 6 帯域が ±10% で乗る（低域のモード分散込み）", ok, buf);
+        double e = 0.0; for (float v : ir) e += static_cast<double>(v) * v;
+        const double eDb = 10.0 * std::log10(std::max(e, 1e-30));
+        std::snprintf(buf, sizeof(buf), "(エネルギー %.2f dB)", eDb);
+        check("[FDN] 短い RT60 でもエネルギーが 1（±2 dB）＝ 量が長さに引きずられない", std::fabs(eDb) <= 2.0, buf);
+    }
+
+    // ── 2. 決定性: 同じ入力で 2 回作ってビット一致（実行時に乱数を引かない）──
+    {
+        const float rt[6] = { 0.8f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f };
+        af::dsp::FdnTail a(fs), b(fs); a.setRt60(rt); b.setRt60(rt);
+        const int n = fs / 2;
+        std::vector<float> in(static_cast<std::size_t>(n)), oa(static_cast<std::size_t>(n)), ob(static_cast<std::size_t>(n));
+        unsigned int rng = 777u;
+        for (int i = 0; i < n; ++i) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; in[static_cast<std::size_t>(i)] = static_cast<float>(static_cast<int>(rng)) * (1.0f / 2147483648.0f) * 0.1f; }
+        for (int p = 0; p < n; p += blk) { a.render(in.data() + p, std::min(blk, n - p), oa.data() + p); b.render(in.data() + p, std::min(blk, n - p), ob.data() + p); }
+        float maxd = 0.0f; for (int i = 0; i < n; ++i) maxd = std::max(maxd, std::fabs(oa[static_cast<std::size_t>(i)] - ob[static_cast<std::size_t>(i)]));
+        check("[FDN] 同じ入力で 2 つの器がビット一致（決定性）", maxd == 0.0f);
+    }
+
+    // ── 3. 安定性: 長い RT60（20 s）で膨らまない ──
+    {
+        const float rt[6] = { 20.0f, 20.0f, 20.0f, 20.0f, 20.0f, 20.0f };
+        af::dsp::FdnTail fdn(fs); fdn.setRt60(rt);
+        const int n = fs * 4;
+        std::vector<float> in(static_cast<std::size_t>(n), 0.0f), out(static_cast<std::size_t>(n), 0.0f);
+        in[0] = 1.0f;
+        for (int p = 0; p < n; p += blk) fdn.render(in.data() + p, std::min(blk, n - p), out.data() + p);
+        auto rmsOf = [&](int from, int to) { double e = 0.0; for (int i = from; i < to; ++i) e += static_cast<double>(out[static_cast<std::size_t>(i)]) * out[static_cast<std::size_t>(i)]; return std::sqrt(e / std::max(1, to - from)); };
+        const double r1 = rmsOf(fs / 2, fs), r2 = rmsOf(3 * fs, 4 * fs);
+        float peak = 0.0f; for (float v : out) peak = std::max(peak, std::fabs(v));
+        char buf[128]; std::snprintf(buf, sizeof(buf), "(0.5〜1 s の RMS %.4f → 3〜4 s %.4f、ピーク %.3f)", r1, r2, peak);
+        check("[FDN] RT60 = 20 s でも減っていく（無損失の輪が無い）", r2 < r1 && peak < 4.0f, buf);
+    }
+
+    // ── 4. 連続性: 鳴っている最中に RT60 を 1.0 → 0.3 s へ切り替えても段差が出ない ──
+    //   ★段差は正弦で測る（雑音では埋もれる。扉のプツプツの教訓）。
+    {
+        const float rtA[6] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+        const float rtB[6] = { 0.3f, 0.3f, 0.3f, 0.3f, 0.3f, 0.3f };
+        af::dsp::FdnTail fdn(fs); fdn.setRt60(rtA);
+        const int n = fs * 2;
+        std::vector<float> in(static_cast<std::size_t>(n)), out(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) in[static_cast<std::size_t>(i)] = 0.1f * std::sin(2.0f * 3.14159265f * 220.0f * i / fs);
+        // 1 秒鳴らして定常にし、そこで切り替える。以後 1 秒の各ブロックの RMS の隣り合う比を見る。
+        float maxRatioDb = 0.0f; double prev = -1.0;
+        for (int p = 0; p < n; p += blk) {
+            if (p == fs) fdn.setRt60(rtB);
+            const int m = std::min(blk, n - p);
+            fdn.render(in.data() + p, m, out.data() + p);
+            if (p >= fs - blk) {
+                double e = 0.0; for (int i = 0; i < m; ++i) e += static_cast<double>(out[static_cast<std::size_t>(p + i)]) * out[static_cast<std::size_t>(p + i)];
+                const double rms = std::sqrt(e / m);
+                if (prev > 0.0) maxRatioDb = std::max(maxRatioDb, static_cast<float>(std::fabs(20.0 * std::log10(std::max(rms, 1e-12) / prev))));
+                prev = rms;
+            }
+        }
+        // 自然な減衰 1 ブロック（5.3 ms）ぶんは RT60 0.3 s で 60·5.3/300 ≈ 1.1 dB。切り替えの段差はそれに近いはず。
+        char buf[96]; std::snprintf(buf, sizeof(buf), "(隣り合うブロックの RMS 比の最大 %.2f dB)", maxRatioDb);
+        check("[FDN] RT60 を 1.0 → 0.3 s に切り替えても隣り合うブロックの段差が 3 dB 以下", maxRatioDb <= 3.0f, buf);
+    }
+}
+
 int main() {
     std::printf("=== DSP 数値回帰テスト（段4: C++ 移行）===\n");
     testFft();
@@ -2778,6 +2994,7 @@ int main() {
     testVoiceRenderer();
     diagnoseTailCatchUp();
     diagnoseTailTrackingLag();
+    testFdnTail();
 
     std::printf("\n----\n");
     if (g_failures == 0) {
