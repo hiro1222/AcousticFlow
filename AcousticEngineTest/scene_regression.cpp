@@ -8072,6 +8072,124 @@ void testRoomSeedAndShare() {
 //     ⑥ 段の写しと同じく、非同期でも同じ答え（[非同期] で比較）
 //     ⑦ 部屋が無ければ尾の比は外形箱で当たる（ホストの予備と同じ）
 // ─────────────────────────────────────────────────────────────────────
+// ==================================== 扉を開けた瞬間の音色の変化（開き始めが一番大きいか）
+// 2026-09-08 の発注者の理想:
+//   「開き始めが一番変化する。そのあとは音源に対しての開口で音が明るくなっていく」
+// つまり**角度が倍になるごとの変化量が、最初ほど大きい**こと。
+//
+// ★測るのは「耳に届く音の色」＝ 直接タップ ＋ 回折タップを全部足した帯域別エネルギー。
+//   直接タップだけ見ても駄目（開口の寄与は回折タップに乗る）。
+//   色 ＝ 10log10(125Hz / 4kHz)。小さいほど明るい。
+//
+// ★隙間（クリアランス）の有無で比べる。隙間 0 だと閉じた状態の開口が数値としてゼロで、
+//   しかも扉の**戸口の面への射影**は w(1−cosθ) なので角度の 2 乗でしか開かない。
+//   最初の数度がまったく動かないのはこれ。実際の扉には 3〜5 mm あり、そこが起点になる。
+void testDoorOpenTimbre() {
+    std::printf("\n[開き始め] 扉を開けた瞬間の音色の変化（角度が倍になるごとの変化量）\n");
+    const float wallT[6] = {0.000398f, 0.0001585f, 0.0000398f,
+                            0.00001f, 0.00000251f, 0.000001f};
+    const float doorT[6] = {0.0316f, 0.0158f, 0.00794f, 0.00398f, 0.00251f, 0.002f};
+    const float hh = 3.0f, th = 0.2f, hf = 7.0f, doorW = 1.0f, doorT2 = 0.03f;
+    const AF_Vector3 L = V(0, 1.6f, -3), Sr = V(0, 1.6f, 3);
+    const float angles[] = { 0.0f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f, 64.0f, 90.0f };
+    const int nA = static_cast<int>(sizeof(angles) / sizeof(angles[0]));
+
+    struct Row { float lvl, color; };
+    auto sweep = [&](float clearance, Row* out) {
+        for (int k = 0; k < nA; ++k) {
+            AF_SceneHandle s = AF_SceneCreate();
+            const int mw = AF_SceneAddMaterial(s, wallT, nullptr, nullptr, 6);
+            const int md = AF_SceneAddMaterial(s, doorT, nullptr, nullptr, 6);
+            AF_SceneAddInstanceBox(s, V(0, -th, 0),    V(hf, th, hf), V(1,0,0), V(0,1,0), mw);
+            AF_SceneAddInstanceBox(s, V(0, hh+th, 0),  V(hf, th, hf), V(1,0,0), V(0,1,0), mw);
+            AF_SceneAddInstanceBox(s, V(-hf, hh*0.5f, 0), V(th, hh*0.5f, hf), V(1,0,0), V(0,1,0), mw);
+            AF_SceneAddInstanceBox(s, V( hf, hh*0.5f, 0), V(th, hh*0.5f, hf), V(1,0,0), V(0,1,0), mw);
+            AF_SceneAddInstanceBox(s, V(0, hh*0.5f, -hf), V(hf, hh*0.5f, th), V(1,0,0), V(0,1,0), mw);
+            AF_SceneAddInstanceBox(s, V(0, hh*0.5f,  hf), V(hf, hh*0.5f, th), V(1,0,0), V(0,1,0), mw);
+            const float side = (2.0f*hf - doorW) * 0.5f;
+            AF_SceneAddInstanceBox(s, V(-(doorW*0.5f + side*0.5f), hh*0.5f, 0),
+                                   V(side*0.5f, hh*0.5f, th*0.5f), V(1,0,0), V(0,1,0), mw);
+            AF_SceneAddInstanceBox(s, V( (doorW*0.5f + side*0.5f), hh*0.5f, 0),
+                                   V(side*0.5f, hh*0.5f, th*0.5f), V(1,0,0), V(0,1,0), mw);
+            // 扉。蝶番は x = -doorW/2、+Z 側へ振れる。隙間は自由端と上下に付ける（蝶番側は密着）。
+            {
+                const float c = clearance;
+                const float w = doorW - c, h2 = hh - 2.0f * c;
+                const float t2 = angles[k] * 3.14159265f / 180.0f;
+                const AF_Vector3 right = V(std::cos(t2), 0.0f, std::sin(t2));
+                const AF_Vector3 hinge = V(-doorW * 0.5f, hh * 0.5f, 0.0f);
+                AF_SceneAddInstanceBox(s,
+                    V(hinge.x + right.x * w * 0.5f, hinge.y, hinge.z + right.z * w * 0.5f),
+                    V(w * 0.5f, h2 * 0.5f, doorT2), right, V(0,1,0), md);
+            }
+            AF_SceneAddPortal(s, V(0, hh * 0.5f, 0), V(1, 0, 0), V(0, 1, 0),
+                              doorW * 0.5f, hh * 0.5f);
+            AF_SceneSetListener(s, L);
+            AF_SceneSetListenerOrientation(s, V(0,0,1), V(0,1,0));
+            AF_SceneSetSource(s, 1, Sr);
+            AF_UpdateConfig cfg{};
+            cfg.role1EveryN = 1; cfg.reflectionRays = 256; cfg.reflectionBounces = 3;
+            cfg.directWeight = 1.0f; cfg.useReflections = 1; cfg.speedOfSound = 343.0f;
+            cfg.distanceRef = 4.0f; cfg.enableReverb = 0;
+            cfg.enableEarlyReflections = 0;             // 反射は別件。開口の色だけ見る
+            cfg.enableDiffractionSources = 1; cfg.diffSources = 8;
+            cfg.diffSrcEveryN = 1; cfg.catalogEveryN = 1;
+            cfg.useEdgeCatalog = 1; cfg.edgeCatalogRes = 16; cfg.edgeCatalogMaxDist = 40.0f;
+            AF_SceneSetUpdateConfig(s, &cfg);
+            for (int it = 0; it < 6; ++it) AF_SceneUpdate(s, 1.0f / 60.0f);
+
+            AF_VoiceProgram vp{};
+            const int idx = AF_SceneSourceIndex(s, 1);
+            double e[kBands] = {0, 0, 0, 0, 0, 0};
+            if (idx >= 0 && AF_SceneGetVoiceProgram(s, idx, &vp)) {
+                // 直接 ＋ 回折を全部足す（耳に届くのはこの和）。エネルギーで足す。
+                for (int i = 0; i < vp.count && i < AF_PROGRAM_MAX_TAPS; ++i)
+                    for (int b = 0; b < kBands; ++b) {
+                        const double g = vp.taps[static_cast<std::size_t>(i)].gain6[b];
+                        e[b] += g * g;
+                    }
+            }
+            double tot = 0.0;
+            for (int b = 0; b < kBands; ++b) tot += e[b];
+            out[k].lvl = static_cast<float>(10.0 * std::log10(std::max(tot / kBands, 1e-20)));
+            out[k].color = static_cast<float>(10.0 * std::log10(std::max(e[0], 1e-20) / std::max(e[5], 1e-20)));
+            AF_SceneDestroy(s);
+        }
+    };
+
+    Row noGap[16], gap[16];
+    sweep(0.000f, noGap);
+    sweep(0.004f, gap);
+
+    std::printf("        角度      隙間なし: 音量 dB  色 dB      隙間 4mm: 音量 dB  色 dB     色の変化(4mm)\n");
+    for (int k = 0; k < nA; ++k) {
+        const float dcol = (k > 0) ? (gap[k - 1].color - gap[k].color) : 0.0f;
+        std::printf("        %5.1f            %8.1f %7.1f          %8.1f %7.1f      %+8.1f\n",
+                    angles[k], noGap[k].lvl, noGap[k].color, gap[k].lvl, gap[k].color, dcol);
+    }
+    // 理想: 角度が倍になるごとの色の変化が、前半ほど大きい。
+    //   0→2° の変化と、16→64° の変化を比べる（どちらも角度は 4 倍ぶん）。
+    float early = gap[0].color - gap[3].color;      // 0 → 2°
+    float late  = gap[6].color - gap[8].color;      // 16 → 64°
+    char nb[200];
+    std::snprintf(nb, sizeof(nb),
+                  "(隙間 4mm の色: 0° %.1f → 2° %.1f → 16° %.1f → 64° %.1f dB。前半 %.1f / 後半 %.1f)",
+                  gap[0].color, gap[3].color, gap[6].color, gap[8].color, early, late);
+    std::printf("      ※色 ＝ 10log10(125Hz / 4kHz)。小さいほど明るい。\n"
+                "        理想は「角度が倍になるごとの変化が前半ほど大きい」。%s\n", nb);
+    // ★理想（開き始めが一番動く）は**いまは満たしていない**。記録として残す。
+    //   開口を「戸口の面への射影」で測っているので、開いた扉の開口は w(1−cosθ) ＝ 角度の 2 乗でしか
+    //   開かない。2° で 0.6 mm、4° で 2.4 mm、8° で 9.7 mm。4 kHz の波長 86 mm に対して小さすぎ、
+    //   最初の 4 度は音響的に存在しない。自由端の隙間（w·sinθ。4° で 70 mm）を開口として数えれば
+    //   前半から動くはずだが、それは開口の模型の変更なので確認してから。
+    //   隙間 4 mm も効かない: 板の透過が TL 15 dB と大きく、縁の 4 mm はその下に隠れる。
+    check("[開き始め] 閉から全開までに色が 15 dB 以上動く",
+          (gap[0].color - gap[nA - 1].color) > 15.0f, nb);
+    check("[開き始め] 色は戻らずに明るくなっていく",
+          gap[3].color >= gap[5].color && gap[5].color >= gap[7].color
+          && gap[7].color >= gap[8].color, nb);
+}
+
 // ============================================ 閉じた扉ごしの音は「こもる」か（前提そのもの）
 // 2026-09-08、Unity の試聴で「ドアを閉めたときに LPF があまり掛かっていないように聞こえる」。
 // 作品の**前提**（閉じた扉ごしの音はこもって届く）が成立しているかどうかなので最優先で測る。
@@ -12741,6 +12859,7 @@ int main() {
         else if (std::strcmp(only, "door") == 0) testDoorSweepClicks();
         else if (std::strcmp(only, "walk") == 0) testWalkContinuity();
         else if (std::strcmp(only, "closed") == 0) testClosedDoorTimbre();
+        else if (std::strcmp(only, "open") == 0) testDoorOpenTimbre();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }
@@ -12792,6 +12911,7 @@ int main() {
     testDoorSweepClicks();
     testWalkContinuity();
     testClosedDoorTimbre();
+    testDoorOpenTimbre();
     testAutoPortals();
     diagnosePortalLeftRightSymmetry();
     diagnosePortalWidthVsDoorCurve();
