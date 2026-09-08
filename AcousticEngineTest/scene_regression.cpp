@@ -8115,7 +8115,13 @@ void testWalkContinuity() {
 
     struct WalkResult { double rateAvg, rateMax, stepAvg, stepMax; };
     // path 0 = 戸口をくぐる（z 方向）／1 = 壁沿いに横切る（x 方向。戸口の縁をまたぐ）
-    auto run = [&](int earlyModel, bool early, int path) {
+    //   keepMask: bit0 直接／bit1 反射／bit2 回折。tailOn=false で尾を落とす（成分の切り分け用）。
+    //   speedMps: 歩く速さ。**半分にして最大 dB/s が半分になるかを見ると、
+    //   「本当に速い変化」と「空間の不連続」を分けられる**（滑らかなら変化率は速さに比例し、
+    //   段があるなら速さを落としても段は消えないので比例しない）。
+    auto run = [&](int earlyModel, bool early, int path, int keepMask = 7, bool tailOn = true,
+                   float speedMps = 1.4f) {
+        const float stepMps = speedMps * dt;   // 1 ブロックの移動距離
         AF_SceneHandle s = AF_SceneCreate();
         const int mat = AF_SceneAddMaterial(s, nullptr, nullptr, nullptr, 0);
         AF_SceneAddInstanceBox(s, V(0, -t, 0),  V(half+t, t, half+t), V(1,0,0), V(0,1,0), mat);
@@ -8148,7 +8154,7 @@ void testWalkContinuity() {
         AF_VoiceHandle v = AF_VoiceCreate(&vc);
         AF_VoiceSetOutputGain(v, 1.0f);
         AF_VoiceSetHrtfEnabled(v, 0);     // 腕の間で共通なので切る（HRTF の混ぜを混入させない）
-        AF_VoiceSetTailLevel(v, 1.0f);
+        AF_VoiceSetTailLevel(v, tailOn ? 1.0f : 0.0f);
         AF_VoiceSetTailEnvelope(v, 1.0f, 1.0f);
 
         std::vector<float> in(static_cast<std::size_t>(block));
@@ -8156,14 +8162,18 @@ void testWalkContinuity() {
         std::vector<float> echo(static_cast<std::size_t>(cfg.echogramBins) * 6, 0.0f);
         std::vector<AF_VoiceTap> taps(AF_PROGRAM_MAX_TAPS);
         AF_VoiceProgram vp{};
-        // 5 音の和（互いに素に近い比。櫛の谷が重ならない）。
-        const double hz[5] = { 110.0, 233.0, 494.0, 1047.0, 2217.0 };
+        // 5 音の和。★周波数は**ブロック同期**にする（sr/block = 93.75 Hz の整数倍）。
+        //   こうしないと 1 ブロックに半端な周期が入り、**信号そのもののブロック RMS が揺れる**。
+        //   最初は 110/233/… で測っていて、静止していても平均 38 dB/s 出た（＝全部が測り方の床）。
+        //   整数周期なら遅延が変わっても RMS は保たれるので、動いた量だけが出る。
+        const double base = static_cast<double>(sr) / block;   // 93.75 Hz
+        const double hz[5] = { base * 2, base * 5, base * 11, base * 23, base * 47 };
         double ph[5] = { 0, 0, 0, 0, 0 };
 
         const float startZ = -4.0f, endZ = 2.0f;      // 戸口をくぐる
         const float startX = -3.0f, endX = 3.0f;      // 壁沿いに横切る
         const float span = (path == 0) ? (endZ - startZ) : (endX - startX);
-        const int steps = static_cast<int>(span / stepM);
+        const int steps = (path == 2) ? 400 : static_cast<int>(span / stepMps);
         const int warm = 60;
 
         double rateSum = 0.0, rateMax = 0.0, stepSum = 0.0, stepMax = 0.0;
@@ -8172,18 +8182,26 @@ void testWalkContinuity() {
         double prevDb = 0.0; bool hasPrevDb = false;
         for (int f = 0; f < warm + steps; ++f) {
             const int k = (f < warm) ? 0 : (f - warm);
-            const float u = static_cast<float>(k) * stepM;
+            const float u = static_cast<float>(k) * stepMps;
             const AF_Vector3 L = (path == 0) ? V(0.0f, 1.6f, startZ + u)
-                                             : V(startX + u, 1.6f, -1.0f);
+                               : (path == 1) ? V(startX + u, 1.6f, -1.0f)
+                                             : V(0.0f, 1.6f, -1.0f);   // path 2 = 静止（床）
             AF_SceneSetListener(s, L);
             AF_SceneUpdate(s, dt);
 
             const int idx = AF_SceneSourceIndex(s, 1);
             if (idx >= 0 && AF_SceneGetVoiceProgram(s, idx, &vp)) {
                 const int all = vp.count < AF_PROGRAM_MAX_TAPS ? vp.count : AF_PROGRAM_MAX_TAPS;
+                int nt = 0;
                 for (int i = 0; i < all; ++i) {
                     const AF_ProgramTap& p = vp.taps[static_cast<std::size_t>(i)];
-                    AF_VoiceTap& q = taps[static_cast<std::size_t>(i)];
+                    // index 0 は必ず直接音（音源 API の約束）。それ以外は種類で絞る。
+                    if (i > 0) {
+                        const int bit = (p.type == 1) ? 2 : ((p.type == 2) ? 4 : 1);
+                        if ((keepMask & bit) == 0) continue;
+                    }
+                    AF_VoiceTap& q = taps[static_cast<std::size_t>(nt)];
+                    ++nt;
                     q.delaySamples = static_cast<int>(p.delayMs * 0.001f * sr + 0.5f);
                     for (int b = 0; b < 6; ++b) q.gain6[b] = p.gain6[b];
                     q.panL = p.panL; q.panR = p.panR;
@@ -8191,13 +8209,13 @@ void testWalkContinuity() {
                     q.dirX = p.dirX; q.dirY = p.dirY; q.dirZ = p.dirZ;
                     AF_VoiceScatterSplit(p.delayMs, vp.mixingTimeMs, 0.5f, 1.0f, &q.gSpec, &q.gDiff);
                 }
-                if (all > 0) AF_VoiceSetTaps(v, taps.data(), all);
+                if (nt > 0) AF_VoiceSetTaps(v, taps.data(), nt);
                 AF_VoiceSetDirection(v, V(vp.directDirX, vp.directDirY, vp.directDirZ), 57.0f);
                 if (vp.hrtfTapIndex >= 0)
                     AF_VoiceSetDiffractionDirection(v, V(vp.hrtfDirX, vp.hrtfDirY, vp.hrtfDirZ), 57.0f);
                 if (f % 8 == 0) {
                     const int bins = AF_SceneGetEchogramBands(s, idx, echo.data(), cfg.echogramBins);
-                    if (bins > 0 && all > 0) {
+                    if (bins > 0 && nt > 0) {
                         float dg = 0.0f;
                         for (int b = 0; b < 6; ++b) dg += vp.taps[0].gain6[b];
                         dg /= 6.0f;
@@ -8259,28 +8277,71 @@ void testWalkContinuity() {
         {"レイ追跡",   0, true},
         {"面の線",     1, true},
     };
-    const char* pathName[2] = { "戸口をくぐる", "壁沿いに横切る" };
+    const char* pathName[3] = { "戸口をくぐる", "壁沿いに横切る", "静止（床）" };
     double worstStepRatio = 0.0, lineRateMax = 0.0, rayRateMax = 0.0;
-    for (int path = 0; path < 2; ++path) {
+    double floorRate = 0.0;
+    for (int path = 2; path >= 0; --path) {   // 先に床を測る（読むときの基準になるので）
         for (const Arm& a : arms) {
             const WalkResult r = run(a.model, a.early, path);
             const double sr2 = r.stepMax / (r.stepAvg > 1e-9 ? r.stepAvg : 1.0);
             std::printf("        %-14s %-10s %10.1f %8.1f %10.3f %8.3f %9.2f\n",
                         pathName[path], a.name, r.rateAvg, r.rateMax, r.stepAvg, r.stepMax, sr2);
             if (sr2 > worstStepRatio) worstStepRatio = sr2;
+            if (path == 2) { if (r.rateMax > floorRate) floorRate = r.rateMax; continue; }
             if (a.early && a.model == 1 && r.rateMax > lineRateMax) lineRateMax = r.rateMax;
             if (a.early && a.model == 0 && r.rateMax > rayRateMax)  rayRateMax  = r.rateMax;
         }
     }
     char nb[220];
     std::snprintf(nb, sizeof(nb),
-                  "(レベルの変化率の最大: 面の線 %.1f dB/s / レイ追跡 %.1f dB/s。段差の最悪 %.2f 倍)",
-                  lineRateMax, rayRateMax, worstStepRatio);
-    std::printf("      ※レベルの変化率が「ぐらつき」、段差が「切れ」。約束の文はレベルの変化率で書く。\n"
+                  "(最大 dB/s: 静止の床 %.1f / 面の線 %.1f / レイ追跡 %.1f。段差の最悪 %.2f 倍)",
+                  floorRate, lineRateMax, rayRateMax, worstStepRatio);
+    std::printf("      ※静止（床）は測り方そのものの床。歩行の値はこれを引いて読むこと。\n"
+                "        レベルの変化率が「ぐらつき」、段差が「切れ」。約束の文はレベルの変化率で書く。\n"
                 "        閾値はまだ決めない ── まず数字を採り、耳で決めてからここに入れる（決めごと: 絶対値は耳）。\n"
                 "        %s\n", nb);
     // いまは「切れていないこと」だけを守る。ぐらつきの閾値は試聴で決めてから入れる。
     check("[歩行] 歩いても波形が切れない（どの模型でも）", worstStepRatio < 4.0, nb);
+
+    // ── 担保の天井はどこか（反射を切った腕でも最大 300 dB/s 級ある。その出どころ）──
+    //   直接タップ・回折二次音源・尾 のどれがぐらつかせているかを、成分を落として見る。
+    std::printf("\n        ぐらつきの出どころ（戸口をくぐる・反射なし）\n");
+    struct Part { const char* name; int mask; bool tail; };
+    const Part parts[] = {
+        {"直接だけ",       1, false},
+        {"直接＋回折",     5, false},
+        {"直接＋尾",       1, true},
+        {"全部（反射なし）", 5, true},
+    };
+    double worstPartRate = 0.0; const char* worstPartName = "";
+    for (const Part& p : parts) {
+        const WalkResult r = run(1, false, 0, p.mask, p.tail);
+        std::printf("        %-20s dB/s 平均 %7.1f  最大 %8.1f   段差 最悪/平均 %6.2f\n",
+                    p.name, r.rateAvg, r.rateMax,
+                    r.stepMax / (r.stepAvg > 1e-9 ? r.stepAvg : 1.0));
+        if (r.rateMax > worstPartRate) { worstPartRate = r.rateMax; worstPartName = p.name; }
+    }
+    std::printf("      ※いちばんぐらついた組み合わせ: %s（最大 %.1f dB/s）\n", worstPartName, worstPartRate);
+
+    // ── その ぐらつき は「速い変化」か「不連続」か ──
+    //   歩く速さを半分にする。空間的に滑らかなら変化率は速さに比例して半分になる。
+    //   段があるなら、速さを落としても段の大きさは変わらないので半分にならない。
+    std::printf("\n        速さを半分にすると変化率も半分か（戸口をくぐる）\n");
+    struct Sp { const char* name; int model; bool early; };
+    const Sp sps[] = { {"反射なし", 1, false}, {"レイ追跡", 0, true}, {"面の線", 1, true} };
+    double worstNonLinear = 0.0; const char* worstNlName = "";
+    for (const Sp& sp : sps) {
+        const WalkResult fast = run(sp.model, sp.early, 0, 7, true, 1.4f);
+        const WalkResult slow = run(sp.model, sp.early, 0, 7, true, 0.7f);
+        // 比例していれば 2.0。1.0 に近いほど「速さに依らない段」＝不連続。
+        const double ratioAvg = slow.rateAvg > 1e-9 ? fast.rateAvg / slow.rateAvg : 0.0;
+        const double ratioMax = slow.rateMax > 1e-9 ? fast.rateMax / slow.rateMax : 0.0;
+        std::printf("        %-10s 1.4m/s %7.1f / 0.7m/s %7.1f ＝ 平均比 %4.2f   最大 %7.1f / %7.1f ＝ %4.2f\n",
+                    sp.name, fast.rateAvg, slow.rateAvg, ratioAvg, fast.rateMax, slow.rateMax, ratioMax);
+        if (ratioMax < 1.5 && ratioMax > worstNonLinear) { worstNonLinear = ratioMax; worstNlName = sp.name; }
+    }
+    std::printf("      ※比が 2.0 なら空間的に滑らか（速い変化なだけ）。1.0 に近いほど段が残っている。\n");
+    (void)worstNonLinear; (void)worstNlName;
 }
 
 // ============================================================ 扉を動かすとぷつぷつ鳴る（再現）
