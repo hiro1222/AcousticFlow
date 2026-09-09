@@ -656,6 +656,10 @@ namespace AcousticFlow
             public static float AcousticMs;
             public static float RoomShare = 1f;   // まわりの空間のうち部屋の中である割合（残響の量の重み）
             public static int TailModel;          // 後期の尾: 0 畳み込み／1 部屋ごとの FDN（VoiceConvolver が預け先を選ぶ）
+            // 尾の FDN の様子（AF ツールの「情報」タブが読む。HUD は箱が小さくて下の行が切れるので、判断はタブで）。
+            public static float TailFdnRt60;      // 部屋の生きた RT60（500 Hz 帯、部屋の平均）
+            public static float TailFdnOpen;      // 口の素通しの面積率（部屋の平均）
+            public static string TailFdnWhy = ""; // FDN を作れていない理由（空なら作れている）
             public static bool UseHrtf;
             public static bool UseSteer;
             public static string[] SourceNames;   // 音源ごとの表示名（クリップ名）
@@ -2437,11 +2441,18 @@ namespace AcousticFlow
             bool on = tailModel == 1 && _audioReady && _scene != null && _scene.IsValid && listener != null && _portalHost != null;
             if (!on)
             {
+                // ★作れない理由を残す。「切り替えたのに音が変わらない」を、窓を見るだけで切り分けられるようにする。
+                Status.TailFdnWhy = (tailModel != 1) ? ""
+                                  : !_audioReady ? "音がまだ用意できていない（_audioReady が false）"
+                                  : (_scene == null || !_scene.IsValid) ? "場面が無い（DLL の読み込みに失敗？）"
+                                  : (listener == null) ? "AudioListener が見つからない"
+                                  : "TailBusRenderer が無い（AudioListener に付く部品）";
                 if (_portalHost != null && _portalHost.FdnMixHandle != System.IntPtr.Zero) _portalHost.RetireFdnMix();
                 _fdnBuild = -1;
                 return;
             }
             int nr = _scene.RoomCount;
+            Status.TailFdnWhy = (nr <= 0) ? "部屋グラフに部屋が無い（囲われていない／セルが粗い）" : "";
             int build = _scene.RoomBuildCount;
             var mix = _portalHost.FdnMixHandle;
             if (mix == System.IntPtr.Zero || build != _fdnBuild || _portalHost.FdnRoomCount != nr)
@@ -2480,6 +2491,7 @@ namespace AcousticFlow
                 hudRt += _fdnRt[2]; hudOpen += open; hudN++;
             }
             if (hudN > 0) { _fdnHudRt = hudRt / hudN; _fdnHudOpen = hudOpen / hudN; }
+            Status.TailFdnRt60 = _fdnHudRt; Status.TailFdnOpen = _fdnHudOpen;
             // 2) リスナーの重み（正規化）。今回置かない部屋のうち前回置いた物だけ 0 にする。
             int n = _scene.GetFdnRoomWeights(listener.position, roomBlendRadius, true, _fdnRoomBuf, _fdnW6, _fdnDir);
             for (int r = 0; r < nr; r++)
@@ -2832,7 +2844,10 @@ namespace AcousticFlow
             if (!showHud) return;
 
             var style = new GUIStyle(GUI.skin.label) { fontSize = 13 };
-            GUILayout.BeginArea(new Rect(10, 10, 480, 300), GUI.skin.box);
+            // ★箱は画面なりに伸ばす。480x300 で固定していたときは、下に足した行から順に**黙って切れて**いた
+            //   （尾の切り替えの行を足しても表示が変わらず「効いていない」と読めた。2026-09-09）。
+            //   ここは切り分け用の一覧なので、確かめる物はできるだけ AF ツールの「情報」タブで見ること。
+            GUILayout.BeginArea(new Rect(10, 10, 560, Mathf.Max(300f, Screen.height - 20f)), GUI.skin.box);
             GUILayout.Label($"[新コア Scene] {_status}", style);
             GUILayout.Label($"FPS: {_fps:F0}    音響計算: {_acousticMs:F2} ms/frame    " +
                             $"空間化: {(useHrtf ? "HRTF" : "パン")} (H)    " +

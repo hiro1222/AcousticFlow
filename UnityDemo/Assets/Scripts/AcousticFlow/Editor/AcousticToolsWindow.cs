@@ -11,6 +11,11 @@
  * いま入っているタブ:
  *   履歴 … 道具2。毎フレームの状態を巻き戻して見る（記録は AcousticHistory）
  *   予算 … 道具10。audio thread の実費と音源数の余裕
+ *   音源 … 道具A。ソロ／ミュートと寄与度順の一覧
+ *   情報 … 2026-09-09 追加。いま何で鳴っているか（模型の切り替え・尾・部屋・音の出どころ）。
+ *          ★画面の HUD は箱が 480x300 で固定なので、下に足した行から順に**切れて見えなくなる**
+ *            （尾の切り替えを足しても表示が変わらず「効いていない」と読めてしまった）。
+ *            聞き比べの判断はこのタブで行う。ここは窓なので伸びるし、切り替えも押せる。
  */
 using System.IO;
 using UnityEditor;
@@ -20,10 +25,10 @@ namespace AcousticFlow.EditorTools
 {
     public class AcousticToolsWindow : EditorWindow
     {
-        private enum Tab { History, Budget, Sources }
-        private static readonly string[] kTabNames = { "履歴", "予算", "音源" };
+        private enum Tab { Info, History, Budget, Sources }
+        private static readonly string[] kTabNames = { "情報", "履歴", "予算", "音源" };
 
-        private Tab _tab = Tab.History;
+        private Tab _tab = Tab.Info;
         private Vector2 _scroll;
 
         // --- 履歴タブの状態 ---
@@ -62,9 +67,108 @@ namespace AcousticFlow.EditorTools
             _tab = (Tab)GUILayout.Toolbar((int)_tab, kTabNames);
             EditorGUILayout.Space(4f);
 
-            if (_tab == Tab.History) DrawHistory();
+            if (_tab == Tab.Info) DrawInfo();
+            else if (_tab == Tab.History) DrawHistory();
             else if (_tab == Tab.Budget) DrawBudget();
             else DrawSources();
+        }
+
+        // =====================================================================
+        // 情報タブ ── いま何で鳴っているか（読むだけでなく、ここから切り替える）
+        // =====================================================================
+        private Vector2 _infoScroll;
+
+        private static string OnOff(bool b) { return b ? "ON" : "OFF"; }
+        private static string Db(float lin) { return (lin > 1e-6f) ? (20f * Mathf.Log10(lin)).ToString("F1") + " dB" : "無音"; }
+
+        private void DrawInfo()
+        {
+            var demo = Object.FindFirstObjectByType<AcousticFlowSceneDemo>();
+            if (demo == null) { EditorGUILayout.HelpBox("AcousticFlowSceneDemo が場面にありません。", MessageType.Warning); return; }
+            bool playing = EditorApplication.isPlaying;
+            _infoScroll = EditorGUILayout.BeginScrollView(_infoScroll);
+
+            // ── 後期の尾（聞き比べの主役）──
+            EditorGUILayout.LabelField("後期の尾", EditorStyles.boldLabel);
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUILayout.Label("模型", GUILayout.Width(60f));
+                int now = Mathf.Clamp(demo.tailModel, 0, 1);
+                int next = GUILayout.Toolbar(now, new[] { "0 畳み込み（IR）", "1 FDN（部屋ごと）" }, GUILayout.Width(260f));
+                if (next != now) { Undo.RecordObject(demo, "tailModel"); demo.tailModel = next; EditorUtility.SetDirty(demo); }
+                GUILayout.Label("(K キーでも切替)", EditorStyles.miniLabel);
+            }
+            var tb = Object.FindFirstObjectByType<TailBusRenderer>();
+            if (!playing)
+            {
+                EditorGUILayout.HelpBox("再生中に、尾の器と音の出どころを表示します。", MessageType.Info);
+            }
+            else if (demo.tailModel == 1)
+            {
+                string why = AcousticFlowSceneDemo.Status.TailFdnWhy;
+                bool live = tb != null && tb.FdnMixHandle != System.IntPtr.Zero;
+                if (!live)
+                    EditorGUILayout.HelpBox("FDN の器がありません: " + (string.IsNullOrEmpty(why) ? "作成待ち" : why), MessageType.Warning);
+                else
+                {
+                    EditorGUILayout.LabelField("  部屋の FDN", tb.FdnRoomCount + " 本   出力 " + Db(tb.FdnRms));
+                    EditorGUILayout.LabelField("  生きた RT60 (500Hz)", AcousticFlowSceneDemo.Status.TailFdnRt60.ToString("F2") + " s"
+                        + "    口の素通し " + AcousticFlowSceneDemo.Status.TailFdnOpen.ToString("F2"));
+                    EditorGUILayout.LabelField("  向き", tb.DirectionBusHandle != System.IntPtr.Zero
+                        ? "方向バス（戸口の向き・自室は一様）" : "L/R の 2 本（方向バスが OFF）");
+                }
+            }
+            else
+            {
+                EditorGUILayout.LabelField("  尾の共有バス", OnOff(tb != null && tb.enableSharedTail)
+                    + "   （音源ごとの尾の出力は「音源」タブ、または下の一覧の 出力 を見る）");
+            }
+
+            // ── 音の出どころ（M を押しても消えない、の切り分け）──
+            EditorGUILayout.Space(6f);
+            EditorGUILayout.LabelField("音の出どころ", EditorStyles.boldLabel);
+            if (!playing) { EditorGUILayout.EndScrollView(); return; }
+            var all = Object.FindObjectsByType<AudioSource>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+            if (all.Length == 0) EditorGUILayout.HelpBox("鳴っている AudioSource がありません。", MessageType.Warning);
+            int muted = 0, playingN = 0;
+            foreach (var a in all) { if (a.mute) muted++; if (a.isPlaying) playingN++; }
+            EditorGUILayout.LabelField("  AudioSource", all.Length + " 本（再生中 " + playingN + "・ミュート " + muted + "）");
+            // ★ミュートが効かないときの正体はたいてい「デモが知らない AudioSource が鳴っている」。
+            //   デモの M キーは Inspector の sources に並んだ物しか触らないので、一覧で見分ける。
+            foreach (var a in all)
+            {
+                var vc = a.GetComponent<VoiceConvolver>();
+                var ic = a.GetComponent<IrConvolver>();
+                string dsp = (vc != null) ? "C++ 畳み込み器" : (ic != null) ? "C# 畳み込み器" : "素通し（畳み込み器なし）";
+                string outRms = (vc != null) ? "  出力 " + Db(vc.rmsOut) : "";
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    GUILayout.Label((a.mute ? "[消] " : a.isPlaying ? "[鳴] " : "[停] ") + a.gameObject.name, GUILayout.Width(190f));
+                    GUILayout.Label(dsp + "   音量 " + a.volume.ToString("F2") + outRms, EditorStyles.miniLabel);
+                    if (GUILayout.Button(a.mute ? "解除" : "消す", EditorStyles.miniButton, GUILayout.Width(44f))) a.mute = !a.mute;
+                }
+            }
+
+            // ── いま効いている模型（切り替えの一覧）──
+            EditorGUILayout.Space(6f);
+            EditorGUILayout.LabelField("模型の切り替え", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField("  DSP 経路 (Y)", demo.useCppDsp ? "C++ VoiceConvolver（タップ補間あり）" : "C# IrConvolver");
+            EditorGUILayout.LabelField("  早期反射 (U)", demo.earlyReflectModel == 1 ? "面の線音源" : "像源をレイで拾う（旧）");
+            EditorGUILayout.LabelField("  直接の半影", demo.directPenumbraMode == 3 ? "走査線＋透過は帯域非依存"
+                : demo.directPenumbraMode == 2 ? "窓の走査線" : demo.directPenumbraMode == 1 ? "環の標本点" : "旧（8 点）");
+            EditorGUILayout.LabelField("  開口の法則", demo.apertureLaw == 2 ? "自由端と枠の弦"
+                : demo.apertureLaw == 1 ? "出ていった物は蓋でない" : "面への射影（既定）");
+            EditorGUILayout.LabelField("  部屋の材質 (L)", demo.occluderMaterial.ToString());
+
+            // ── 部屋（尾の土台）──
+            EditorGUILayout.Space(6f);
+            EditorGUILayout.LabelField("部屋", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField("  実効 V / RT60", AcousticFlowSceneDemo.Status.RoomVolume.ToString("F0") + " m3   "
+                + AcousticFlowSceneDemo.Status.RoomRt60.ToString("F2") + " s   部屋の中である割合 "
+                + AcousticFlowSceneDemo.Status.RoomShare.ToString("F2"));
+            EditorGUILayout.LabelField("  早期↔後期の境", AcousticFlowSceneDemo.Status.MixingTimeMs.ToString("F0") + " ms   "
+                + "尾の比 " + AcousticFlowSceneDemo.Status.ReverbTargetRatio.ToString("F2"));
+            EditorGUILayout.EndScrollView();
         }
 
         // =====================================================================
