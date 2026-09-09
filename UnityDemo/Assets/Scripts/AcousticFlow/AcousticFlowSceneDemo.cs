@@ -1342,7 +1342,16 @@ namespace AcousticFlow
                 a.spatialBlend = 0f;
                 a.mute = _muted;
                 if (useAltClip && altClip != null) a.clip = altClip;
-                if (a.clip == null) continue;
+                // ★"ir_silence" は C# の畳み込み器が「クリップが空のとき」に差し込む無音 1 秒。
+                //   これをクリップ有りとして数えると、**鳴っているのに無音**のまま _audioReady が立ち、
+                //   「音が変わらない」の理由が黙って隠れる（2026-09-09 に実際に踏んだ）。
+                if (a.clip == null || a.clip.name == "ir_silence")
+                {
+                    Debug.LogWarning($"[AcousticFlowScene] 音源 {_sources[i].name} にクリップがありません"
+                                     + $"{(a.clip != null ? "（無音の差し込み ir_silence）" : "")}。"
+                                     + "AudioSource にクリップを差してください（Assets/Audio/ に素材があります）。");
+                    continue;
+                }
                 if (!a.isPlaying) a.Play();
                 playing++;
             }
@@ -1399,36 +1408,38 @@ namespace AcousticFlow
         private IrConvolver _hudIr;       // HUD 表示用（音には使わない）
         private VoiceConvolver _hudVoice; // HUD 表示用（音には使わない）
 
+        // ★音の計算は**音響エンジン（C++）だけ**（2026-09-09 決定）。C# は「音の面の操作」だけを持つ。
+        //   C# 経路（IrConvolver）との A/B は終わり。このレーンのシーンからは C# の畳み込み器を外した。
+        //   ⚠ useCppDsp のフィールドは残す（BellGame レーンが書き込んでいる）。値は常に true。
+        //   ⚠ IrConvolver.cs 自体も残す（同じ理由）。場面に居たら**無効にして黙らせる**だけ。
         private void SetDspPath(bool cpp)
         {
-            useCppDsp = cpp;
-            // ★FindObjectsInactive.Include が要る。切替の相手は**今まさに無効な方**なので、
-            //   既定（Exclude）だと有効な側しか拾えず、一度切ったら戻せなくなる。
+            useCppDsp = true;
+            // ★FindObjectsInactive.Include が要る。無効な側も拾って確実に黙らせるため。
             var irs = FindObjectsByType<IrConvolver>(
                 FindObjectsInactive.Include, FindObjectsSortMode.None);
             var voices = FindObjectsByType<VoiceConvolver>(
                 FindObjectsInactive.Include, FindObjectsSortMode.None);
             int nIr = irs.Length, nVoice = voices.Length;
-            foreach (var c in irs) c.enabled = !cpp;
-            foreach (var c in voices) c.enabled = cpp;
+            foreach (var c in irs) c.enabled = false;
+            foreach (var c in voices) c.enabled = true;
             // HUD で追従の定数を出すのに使う。欄が別のコンポーネントに散っているので、
             //   ここで拾っておく（毎フレーム Find すると重い）。
             _hudIr = (irs.Length > 0) ? irs[0] : null;
             _hudVoice = (voices.Length > 0) ? voices[0] : null;
 
-            if (cpp && nVoice == 0)
+            if (nVoice == 0)
             {
-                // シーンが古い（VoiceConvolver が載っていない）。黙って C# 経路のままにすると
-                // 「切り替えたのに音が変わらない」で悩むので、はっきり言う。
-                useCppDsp = false;
-                foreach (var c in irs) c.enabled = true;
-                Debug.LogWarning("[AcousticFlowScene] VoiceConvolver がシーンにありません。"
-                                 + "C# 経路(IrConvolver)のままです。メニュー "
-                                 + "AcousticFlow > テストシーン生成 でシーンを作り直してください。");
+                // シーンが古い（VoiceConvolver が載っていない）＝**音が出ない**。黙って落とさない。
+                Debug.LogError("[AcousticFlowScene] VoiceConvolver がシーンにありません ── 音の計算をする物が居ません。"
+                               + "メニュー AcousticFlow > Test Scenes でシーンを作り直してください。");
                 return;
             }
-            Debug.Log($"[AcousticFlowScene] DSP 経路: {(useCppDsp ? "C++ (VoiceConvolver)" : "C# (IrConvolver)")}"
-                      + $"  IrConvolver {nIr} / VoiceConvolver {nVoice}");
+            if (nIr > 0)
+                Debug.LogWarning($"[AcousticFlowScene] C# の畳み込み器(IrConvolver)が {nIr} 個ありますが無効にしました。"
+                                 + "音の計算は音響エンジン(C++)だけが行います。シーンから外してください"
+                                 + "（AcousticFlow > Test Scenes で作り直すと外れます）。");
+            Debug.Log($"[AcousticFlowScene] 音の計算: 音響エンジン(C++) / VoiceConvolver {nVoice} 本");
         }
 
         private void HandleMovement()
@@ -1495,7 +1506,7 @@ namespace AcousticFlow
             //   同じタップ束を食わせて鳴らし比べるためのもの。移行が正しければ同じ音が出る。
             //   ★扉の開閉の連続性（タップのパラメータ補間）は C++ 側にしか入っていないので、
             //     「開けた瞬間ガタっと変わる」を聞き分けるときは必ずこちらで確認すること。
-            if (Input.GetKeyDown(KeyCode.Y)) SetDspPath(!useCppDsp);
+            // （Y キーの DSP 経路切替は廃止。音の計算は音響エンジンだけになった）
             // L：部屋の材質（AcousticSurface の無い occluder の既定）を巡る。反射・尾・Sabine の RT60 が一緒に変わる。
             if (Input.GetKeyDown(KeyCode.L)) occluderMaterial = NextRoomPreset(occluderMaterial);
             // U：早期反射の模型を切り替える（1 = 面の線音源 ⇄ 0 = 像源をレイで拾う旧模型）。
@@ -2878,7 +2889,6 @@ namespace AcousticFlow
             GUILayout.Label($"FPS {_fps:F0}   音響 {_acousticMs:F2} ms   "
                             + $"尾 {(tailModel == 1 ? "FDN" : "畳み込み")} (K)   "
                             + $"反射 {(earlyReflectModel == 1 ? "面の線" : "像源")} (U)   "
-                            + $"DSP {(useCppDsp ? "C++" : "C#")} (Y)"
                             + $"   ─ 詳細は AcousticFlow ▸ ツール の「情報」タブ", style);
             GUILayout.EndArea();
         }
@@ -2896,7 +2906,7 @@ namespace AcousticFlow
             if (enableMovement)
                 GUILayout.Label("操作: WASD / 右ドラッグ / QE / Shift / Space:重ね / H:HRTF / G:ステア / R:反響経路 / C:回折候補"
                                 + " / F:早期反射(Rタップ) / U:反射の模型(面の線/像源) / L:部屋の材質"
-                                + " / V:回折二次音源(Fタップ) / Y:DSP経路(C#/C++) / B:クリップ差し替え"
+                                + " / V:回折二次音源(Fタップ) / B:クリップ差し替え"
                                 + " / M:音源ミュート / P:扉の定点 / 1-4:成分ソロ", style);
             GUILayout.Label($"音: {(useAltClip && altClip != null ? $"差し替え ({altClip.name})" : "各音源のクリップ")}"
                             + (_muted ? "  ミュート中 (M)" : ""), style);
@@ -3050,10 +3060,8 @@ namespace AcousticFlow
             GUILayout.Label(useBtmDiffraction
                 ? $"回折の出し方: BTM(検証途上)  開口コントラスト {apertureContrast:F1}"
                 : $"回折の出し方: 前川＋開口積分  開口コントラスト {apertureContrast:F1}", style);
-            // どちらの DSP で鳴っているか。扉の連続性は C++ 側にしか入っていないので必ず出す。
-            GUILayout.Label(useCppDsp
-                ? "DSP 経路: C++ (VoiceConvolver) ─ タップ補間あり (Y)"
-                : "DSP 経路: C# (IrConvolver) ─ タップ補間なし (Y)", style);
+            // 音の計算は音響エンジン（C++）だけ。C# は「音の面の操作」しか持たない（2026-09-09 決定）。
+            GUILayout.Label("音の計算: 音響エンジン (C++ VoiceConvolver)   C# は操作と計器だけ", style);
 
             if (_scene != null && _scene.IsValid)
             {

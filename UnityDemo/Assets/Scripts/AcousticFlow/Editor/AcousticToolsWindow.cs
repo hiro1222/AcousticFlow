@@ -105,17 +105,13 @@ namespace AcousticFlow.EditorTools
                 if (d != demo.hudDetail) { Undo.RecordObject(demo, "hudDetail"); demo.hudDetail = d; EditorUtility.SetDirty(demo); }
                 GUILayout.Label("(ビルドで見るとき用)", EditorStyles.miniLabel);
             }
-            // ★噛み合わせ: tailModel=1（FDN）は **VoiceConvolver（C++ 経路）にしか実装が無い**。
-            //   C# 経路（IrConvolver）に落ちていると、切り替えても何も起きない。
-            if (demo.tailModel == 1 && !demo.useCppDsp)
-                EditorGUILayout.HelpBox("DSP 経路が C#（IrConvolver）です。FDN は C++ の VoiceConvolver にしか無いので、"
-                    + "この組み合わせでは何も起きません。Y キーで C++ に切り替えてください。", MessageType.Error);
-            // ★C# 側にも古い FDN がある（IrConvolver.TailMode.Fdn。RT60 スカラ 1 本・音源ごと・比較用の残置）。
-            //   今回の FDN（部屋ごと・帯域別 RT60・戸口で配線）とは**別物**。名前が似ているので並べて出す。
+            // ★C# の畳み込み器が場面に残っていたら言う（2026-09-09 以降、音の計算は音響エンジンだけ）。
+            //   IrConvolver は名前に反して中に C# の FDN も持っているので、残っていると「どちらの尾か」が濁る。
             var ir = Object.FindFirstObjectByType<IrConvolver>(FindObjectsInactive.Include);
-            EditorGUILayout.LabelField("  C# 側の尾（参考）", ir == null ? "IrConvolver が場面に無い"
-                : "IrConvolver.tailMode = " + ir.tailMode
-                + (demo.useCppDsp ? "（C# 経路のときだけ効く。いまは C++ なので鳴っていない）" : "（いま効いている）"));
+            if (ir != null)
+                EditorGUILayout.HelpBox("C# の畳み込み器(IrConvolver)が場面に残っています（無効にしてあります）。"
+                    + "音の計算は音響エンジン(C++)だけです。AcousticFlow ▸ Test Scenes でシーンを作り直すと外れます。",
+                    MessageType.Warning);
 
             var tb = Object.FindFirstObjectByType<TailBusRenderer>();
             if (!playing)

@@ -853,7 +853,7 @@ namespace AcousticFlow.EditorTools
             var srcs = new Transform[events.Length];
             for (int i = 0; i < events.Length; i++)
                 srcs[i] = AddConvolver(srcPos, i, clipPath,
-                                       name: "IrConvolver_" + events[i]).transform;
+                                       name: "AF_Source_" + events[i]).transform;
 
             var go = new GameObject("AcousticFlowSceneDemo");
             var demo = go.AddComponent<AcousticFlowSceneDemo>();
@@ -892,17 +892,22 @@ namespace AcousticFlow.EditorTools
         // 音源 sourceIndex ぶんの畳み込み器。遅延も到来方向も遮蔽も音源ごとに違うので、
         // 鳴らしたい音源 1 つにつき 1 つ置く。clip を渡さなければ既定の足音を使う。
         //
-        // ★C# 経路(IrConvolver) と C++ 経路(VoiceConvolver) を**両方**載せる。
-        //   同じ AudioSource を共有し、AcousticFlowSceneDemo が片方だけ enabled にする
-        //   （Y キーで切替）。AudioSource を分けないのは、鳴らし比べのときに
-        //   再生位置がズレて「同じ瞬間の音」を比較できなくなるため。
-        private static IrConvolver AddConvolver(Vector3 pos, int sourceIndex = 0,
-                                                string clipPath = null, string name = null)
+        // ★音の計算は**音響エンジン（C++）だけ**が行う（2026-09-09 決定）。
+        //   C# が持つのは「音の面の操作」── 何を鳴らすか（AudioSource のクリップ）、どう切り替えるか、
+        //   計器の読み出し。信号を作る側には触らない。
+        //   それまでは C# 経路(IrConvolver) と C++ 経路(VoiceConvolver) を両方載せて Y キーで切り替えていたが、
+        //   (a) 名前に反して IrConvolver は中に C# の FDN も持っていて「どちらの尾の話か」が判らない
+        //   (b) 無効な側でも IrConvolver.Awake が走って AudioSource（クリップ・loop・spatialBlend）を握る
+        //   (c) 空のクリップに ir_silence（無音）を差し込むので「鳴っているのに無音」が黙って起きる
+        //   ── これらが試聴の妨げになった。C++ 経路の採用が固まったので、こちらのレーンからは外す。
+        //   ⚠ IrConvolver.cs 自体は消していない（BellGame レーンが構造的に使っているため）。
+        private static VoiceConvolver AddConvolver(Vector3 pos, int sourceIndex = 0,
+                                                   string clipPath = null, string name = null)
         {
             // ★球にして**見える**ようにする。音源オブジェクトを兼ねているので、
             //   どこで鳴っているかが目で分かることが要る（見えている物と音の一致が狙い）。
             var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            go.name = name ?? ("IrConvolver_" + sourceIndex);
+            go.name = name ?? ("AF_Source_" + sourceIndex);
             go.transform.position = pos;
             go.transform.localScale = Vector3.one * 0.4f;
             var src = go.AddComponent<AudioSource>();
@@ -910,16 +915,14 @@ namespace AcousticFlow.EditorTools
             if (clip == null) clip = AssetDatabase.LoadAssetAtPath<AudioClip>("Assets/Audio/TokyoGeto.wav");
             if (clip != null) src.clip = clip;
 
-            var conv = go.AddComponent<IrConvolver>();
-            conv.sourceIndex = sourceIndex;
-            conv.tailLevel = 0.3f;                       // 全シーン統一
-            conv.generateTestSignal = (clip == null);    // clipがあれば実音源を畳み込み / 無ければテスト信号
+            if (clip == null)
+                Debug.LogWarning($"[AcousticFlow] 音源のクリップが見つかりません（{clipPath ?? kTestClipPath}）。"
+                                 + "無音のまま生成します ── AudioSource にクリップを差してください。");
 
             var voice = go.AddComponent<VoiceConvolver>();
             voice.sourceIndex = sourceIndex;
-            voice.tailLevel = 0.3f;                      // IrConvolver と揃える（A/B の条件を合わせる）
-            voice.enabled = false;                       // 既定は Demo 側の useCppDsp が決める
-            return conv;
+            voice.tailLevel = 0.3f;                      // 全シーン統一
+            return voice;
         }
 
         private static void Tint(Transform t, Color c)
