@@ -1,0 +1,120 @@
+# 新コアの地図（段 0）── どのファイルが何をして、どの順に呼ばれるか
+
+2026-09-10。`docs/SOUND_SYSTEM_DESIGN.md`（ピラーからの全体整理）を実装に落とすための一枚。
+**実装は私、ファイルごとに「役割・仕組み・繋がり・退けた書き方・壊れる所」を付けて出す。**この地図はその目次。
+
+---
+
+## 1. 設計文書 Ⅵ の図に、ファイルを重ねる
+
+```
+音源 emitter.h（幅を持つ点・優先度・変化量）           リスナー emitter.h
+ │
+ ├─ 予算 budget.h（総レイ数は固定。操作対象 > 距離 > 音量 > 変化量 で配る）
+ │
+ ├─ レイトレース energy_trace.h（BVH。面で 反射/透過/吸収 に分配。リスナーへ次イベント推定で集計）
+ │   └→ 帯域別エネルギーの総量と内訳
+ │       ├→ 直接音   ── ★解析 aperture.h（扉の開口は走査線積分。レイに頼らない）
+ │       ├→ 回折音   ── 前川式 diffraction.h（遮られた直接音の代わり。既存 maekawa.h）
+ │       ├→ 透過音   ── レイ
+ │       ├→ 反射音（初期）── レイの総量を ISM の方向へ配る ─┐
+ │       └→ 反射音（後期）── レイの総量を FDN へ送る ───────┤
+ │                                                        │
+ └─ ISM image_sources.h（BVH で検証。方向と正規化重みだけ。量は持たない）
+                                                          │
+   配分 distribute.h ── 総量 × 重み → 五成分 × 六帯域 × 方向 → mix.h
+   速度 response.h ── 鮮明さ五要素の追従の表（量は毎フレーム、形 26〜54 ms、…）
+                                                          ↓
+   DSP（残す）voice_renderer.h ← mix を受ける入口を 1 つ足す
+     ├→ 方向バス direction_bus.h → ASW
+     └→ 部屋ごとの FDN fdn_room_mix.h + fdn_tail.h → LEV
+          ↑ プローブ probe.h（帯域別 RT60・体積・表面積。部屋グラフ room_graph.h が生成）
+          ↑ 世界の決まり world_rules.h（材質の表 ＋ 配分への重み一組）
+                                                          ↓
+                                                       リスナー
+```
+
+束ねるのは `world.h`（更新の 1 サイクル）と `flow_api.h`（C API、`AF_World*`）。
+
+---
+
+## 2. ファイルの表（音が流れる順）
+
+置き場所は `AcousticEngine/src/Flow/`。旧コア（`Core/scene.h`）とは別の階層に置き、採用が固まるまで並走させる。
+
+| # | ファイル | 役割（一行） | 受ける | 出す | その段だけの検査 |
+|---|---|---|---|---|---|
+| 1 | `world_rules.h` | 世界の決まり。材質の表（帯域別 吸音・透過・散乱）と、配分への世界ごとの重み一組 | 設定 | 表 | 既定の世界で重みが全部 1 |
+| 2 | `probe.h` | プローブの形式。帯域別 RT60・体積・表面積・平均自由行程。部屋グラフから自動生成、手で上書き可 | `room_graph.h` | 部屋ごとの値 | 生成値が旧 Sabine と一致 |
+| 3 | `emitter.h` | 音源（位置・幅・優先度・前フレームからの変化量）とリスナー（位置・向き） | ホスト | 状態 | 変化量が静止で 0 |
+| 4 | `budget.h` | 予算。総レイ数固定。優先度（操作対象 > 距離 > 音量 > 変化量）で音源に配り、フレームに分散 | emitter | 音源ごとの今フレームのレイ数 | 合計が予算に一致、操作対象が最大 |
+| 5 | `energy_trace.h` | レイトレース。音源から出て面で 反射/透過/吸収 に分かれ、各当たり点からリスナーへ次イベント推定で集計。到達時刻で初期/後期に分ける | BVH・材質・予算 | 帯域別の 総量と内訳（初期・後期・透過） | **保存則**（集計＋吸収＝放射）。閉じた箱で反射の定常値が Sabine と一致 |
+| 6 | `aperture.h` | 扉の開口の解析。幅を持つ音源が開口（扉板・枠）を通る割合を走査線積分で。開口率も出す | 幾何・扉の角度 | 直接音の通る割合、開口率 | 扉を回して**単調・連続**。Monte Carlo の揺れが 0 |
+| 7 | `diffraction.h` | 前川式。直接音が遮られた分に、最寄りの稜線からの減衰（帯域別のフレネル数）を掛ける。方向は稜線の点 | 幾何・aperture | 回折の帯域別ゲインと方向 | 前川の図表と一致（N=1 で約 13 dB） |
+| 8 | `image_sources.h` | ISM。次数 2〜3 の虚像を BVH で検証。**方向と正規化重みだけ**（距離 → 距離＋累積反射率） | 幾何・材質 | 虚像の並び（方向・遅延・重み） | 鏡像の位置が幾何と一致。重みの和が 1 |
+| 9 | `response.h` | 速度の表。鮮明さ五要素と尾の追従の時定数を一か所に。デザイナが触る場所 | 設定 | 時定数 | 表の既定値が設計文書 追記 C と一致 |
+| 10 | `distribute.h` | **配分の心臓。**総量を五成分に配り、初期を ISM の方向へ、後期を FDN の送りへ。直接は aperture の解析値で置き換え、回折を足し、世界の重みを掛け、response の速度で追従させる | 5〜9 | `mix.h` | **五成分の和が総量**。歩行の連続性（静止で揺れない） |
+| 11 | `mix.h` | 配分の結果の形式。タップ（遅延・帯域ゲイン・方向・種別）の並び ＋ FDN の送り ＋ 尾の開始 | distribute | DSP へ | 形式だけ。検査なし |
+| 12 | `world.h` | 更新の 1 サイクルを束ねる。非同期は旧 `scene_async.h` の形を流用 | 1〜11 | 音源ごとの mix | 同期と非同期でビット一致 |
+| 13 | `flow_api.h` / `.cpp` | C API。`AF_World*`（作る・形を足す・材質・音源・リスナー・更新・mix を取る） | world | ホスト | 呼び出しの往復 |
+| 14 | `voice_renderer.h`（残す） | DSP。`setMix` を 1 つ足す。畳み込みの尾は採用後に消す | mix | 音 | 既存 150 件 ＋ **出力エネルギーが配分と一致** |
+| 15 | Unity `AcousticWorld.cs` / `WorldVoice.cs` | 薄い層。bindings と、AudioSource → `AF_Voice` の橋。AF ツール情報タブに繋ぐ | | | C# 型検査 |
+| 16 | `AcousticEngineTest/flow_regression.cpp` + `test_instruments.h` | 新コアの検査。物差し（帯域分割・T60 の当て・歩行の揺れ・正弦の段差）は旧 `scene_regression.cpp` から抜き出す | | | |
+
+---
+
+## 3. 出す順（段）と、各段で聞ける物
+
+「まず全体を通してから要所を調整」。最小の一周を先に鳴らし、扉・回折・ISM を一つずつ足す。
+
+| 段 | 出す物 | 検査 | 聞ける物 |
+|---|---|---|---|
+| 0 | この地図、設計文書 | | |
+| 1 | 形式: `world_rules` `probe` `emitter` `mix` `test_instruments` | プローブ＝旧 Sabine | |
+| 2 | `energy_trace` | 保存則、Sabine の定常 | |
+| 3 | `distribute`（最小: 直接・初期・後期・透過。回折 0、初期は方向なし）＋ `response` | 和＝総量、歩行の連続性 | |
+| 4 | `world` `flow_api` `voice_renderer.setMix` Unity 薄い層 | 往復、出力＝配分 | **試聴 1**: 部屋の中を歩く（扉なし） |
+| 5 | `aperture` | 単調・連続・揺れ 0 | **試聴 2**: 扉を開ける。立ち上がり |
+| 6 | `diffraction` | 前川の図表 | **試聴 3**: 扉の陰 |
+| 7 | `image_sources` | 鏡像・重みの和 | **試聴 4**: ASW、向こうの部屋の初期反射 |
+| 8 | `budget` | 合計＝予算 | **試聴 5**: 多音源 |
+| 9 | `response` の値の調整 | | **試聴 6**: 鮮明さ五要素の速度 |
+| 10 | 採用 → 旧コアを削除（下の一覧） | 全検査 | |
+
+各段は **1〜3 ファイル ＋ 落ちる検査 ＋ 解説（5 項目）** で 1 コミット。
+
+---
+
+## 4. 残す物と、その理由
+
+| 残す | 行 | 理由 |
+|---|---|---|
+| `Dsp/fdn_tail.h` `fdn_room_mix.h` `direction_bus.h` `voice_renderer.h` `hrtf_set.h` `fft.h` | 2,300 | 音の出口。150 件で検証済み。入口を 1 つ足すだけ |
+| `Core/room_graph.h` | 1,481 | プローブ値の生成器 |
+| `Core/bvh.h` `mesh_geom.h` `aabb.h` `triangle.h` `ray.h` `vec3.h` | 900 | 幾何 |
+| `Core/material.h/.cpp` | 210 | 世界ルールの材質（プリセット込み） |
+| `Core/maekawa.h` | 97 | 前川式そのもの |
+| `Core/scene_async.h` `worker_pool.h` | 430 | 非同期の形。型を流用 |
+| `Core/aperture_fresnel.h` | 139 | 開口の帯域依存。`aperture.h` から使う |
+| 検査の物差し（`scene_regression.cpp` の中の 帯域分割・T60・歩行・正弦） | | `test_instruments.h` へ抜き出す。**期待値は捨てる** |
+| Unity `TailBusRenderer.cs` `AudioMonitor.cs` `HrtfSet.cs` AF ツール | | 「C# は操作だけ」に揃え済み |
+
+## 5. 採用が固まったら消す物（段 10）
+
+`Core/scene.h`（8,356）・`tap_builder.h`・`btm.h`・`utd.h`・`kirchhoff.h`・`Export/scene_api.cpp`・`include/acoustic_scene.h`・
+`Dsp/early_reflect_conv.h` `nonuniform_convolver.h` `partitioned_convolver.h` `reverb_tail_ir.h` `tail_bus.h` `hrtf_processor.h`（畳み込みの尾）・
+`AcousticEngineTest/scene_regression.cpp`（14,511）・`btm_regression.cpp`・Unity `AcousticFlowSceneDemo.cs` `VoiceConvolver.cs` `AcousticScene.cs` ほか旧 API の bindings。
+
+BTM と UTD は前川式で置き換わる。旧実装の BTM はタップ組みに整合していた（設計文書 追記 H）。
+
+---
+
+## 6. このコアの中で守る決めごと
+
+1. **答えは 1 つ。**同じ量を 2 か所で出さない（尾の形は probe、扉越しの量は distribute、と場所を決める）
+2. **扉の開口は解析、統計はレイ。**扉に関わる量に Monte Carlo を通さない
+3. **五成分の和は総量。**distribute の出口で必ず検査する（旧実装の 15.7 dB の穴はこれで塞がる）
+4. **行動していないときは揺れない。**歩行の連続性を段 3 から常に測る
+5. **速度は一か所。**時定数は `response.h` にしか書かない
+6. **文字列は ASCII、コメントは日本語、検査は落ちる形で。**旧コアと同じ
+7. **書き直せる大きさ。**1 ファイル 300 行を目安。超えたら割る
