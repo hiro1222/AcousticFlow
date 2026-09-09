@@ -98,6 +98,13 @@ namespace AcousticFlow.EditorTools
                 if (next != now) { Undo.RecordObject(demo, "tailModel"); demo.tailModel = next; EditorUtility.SetDirty(demo); }
                 GUILayout.Label("(K キーでも切替)", EditorStyles.miniLabel);
             }
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUILayout.Label("画面の HUD", GUILayout.Width(60f));
+                bool d = GUILayout.Toggle(demo.hudDetail, "一覧も画面に出す（既定 OFF＝2 行）", "Button", GUILayout.Width(260f));
+                if (d != demo.hudDetail) { Undo.RecordObject(demo, "hudDetail"); demo.hudDetail = d; EditorUtility.SetDirty(demo); }
+                GUILayout.Label("(ビルドで見るとき用)", EditorStyles.miniLabel);
+            }
             var tb = Object.FindFirstObjectByType<TailBusRenderer>();
             if (!playing)
             {
@@ -149,27 +156,16 @@ namespace AcousticFlow.EditorTools
                 }
             }
 
-            // ── いま効いている模型（切り替えの一覧）──
+            // ── 診断の一覧 ──
+            //   ★画面の HUD と**同じ関数**を呼ぶ（AcousticFlowSceneDemo.DrawDiagnosticsGui）。
+            //     ここで書き写すと、片方だけ直して食い違う。窓は伸びるので、全部ここで見られる。
             EditorGUILayout.Space(6f);
-            EditorGUILayout.LabelField("模型の切り替え", EditorStyles.boldLabel);
-            EditorGUILayout.LabelField("  DSP 経路 (Y)", demo.useCppDsp ? "C++ VoiceConvolver（タップ補間あり）" : "C# IrConvolver");
-            EditorGUILayout.LabelField("  早期反射 (U)", demo.earlyReflectModel == 1 ? "面の線音源" : "像源をレイで拾う（旧）");
-            EditorGUILayout.LabelField("  直接の半影", demo.directPenumbraMode == 3 ? "走査線＋透過は帯域非依存"
-                : demo.directPenumbraMode == 2 ? "窓の走査線" : demo.directPenumbraMode == 1 ? "環の標本点" : "旧（8 点）");
-            EditorGUILayout.LabelField("  開口の法則", demo.apertureLaw == 2 ? "自由端と枠の弦"
-                : demo.apertureLaw == 1 ? "出ていった物は蓋でない" : "面への射影（既定）");
-            EditorGUILayout.LabelField("  部屋の材質 (L)", demo.occluderMaterial.ToString());
-
-            // ── 部屋（尾の土台）──
-            EditorGUILayout.Space(6f);
-            EditorGUILayout.LabelField("部屋", EditorStyles.boldLabel);
-            EditorGUILayout.LabelField("  実効 V / RT60", AcousticFlowSceneDemo.Status.RoomVolume.ToString("F0") + " m3   "
-                + AcousticFlowSceneDemo.Status.RoomRt60.ToString("F2") + " s   部屋の中である割合 "
-                + AcousticFlowSceneDemo.Status.RoomShare.ToString("F2"));
-            EditorGUILayout.LabelField("  早期↔後期の境", AcousticFlowSceneDemo.Status.MixingTimeMs.ToString("F0") + " ms   "
-                + "尾の比 " + AcousticFlowSceneDemo.Status.ReverbTargetRatio.ToString("F2"));
+            EditorGUILayout.LabelField("診断（画面の HUD と同じ中身）", EditorStyles.boldLabel);
+            if (_diagStyle == null) _diagStyle = new GUIStyle(GUI.skin.label) { fontSize = 12, wordWrap = true };
+            demo.DrawDiagnosticsGui(_diagStyle);
             EditorGUILayout.EndScrollView();
         }
+        private GUIStyle _diagStyle;
 
         // =====================================================================
         // 履歴タブ（道具2）

@@ -357,6 +357,10 @@ namespace AcousticFlow
                  + "同じビルドで聞き比べるための切り替え（Play 中に動かしてよい。K キー）。量は同じ規約（tailGain）で揃えてある。"
                  + "採用が固まったら畳み込み側を消す。")]
         [Range(0, 1)] public int tailModel = 0;
+        [Tooltip("画面の HUD に診断の一覧を全部出す。既定 OFF ＝ 2 行だけ（画面を塞がない）。\n\n"
+                 + "詳細は AcousticFlow ▸ ツール の「情報」タブが**同じ関数**（DrawDiagnosticsGui）で描くので、"
+                 + "エディタで見るならこちらは OFF のままでよい。ビルドした実行ファイルで一覧を見たいときに ON。")]
+        public bool hudDetail = false;
         [Tooltip("直接経路の半影の作り方。\n"
                  + "3 = 走査線 ＋ 透過の重みを帯域に依らせない（2026-09-08 既定。閉じた扉が材質どおりこもる）\n"
                  + "2 = 窓の走査線積分（09-05。戸口の扉だと低域の帯が周りの壁を拾って明るくなる）\n"
@@ -2844,10 +2848,34 @@ namespace AcousticFlow
             if (!showHud) return;
 
             var style = new GUIStyle(GUI.skin.label) { fontSize = 13 };
-            // ★箱は画面なりに伸ばす。480x300 で固定していたときは、下に足した行から順に**黙って切れて**いた
-            //   （尾の切り替えの行を足しても表示が変わらず「効いていない」と読めた。2026-09-09）。
-            //   ここは切り分け用の一覧なので、確かめる物はできるだけ AF ツールの「情報」タブで見ること。
-            GUILayout.BeginArea(new Rect(10, 10, 560, Mathf.Max(300f, Screen.height - 20f)), GUI.skin.box);
+            // ★画面に出すのは「動きながら見る物」だけ（2026-09-09）。
+            //   それまでは 20 行以上を 480x300 の箱に詰めていて、(a) 画面を大きく塞ぎ、
+            //   (b) 箱に入り切らない行は**何も言わずに描かれなかった**（尾の切り替えの行が常に箱の外で、
+            //   「K が効いていない」と読めた）。詳細は AF ツールの「情報」タブが**同じ関数**で描く
+            //   ── DrawDiagnosticsGui を窓と HUD で共用する（決めごと: 答えは 1 つ）。
+            if (hudDetail)
+            {
+                GUILayout.BeginArea(new Rect(10, 10, 560, Mathf.Max(300f, Screen.height - 20f)), GUI.skin.box);
+                DrawDiagnosticsGui(style);
+                GUILayout.EndArea();
+                return;
+            }
+            GUILayout.BeginArea(new Rect(10, 10, 560, 78f), GUI.skin.box);
+            GUILayout.Label($"[新コア Scene] {_status}", style);
+            DrawAudioHealth(style);
+            GUILayout.Label($"FPS {_fps:F0}   音響 {_acousticMs:F2} ms   "
+                            + $"尾 {(tailModel == 1 ? "FDN" : "畳み込み")} (K)   "
+                            + $"反射 {(earlyReflectModel == 1 ? "面の線" : "像源")} (U)   "
+                            + $"DSP {(useCppDsp ? "C++" : "C#")} (Y)"
+                            + $"   ─ 詳細は AcousticFlow ▸ ツール の「情報」タブ", style);
+            GUILayout.EndArea();
+        }
+
+        /// 診断の一覧。**AF ツールの「情報」タブと画面の HUD（hudDetail）が同じ物を描く。**
+        ///   ★GUILayout だけで書くこと。UnityEditor の型を使うと実行時アセンブリが壊れる。
+        ///   ★呼び手が BeginArea / スクロールを用意する（ここは中身だけ）。
+        public void DrawDiagnosticsGui(GUIStyle style)
+        {
             GUILayout.Label($"[新コア Scene] {_status}", style);
             GUILayout.Label($"FPS: {_fps:F0}    音響計算: {_acousticMs:F2} ms/frame    " +
                             $"空間化: {(useHrtf ? "HRTF" : "パン")} (H)    " +
@@ -2889,10 +2917,12 @@ namespace AcousticFlow
                 GUILayout.Label($"部屋の材質(L): {occluderMaterial}" + (_roomRt60 != null
                     ? $"   Sabine RT60 125/500/4k = {_roomRt60[0]:F2}/{_roomRt60[2]:F2}/{_roomRt60[5]:F2} s" : ""), style);
                 // 部屋（幾何から自動検出）。部屋番号は表示だけで、音は割合で混ぜている。
-                if (_scene != null)
                 {
-                    int nr = _scene.RoomCount;
-                    if (nr > 0)
+                    // ★行は必ず 1 本。部屋の数は DLL 側（ワーカーが publish する）ので、
+                    //   Layout と Repaint の間で 0 ↔ N と変わりうる。出し分けるのは文字列だけ。
+                    int nr = (_scene != null) ? _scene.RoomCount : 0;
+                    string roomLine;
+                    if (nr > 0 && listener != null)
                     {
                         if (_roomIdsUi == null) { _roomIdsUi = new int[4]; _roomWUi = new float[4]; }
                         int n = _scene.GetRoomWeights(listener.position, roomBlendRadius,
@@ -2901,10 +2931,11 @@ namespace AcousticFlow
                         for (int i = 0; i < n && i < 3; i++)
                             mix += $"{(i > 0 ? " + " : "")}部屋{_roomIdsUi[i]} {_roomWUi[i] * 100f:F0}%";
                         if (n == 0) mix = "部屋の外";
-                        GUILayout.Label(
-                            $"部屋: {nr}個 / 開口 {_scene.ApertureCount}箇所   居場所 = {mix}   " +
-                            $"実効 V {Status.RoomVolume:F0}m3  RT60 {Status.RoomRt60:F2}s", style);
+                        roomLine = $"部屋: {nr}個 / 開口 {_scene.ApertureCount}箇所   居場所 = {mix}   "
+                                 + $"実効 V {Status.RoomVolume:F0}m3  RT60 {Status.RoomRt60:F2}s";
                     }
+                    else roomLine = "部屋: まだ検出されていません（囲われていない／場面が未初期化）";
+                    GUILayout.Label(roomLine, style);
                 }
             }
 
@@ -2942,8 +2973,7 @@ namespace AcousticFlow
             }
             {
                 var tb = _portalHost != null ? _portalHost : FindFirstObjectByType<TailBusRenderer>();
-                if (tb != null)
-                    GUILayout.Label($"方向バス: {(tb.enableDirectionBus && tb.DirectionBusHandle != System.IntPtr.Zero ? $"{tb.directionLanes} 方向 × 2 耳（RMS {20f * Mathf.Log10(Mathf.Max(tb.DirectionBusRms, 1e-6f)):F1} dB）" : "OFF（タップごとの両耳化）")}", style);
+                GUILayout.Label($"方向バス: {(tb == null ? "まだ生えていません" : tb.enableDirectionBus && tb.DirectionBusHandle != System.IntPtr.Zero ? $"{tb.directionLanes} 方向 × 2 耳（RMS {20f * Mathf.Log10(Mathf.Max(tb.DirectionBusRms, 1e-6f)):F1} dB）" : "OFF（タップごとの両耳化）")}", style);
                 // 後期の尾の作り方（docs/TAIL_FDN_PLAN.md 手順 4 の切り替え）。
                 string fdnInfo = "";
                 if (tailModel == 1 && tb != null && tb.FdnMixHandle != System.IntPtr.Zero)
@@ -2990,6 +3020,7 @@ namespace AcousticFlow
                                     style);
 
             // ポータルの開き具合。主音源に対して測って出す（見て分かるように）。
+            // ★ここも行数を固定する（ポータルは実行時に自動生成されるので数が動く）。
             if (_portals.Count > 0 && _scene != null && _scene.IsValid)
             {
                 var p0 = _portals[0];
@@ -3017,7 +3048,6 @@ namespace AcousticFlow
                 GUILayout.Label(BandLine("主音源 透過", _bands), style);
                 GUILayout.Label(BandLine("主音源 回折", _diffBands), style);
             }
-            GUILayout.EndArea();
         }
 
         // 【ぷつぷつの切り分け】音が飛ぶとき、原因は 3 つのどれか。1 行で見分けられるようにする。
@@ -3058,10 +3088,13 @@ namespace AcousticFlow
             GUILayout.Label(
                 $"音声スレッド: 負荷 {load:F0}%（音源 {voices} 本 計 {total:F2} ms / バッファ {blockMs:F1} ms）"
                 + $"   波形の段差 {now:F2} ÷ 平常 {calm:F2} ＝ {times:F1} 倍   跳ね {_spikeRate}/秒", style);
-            if (load >= 85f)
-                GUILayout.Label("  ⚠ 負荷が高い。ぷつぷつはドロップアウトの可能性（段の予算・音源数を下げる）", style);
-            else if (_spikeRate > 0)
-                GUILayout.Label("  ⚠ 波形が切れている（負荷ではない）。差し替えの継ぎ目を疑う", style);
+            // ★行は必ず 1 本出す（中身だけ変える）。負荷も跳ねも Layout と Repaint の間で動くので、
+            //   出し分けるとコントロールの数が変わって IMGUI が例外を投げ、以降が描かれなくなる。
+            GUILayout.Label(load >= 85f
+                ? "  ⚠ 負荷が高い。ぷつぷつはドロップアウトの可能性（段の予算・音源数を下げる）"
+                : _spikeRate > 0
+                ? "  ⚠ 波形が切れている（負荷ではない）。差し替えの継ぎ目を疑う"
+                : "  （負荷・段差ともに平常）", style);
         }
 
         private static string BandLine(string label, float[] g)
