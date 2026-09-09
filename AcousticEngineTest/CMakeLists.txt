@@ -55,3 +55,8 @@ target_link_libraries(AfCapScan PRIVATE AcousticEngine)
 #   「IR が畳み込みまで持っているから CPU が厳しい」を数字で確かめるための道具（2026-09-03）。
 add_executable(AfDspBench dsp_bench.cpp)
 target_link_libraries(AfDspBench PRIVATE AcousticEngine)
+
+# Flow (new core, 2026-09-10) regression. Header-only + material.cpp; no DLL dependency yet.
+add_executable(FlowRegressionTest flow_regression.cpp ../AcousticEngine/src/Core/material.cpp)
+target_include_directories(FlowRegressionTest PRIVATE ${CMAKE_SOURCE_DIR}/AcousticEngine/src)
+target_compile_features(FlowRegressionTest PRIVATE cxx_std_17)

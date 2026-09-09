@@ -1,0 +1,241 @@
+/* AcousticEngineTest/flow_regression.cpp ── 新コアの検査（段 1: 形式）
+ *
+ * 期待値は「絶対値」でなく「関係」で書く（保存則、単調、一致、静止で 0）。
+ * 段が進むごとにここへ足す。AF_ONLY=<name> で 1 つだけ走らせられる。
+ */
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include "test_instruments.h"
+#include "../AcousticEngine/src/Core/aabb.h"
+#include "../AcousticEngine/src/Core/room_graph.h"
+#include "../AcousticEngine/src/Flow/world_rules.h"
+#include "../AcousticEngine/src/Flow/probe.h"
+#include "../AcousticEngine/src/Flow/emitter.h"
+#include "../AcousticEngine/src/Flow/mix.h"
+
+using namespace acoustic;
+using namespace acoustic::flow;
+using afti::check;
+
+namespace {
+
+// 14 m 角・高さ 3 m の箱を z=0 の壁で 2 部屋に割り、幅 1 m の戸口を開ける（旧テストと同じ形）。
+//   扉の板は入れない（動く物は部屋グラフから外す決まり）。
+std::vector<rooms::SolidBox> twoRoomsWithDoor(const AcousticMaterial& mat) {
+    const float t = 0.2f, h = 3.0f, half = 7.0f, doorW = 1.0f;
+    std::vector<rooms::SolidBox> v;
+    auto add = [&](Vec3 c, Vec3 he) {
+        rooms::SolidBox sb; sb.obb = Obb::axisAligned(c, he);
+        for (int b = 0; b < kNumBands; ++b) sb.absorption[b] = mat.absorption[b];
+        v.push_back(sb);
+    };
+    add(Vec3(0, -t, 0), Vec3(half + t, t, half + t));
+    add(Vec3(0, h + t, 0), Vec3(half + t, t, half + t));
+    add(Vec3(-half - t, h * 0.5f, 0), Vec3(t, h * 0.5f, half + t));
+    add(Vec3(half + t, h * 0.5f, 0), Vec3(t, h * 0.5f, half + t));
+    add(Vec3(0, h * 0.5f, -half - t), Vec3(half + t, h * 0.5f, t));
+    add(Vec3(0, h * 0.5f, half + t), Vec3(half + t, h * 0.5f, t));
+    const float side = (2.0f * half - doorW) * 0.5f;
+    add(Vec3(-(doorW * 0.5f + side * 0.5f), h * 0.5f, 0), Vec3(side * 0.5f, h * 0.5f, t));
+    add(Vec3((doorW * 0.5f + side * 0.5f), h * 0.5f, 0), Vec3(side * 0.5f, h * 0.5f, t));
+    return v;
+}
+
+// ================================ [決まり] world_rules
+void testWorldRules() {
+    std::printf("\n[決まり] 帯域表・世界の重み・面の分配\n");
+    float worst = 0.0f;
+    for (int c = 0; c < kNumBands - 1; ++c) {
+        const float gm = std::sqrt(kBandHz[c] * kBandHz[c + 1]);
+        worst = std::max(worst, std::fabs(kCrossHz[c] - gm) / gm);
+    }
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "(相乗平均とのずれ 最大 %.4f%%)", worst * 100.0f);
+    check("[決まり] 帯域の境目が隣り合う中心の相乗平均", worst < 1e-3f, buf);
+    float sum = 0.0f; for (int b = 0; b < kNumBands; ++b) sum += bandWidthHz(b, 48000.0f);
+    std::snprintf(buf, sizeof(buf), "(幅の和 %.1f Hz)", sum);
+    check("[決まり] 帯域の幅の和が fs/2", std::fabs(sum - 24000.0f) < 0.5f, buf);
+    WorldWeights w;
+    check("[決まり] 既定の世界の重みは全部 1", w.isIdentity());
+    MaterialTable tbl;
+    const int id = tbl.add(AcousticMaterial::woodDoor());
+    bool ok = true;
+    for (int b = 0; b < kNumBands; ++b) {
+        const SurfaceSplit s = splitAt(tbl.get(id), b);
+        if (std::fabs(s.reflect + s.transmit + s.absorb - 1.0f) > 1e-6f || s.reflect < 0.0f) ok = false;
+    }
+    check("[決まり] 面の分配（反射+透過+吸収）の和が 1、反射は負にならない", ok);
+    AcousticMaterial bad = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { bad.absorption[b] = 0.8f; bad.transmission[b] = 0.5f; }
+    const SurfaceSplit s = splitAt(bad, 0);
+    std::snprintf(buf, sizeof(buf), "(α 0.8 + τ 0.5 → 反射 %.2f 透過 %.2f)", s.reflect, s.transmit);
+    check("[決まり] α+τ>1 の材質でも反射が負にならない（τ を頭打ち）", s.reflect >= 0.0f && std::fabs(s.reflect + s.transmit + s.absorb - 1.0f) < 1e-6f, buf);
+    check("[決まり] 材質 0 番は既定の壁（無効な番号も 0 番に落ちる）", tbl.get(-1).absorption[0] == AcousticMaterial::defaultWall().absorption[0]);
+}
+
+// ================================ [プローブ] probe
+void testProbe() {
+    std::printf("\n[プローブ] 部屋グラフからの生成・開口の板・Sabine の一致\n");
+    rooms::Builder builder;
+    const auto boxes = twoRoomsWithDoor(AcousticMaterial::defaultWall());
+    const rooms::Result& res = builder.build(boxes);
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "(部屋 %d 個、開口 %d 箇所)", static_cast<int>(res.rooms.size()), static_cast<int>(res.apertures.size()));
+    check("[プローブ] 戸口で割った箱は部屋 2 個・開口 1 箇所", res.rooms.size() == 2 && res.apertures.size() == 1, buf);
+    if (res.rooms.size() != 2 || res.apertures.size() != 1) return;
+
+    // 1) 全開（穴）のプローブは部屋グラフの Sabine と一致する（式が 1 つであることの証明）。
+    float worst = 0.0f;
+    for (std::size_t r = 0; r < res.rooms.size(); ++r) {
+        const Probe p = probeFromRoom(res.rooms[r], res.grid.cell);
+        for (int b = 0; b < kNumBands; ++b)
+            worst = std::max(worst, std::fabs(p.rt60[b] - res.rooms[r].rt60[b]) / std::max(res.rooms[r].rt60[b], 1e-6f));
+    }
+    std::snprintf(buf, sizeof(buf), "(相対のずれ 最大 %.5f)", worst);
+    check("[プローブ] 全開のプローブの RT60 が部屋グラフの Sabine と一致（Sabine は 1 か所）", worst < 1e-4f, buf);
+
+    // 2) 開口の板: a=1 で不変、a=0（木の扉）で伸びる、a に対して単調。
+    const rooms::Aperture& ap = res.apertures[0];
+    const AcousticMaterial leaf = AcousticMaterial::woodDoor();
+    auto rt500 = [&](int room, float a) {
+        Probe p = probeFromRoom(res.rooms[static_cast<std::size_t>(room)], res.grid.cell);
+        OpeningState o; o.room = room; o.area = ap.area; o.openFrac = a;
+        for (int b = 0; b < kNumBands; ++b) o.leafAbsorb[b] = std::min(1.0f, leaf.absorption[b] + leaf.transmission[b]);
+        applyOpenings(p, room, &o, 1);
+        return p.rt60[2];
+    };
+    const int rA = ap.roomA, rB = ap.roomB;
+    const float openA = rt500(rA, 1.0f), closedA = rt500(rA, 0.0f);
+    const float openB = rt500(rB, 1.0f), closedB = rt500(rB, 0.0f);
+    const float baseA = probeFromRoom(res.rooms[static_cast<std::size_t>(rA)], res.grid.cell).rt60[2];
+    std::snprintf(buf, sizeof(buf), "(部屋%d 500Hz: 全開 %.3f s → 閉 %.3f s、部屋%d: %.3f → %.3f s)", rA, openA, closedA, rB, openB, closedB);
+    check("[プローブ] 全開の板は RT60 を変えない", std::fabs(openA - baseA) < 1e-6f, buf);
+    check("[プローブ] 扉を閉めると両部屋の RT60 が伸びる（開口が板になる）", closedA > openA && closedB > openB, buf);
+    bool mono = true; float prev = -1.0f;
+    for (int k = 0; k <= 10; ++k) { const float v = rt500(rA, 1.0f - 0.1f * k); if (prev > 0.0f && v < prev - 1e-6f) mono = false; prev = v; }
+    check("[プローブ] 閉めるほど RT60 が単調に伸びる（0.1 刻み）", mono);
+
+    // 3) 手で上書きしたプローブには触らない。
+    Probe over = probeFromRoom(res.rooms[static_cast<std::size_t>(rA)], res.grid.cell);
+    over.overridden = true; over.rt60[2] = 9.0f;
+    OpeningState o; o.room = rA; o.area = ap.area; o.openFrac = 0.0f;
+    applyOpenings(over, rA, &o, 1);
+    check("[プローブ] 上書きされたプローブは開口の板で変わらない", over.rt60[2] == 9.0f);
+
+    // 4) 線の尺度: 14 m の半分（7 m × 14 m × 3 m）で 1 を超え、上限 4 以内。
+    const Probe pa = probeFromRoom(res.rooms[static_cast<std::size_t>(rA)], res.grid.cell);
+    std::snprintf(buf, sizeof(buf), "(平均自由行程 %.2f m、lineScale %.2f、体積 %.0f m3)", pa.meanFreePath, fdnLineScale(pa), pa.volume);
+    check("[プローブ] 7×14×3 m の部屋の線の尺度が 0.25〜4 の中", fdnLineScale(pa) > 0.25f && fdnLineScale(pa) < 4.0f, buf);
+}
+
+// ================================ [音源] emitter
+void testEmitter() {
+    std::printf("\n[音源] リスナー座標・変化量・見込み角\n");
+    Listener L; L.pos = Vec3(0, 1.6f, 0); L.forward = Vec3(0, 0, 1); L.up = Vec3(0, 1, 0);
+    const Vec3 r = L.toLocal(Vec3(1, 0, 0)), f = L.toLocal(Vec3(0, 0, 1));
+    check("[音源] 正面向きで world +x は右（local +x）", std::fabs(r.x - 1.0f) < 1e-5f && std::fabs(r.z) < 1e-5f);
+    check("[音源] 正面向きで world +z は前（local +z）", std::fabs(f.z - 1.0f) < 1e-5f && std::fabs(f.x) < 1e-5f);
+    L.forward = Vec3(1, 0, 0);
+    const Vec3 r2 = L.toLocal(Vec3(0, 0, -1));
+    check("[音源] +x を向くと world −z が右（左手系の規約）", std::fabs(r2.x - 1.0f) < 1e-5f);
+    L.forward = Vec3(0.6f, 0, 0.8f); L.up = Vec3(0, 3, 0);      // 正規化していない入力
+    const Vec3 rr = L.toLocal(Vec3(0.8f, 0, -0.6f));
+    check("[音源] forward/up が正規化されていなくても右が単位", std::fabs(rr.x - 1.0f) < 1e-4f);
+
+    Emitter e; e.id = 0; e.pos = Vec3(3, 1, 4); e.prevPos = e.pos;
+    e.beginFrame(1.0f / 60.0f);
+    check("[音源] 静止で変化量が 0", e.change == 0.0f);
+    e.pos = Vec3(3, 1, 4.1f); e.beginFrame(0.1f);
+    char buf[96]; std::snprintf(buf, sizeof(buf), "(0.1 m を 0.1 s で → %.2f m/s)", e.change);
+    check("[音源] 動くと変化量が速度（m/s）になる", std::fabs(e.change - 1.0f) < 1e-3f, buf);
+    e.beginFrame(0.1f);
+    check("[音源] 止まった次のフレームで変化量が 0 に戻る", e.change == 0.0f);
+    e.addChange(2.0f); e.addChange(-5.0f);
+    check("[音源] addChange は負を足さない", std::fabs(e.change - 2.0f) < 1e-6f);
+
+    e.radius = 0.3f;
+    const float near = e.effectiveRadius(1.0f), far = e.effectiveRadius(100.0f);
+    std::snprintf(buf, sizeof(buf), "(0.3 m の音源: 1 m で %.2f、100 m で %.2f)", near, far);
+    check("[音源] 近くでは幅のまま、遠くでは点", std::fabs(near - 0.3f) < 1e-5f && far == 0.0f, buf);
+    bool mono = true; float prev = 1.0f;
+    for (float d = 1.0f; d < 120.0f; d *= 1.1f) { const float w = e.effectiveRadius(d); if (w > prev + 1e-6f) mono = false; prev = w; }
+    check("[音源] 幅は距離に対して単調に縮む（跳ばない）", mono);
+    check("[音源] 予算の detail=0 で点", e.effectiveRadius(1.0f, 0.0f) == 0.0f);
+    check("[音源] 幅 0 は常に点", Emitter{}.effectiveRadius(1.0f) == 0.0f);
+}
+
+// ================================ [配分の形式] mix
+void testMix() {
+    std::printf("\n[配分の形式] 帳簿の保存則\n");
+    Mix m; m.clear();
+    for (int b = 0; b < kNumBands; ++b) {
+        m.component6[kDirect][b] = 0.5f; m.component6[kEarly][b] = 0.2f; m.component6[kLate][b] = 0.2f;
+        m.component6[kDiffract][b] = 0.05f; m.component6[kTransmit][b] = 0.05f;
+        m.energy6[b] = 1.0f;
+    }
+    check("[配分の形式] 五成分の和 ＝ 総量 なら conserves", m.conserves(0.1f));
+    m.component6[kLate][3] = 0.1f;
+    check("[配分の形式] 1 帯域でも 0.1 足りなければ落ちる（−0.46 dB）", !m.conserves(0.1f));
+    m.clear();
+    check("[配分の形式] 全部 0 は保存とみなす", m.conserves());
+    for (int i = 0; i < Mix::kMaxTaps + 3; ++i) m.pushTap();
+    check("[配分の形式] タップは上限で止まる（黙って落ちるのは呼び手の責任）", m.tapCount == Mix::kMaxTaps);
+}
+
+// ================================ [物差し] test_instruments
+void testInstruments() {
+    std::printf("\n[物差し] 帯域分割・T60・連続性・クリック\n");
+    const int fs = 48000, n = fs * 2;
+    afti::Xorshift rng;
+    std::vector<float> noise(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) noise[static_cast<std::size_t>(i)] = rng.next() * 0.3f;
+    std::vector<float> bands; afti::split6(noise.data(), n, fs, bands, 2);
+    // 帯域の信号の和は元に戻る（構成上）。エネルギーの和は境目の重なりで元より大きい（参考に出す）。
+    double maxErr = 0.0, sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double s = 0.0;
+        for (int b = 0; b < 6; ++b) s += bands[static_cast<std::size_t>(b) * n + i];
+        maxErr = std::max(maxErr, std::fabs(s - noise[static_cast<std::size_t>(i)]));
+    }
+    for (int b = 0; b < 6; ++b) sum += afti::energy(bands.data() + static_cast<std::size_t>(b) * n, n);
+    const double tot = afti::energy(noise.data(), n);
+    std::printf("      参考: 帯域のエネルギーの和 %.2f dB 対 元 %.2f dB（境目の重なり +%.2f dB。帯域の数字は同じ物差しどうしで比べる）\n",
+                afti::dB(sum), afti::dB(tot), afti::dB(sum) - afti::dB(tot));
+    char buf[128]; std::snprintf(buf, sizeof(buf), "(サンプルの最大誤差 %.2e)", maxErr);
+    check("[物差し] 6 帯域の信号の和が元に戻る（構成上の完全再構成）", maxErr < 1e-4, buf);
+
+    // 合成の指数減衰（T60 = 0.8 s）を当てる。
+    std::vector<float> decay(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) decay[static_cast<std::size_t>(i)] = rng.next() * std::pow(10.0f, -3.0f * i / (0.8f * fs));
+    const float t60 = afti::fitT60(decay.data(), n, fs, 0.02f);
+    std::snprintf(buf, sizeof(buf), "(0.80 s の合成減衰 → %.3f s)", t60);
+    check("[物差し] EDC の当てが合成の T60 を ±3% で戻す", std::fabs(t60 - 0.8f) < 0.024f, buf);
+
+    // 定常の正弦の和は隣り合うブロックで揺れない。
+    afti::SineSum sig(fs, 512); std::vector<float> tone(static_cast<std::size_t>(n));   // ★ブロックと同期
+    for (int i = 0; i < n; ++i) tone[static_cast<std::size_t>(i)] = sig.next();
+    const double steps = afti::blockLevelSteps(tone.data(), n, 512);
+    std::snprintf(buf, sizeof(buf), "(最大 %.3f dB)", steps);
+    check("[物差し] 定常の 5 音の和は隣り合うブロックで 0.2 dB も揺れない", steps < 0.2, buf);
+    const double calm = afti::sampleStepRatio(tone.data(), 512);
+    tone[300] += 0.5f;   // クリックを 1 つ入れる
+    const double clicked = afti::sampleStepRatio(tone.data(), 512);
+    std::snprintf(buf, sizeof(buf), "(平常 %.3f → クリック %.3f、%.0f 倍)", calm, clicked, clicked / std::max(calm, 1e-9));
+    check("[物差し] 波形の飛びは平常の 4 倍以上に出る", clicked > 4.0 * calm, buf);
+}
+
+}  // namespace
+
+int main() {
+    std::printf("=== 新コア（Flow）の数値回帰テスト ===\n");
+    const char* only = std::getenv("AF_ONLY");
+    struct { const char* name; void (*fn)(); } suites[] = {
+        {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
+    };
+    for (const auto& s : suites) if (!only || std::strcmp(only, s.name) == 0) s.fn();
+    return afti::finish("Flow");
+}

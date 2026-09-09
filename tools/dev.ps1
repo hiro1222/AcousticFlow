@@ -52,11 +52,11 @@ switch ($Cmd) {
 
   "test" {
     $which = if ($Rest.Count -gt 0) { $Rest[0] } else { "scene" }
-    $map = @{ scene = "SceneRegressionTest.exe"; dsp = "DspRegressionTest.exe"; btm = "BtmRegressionTest.exe" }
-    $list = if ($which -eq "all") { @("scene", "dsp", "btm") } else { @($which) }
+    $map = @{ scene = "SceneRegressionTest.exe"; dsp = "DspRegressionTest.exe"; btm = "BtmRegressionTest.exe"; flow = "FlowRegressionTest.exe" }
+    $list = if ($which -eq "all") { @("scene", "dsp", "btm", "flow") } else { @($which) }
     $fail = 0
     foreach ($k in $list) {
-      if (-not $map.ContainsKey($k)) { throw "test の引数は scene|dsp|btm|all" }
+      if (-not $map.ContainsKey($k)) { throw "test の引数は scene|dsp|btm|flow|all" }
       $out = & (Join-Path $bin $map[$k]) 2>&1 | ForEach-Object { "$_" }
       $code = $LASTEXITCODE
       # 落ちた行と集計行だけを出す（全文は長い）。
