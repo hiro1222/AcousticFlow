@@ -135,5 +135,10 @@ int AF_WorldMixInfo(AF_WorldHandle w, int e, AF_MixInfo* out) {
     out->tapCount = m->tapCount; out->sendCount = m->sendCount;
     out->room = em->room; out->directCrossings = t->directCrossings;
     out->firstReflectSec = t->firstReflectSec; out->raysTraced = t->raysTraced; out->hits = t->hits;
+    const acoustic::flow::Visibility* vis = W->visibility(e);
+    out->visibleFraction = vis ? vis->visible : 1.0f;
+    out->shadowers = vis ? vis->shadowers : 0;
     return 1;
 }
+int   AF_WorldApertureCount(AF_WorldHandle w) { acoustic::flow::World* W = asWorld(w); return W ? W->apertureCount() : 0; }
+float AF_WorldApertureOpenFrac(AF_WorldHandle w, int a) { acoustic::flow::World* W = asWorld(w); return W ? W->apertureOpenFrac(a) : 1.0f; }

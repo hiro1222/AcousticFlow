@@ -971,6 +971,58 @@ namespace AcousticFlow.EditorTools
                  "新コア 段 4。閉じた部屋 7×7×3 m を WASD で歩く（右ドラッグで向く）。AF ツール ▸ 情報 に帳簿が出る。");
         }
 
+        //   段 5「扉を開ける」: 14×3×14 m を仕切って幅 1 m の戸口、木の扉（SwingDoor、5/6 キー）。音源は向こうの部屋。
+        //   扉は SwingDoor の下なので AcousticWorld が動く箱として扱う（部屋グラフから外れ、毎フレーム位置を送る）。
+        [MenuItem("AcousticFlow/Flow (新コア)/Swing Door (扉を開ける)")]
+        public static void FlowSwingDoorScene()
+        {
+            var scene = NewScene();
+            const float half = 7f, h = 3f, t = 0.2f, gapL = -0.5f, gapR = 0.5f;
+            MakeBox("Floor",   new Vector3(0, -t * 0.5f, 0),     new Vector3(2 * half + 2 * t, t, 2 * half + 2 * t));
+            MakeBox("Ceiling", new Vector3(0, h + t * 0.5f, 0),  new Vector3(2 * half + 2 * t, t, 2 * half + 2 * t));
+            MakeBox("Wall_W",  new Vector3(-half - t * 0.5f, h * 0.5f, 0), new Vector3(t, h, 2 * half + 2 * t));
+            MakeBox("Wall_E",  new Vector3( half + t * 0.5f, h * 0.5f, 0), new Vector3(t, h, 2 * half + 2 * t));
+            MakeBox("Wall_S",  new Vector3(0, h * 0.5f, -half - t * 0.5f), new Vector3(2 * half + 2 * t, h, t));
+            MakeBox("Wall_N",  new Vector3(0, h * 0.5f,  half + t * 0.5f), new Vector3(2 * half + 2 * t, h, t));
+            float leftW = gapL - (-half), rightW = half - gapR;
+            Tint(MakeBox("Partition_L", new Vector3(-half + leftW * 0.5f, h * 0.5f, 0), new Vector3(leftW, h, t)), new Color(0.30f, 0.33f, 0.40f));
+            Tint(MakeBox("Partition_R", new Vector3(gapR + rightW * 0.5f, h * 0.5f, 0), new Vector3(rightW, h, t)), new Color(0.30f, 0.33f, 0.40f));
+            // 扉。左枠を蝶番に +Z 側へ振れる（Test_SwingDoor と同じ）。木の扉の材質。
+            var hinge = new GameObject("Door_Hinge").transform;
+            hinge.position = new Vector3(gapL, h * 0.5f, 0);
+            var doorGo = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            doorGo.name = "Door";
+            var door = doorGo.AddComponent<SwingDoor>();
+            door.hinge = hinge; door.width = gapR - gapL; door.height = h; door.thickness = 0.06f;
+            door.swingTowardPositiveZ = true; door.angleDeg = 0f;
+            door.Apply();
+            Tint(doorGo.transform, new Color(0.95f, 0.55f, 0.15f));
+            doorGo.AddComponent<AcousticSurface>().material = AcousticMaterialPreset.WoodDoor;
+            var cam = Camera.main;
+            if (cam != null)
+            {
+                cam.transform.position = new Vector3(0f, 1.6f, -3f);
+                cam.transform.rotation = Quaternion.LookRotation(Vector3.forward);
+                if (cam.GetComponent<AudioListener>() == null) cam.gameObject.AddComponent<AudioListener>();
+                cam.gameObject.AddComponent<FlowWalker>();
+            }
+            var src = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            src.name = "AF_Source_Main";
+            src.transform.position = new Vector3(0f, 1.6f, 3f);
+            src.transform.localScale = Vector3.one * 0.4f;
+            Object.DestroyImmediate(src.GetComponent<Collider>());
+            var a = src.AddComponent<AudioSource>();
+            var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(kTestClipPath);
+            if (clip != null) a.clip = clip; else Debug.LogWarning("[AcousticFlow] クリップが見つかりません: " + kTestClipPath);
+            var voice = src.AddComponent<WorldVoice>();
+            voice.radius = 0.2f;                       // 幅を持たせる（開口の積分が効く）
+            Tint(src.transform, new Color(1f, 0.5f, 0.2f));
+            var world = new GameObject("AcousticWorld").AddComponent<AcousticWorld>();
+            world.defaultMaterial = AcousticMaterialPreset.Concrete;
+            Save(scene, "Flow_SwingDoor.unity",
+                 "新コア 段 5。戸口の手前に立ち、5/6 キーで扉を開閉。向こうの部屋の音源が扉の開きで連続に変わる。AF ツール ▸ 情報 に見通しの割合と戸口の素通し。");
+        }
+
         private static void Save(UnityEngine.SceneManagement.Scene scene, string fileName, string note)
         {
             const string dir = "Assets/Scenes";

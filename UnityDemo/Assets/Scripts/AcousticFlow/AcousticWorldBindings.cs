@@ -16,6 +16,8 @@ namespace AcousticFlow
         public int tapCount, sendCount, room, directCrossings;
         public float firstReflectSec;
         public int raysTraced, hits;
+        public float visibleFraction;   // 見通しの割合 0..1（段 5）
+        public int shadowers;
     }
 
     public static class NativeWorld
@@ -54,5 +56,7 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldFdnStale(IntPtr w);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldApplyVoice(IntPtr w, int emitter, IntPtr voice, int sampleRate);
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldMixInfo(IntPtr w, int emitter, out AFMixInfo info);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldApertureCount(IntPtr w);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern float AF_WorldApertureOpenFrac(IntPtr w, int aperture);
     }
 }

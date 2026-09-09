@@ -1,4 +1,4 @@
-// AcousticWorld.cs ── 新コア（Flow）のホスト（段 4）。
+// AcousticWorld.cs ── 新コア（Flow）のホスト（段 4。段 5 で動く箱）。
 //
 // ■ 役割
 //   場面の箱（BoxCollider）と材質を音響エンジンの「世界」に渡し、毎フレーム リスナーと音源の位置を置いて
@@ -8,23 +8,24 @@
 // ■ 中の仕組み
 //   OnEnable: 世界を作り、BoxCollider を拾って箱を足し（材質は AcousticSurface があればそれ、無ければ既定）、
 //             AudioListener の Transform をリスナーに、AudioListener に TailBusRenderer（後期の器と方向バスの持ち主）を付ける。
-//   Update:   リスナー → 音源 → AF_WorldUpdate → 各 Voice へ ApplyVoice。
+//             動く箱（SwingDoor の下、非キネマティックの Rigidbody、dynamicColliders に入れた物）は dynamic 印で足す。
+//   Update:   動く箱の位置 → リスナー → 音源 → AF_WorldUpdate → 各 Voice へ ApplyVoice。
 //             FDN の器: 世界が「古い」と言ったら（部屋グラフの作り直し）、TailBusRenderer.ReplaceFdnMix で新しい器を作り、
 //             AF_WorldBindFdn と各 Voice の AF_VoiceSetFdnMix を向け直す。
 //   Register/Unregister: WorldVoice が自分を登録する（AF_WorldAddEmitter）。
 //
 // ■ 繋がり
-//   受ける: 場面（BoxCollider、AcousticSurface、AudioListener、WorldVoice）。
+//   受ける: 場面（BoxCollider、AcousticSurface、SwingDoor、AudioListener、WorldVoice）。
 //   渡す:   DLL（NativeWorld）、WorldVoice（Voice の設定）、TailBusRenderer（器）。
 //
 // ■ 退けた書き方
 //   ・AcousticFlowSceneDemo（旧ホスト 3,000 行）を流用: 旧 API と旧の模型の切り替えが焼き込まれている。新コアは 200 行で足りる。
-//   ・Voice ごとに FDN を持つ: 器は 1 つ（設計文書「FDN は部屋ごと。音源数に比例しない」）。
+//   ・動く箱を毎フレーム全部送る: 静的な箱を動かすと部屋グラフの作り直し（16 ms）が毎フレーム走る。印の付いた物だけ。
 //
 // ■ 壊れる所
 //   ・AudioListener が無いと世界は作れても音が出ない（リスナー位置が原点のまま）。警告を出す。
-//   ・器を差し替えたのに Voice の AF_VoiceSetFdnMix を向け直さないと、Voice は壊された器へ送り続ける（1 秒の猶予の後に落ちる）。
-//   ・段 4 では動く箱（扉）を毎フレーム追わない（段 5）。dynamic 印の箱は部屋グラフから外れるだけ。
+//   ・器を差し替えたのに Voice の AF_VoiceSetFdnMix を向け直さないと、Voice は壊された器へ送り続ける。
+//   ・扉に dynamic 印が付かないと、閉じた扉が部屋グラフに焼かれて戸口が消える（部屋が 2 つに割れたまま開かない）。
 using System;
 using System.Collections.Generic;
 using UnityEngine;
@@ -43,6 +44,8 @@ namespace AcousticFlow
         public AcousticMaterialPreset defaultMaterial = AcousticMaterialPreset.Default;
         [Tooltip("リスナー。空なら AudioListener を探す")]
         public Transform listener;
+        [Tooltip("動く箱として扱う Collider（SwingDoor の下と非キネマティックの Rigidbody は自動で動く扱い）")]
+        public List<Collider> dynamicColliders = new List<Collider>();
 
         [Header("レイ（段 8 で予算に置き換わる）")]
         public int raysPerEmitter = 256;
@@ -64,12 +67,17 @@ namespace AcousticFlow
 
         public IntPtr Handle => _world;
         public int RoomCount => _world != IntPtr.Zero ? NativeWorld.AF_WorldRoomCount(_world) : 0;
+        public int ApertureCount => _world != IntPtr.Zero ? NativeWorld.AF_WorldApertureCount(_world) : 0;
+        public float ApertureOpenFrac(int i) => _world != IntPtr.Zero ? NativeWorld.AF_WorldApertureOpenFrac(_world, i) : 1f;
         public float UpdateMs { get; private set; }
-        public int VoiceCount => _voices.Count;
+        public int BoxCount => _boxes.Count;
+        public int DynamicCount { get; private set; }
         public IReadOnlyList<WorldVoice> Voices => _voices;
         public TailBusRenderer TailHost => _tail;
 
+        private struct Box { public Collider col; public int id; public bool dynamic; }
         private IntPtr _world;
+        private readonly List<Box> _boxes = new List<Box>();
         private readonly List<WorldVoice> _voices = new List<WorldVoice>();
         private TailBusRenderer _tail;
         private int _sampleRate = 48000;
@@ -97,7 +105,6 @@ namespace AcousticFlow
             NativeWorld.AF_WorldSetHeadCm(_world, headCircumferenceCm);
             NativeWorld.AF_WorldBuild(_world);
 
-            // 後期の器と方向バスは AudioListener に付く TailBusRenderer が持つ（OnAudioFilterRead で 1 回回す）。
             if (listener != null)
             {
                 _tail = listener.GetComponent<TailBusRenderer>();
@@ -106,21 +113,39 @@ namespace AcousticFlow
                 RebindFdn();
             }
             foreach (var v in FindObjectsByType<WorldVoice>(FindObjectsSortMode.None)) Register(v);
-            Debug.Log($"[AcousticWorld] 世界: 箱 {_boxCount} / 部屋 {RoomCount} / 音源 {_voices.Count}（レイ {raysPerEmitter} 本）");
+            Debug.Log($"[AcousticWorld] 世界: 箱 {_boxes.Count}（動く物 {DynamicCount}）/ 部屋 {RoomCount} / 戸口 {ApertureCount} / 音源 {_voices.Count}（レイ {raysPerEmitter} 本）");
         }
 
         private void OnDisable()
         {
             foreach (var v in _voices) v.Detach();
             _voices.Clear();
+            _boxes.Clear();
             if (_world != IntPtr.Zero) { NativeWorld.AF_WorldDestroy(_world); _world = IntPtr.Zero; }
             if (Instance == this) Instance = null;
         }
 
-        private int _boxCount;
+        private bool IsDynamic(Collider col)
+        {
+            if (dynamicColliders.Contains(col)) return true;
+            if (col.GetComponentInParent<SwingDoor>() != null) return true;
+            var rb = col.GetComponentInParent<Rigidbody>();
+            return rb != null && !rb.isKinematic;
+        }
+
+        private static void ObbOf(Collider c, out Vector3 center, out Vector3 half, out Vector3 right, out Vector3 up)
+        {
+            var box = c as BoxCollider;
+            var t = c.transform;
+            Vector3 s = t.lossyScale;
+            center = t.TransformPoint(box.center);
+            half = new Vector3(Mathf.Abs(box.size.x * s.x), Mathf.Abs(box.size.y * s.y), Mathf.Abs(box.size.z * s.z)) * 0.5f;
+            right = t.right; up = t.up;
+        }
+
         private void CollectBoxes()
         {
-            _boxCount = 0;
+            _boxes.Clear(); DynamicCount = 0;
             if (!autoCollectBoxColliders) return;
             var cache = new Dictionary<AcousticMaterialPreset, int>();
             foreach (var col in FindObjectsByType<BoxCollider>(FindObjectsSortMode.None))
@@ -140,13 +165,11 @@ namespace AcousticFlow
                     var preset = surf != null ? surf.material : defaultMaterial;
                     if (!cache.TryGetValue(preset, out mat)) { mat = NativeWorld.AF_WorldAddMaterialPreset(_world, (int)preset); cache[preset] = mat; }
                 }
-                var t = col.transform;
-                Vector3 s = t.lossyScale;
-                var center = t.TransformPoint(col.center);
-                var half = new Vector3(Mathf.Abs(col.size.x * s.x), Mathf.Abs(col.size.y * s.y), Mathf.Abs(col.size.z * s.z)) * 0.5f;
-                bool dynamic = col.GetComponentInParent<Rigidbody>() != null && !col.GetComponentInParent<Rigidbody>().isKinematic;
-                NativeWorld.AF_WorldAddBox(_world, new AFVector3(center), new AFVector3(half), new AFVector3(t.right), new AFVector3(t.up), mat, dynamic ? 1 : 0);
-                ++_boxCount;
+                ObbOf(col, out var center, out var half, out var right, out var up);
+                bool dyn = IsDynamic(col);
+                int id = NativeWorld.AF_WorldAddBox(_world, new AFVector3(center), new AFVector3(half), new AFVector3(right), new AFVector3(up), mat, dyn ? 1 : 0);
+                _boxes.Add(new Box { col = col, id = id, dynamic = dyn });
+                if (dyn) DynamicCount++;
             }
         }
 
@@ -178,6 +201,13 @@ namespace AcousticFlow
         {
             if (_world == IntPtr.Zero) return;
             long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            // 動く箱（扉）の位置。静的な箱は触らない（触ると部屋グラフが作り直される）。
+            foreach (var b in _boxes)
+            {
+                if (!b.dynamic || b.col == null) continue;
+                ObbOf(b.col, out var center, out _, out var right, out var up);
+                NativeWorld.AF_WorldSetBoxTransform(_world, b.id, new AFVector3(center), new AFVector3(right), new AFVector3(up));
+            }
             if (listener != null)
                 NativeWorld.AF_WorldSetListener(_world, new AFVector3(listener.position), new AFVector3(listener.forward), new AFVector3(listener.up));
             _w5[0] = weightDirect; _w5[1] = weightEarly; _w5[2] = weightLate; _w5[3] = weightDiffract; _w5[4] = weightTransmit;

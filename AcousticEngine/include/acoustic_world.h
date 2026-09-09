@@ -76,7 +76,12 @@ typedef struct AF_MixInfo {
     int   directCrossings;     /* 直線が横切った壁の枚数 */
     float firstReflectSec;
     int   raysTraced, hits;
+    float visibleFraction;     /* 見通しの割合 0..1（段 5 aperture） */
+    int   shadowers;           /* 影を落とした箱の数 */
 } AF_MixInfo;
+/* 戸口の数と、戸口 i の素通しの割合（1 − 板の覆い。Update の後に読む）。 */
+ACOUSTIC_API int   AF_WorldApertureCount(AF_WorldHandle w);
+ACOUSTIC_API float AF_WorldApertureOpenFrac(AF_WorldHandle w, int aperture);
 ACOUSTIC_API int AF_WorldMixInfo(AF_WorldHandle w, int emitter, AF_MixInfo* out);
 
 #ifdef __cplusplus

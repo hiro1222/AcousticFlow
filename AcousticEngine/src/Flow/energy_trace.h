@@ -1,15 +1,15 @@
-/* Flow/energy_trace.h ── レイトレース（段 2）
+/* Flow/energy_trace.h ── レイトレース（段 2。段 5 で直接音を aperture に渡した）
  *
  * ■ 役割
  *   音源から出た音のエネルギーが、面で 反射／透過／吸収 に分かれながら、リスナーにどれだけ・いつ届くかを
  *   帯域別に集計する。設計文書 Ⅵ「レイトレース（BVH）── 素材の透過率・反射率でエネルギー分配 → 帯域別エネルギー総量」。
- *   出すのは 4 つの数: 直接・透過（どちらも直線で決定的）、反射の初期・後期（レイで統計的）。
+ *   出すのは 3 つ: 自由音場の直接音（決定的。見通しの割合は aperture が別に出す）、反射の初期・後期（レイで統計的）。
  *
  * ■ 中の仕組み
  *   単位は「音源の出力を 1 としたときの、リスナーの点に届く強さ（1/m²）」。直接音なら 1/(4πd²)。
- *   1) 直接と透過は**レイを飛ばさない**。音源→リスナーの直線 1 本で、横切った箱の τ を掛ける（surfaces.transmittance）。
- *      横切りが 0 枚なら直接音、1 枚以上なら透過音。どちらも 1/(4πd²) × 空気吸収。決定的なので揺れない。
- *      ★直接音の「見通し 1/0」は段 5 で aperture の**割合**（走査線積分）に置き換わる（追記 A）。
+ *   1) 自由音場の直接 freeDirect6 = 1/(4πd²) × 空気吸収。**レイを飛ばさない**。見通し（割合と τ）は段 5 の aperture が
+ *      解析で出し、distribute が 直接 = free × 割合、透過 = free × (1−割合) × τ にする（追記 A）。
+ *      直線が横切った壁の枚数 directCrossings は情報として残す。
  *   2) 反射は N 本のレイ。各当たり点で
  *          吸収 a·e を帳簿へ、残り (r+t)·e を運ぶ。反射か透過かは r:t の確率で片方だけ選ぶ（期待値は不偏）。
  *      反射方向は材質の散乱率で 鏡面⇄拡散 を振り分ける（旧 scene.h の scatteredDir と同じ）。
@@ -19,28 +19,27 @@
  *      初期、以上なら後期。★レイがリスナーの球に当たるのを待たない（当たらない＝分散が大きい）。
  *      「diffuse rain」と呼ばれる標準の推定法。
  *   4) 打ち切り: 帯域の最大エネルギーが出発の 1e-4（−40 dB）を切るか、maxBounces に達したら残りを帳簿の
- *      remainder へ。保存則  emitted = absorbed + remainder + escaped  が帯簿で成り立つ（検査）。
+ *      remainder へ。保存則  emitted = absorbed + remainder + escaped  が帳簿で成り立つ（検査）。
  *   5) **乱数の種は音源ごとに固定**。同じ幾何・同じ位置なら毎フレーム同じレイが飛び、結果がビット一致する。
  *      → 静止していれば揺れない（追記 D）。動けば相関した標本が滑らかに追う。
- *      新しい乱数を毎フレーム引くと、静止でも Monte Carlo の分散ぶん（±1 dB 前後）揺れる。
  *
  * ■ 繋がり
  *   受ける: Surfaces、MaterialTable、Emitter の位置、Listener の位置、TraceParams（本数は budget が決める）。
- *   渡す:   TraceResult（direct6 / transmit6 / early6 / late6 と帳簿）を distribute へ。
+ *   渡す:   TraceResult（freeDirect6 / early6 / late6 と帳簿）を distribute へ。
  *
  * ■ 退けた書き方
  *   ・リスナーの球にレイが当たったら集計（検出球）: 当たる本数が少なく、256 本では初期反射がほぼ 0 か 1 本。
- *     NEE なら毎ヒットが 1 標本になる。
  *   ・直接音もレイで出す: 決定的に出せる物を統計で出す理由が無い。揺れの源を増やすだけ。
+ *   ・直接音の τ をここで直線から出す（段 4 までの形）: 幅を持つ音源が半分だけ板に隠れるとき、中心の直線は見通しでも
+ *     隠れた半分は板を通る。τ は「遮っている物」の物で、aperture が影ごとに出すのが筋。段 5 でこちらから外した。
  *   ・反射と透過の両方にレイを分岐させる: 本数が指数で増える。片方を確率で選び重みで補うのが標準。
- *   ・NEE を鏡面反射の向きに合わせる（鏡面ローブ）: 方向の構造は ISM（段 7）が持つ。ここは総量だけなので
- *     ランバートで十分。総量の物差し（4/R）と合う。
  *
  * ■ 壊れる所
  *   ・影レイの原点を当たり点ちょうどに置くと自分の面に当たって全部遮られる（kEps で法線側へ押す）。
  *   ・cosθ を絶対値にすると、面の裏側のリスナーに反射エネルギーが届く（壁を透ける）。表裏で e_side を分ける。
- *   ・NEE の 1/π を忘れると反射が π 倍（+5 dB）。ランバートの放射強度は E·cosθ/π（半球で積分すると E）。
- *   ・種を毎フレーム変えると静止で揺れる。種を音源で固定し、幾何が変わったときだけ結果が動く。
+ *   ・NEE の 1/π を忘れると反射が π 倍（+5 dB）。
+ *   ・種を毎フレーム変えると静止で揺れる。
+ *   ・帳簿は double。4096 本 × 40 回のヒットで float では 2e-4 ずれて保存則の検査が落ちた（段 2）。
  */
 #ifndef ACOUSTICFLOW_FLOW_ENERGY_TRACE_H
 #define ACOUSTICFLOW_FLOW_ENERGY_TRACE_H
@@ -95,16 +94,14 @@ struct TraceParams {
 };
 
 struct TraceResult {
-    float direct6[kNumBands] = {};      // 直接（見通し 1/0。段 5 で割合に）
-    float transmit6[kNumBands] = {};    // 透過（直線の τ の積）
+    float freeDirect6[kNumBands] = {};  // 自由音場の直接（1/4πd² × 空気）。見通しは aperture が別に出す
     float early6[kNumBands] = {};       // 反射、t < mixing
     float late6[kNumBands] = {};        // 反射、t ≥ mixing
     float firstReflectSec = -1.0f;      // 最初に届いた反射の時刻（尾の開始の代用。ISM が来たら置き換え）
     float directSec = 0.0f;             // 直接音の到達時刻
-    int   directCrossings = 0;          // 直線が横切った壁の枚数（0 = 見通し）
+    float directDist = 0.0f;            // 直接音の距離
+    int   directCrossings = 0;          // 直線が横切った壁の枚数（情報）
     // 帳簿（レイ側）。保存則: emitted = absorbed + remainder + escaped
-    //   ★double。4096 本 × 40 回のヒットで 16 万項を足すと float では 2e-4 ずれて保存則の検査が落ちた（段 2）。
-    //     集計（early6 など）は float のままでよい（相対誤差 1e-4 は音には見えない）。帳簿は「一致」を見る物なので精度が要る。
     double emitted6[kNumBands] = {}, absorbed6[kNumBands] = {}, remainder6[kNumBands] = {}, escaped6[kNumBands] = {};
     int   raysTraced = 0, hits = 0, neeVisible = 0;
 
@@ -116,18 +113,16 @@ public:
     TraceResult run(const Surfaces& surf, const MaterialTable& mats,
                     const Vec3& source, const Vec3& listener, const TraceParams& prm) const {
         TraceResult R;
-        // ── 1) 直接と透過（決定的）──
+        // ── 1) 自由音場の直接（決定的）──
         {
             const float d = std::max(length(listener - source), kEps);
             float tr[kNumBands]; int crossings = 0;
-            surf.transmittance(source, listener, -1, mats, tr, &crossings);
+            surf.transmittance(source, listener, -1, mats, tr, &crossings);   // 枚数だけ使う（τ は aperture の物）
             R.directCrossings = crossings;
+            R.directDist = d;
             R.directSec = d / kSpeedOfSound;
             const float geo = 1.0f / (4.0f * kPi * d * d);
-            for (int b = 0; b < kNumBands; ++b) {
-                const float e = geo * airEnergy(b, d) * tr[b];
-                if (crossings == 0) R.direct6[b] = e; else R.transmit6[b] = e;
-            }
+            for (int b = 0; b < kNumBands; ++b) R.freeDirect6[b] = geo * airEnergy(b, d);
         }
         // ── 2) 反射（レイ + NEE）──
         const int N = std::max(1, prm.rays);
@@ -148,7 +143,6 @@ public:
                 ++R.hits;
                 pathLen += h.t;
                 const AcousticMaterial& m = mats.get(surf.at(h.index).material);
-                // 面での分配。帯域平均で経路を選び、帯域別の重みで運ぶ。
                 float rMean = 0.0f, tMean = 0.0f;
                 SurfaceSplit sp[kNumBands];
                 for (int b = 0; b < kNumBands; ++b) {
@@ -157,7 +151,6 @@ public:
                     rMean += sp[b].reflect; tMean += sp[b].transmit;
                 }
                 rMean /= kNumBands; tMean /= kNumBands;
-                // 当たった面の向き（レイが来た側を表にする）。
                 const Vec3 nFace = (dot(h.normal, dir) < 0.0f) ? h.normal : h.normal * -1.0f;
                 // ── NEE: この当たり点からリスナーへ ──
                 {
@@ -165,7 +158,7 @@ public:
                     const float d = length(toL);
                     if (d > kEps) {
                         const Vec3 u = toL * (1.0f / d);
-                        const float cosF = dot(nFace, u);                       // 表側なら正
+                        const float cosF = dot(nFace, u);
                         const bool front = cosF > 0.0f;
                         const float cosT = std::fabs(cosF);
                         const Vec3 org = h.point + (front ? nFace : nFace * -1.0f) * kEps;
@@ -195,12 +188,12 @@ public:
                 float eMax = 0.0f; for (int b = 0; b < kNumBands; ++b) eMax = std::max(eMax, e[b]);
                 if (eMax < e0 * 1e-4f) { for (int b = 0; b < kNumBands; ++b) R.remainder6[b] += e[b]; terminated = true; break; }
                 if (goReflect) {
-                    const float s = 0.0f + std::max(0.0f, std::min(1.0f, m.scattering[3]));   // 1 kHz の散乱率で向きを決める
+                    const float s = std::max(0.0f, std::min(1.0f, m.scattering[3]));   // 1 kHz の散乱率で向きを決める
                     dir = (rand01(rng) < s) ? cosineHemisphere(nFace, rng) : reflect(dir, nFace);
-                    if (dot(dir, nFace) <= 0.0f) dir = cosineHemisphere(nFace, rng);          // 面の中へ向いたら拡散で出し直す
+                    if (dot(dir, nFace) <= 0.0f) dir = cosineHemisphere(nFace, rng);
                     pos = h.point + nFace * kEps;
                 } else {
-                    pos = h.point - nFace * kEps;      // 面の裏へ抜ける。向きはそのまま
+                    pos = h.point - nFace * kEps;
                 }
                 skip = h.index;
             }

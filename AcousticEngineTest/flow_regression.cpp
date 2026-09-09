@@ -273,11 +273,11 @@ void testEnergyTrace() {
     check("[レイ] 保存則: 放射 = 吸収 + 打ち切りの残り + 逃げ（全帯域 1e-4 以内）", worst < 1e-4f, buf);
     check("[レイ] 閉じた箱からは逃げない", R.escaped6[2] == 0.0f);
 
-    // 直接音: 見通しで 1/(4πd²)
+    // 直接音: 自由音場で 1/(4πd²)（見通しの割合は aperture が別に出す）
     const float d = length(L - S);
     const float expect = 1.0f / (4.0f * 3.14159265f * d * d);
-    std::snprintf(buf, sizeof(buf), "(d %.2f m: 直接 %.3e 対 1/4πd² %.3e、横切り %d 枚)", d, R.direct6[2], expect, R.directCrossings);
-    check("[レイ] 見通しの直接音は 1/(4πd²)（空気吸収を除いて 0.1%）", std::fabs(R.direct6[2] / expect - 1.0f) < 0.01f && R.directCrossings == 0, buf);
+    std::snprintf(buf, sizeof(buf), "(d %.2f m: 自由音場 %.3e 対 1/4πd² %.3e、横切り %d 枚)", d, R.freeDirect6[2], expect, R.directCrossings);
+    check("[レイ] 自由音場の直接音は 1/(4πd²)（空気吸収を除いて 0.1%）、見通しなら横切り 0 枚", std::fabs(R.freeDirect6[2] / expect - 1.0f) < 0.01f && R.directCrossings == 0, buf);
 
     // 部屋定数: 反射の総量 ≈ 4(1−ᾱ)/(Sᾱ)（拡散音場の古典式）。
     const float Sarea = 2.0f * ((2 * half) * (2 * half) + 2.0f * (2 * half) * h);
@@ -297,7 +297,7 @@ void testEnergyTrace() {
     // ★memcmp で構造体を比べない: double と float が混ざるとパディングが入り、そこは初期化されない。
     auto same = [](const TraceResult& a, const TraceResult& b) {
         for (int i = 0; i < kNumBands; ++i)
-            if (a.direct6[i] != b.direct6[i] || a.transmit6[i] != b.transmit6[i] || a.early6[i] != b.early6[i] || a.late6[i] != b.late6[i]
+            if (a.freeDirect6[i] != b.freeDirect6[i] || a.early6[i] != b.early6[i] || a.late6[i] != b.late6[i]
                 || a.emitted6[i] != b.emitted6[i] || a.absorbed6[i] != b.absorbed6[i] || a.remainder6[i] != b.remainder6[i]) return false;
         return a.firstReflectSec == b.firstReflectSec && a.hits == b.hits && a.neeVisible == b.neeVisible;
     };
@@ -318,8 +318,10 @@ void testEnergyTrace() {
     Surfaces box2 = closedBox(half, h, matId);
     box2.add(Obb::axisAligned(Vec3(0, h * 0.5f, 0.25f), Vec3(half, h * 0.5f, 0.02f)), leafId);   // 間仕切り
     const TraceResult T = tr.run(box2, mats, S, L, prm);
-    std::snprintf(buf, sizeof(buf), "(横切り %d 枚: 直接 %.2e、透過 %.2e = 1/4πd² × %.3f)", T.directCrossings, T.direct6[2], T.transmit6[2], T.transmit6[2] / expect);
-    check("[レイ] 板を挟むと直接が 0 になり透過に τ が掛かる（0.01）", T.directCrossings == 1 && T.direct6[2] == 0.0f && std::fabs(T.transmit6[2] / expect - 0.01f) < 0.002f, buf);
+    const Visibility vt = discVisibility(box2, mats, L, S, 0.0f);                    // 点音源の見通し（段 5 aperture）
+    std::snprintf(buf, sizeof(buf), "(横切り %d 枚: 見通し %.2f、遮る物 %d、τ %.4f)", T.directCrossings, vt.visible, vt.shadowers, vt.shadowTau6[2]);
+    check("[レイ] 板を挟むと横切り 1 枚、見通し 0、遮る物の τ = 0.01（直接 = free × 0、透過 = free × τ）",
+          T.directCrossings == 1 && vt.visible == 0.0f && vt.shadowers == 1 && std::fabs(vt.shadowTau6[2] - 0.01f) < 1e-4f, buf);
     check("[レイ] 板を挟んでも反射の総量は残る（板の向こうで反射して抜けてくる）", T.reflected6(2) > 0.0f && T.reflected6(2) < gotRev);
 
     // 初期／後期の境: mixing を 0 にすると全部後期、大きくすると全部初期。
@@ -568,6 +570,126 @@ void testBridge() {
     delete w;
 }
 
+// ================================ [開口] aperture（段 5）
+//   蝶番 (gapL, h/2, 0) を軸に +Z へ θ 開いた板の Obb（Test_SwingDoor と同じ置き方）。
+Obb doorLeaf(float thetaDeg, float gapL = -0.5f, float w = 1.0f, float h = 3.0f, float thick = 0.06f) {
+    const float th = thetaDeg * 3.14159265f / 180.0f;
+    const Vec3 right(std::cos(th), 0.0f, std::sin(th));
+    const Vec3 hinge(gapL, h * 0.5f, 0.0f);
+    Obb b; b.center = hinge + right * (w * 0.5f); b.halfExtents = Vec3(w * 0.5f, h * 0.5f, thick * 0.5f);
+    b.axisX = right; b.axisY = Vec3(0, 1, 0); b.axisZ = cross(b.axisX, b.axisY);
+    return b;
+}
+void testAperture() {
+    std::printf("\n[開口] 見通しの割合（解析）・板の覆い・扉の開きに対する連続性\n");
+    MaterialTable mats;
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    const int matId = mats.add(wall);
+    const int leafId = mats.add(AcousticMaterial::woodDoor());
+    Surfaces s;
+    for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) s.add(sb.obb, matId, false);
+    const Vec3 L(0, 1.6f, -3.0f), S(0, 1.6f, 3.0f);
+    char buf[200];
+
+    // 1) 点音源: 戸口の正面は見通し 1、仕切りの裏は 0（壁の τ）
+    Visibility v0 = discVisibility(s, mats, L, S, 0.0f);
+    Visibility v1 = discVisibility(s, mats, L, Vec3(3.0f, 1.6f, 3.0f), 0.0f);
+    std::snprintf(buf, sizeof(buf), "(正面 %.2f / 仕切りの裏 %.2f、遮る物 %d、τ %.4f)", v0.visible, v1.visible, v1.shadowers, v1.shadowTau6[2]);
+    check("[開口] 点音源: 戸口の正面は 1、仕切りの裏は 0 で壁の τ", v0.visible == 1.0f && v0.shadowers == 0 && v1.visible == 0.0f && v1.shadowers == 1 && std::fabs(v1.shadowTau6[2] - 0.001f) < 1e-5f, buf);
+
+    // 2) 幅 0.3 m の音源を x=0 → 2.5 m へ 2 cm 刻みで動かす: 単調非増加、段差 0.05 未満、両端は 1 と 0
+    {
+        float prev = 2.0f, worst = 0.0f, first = -1.0f, last = -1.0f; bool mono = true;
+        for (float x = 0.0f; x <= 2.5f; x += 0.02f) {
+            const float vis = discVisibility(s, mats, L, Vec3(x, 1.6f, 3.0f), 0.3f).visible;
+            if (first < 0.0f) first = vis;
+            if (prev < 1.5f) { if (vis > prev + 1e-4f) mono = false; worst = std::max(worst, prev - vis); }
+            prev = vis; last = vis;
+        }
+        // ★段差の上限は物理から: ガウス円盤（σ = r/2）の最大の傾きは 1/(σ√2π) [1/m]。r=0.3 なら 2 cm で 0.053。
+        //   これより大きい段差が出たら不連続、これ以下なら「そういう形」。最初 0.05 と勘で書いて 0.058 で落ちた。
+        const float slopeMax = 1.0f / (0.15f * 2.5066f), allowed = 1.3f * 0.02f * slopeMax;
+        std::snprintf(buf, sizeof(buf), "(x=0 で %.3f、x=2.5 で %.3f、2 cm あたりの最大段差 %.4f。ガウスの傾きの上限 %.4f)", first, last, worst, allowed);
+        check("[開口] 幅を持つ音源が仕切りに隠れていくとき、見通しは単調に減り、段差はガウス円盤の傾きの範囲", mono && first > 0.999f && last < 1e-3f && worst < allowed, buf);
+    }
+
+    // 3) 扉: 0° → 90° を 1° 刻み。閉で 0、単調増加、1° で既に正、90° で 0.9 以上、段差 0.05 未満
+    {
+        const int leaf = s.add(doorLeaf(0.0f), leafId, true);
+        // ★音源が扉の真後ろ（x=0）だと、板は +Z 側へ振れて視線に居座り、**見通しが開くのは 57° 付近**。
+        //   板の自由端の投影が円盤（r=0.2）を横切るのは約 5° の間で、その間の傾きはガウスの上限（1/(σ√2π)、σ=0.1）。
+        //   「開き始めた瞬間の立ち上がり」（Ⅸ）は見通しでは出ない ── 隙間を回る回折（段 6）と板の透過の仕事。
+        //   この検査は「見通しの割合そのもの」が連続で単調であることを見る。
+        float prev = -1.0f, worst = 0.0f, atClosed = -1.0f, atOpen = -1.0f; bool mono = true;
+        int firstPositive = -1, at05 = -1, at95 = -1;
+        for (int deg = 0; deg <= 90; ++deg) {
+            s.at(leaf).obb = doorLeaf(static_cast<float>(deg));
+            const float vis = discVisibility(s, mats, L, S, 0.2f).visible;
+            if (deg == 0) atClosed = vis; if (deg == 90) atOpen = vis;
+            if (vis > 0.0f && firstPositive < 0) firstPositive = deg;
+            if (vis > 0.05f && at05 < 0) at05 = deg;
+            if (vis > 0.95f && at95 < 0) at95 = deg;
+            if (prev >= 0.0f) { if (vis < prev - 1e-4f) mono = false; worst = std::max(worst, vis - prev); }
+            prev = vis;
+        }
+        std::snprintf(buf, sizeof(buf), "(閉 %.3f、初めて正 %d°、0.05 超 %d°、0.95 超 %d°、90° %.3f、1° あたりの最大段差 %.4f)", atClosed, firstPositive, at05, at95, atOpen, worst);
+        check("[開口] 扉: 閉で 0、90° で 0.9 以上、見通しが開くのは 90° より手前", atClosed == 0.0f && atOpen > 0.9f && firstPositive > 0 && firstPositive < 90, buf);
+        check("[開口] 扉: 開くほど単調に増え、0.05 → 0.95 に 3° 以上かけて連続に開く（一段の跳びではない）", mono && at95 - at05 >= 3 && worst < 0.2f, buf);
+        const Visibility vc = discVisibility(s, mats, L, S, 0.2f);   // 90° のまま
+        check("[開口] 90° の扉の残りの影は木の扉の τ を持つ（遮る物 1）", vc.shadowers <= 1);
+        s.at(leaf).obb = doorLeaf(30.0f);
+        const Visibility v30 = discVisibility(s, mats, L, S, 0.2f);
+        std::snprintf(buf, sizeof(buf), "(30°: 見通し %.3f、遮る物 %d、τ(1k) %.4f 対 木の扉 %.4f)", v30.visible, v30.shadowers, v30.shadowTau6[3], AcousticMaterial::woodDoor().transmission[3]);
+        check("[開口] 30° の扉が遮る分の τ は木の扉の物", v30.shadowers == 1 && std::fabs(v30.shadowTau6[3] - AcousticMaterial::woodDoor().transmission[3]) < 1e-4f, buf);
+    }
+
+    // 4) 板の覆い（正射影）: 閉で 1、90° で 厚み/幅 ≒ 0.06、単調、遠くの板は 0
+    {
+        rooms::Builder builder;
+        const rooms::Result& res = builder.build(twoRoomsWithDoor(wall));
+        check("[開口] 部屋グラフの戸口が 1 つ", res.apertures.size() == 1);
+        if (res.apertures.size() == 1) {
+            const rooms::Aperture& ap = res.apertures[0];
+            const float c0 = openingCoverage(ap, doorLeaf(0.0f)), c45 = openingCoverage(ap, doorLeaf(45.0f)), c90 = openingCoverage(ap, doorLeaf(90.0f));
+            bool mono = true; float prev = 2.0f;
+            for (int deg = 0; deg <= 90; deg += 5) { const float c = openingCoverage(ap, doorLeaf(static_cast<float>(deg))); if (c > prev + 1e-4f) mono = false; prev = c; }
+            Obb far = doorLeaf(0.0f); far.center = far.center + Vec3(0, 0, 5.0f);
+            std::snprintf(buf, sizeof(buf), "(閉 %.3f、45° %.3f、90° %.3f、5 m 先の板 %.3f。戸口 %.2f×%.2f m)", c0, c45, c90, openingCoverage(ap, far), 2 * ap.halfU, 2 * ap.halfV);
+            check("[開口] 板の覆い: 閉で 0.9 以上、45° で cos45 の近く、90° で 0.15 未満、開くほど単調に減る", c0 > 0.9f && std::fabs(c45 - 0.707f) < 0.15f && c90 < 0.15f && mono, buf);
+            check("[開口] 面から離れた板は覆いに数えない", openingCoverage(ap, far) == 0.0f);
+        }
+    }
+
+    // 5) 世界を通す: 閉めると直接 ≈ 0 で透過が残り、開けると直接が戻る。閉めた部屋の RT60 が伸びる。
+    {
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        const int leaf = w.addBox(doorLeaf(0.0f), lm, true);
+        w.raysPerEmitter = 128;
+        w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w.addEmitter(S, 0.2f);
+        w.build();
+        const float dt = 512.0f / 48000.0f;
+        for (int k = 0; k < 5; ++k) w.update(dt);
+        const int lroom = w.roomAt(L);
+        const float rtClosed = w.probe(lroom).rt60[2];
+        double dClosed = 0, tClosed = 0;
+        for (int b = 0; b < kNumBands; ++b) { dClosed += w.mix(e)->component6[kDirect][b]; tClosed += w.mix(e)->component6[kTransmit][b]; }
+        w.setBoxTransform(leaf, doorLeaf(90.0f));
+        for (int k = 0; k < 5; ++k) w.update(dt);
+        const float rtOpen = w.probe(lroom).rt60[2];
+        double dOpen = 0, tOpen = 0;
+        for (int b = 0; b < kNumBands; ++b) { dOpen += w.mix(e)->component6[kDirect][b]; tOpen += w.mix(e)->component6[kTransmit][b]; }
+        std::snprintf(buf, sizeof(buf), "(閉: 直接 %.2e 透過 %.2e RT60 %.3f s → 開: 直接 %.2e 透過 %.2e RT60 %.3f s、素通し %.2f→%.2f)",
+                      dClosed, tClosed, rtClosed, dOpen, tOpen, rtOpen, 0.0f, w.apertureOpenFrac(0));
+        check("[開口] 世界: 閉めると直接 0 で透過が残り、開けると直接が戻って透過が減る", dClosed == 0.0 && tClosed > 0.0 && dOpen > 0.0 && tOpen < tClosed, buf);
+        check("[開口] 世界: 閉めた扉でリスナーの部屋の RT60 が伸びる（同じ a が RT60 と直接音の両方に効く）", rtClosed > rtOpen, buf);
+        check("[開口] 世界: 帳簿は扉の開閉でも保存", w.mix(e)->conserves(0.01f));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -576,7 +698,7 @@ int main() {
     struct { const char* name; void (*fn)(); } suites[] = {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
-        {"world", testWorld}, {"bridge", testBridge},
+        {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture},
     };
     for (const auto& s : suites) if (!only || std::strcmp(only, s.name) == 0) s.fn();
     return afti::finish("Flow");
