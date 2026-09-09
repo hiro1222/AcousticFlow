@@ -900,6 +900,18 @@ namespace AcousticFlow
                 }
             }
 
+            // ★★ 音源の AudioSource を拾って鳴らす ★★
+            //   ここが**抜けていた**（2026-09-09 に発見）。SetupAudio は RefreshSources（音源の顔ぶれが
+            //   変わったとき）からしか呼ばれておらず、素直に Play しただけの場面では一度も走らない。
+            //   そのせいで:
+            //     ・_srcAudio が null → **M（一括ミュート）が何もしない**
+            //     ・_audioReady が false → 尾の FDN も扉の定点も**丸ごと止まる**（どちらも条件に入れている）
+            //     ・a.spatialBlend = 0 が当たらない → Unity 側の 3D 減衰が畳み込み器と二重に掛かる
+            //     ・クリップ未設定の警告も出ない → 「音が鳴らない」理由が黙って隠れる
+            //   畳み込み器（IrConvolver.Awake）が無音クリップを差し込むので**再生自体はできてしまい**、
+            //   「鳴っているのに旗が false」という食い違いが表に出なかった。
+            if (enableAudio) SetupSourceAudio();
+
             _status = $"Scene OK / instances={_scene.InstanceCount} / sources={_sources.Length}"
                     + (_audioReady ? " / 再生中" : (enableAudio ? " / 音声なし" : ""));
         }

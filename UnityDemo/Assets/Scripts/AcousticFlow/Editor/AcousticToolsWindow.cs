@@ -148,10 +148,15 @@ namespace AcousticFlow.EditorTools
                 var ic = a.GetComponent<IrConvolver>();
                 string dsp = (vc != null) ? "C++ 畳み込み器" : (ic != null) ? "C# 畳み込み器" : "素通し（畳み込み器なし）";
                 string outRms = (vc != null) ? "  出力 " + Db(vc.rmsOut) : "";
+                // ★クリップ名を必ず出す。畳み込み器は clip が空だと "ir_silence"（無音 1 秒）を差し込んで
+                //   再生してしまうので、「鳴っているのに何も聞こえない」が起きる。名前で見分ける。
+                string clip = (a.clip == null) ? "クリップ無し"
+                            : (a.clip.name == "ir_silence") ? "★無音の差し込み（クリップ未設定）"
+                            : a.clip.name + " " + a.clip.length.ToString("F1") + "s";
                 using (new EditorGUILayout.HorizontalScope())
                 {
                     GUILayout.Label((a.mute ? "[消] " : a.isPlaying ? "[鳴] " : "[停] ") + a.gameObject.name, GUILayout.Width(190f));
-                    GUILayout.Label(dsp + "   音量 " + a.volume.ToString("F2") + outRms, EditorStyles.miniLabel);
+                    GUILayout.Label(clip + "   " + dsp + "   音量 " + a.volume.ToString("F2") + outRms, EditorStyles.miniLabel);
                     if (GUILayout.Button(a.mute ? "解除" : "消す", EditorStyles.miniButton, GUILayout.Width(44f))) a.mute = !a.mute;
                 }
             }
