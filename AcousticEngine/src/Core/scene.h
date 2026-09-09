@@ -1806,7 +1806,10 @@ public:
     //                 音源側は false ── 注ぐ量そのもの。外にいる音源は口からしか入らない。
     //   戸口の中では両側の部屋が 0.5 + 0.5·α²·(1/2)·0.5 ≒ 0.63 ずつ（合計 +1 dB）。段は無い。
     //   書けた数を返す（E の大きい順、outW6[k*6+b]）。
-    int fdnRoomWeights(const Vec3& p, float radius, bool normalizeOwn, int* outRooms, float* outW6, int maxOut) const {
+    //   outDirSpread4（手順 6、null 可）: [k*4+0..2] その部屋の尾が来る向き（ワールド、口の寄与のエネルギー重み付き平均。
+    //     口の寄与が無ければ 0）、[k*4+3] 広がり（0 点〜1 一様。自室ぶん ＋ 口の寄与 × min(1, 2·立体角の割合)）。
+    int fdnRoomWeights(const Vec3& p, float radius, bool normalizeOwn, int* outRooms, float* outW6, int maxOut,
+                       float* outDirSpread4 = nullptr) const {
         if (!outRooms || !outW6 || maxOut <= 0) return 0;
         const rooms::Result& rr = roomGraph();
         const int nr = std::min(static_cast<int>(rr.rooms.size()), 64);
@@ -1824,6 +1827,7 @@ public:
         float own[64] = {};
         for (int r = 0; r < nr; ++r) own[r] = (normalizeOwn && sum > 1e-6f) ? std::min(1.0f, s[r] / sum) : s[r];
         double E[64][kNumBands];
+        double dirX[64] = {}, dirY[64] = {}, dirZ[64] = {}, eSpread[64] = {};   // 口の寄与の向き（1 kHz 帯の重み）と広がり
         for (int r = 0; r < nr; ++r) for (int b = 0; b < kNumBands; ++b) E[r][b] = own[r];
         for (int pid = 0; pid < portalCount(); ++pid) {
             const Portal& pt = portals_[static_cast<std::size_t>(pid)];
@@ -1844,6 +1848,11 @@ public:
                 portalOpenBands(pt, p, rr.rooms[static_cast<std::size_t>(r)].centroid, f6, nullptr);
                 for (int b = 0; b < kNumBands; ++b)
                     E[r][b] += (1.0 - own[r]) * gate * static_cast<double>(f6[b]) * f6[b] * solid;
+                // 向き（手順 6）: 口の中心への単位ベクトルを 1 kHz 帯の寄与で重み付け。広がりは立体角の割合（面の上で一様）。
+                const double term = (1.0 - own[r]) * gate * static_cast<double>(f6[3]) * f6[3] * solid;
+                const float dlen = std::sqrt(std::max(dot(dp, dp), 1e-8f));
+                dirX[r] += term * (-dp.x / dlen); dirY[r] += term * (-dp.y / dlen); dirZ[r] += term * (-dp.z / dlen);
+                eSpread[r] += term * std::min(1.0, 2.0 * solid);
             }
         }
         int order[64]; int cnt = 0;
@@ -1853,6 +1862,17 @@ public:
         for (int k = 0; k < written; ++k) {
             outRooms[k] = order[k];
             for (int b = 0; b < kNumBands; ++b) outW6[k * kNumBands + b] = static_cast<float>(std::sqrt(std::min(1.0, E[order[k]][b])));
+            if (outDirSpread4) {
+                const int r = order[k];
+                const double eTot = std::max(E[r][3], 1e-12);
+                const double ePortal = std::max(0.0, eTot - own[r]);
+                const double len = std::sqrt(dirX[r] * dirX[r] + dirY[r] * dirY[r] + dirZ[r] * dirZ[r]);
+                outDirSpread4[k * 4 + 0] = (len > 1e-12) ? static_cast<float>(dirX[r] / len) : 0.0f;
+                outDirSpread4[k * 4 + 1] = (len > 1e-12) ? static_cast<float>(dirY[r] / len) : 0.0f;
+                outDirSpread4[k * 4 + 2] = (len > 1e-12) ? static_cast<float>(dirZ[r] / len) : 0.0f;
+                const double spread = (ePortal > 1e-12) ? (own[r] + eSpread[r]) / eTot : 1.0;
+                outDirSpread4[k * 4 + 3] = static_cast<float>(std::min(1.0, std::max(0.0, spread)));
+            }
         }
         return written;
     }

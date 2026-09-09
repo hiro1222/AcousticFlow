@@ -135,6 +135,10 @@ public:
         tailOutL_.assign(mf, 0.0f);
         tailOutR_.assign(mf, 0.0f);
         maxFrames_ = static_cast<int>(mf);
+        // 尾の FDN の開始（手順 5）: 送りの前の遅延線。上限 240 ms ＋ 1 チャンク。
+        fdnDelayLen_ = static_cast<int>(0.25f * static_cast<float>(sampleRate_)) + maxFrames_ + 2;
+        fdnDelay_.assign(static_cast<std::size_t>(fdnDelayLen_), 0.0f);
+        fdnSendBuf_.assign(mf, 0.0f);
     }
 
     VoiceRenderer(const VoiceRenderer&) = delete;
@@ -311,6 +315,18 @@ public:
     void setTailAmount(float directGain, float targetRatio) {
         tailGain_ = ReverbTailIr::calibrateGain(directGain, targetRatio);
     }
+    /// 【手順 5】尾の開始（ms、直接音からの相対）。最初の壁の反射の到達 ＝ ITDG を渡す。
+    ///   √V（反射が密になる統計の目安）だと 7 m を超える部屋で最初の壁より先に尾が鳴った（SPATIAL_DEPTH.md）。
+    ///   送りの前の遅延線で作る。FDN 自身の最短の線（≒平均自由行程 1 つ）がその上に乗るので、尾の最初の
+    ///   反射は「最初の壁 ＋ 壁 1 つ」＝ 2 次以降の反射の位置に来る（1 次は面の線音源が持つ）。
+    ///   変えるときはチャンクの中で新旧の遅延の読みを線形に混ぜる（ピッチを動かさず、段も付けない）。
+    void setFdnOnsetMs(float ms) {
+        const float s = std::min(240.0f, std::max(0.0f, ms)) * 0.001f * static_cast<float>(sampleRate_);
+        if (std::fabs(s - pendOnset_) < 0.25f) return;      // 同じ目標なら触らない（渡りの途中を乱さない）
+        pendOnset_ = s;
+        onsetVersion_.fetch_add(1, std::memory_order_release);
+    }
+    float fdnOnsetMs() const { return pendOnset_ * 1000.0f / static_cast<float>(sampleRate_); }
     static constexpr int kMaxFdnSends = 4;
 
     /// 反射・回折のタップを方向バスへ預ける。bus=NULL で自前の両耳化（軽量両耳化／パン）に戻る。
@@ -425,11 +441,57 @@ private:
                 for (int k = 0; k < kMaxFdnSends; ++k) { fdnRoom_[k] = room[k]; fdnGainTgt_[k] = tgt[k]; fdnGainCur_[k] = cur[k]; }
                 fdnSeen_ = v;
             }
+            // 尾の開始（手順 5）: 送りを ITDG ぶん遅らせる。新旧の遅延の読みをチャンク内で線形に混ぜる。
+            const float* sendSrc = input;
+            {
+                const int len = fdnDelayLen_;
+                float* ring = fdnDelay_.data();
+                for (int i = 0; i < n; ++i) ring[(fdnDelayW_ + i) % len] = input[i];
+                // 目標が変わっていれば取り込む。渡りの長さは跳びの 4 倍（1 チャンク〜200 ms）。
+                //   ★1 ブロックで混ぜ切ると、正弦では位相の跳び（35 ms ＝ 7.7 周期）が FDN の定常状態を崩して
+                //     隣り合うブロックで 11.7 dB 跳んだ（実測）。歩きでは ITDG は連続に動く（跳びは 1 ms 未満 → 1 ブロック）。
+                //     大きく跳ぶのは最初の反射が別の面に替わったとき（扉が開いた等）で、そこは跳びなりに長く混ぜる。
+                {
+                    const int ov = onsetVersion_.load(std::memory_order_acquire);
+                    if (ov != onsetSeen_) {
+                        const float s = pendOnset_;
+                        // 渡りの途中なら、半分を過ぎていれば向かっていた先を旧にする（半分前なら旧のまま）。
+                        if (fdnXf_ < 1.0f && fdnXf_ > 0.5f) fdnOnsetOld_ = fdnOnsetNew_;
+                        else if (fdnXf_ >= 1.0f) fdnOnsetOld_ = fdnOnsetNew_;
+                        fdnOnsetNew_ = s;
+                        const float jump = std::fabs(fdnOnsetNew_ - fdnOnsetOld_);
+                        const float T = std::min(0.2f * static_cast<float>(sampleRate_), std::max(static_cast<float>(maxFrames_), jump * 4.0f));
+                        fdnXf_ = 0.0f;
+                        fdnXfStep_ = 1.0f / T;
+                        onsetSeen_ = ov;
+                    }
+                }
+                auto readAt = [&](int i, float d) {
+                    const float pos = static_cast<float>(fdnDelayW_ + i) - d;   // 遅延 d（小数）だけ前
+                    const int p0 = static_cast<int>(std::floor(pos));
+                    const float fr = pos - static_cast<float>(p0);
+                    const int a = ((p0 % len) + len) % len, b2 = (a + 1) % len;
+                    return ring[a] * (1.0f - fr) + ring[b2] * fr;
+                };
+                float* dst = fdnSendBuf_.data();
+                if (fdnXf_ >= 1.0f) {
+                    for (int i = 0; i < n; ++i) dst[i] = readAt(i, fdnOnsetNew_);
+                } else {
+                    for (int i = 0; i < n; ++i) {
+                        const float t = std::min(1.0f, fdnXf_ + fdnXfStep_ * static_cast<float>(i + 1));
+                        dst[i] = readAt(i, fdnOnsetOld_) * (1.0f - t) + readAt(i, fdnOnsetNew_) * t;
+                    }
+                    fdnXf_ = std::min(1.0f, fdnXf_ + fdnXfStep_ * static_cast<float>(n));
+                    if (fdnXf_ >= 1.0f) fdnOnsetOld_ = fdnOnsetNew_;
+                }
+                fdnDelayW_ = (fdnDelayW_ + n) % len;
+                sendSrc = dst;
+            }
             for (int k = 0; k < kMaxFdnSends; ++k) {
                 if (fdnRoom_[k] < 0) continue;
                 const float gS = tgStart * outputGain_ * fdnGainCur_[k];
                 const float gE = tgEnd * outputGain_ * fdnGainTgt_[k];
-                if (gS > 0.0f || gE > 0.0f) fdnMix_->add(fdnRoom_[k], input, n, gS, gE, dstOffset);
+                if (gS > 0.0f || gE > 0.0f) fdnMix_->add(fdnRoom_[k], sendSrc, n, gS, gE, dstOffset);
                 fdnGainCur_[k] = fdnGainTgt_[k];
                 if (fdnGainTgt_[k] <= 0.0f) fdnRoom_[k] = -1;   // 繋ぎ終えた送りは片付ける
             }
@@ -584,6 +646,16 @@ private:
     float pendFdnGain_[kMaxFdnSends] = {};
     std::atomic<int> fdnVersion_{0};
     int   fdnSeen_ = 0;
+    // 尾の開始（手順 5）: 送りの前の遅延線と、その読み位置（サンプル。小数）。
+    std::vector<float> fdnDelay_;
+    std::vector<float> fdnSendBuf_;
+    int   fdnDelayLen_ = 1;
+    int   fdnDelayW_ = 0;
+    float pendOnset_ = 0.0f;                 // 制御スレッドが書く目標（サンプル）
+    std::atomic<int> onsetVersion_{0};
+    int   onsetSeen_ = 0;
+    float fdnOnsetOld_ = 0.0f, fdnOnsetNew_ = 0.0f;   // 渡りの旧と新（オーディオスレッド）
+    float fdnXf_ = 1.0f, fdnXfStep_ = 0.0f;           // 渡りの位置（0..1）と 1 サンプルあたりの進み
     // 器は 1 つ。差し替えの混ぜは中（遅延線は共有、IR スペクトルだけ 2 世代）。
     NonUniformConvolver tailConv_;
     ReverbTailIr tailIr_;

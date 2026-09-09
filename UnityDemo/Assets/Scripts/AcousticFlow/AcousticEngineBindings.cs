@@ -325,7 +325,8 @@ namespace AcousticFlow
         // 【手順 4】点のまわりの各部屋の FDN との結び付き（帯域別の振幅 outW6[k*6+b]）。normalizeOwn=1 はリスナー、0 は音源。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_SceneFdnRoomWeights(IntPtr scene, AFVector3 p, float radius, int normalizeOwn,
-                                                        [Out] int[] outRooms, [Out] float[] outW6, int maxOut);
+                                                        [Out] int[] outRooms, [Out] float[] outW6, int maxOut,
+                                                        [Out] float[] outDirSpread4);
 
         // 部屋どうしを繋ぐ開口（戸口・窓・壊れた壁の穴）。面積の大きい順。
         [DllImport(Dll, CallingConvention = Cc)]
@@ -661,6 +662,15 @@ namespace AcousticFlow
         // 尾の量だけを置く（IR を組まない道）。
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_VoiceSetTailAmount(IntPtr voice, float directGain, float targetRatio);
+        // 【手順 5】尾の開始（ms、直接音からの相対）。最初の壁の反射の到達 ＝ ITDG を毎フレーム。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_VoiceSetFdnOnsetMs(IntPtr voice, float ms);
+        // 【手順 6】方向バスを差す（Zero で L/R に戻る）。AudioListener で FDN → 方向バスの順に Render すること。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_FdnMixSetDirectionBus(IntPtr mix, IntPtr bus, float headCircumferenceCm);
+        // 部屋の尾が来る向き（リスナー座標）と広がり（0 点〜1 一様）。
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_FdnMixSetListenerDirection(IntPtr mix, int room, float dx, float dy, float dz, float spread);
 
         // ── 方向バス（2026-09-04）: 反射・回折タップをリスナー座標で固定したレーンへ振り、レーンごとに固定の HRIR で畳む ──
         [DllImport(Dll, CallingConvention = Cc)]

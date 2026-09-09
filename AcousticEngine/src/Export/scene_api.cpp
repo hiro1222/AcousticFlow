@@ -1238,10 +1238,10 @@ int AF_SceneRoomRt60Live(AF_SceneHandle scene, int room, float* outRt60_6, float
 }
 
 int AF_SceneFdnRoomWeights(AF_SceneHandle scene, AF_Vector3 p, float radius, int normalizeOwn,
-                           int* outRooms, float* outW6, int maxOut) {
+                           int* outRooms, float* outW6, int maxOut, float* outDirSpread4) {
     ReadGuard afGuard(asBox(scene)); Scene* s = afGuard.get();
     if (!s || !outRooms || !outW6 || maxOut <= 0) return 0;
-    return s->fdnRoomWeights(toVec3(p), radius, normalizeOwn != 0, outRooms, outW6, maxOut);
+    return s->fdnRoomWeights(toVec3(p), radius, normalizeOwn != 0, outRooms, outW6, maxOut, outDirSpread4);
 }
 
 int AF_SceneRoomAcoustics(AF_SceneHandle scene, int room, float* outSurface,

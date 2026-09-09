@@ -751,12 +751,15 @@ namespace AcousticFlow
         }
         /// 【手順 4】点のまわりの各部屋の FDN との結び付き（帯域別の振幅 outW6[k*6+b]）。
         ///   normalizeOwn: リスナーは true（尾の比が「部屋の中である割合」を既に持つ）／音源は false（注ぐ量そのもの）。
-        public int GetFdnRoomWeights(Vector3 p, float radius, bool normalizeOwn, int[] outRooms, float[] outW6)
+        ///   outDirSpread4（手順 6、null 可）: [k*4+0..2] その部屋の尾が来る向き（ワールド）、[k*4+3] 広がり（0 点〜1 一様）。
+        public int GetFdnRoomWeights(Vector3 p, float radius, bool normalizeOwn, int[] outRooms, float[] outW6,
+                                     float[] outDirSpread4 = null)
         {
             if (_handle == IntPtr.Zero || outRooms == null || outW6 == null) return 0;
             int cap = Mathf.Min(outRooms.Length, outW6.Length / 6);
+            if (outDirSpread4 != null) cap = Mathf.Min(cap, outDirSpread4.Length / 4);
             if (cap <= 0) return 0;
-            try { return Native.AF_SceneFdnRoomWeights(_handle, new AFVector3(p), radius, normalizeOwn ? 1 : 0, outRooms, outW6, cap); }
+            try { return Native.AF_SceneFdnRoomWeights(_handle, new AFVector3(p), radius, normalizeOwn ? 1 : 0, outRooms, outW6, cap, outDirSpread4); }
             catch (System.Exception) { return 0; }
         }
 

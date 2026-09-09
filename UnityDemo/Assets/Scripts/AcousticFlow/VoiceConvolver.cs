@@ -393,7 +393,11 @@ namespace AcousticFlow
                     _tailEchoVersion = -1;   // 預けたら量を置き直す／戻ったら IR を組み直す
                 }
                 if (_fdnMix != IntPtr.Zero)
+                {
                     Native.AF_VoiceSetFdnSends(_voice, ts.FdnRooms, ts.FdnGains, ts.FdnCount);
+                    // 【手順 5】尾の開始 ＝ 最初の壁の反射の到達（ITDG）。√V でなく幾何から（SPATIAL_DEPTH.md）。
+                    Native.AF_VoiceSetFdnOnsetMs(_voice, Mathf.Max(0f, ts.ItdgMs));
+                }
             }
 
             if (++_frameCounter >= Mathf.Max(1, tailRebuildEveryFrames))

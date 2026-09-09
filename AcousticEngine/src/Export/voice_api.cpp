@@ -189,6 +189,19 @@ void AF_VoiceSetTailAmount(AF_VoiceHandle voice, float directGain, float targetR
     if (af::dsp::VoiceRenderer* v = asVoice(voice)) v->setTailAmount(directGain, targetRatio);
 }
 
+void AF_VoiceSetFdnOnsetMs(AF_VoiceHandle voice, float ms) {
+    if (af::dsp::VoiceRenderer* v = asVoice(voice)) v->setFdnOnsetMs(ms);
+}
+
+void AF_FdnMixSetDirectionBus(AF_FdnMixHandle mix, AF_DirectionBusHandle bus, float headCircumferenceCm) {
+    if (af::dsp::FdnRoomMix* m = asFdn(mix))
+        m->setDirectionBus(static_cast<af::dsp::DirectionBus*>(bus), (headCircumferenceCm > 0.0f) ? headCircumferenceCm : 57.0f);
+}
+
+void AF_FdnMixSetListenerDirection(AF_FdnMixHandle mix, int room, float dx, float dy, float dz, float spread) {
+    if (af::dsp::FdnRoomMix* m = asFdn(mix)) { const float d[3] = { dx, dy, dz }; m->setListenerDirection(room, d, spread); }
+}
+
 AF_DirectionBusHandle AF_DirectionBusCreate(int sampleRate, int lanes, int maxFrames) {
     return new (std::nothrow) af::dsp::DirectionBus(orDefault(sampleRate, 48000), orDefault(lanes, 8),
                                                     orDefault(maxFrames, 1024));

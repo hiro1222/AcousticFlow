@@ -8609,9 +8609,9 @@ void testWalkContinuity() {
                         }
                         int rooms[8]; float w6[48]; const float zero[6] = {};
                         for (int r = 0; r < nr; ++r) AF_FdnMixSetListenerWeight(fdn, r, zero);
-                        const int nl = AF_SceneFdnRoomWeights(s, L, 2.0f, 1, rooms, w6, 8);
+                        const int nl = AF_SceneFdnRoomWeights(s, L, 2.0f, 1, rooms, w6, 8, nullptr);
                         for (int k = 0; k < nl; ++k) AF_FdnMixSetListenerWeight(fdn, rooms[k], w6 + k * 6);
-                        const int ns = AF_SceneFdnRoomWeights(s, Sp, 2.0f, 0, rooms, w6, 4);
+                        const int ns = AF_SceneFdnRoomWeights(s, Sp, 2.0f, 0, rooms, w6, 4, nullptr);
                         float g[4] = {};
                         for (int k = 0; k < ns; ++k) { float mm = 0; for (int b = 0; b < 6; ++b) mm += w6[k * 6 + b]; g[k] = mm / 6.0f; }
                         AF_VoiceSetFdnSends(v, rooms, g, ns);
@@ -8929,9 +8929,9 @@ void testDoorSweepClicks() {
                         }
                         int rooms[8]; float w6[48]; const float zero[6] = {};
                         for (int r = 0; r < nr; ++r) AF_FdnMixSetListenerWeight(fdn, r, zero);
-                        const int nl = AF_SceneFdnRoomWeights(s, Lp, 2.0f, 1, rooms, w6, 8);
+                        const int nl = AF_SceneFdnRoomWeights(s, Lp, 2.0f, 1, rooms, w6, 8, nullptr);
                         for (int k = 0; k < nl; ++k) AF_FdnMixSetListenerWeight(fdn, rooms[k], w6 + k * 6);
-                        const int ns = AF_SceneFdnRoomWeights(s, Sp, 2.0f, 0, rooms, w6, 4);
+                        const int ns = AF_SceneFdnRoomWeights(s, Sp, 2.0f, 0, rooms, w6, 4, nullptr);
                         float g[4] = {};
                         for (int k = 0; k < ns; ++k) { float mm = 0; for (int b = 0; b < 6; ++b) mm += w6[k * 6 + b]; g[k] = mm / 6.0f; }
                         AF_VoiceSetFdnSends(v, rooms, g, ns);
@@ -9394,12 +9394,12 @@ void testFdnWiring() {
         for (int i = 0; i < 2; ++i) AF_SceneUpdate(s, dt);
         int rooms[8]; float w6[48];
         float lo = 0, ln[3] = {}, so = 0, sn[3] = {};
-        const int nl = AF_SceneFdnRoomWeights(s, Lp, 2.0f, 1, rooms, w6, 8);
+        const int nl = AF_SceneFdnRoomWeights(s, Lp, 2.0f, 1, rooms, w6, 8, nullptr);
         for (int k = 0; k < nl; ++k) {
             if (rooms[k] == roomL) lo = w6[k * 6 + 3];
             else if (rooms[k] == roomS) { ln[0] = w6[k * 6 + 0]; ln[1] = w6[k * 6 + 3]; ln[2] = w6[k * 6 + 5]; }
         }
-        const int ns = AF_SceneFdnRoomWeights(s, Sp, 2.0f, 0, rooms, w6, 8);
+        const int ns = AF_SceneFdnRoomWeights(s, Sp, 2.0f, 0, rooms, w6, 8, nullptr);
         for (int k = 0; k < ns; ++k) {
             if (rooms[k] == roomS) so = w6[k * 6 + 3];
             else if (rooms[k] == roomL) { sn[0] = w6[k * 6 + 0]; sn[1] = w6[k * 6 + 3]; sn[2] = w6[k * 6 + 5]; }
@@ -9423,7 +9423,7 @@ void testFdnWiring() {
         float prevA = -1.0f, prevB = -1.0f, maxStep = 0.0f, maxSum = 0.0f, minSum = 9.0f;
         for (float z = -3.0f; z <= 3.0f + 1e-4f; z += 0.05f) {
             int rooms[8]; float w6[48];
-            const int n = AF_SceneFdnRoomWeights(s, V(0, 1.6f, z), 2.0f, 1, rooms, w6, 8);
+            const int n = AF_SceneFdnRoomWeights(s, V(0, 1.6f, z), 2.0f, 1, rooms, w6, 8, nullptr);
             float wa = 0, wb = 0;
             for (int k = 0; k < n; ++k) { if (rooms[k] == roomL) wa = w6[k * 6 + 3]; else if (rooms[k] == roomS) wb = w6[k * 6 + 3]; }
             if (prevA >= 0.0f) maxStep = std::max(maxStep, std::max(std::fabs(wa - prevA), std::fabs(wb - prevB)));
@@ -9481,9 +9481,9 @@ void testFdnWiring() {
                 }
                 AF_VoiceSetFdnMix(v, fdn);
                 int rooms[8]; float w6[48];
-                const int nl = AF_SceneFdnRoomWeights(s, Lp, 2.0f, 1, rooms, w6, 8);
+                const int nl = AF_SceneFdnRoomWeights(s, Lp, 2.0f, 1, rooms, w6, 8, nullptr);
                 for (int k = 0; k < nl; ++k) AF_FdnMixSetListenerWeight(fdn, rooms[k], w6 + k * 6);
-                const int ns = AF_SceneFdnRoomWeights(s, srcPos, 2.0f, 0, rooms, w6, 4);
+                const int ns = AF_SceneFdnRoomWeights(s, srcPos, 2.0f, 0, rooms, w6, 4, nullptr);
                 float g[4] = {};
                 for (int k = 0; k < ns; ++k) { float m = 0; for (int b = 0; b < 6; ++b) m += w6[k * 6 + b]; g[k] = m / 6.0f; }
                 AF_VoiceSetFdnSends(v, rooms, g, ns);
@@ -9525,12 +9525,87 @@ void testFdnWiring() {
     compareLevels(Sp, "扉 60° 越し（畳み込みは tailSrcLevel=1 のまま。差 ＝ 配線の量。合否なし）", false);
     AF_SceneSetSource(s, 1, Sp);
 
+    // ── 手順 6: 部屋の尾が来る向きと広がり（リスナーは部屋0、戸口は +z 側）──
+    {
+        setDoor(90.0f);
+        for (int i = 0; i < 2; ++i) AF_SceneUpdate(s, dt);
+        int rooms[8]; float w6[48]; float ds[32];
+        const int n = AF_SceneFdnRoomWeights(s, Lp, 2.0f, 1, rooms, w6, 8, ds);
+        float ownSpread = -1.0f, nbSpread = -1.0f, nbDz = 0.0f;
+        for (int k = 0; k < n; ++k) {
+            if (rooms[k] == roomL) ownSpread = ds[k * 4 + 3];
+            else if (rooms[k] == roomS) { nbSpread = ds[k * 4 + 3]; nbDz = ds[k * 4 + 2]; }
+            std::printf("        部屋%d: 向き (%+.2f, %+.2f, %+.2f)  広がり %.2f\n", rooms[k], ds[k * 4 + 0], ds[k * 4 + 1], ds[k * 4 + 2], ds[k * 4 + 3]);
+        }
+        std::snprintf(buf, sizeof(buf), "(自室の広がり %.2f、隣室の広がり %.2f、隣室の向き z %+.2f)", ownSpread, nbSpread, nbDz);
+        check("[尾・FDN] 自室の尾は一様（広がり 1）、隣室の尾は戸口の向き（+z）で広がりは 0.7 未満", ownSpread > 0.99f && nbSpread >= 0.0f && nbSpread < 0.7f && nbDz > 0.9f, buf);
+    }
+
+    // ── 手順 5: 尾の開始（送りの前の遅延）──
+    {
+        auto firstMs = [&](float onsetMs, double* maxStepDb) {
+            AF_VoiceConfig vc{};
+            vc.sampleRate = sr; vc.maxFrames = block; vc.tailSeconds = 1.0f;
+            vc.tapCrossfadeMs = 30.0f; vc.hrtfCrossfadeMs = 12.0f;
+            vc.tailFirstBlock = 64; vc.tailCapBlock = 8192;
+            AF_VoiceHandle v = AF_VoiceCreate(&vc);
+            AF_VoiceSetOutputGain(v, 1.0f);
+            AF_VoiceSetHrtfEnabled(v, 0);
+            AF_VoiceSetTailLevel(v, 1.0f);
+            AF_VoiceSetTailEnvelope(v, 1.0f, 1.0f);
+            AF_VoiceTap tap{}; AF_VoiceSetTaps(v, &tap, 1);
+            AF_FdnMixHandle fdn = AF_FdnMixCreate(sr, block, 0.6f);
+            float rts[6] = { 0.6f, 0.6f, 0.6f, 0.6f, 0.6f, 0.6f };
+            AF_FdnMixAddRoom(fdn, 1.0f, rts, 0);
+            const float one[6] = { 1, 1, 1, 1, 1, 1 };
+            AF_FdnMixSetListenerWeight(fdn, 0, one);
+            AF_VoiceSetFdnMix(v, fdn);
+            const int rr0 = 0; const float g1 = 1.0f;
+            AF_VoiceSetFdnSends(v, &rr0, &g1, 1);
+            AF_VoiceSetTailAmount(v, 1.0f, 1.0f);
+            AF_VoiceSetFdnOnsetMs(v, (maxStepDb) ? 5.0f : onsetMs);
+            const int total = sr * 2;
+            // インパルスは 300 ms に置く（最初のチャンクは送りの量が 0 → 1 に傾斜するので 0 ms だと消える。開始の渡りは最長 200 ms なので、その後）。
+            const int impulseAt = (sr * 3 / 10 / block) * block;
+            std::vector<float> in(static_cast<std::size_t>(block)), oL(static_cast<std::size_t>(block)), oR(static_cast<std::size_t>(block));
+            double first = -1.0, prev = -1.0; if (maxStepDb) *maxStepDb = 0.0;
+            for (int p = 0; p < total; p += block) {
+                if (maxStepDb) {
+                    for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = 0.1f * std::sin(2.0f * 3.14159265f * 220.0f * (p + i) / sr);
+                    if (p >= sr && p < sr + block) AF_VoiceSetFdnOnsetMs(v, onsetMs);   // 1 秒で 5 → onsetMs へ
+                } else {
+                    std::fill(in.begin(), in.end(), 0.0f);
+                    if (p == impulseAt) in[0] = 1.0f;
+                }
+                AF_VoiceRender(v, in.data(), block, oL.data(), oR.data(), nullptr);
+                std::fill(oL.begin(), oL.end(), 0.0f); std::fill(oR.begin(), oR.end(), 0.0f);
+                AF_FdnMixRender(fdn, block, oL.data(), oR.data());
+                if (!maxStepDb) {
+                    for (int i = 0; i < block && first < 0.0; ++i) if (p >= impulseAt && std::fabs(oL[static_cast<std::size_t>(i)]) > 1e-6f) first = (p + i - impulseAt) * 1000.0 / sr;
+                } else if (p >= sr / 2) {
+                    double q = 0.0; for (int i = 0; i < block; ++i) q += static_cast<double>(oL[static_cast<std::size_t>(i)]) * oL[static_cast<std::size_t>(i)];
+                    const double rms = std::sqrt(q / block);
+                    if (prev > 0.0) *maxStepDb = std::max(*maxStepDb, std::fabs(20.0 * std::log10(std::max(rms, 1e-12) / prev)));
+                    prev = rms;
+                }
+            }
+            AF_VoiceSetFdnMix(v, nullptr); AF_FdnMixDestroy(fdn); AF_VoiceDestroy(v);
+            return first;
+        };
+        const double t0 = firstMs(0.0f, nullptr), t30 = firstMs(30.0f, nullptr);
+        double st = 0.0; firstMs(40.0f, &st);
+        std::snprintf(buf, sizeof(buf), "(尾の最初の出力: 開始 0 で %.1f ms、30 ms で %.1f ms。5 → 40 ms へ切り替えの段差 %.2f dB)", t0, t30, st);
+        std::printf("      手順 5: 尾の開始 ＝ 送りの前の遅延（FDN 自身の最短の線がその上に乗る）%s\n", buf);
+        check("[尾・FDN] 尾の開始を 30 ms にすると最初の出力が 30 ms 以上遅れる（差 25 ms 以上）", t30 >= 30.0 && (t30 - t0) >= 25.0, buf);
+        check("[尾・FDN] 鳴らしながら尾の開始を 5 → 40 ms へ変えても隣り合うブロックの段差が 3 dB 以下", st <= 3.0, buf);
+    }
+
     // ── 費用（主スレッドで毎フレーム呼ぶ物）──
     {
         using clk = std::chrono::steady_clock;
         int rooms[8]; float w6[48]; float rt[6];
         const auto t0 = clk::now();
-        for (int i = 0; i < 100; ++i) AF_SceneFdnRoomWeights(s, Lp, 2.0f, 1, rooms, w6, 8);
+        for (int i = 0; i < 100; ++i) AF_SceneFdnRoomWeights(s, Lp, 2.0f, 1, rooms, w6, 8, nullptr);
         const auto t1 = clk::now();
         for (int i = 0; i < 100; ++i) for (int r = 0; r < nr; ++r) AF_SceneRoomRt60Live(s, r, rt, nullptr);
         const auto t2 = clk::now();

@@ -775,8 +775,10 @@ ACOUSTIC_API int  AF_SceneRoomRt60Live(AF_SceneHandle scene, int room, float* ou
 /* 【手順 4】点 p のまわりで各部屋の FDN との結び付き（帯域別の振幅、outW6[k*6+b]）。
  *   リスナーの重み（normalizeOwn=1）と音源の送り（normalizeOwn=0）の両方がこの 1 つの式。
  *   E_r,b = s_r + (1−s_r)·Σ口 gate·α_口,b²·min(1/2, S/4πd²)、w = √E。書けた数を返す（大きい順）。 */
+/*   outDirSpread4（手順 6、NULL 可）: [k*4+0..2] その部屋の尾が来る向き（ワールド。口の寄与の重み付き平均、無ければ 0）、
+ *   [k*4+3] 広がり（0 点〜1 一様）。ホストはリスナー座標へ回して AF_FdnMixSetListenerDirection へ。 */
 ACOUSTIC_API int  AF_SceneFdnRoomWeights(AF_SceneHandle scene, AF_Vector3 p, float radius, int normalizeOwn,
-                                         int* outRooms, float* outW6, int maxOut);
+                                         int* outRooms, float* outW6, int maxOut, float* outDirSpread4);
 
 ACOUSTIC_API int  AF_SceneApertureCount(AF_SceneHandle scene);
 

@@ -61,6 +61,7 @@ namespace AcousticFlow
             if (_dirBus != System.IntPtr.Zero) return _dirBus;
             try { _dirBus = Native.AF_DirectionBusCreate(_sampleRate, directionLanes, Mathf.Max(maxFrames, 2048)); }
             catch (System.EntryPointNotFoundException) { _dirBus = System.IntPtr.Zero; }
+            AttachFdnToDirectionBus();
             return _dirBus;
         }
 
@@ -103,7 +104,15 @@ namespace AcousticFlow
             catch (System.EntryPointNotFoundException) { return System.IntPtr.Zero; }
             RetireFdnMix();
             _fdn = mix;   // 参照の書き換えは原子的。オーディオスレッドは古い器か新しい器のどちらかを見る
+            AttachFdnToDirectionBus();
             return mix;
+        }
+        /// 【手順 6】尾の FDN を方向バスへ（レーンごとに独立した尾。向きは部屋ごと）。両方が揃ったときに差す。
+        private void AttachFdnToDirectionBus()
+        {
+            if (_fdn == System.IntPtr.Zero || _dirBus == System.IntPtr.Zero) return;
+            try { Native.AF_FdnMixSetDirectionBus(_fdn, _dirBus, 57f); }
+            catch (System.EntryPointNotFoundException) { }
         }
         /// 今の器を引退させる（音源を外し、1 秒後に壊す）。
         public void RetireFdnMix()

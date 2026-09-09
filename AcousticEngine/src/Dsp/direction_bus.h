@@ -87,7 +87,9 @@ public:
     void setHrtfSet(const HrtfSet* set, float /*headCircumferenceCm*/) {
         hasHrtf_ = false;
         conv_.clear();
+        meanPowerGain_ = 1.0f;
         if (!set || !set->isValid()) return;
+        meanPowerGain_ = std::max(1e-6f, set->meanPowerGain());   // 尾の FDN がレーンの量を等パワーのパンに揃えるのに使う
         const int irLen = std::min(set->irLength(), kLaneIrMax);
         const int fade = std::min(16, irLen / 4);
         std::vector<float> cut(static_cast<std::size_t>(irLen));
@@ -171,6 +173,8 @@ public:
 
     /// 直近ブロックの出力の RMS（左）。
     float rms() const { return rms_; }
+    /// HRIR の平均パワーゲイン（HRIR 無しなら 1）。VoiceRenderer の difNorm_ と同じ揃え方に使う。
+    float meanPowerGain() const { return meanPowerGain_; }
 
 private:
     static constexpr float kPi = 3.14159265358979f;
@@ -185,6 +189,7 @@ private:
     int pending_ = 0;                       // このブロックで触った長さ
     std::vector<float> scratchL_, scratchR_;
     float rms_ = 0.0f;
+    float meanPowerGain_ = 1.0f;
 };
 
 }  // namespace dsp

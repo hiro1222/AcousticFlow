@@ -2423,6 +2423,7 @@ namespace AcousticFlow
         private readonly int[] _fdnRoomBuf = new int[8];
         private readonly float[] _fdnW6 = new float[48];
         private readonly float[] _fdnW6One = new float[6];
+        private readonly float[] _fdnDir = new float[8 * 4];   // 部屋ごとの向き（ワールド）と広がり
         private readonly float[] _fdnRt = new float[6];
         private readonly float[] _fdnAb = new float[6];
         private readonly float[] _fdnZero = new float[6];
@@ -2480,7 +2481,7 @@ namespace AcousticFlow
             }
             if (hudN > 0) { _fdnHudRt = hudRt / hudN; _fdnHudOpen = hudOpen / hudN; }
             // 2) リスナーの重み（正規化）。今回置かない部屋のうち前回置いた物だけ 0 にする。
-            int n = _scene.GetFdnRoomWeights(listener.position, roomBlendRadius, true, _fdnRoomBuf, _fdnW6);
+            int n = _scene.GetFdnRoomWeights(listener.position, roomBlendRadius, true, _fdnRoomBuf, _fdnW6, _fdnDir);
             for (int r = 0; r < nr; r++)
             {
                 bool now = false;
@@ -2493,6 +2494,11 @@ namespace AcousticFlow
                 if (_fdnRoomBuf[k] < 0 || _fdnRoomBuf[k] >= nr) continue;
                 System.Array.Copy(_fdnW6, k * 6, _fdnW6One, 0, 6);
                 Native.AF_FdnMixSetListenerWeight(mix, _fdnRoomBuf[k], _fdnW6One);
+                // 【手順 6】その部屋の尾が来る向き（戸口越しなら口の向き、自室は一様）をリスナー座標で置く。方向バスが無ければ効かない。
+                Vector3 wd = new Vector3(_fdnDir[k * 4], _fdnDir[k * 4 + 1], _fdnDir[k * 4 + 2]);
+                Vector3 ld = (wd.sqrMagnitude > 1e-6f) ? listener.InverseTransformDirection(wd.normalized) : Vector3.forward;
+                try { Native.AF_FdnMixSetListenerDirection(mix, _fdnRoomBuf[k], ld.x, ld.y, ld.z, _fdnDir[k * 4 + 3]); }
+                catch (System.EntryPointNotFoundException) { }
             }
             // 3) 音源ごとの送り先（そのまま）。重みは帯域の平均（送りはモノラルなので色は付けない。色はリスナー側の重みが持つ）。
             if (_taps == null || _srcPos == null || _taps.Length != _srcPos.Length) return;
@@ -2926,7 +2932,8 @@ namespace AcousticFlow
                 // 後期の尾の作り方（docs/TAIL_FDN_PLAN.md 手順 4 の切り替え）。
                 string fdnInfo = "";
                 if (tailModel == 1 && tb != null && tb.FdnMixHandle != System.IntPtr.Zero)
-                    fdnInfo = $"（部屋 {tb.FdnRoomCount} 本・RMS {20f * Mathf.Log10(Mathf.Max(tb.FdnRms, 1e-6f)):F1} dB・生きた RT60 500Hz {_fdnHudRt:F2} s・口の素通し {_fdnHudOpen:F2}）";
+                    fdnInfo = $"（部屋 {tb.FdnRoomCount} 本・RMS {20f * Mathf.Log10(Mathf.Max(tb.FdnRms, 1e-6f)):F1} dB・生きた RT60 500Hz {_fdnHudRt:F2} s・口の素通し {_fdnHudOpen:F2}"
+                            + $"・向き {(tb.DirectionBusHandle != System.IntPtr.Zero ? "方向バス（戸口の向き）" : "L/R")}・開始 ITDG）";
                 else if (tailModel == 1)
                     fdnInfo = "（器を作れていません: 部屋グラフが無いか DLL が古い）";
                 GUILayout.Label($"尾: {(tailModel == 1 ? "FDN（部屋ごとの帰還遅延網）" : "畳み込み（エコグラム → IR）")} (K / tailModel){fdnInfo}", style);

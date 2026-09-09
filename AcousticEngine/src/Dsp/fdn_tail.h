@@ -112,6 +112,9 @@ public:
         lineBuf_.assign(bandStride_ * kNumBands, 0.0f);
         for (int b = 0; b < kNumBands; ++b)
             for (int i = 0; i < kLines; ++i) linePos_[b][i] = 0;
+        // Hadamard の符号表（行 r・線 i）。行 0 = 全部 +1（M）。
+        for (int r = 0; r < kLines; ++r)
+            for (int i = 0; i < kLines; ++i) signTab_[r][i] = parity(i & r) ? -1.0f : 1.0f;
 
         total = 0;
         for (int k = 0; k < kAllpass; ++k) {
@@ -184,21 +187,38 @@ public:
 
     /// in をモノラルで frames サンプル入れ、尾を out に**上書き**する。in と out は別の配列。
     ///   係数は 1 ブロックの中で目標へ線形に寄る（連続性の担保はここ）。
-    void render(const float* in, int frames, float* out) { renderImpl(in, frames, out, nullptr, nullptr, nullptr); }
+    void render(const float* in, int frames, float* out) { renderImpl(in, frames, out, nullptr, nullptr, 0, nullptr); }
     /// 診断: 帯域ごとの輪の出力を別々に書く（outBands[b][n]）。減衰の検査が輪を直接測るのに使う。
-    void renderBands(const float* in, int frames, float* const* outBands) { renderImpl(in, frames, nullptr, outBands, nullptr, nullptr); }
+    void renderBands(const float* in, int frames, float* const* outBands) { renderImpl(in, frames, nullptr, outBands, nullptr, 0, nullptr); }
     /// 帯域ごとに M/L/R の 3 本を書く（部屋ごとの配線用。FdnRoomMix が使う）。
-    ///   M = 全線の和（隣室への結合に使う）、L/R = Hadamard の別の行（bit0 / bit1）の符号で足した 2 本。
+    ///   M = 全線の和（Hadamard の行 0）、L/R = 別の行（行 1 = bit0 / 行 2 = bit1）の符号で足した 2 本。
     ///   M・L・R は互いに直交する符号なので拡散状態では無相関＝尾が広がる（畳み込みの尾の L/R 独立ノイズと同じ性質）。
     ///   エネルギーは 3 本とも同じ（各行の符号は ±1 が 16 個）。どれも nullptr 可。
     void renderBandsMLR(const float* in, int frames, float* const* outM, float* const* outL, float* const* outR) {
-        renderImpl(in, frames, nullptr, outM, outL, outR);
+        const int rows[3] = { 0, 1, 2 };
+        float* ptr[3 * kNumBands];
+        for (int b = 0; b < kNumBands; ++b) {
+            ptr[b] = outM ? outM[b] : nullptr;
+            ptr[kNumBands + b] = outL ? outL[b] : nullptr;
+            ptr[2 * kNumBands + b] = outR ? outR[b] : nullptr;
+        }
+        renderImpl(in, frames, nullptr, nullptr, rows, 3, ptr);
+    }
+    /// 【手順 6】Hadamard の任意の行を帯域ごとに書く（方向バスのレーン用）。行 r の線 i の符号 = popcount(i & r) の偶奇。
+    ///   行どうしは直交するので拡散状態では無相関（レーンごとに独立した尾＝方向ごとに別のノイズ）。
+    ///   outRows[r * kNumBands + b] に frames サンプル（nullptr 可）。行は 0..15（16 本の線）。
+    void renderBandsRows(const float* in, int frames, const int* rows, int nRows, float* const* outRows) {
+        renderImpl(in, frames, nullptr, nullptr, rows, nRows, outRows);
     }
 
 private:
+    static int parity(int x) { x ^= x >> 8; x ^= x >> 4; x ^= x >> 2; x ^= x >> 1; return x & 1; }
+
     void renderImpl(const float* in, int frames, float* out, float* const* outBands,
-                    float* const* outBandsL, float* const* outBandsR) {
-        if ((!out && !outBands && !outBandsL && !outBandsR) || frames <= 0) return;
+                    const int* rows, int nRows, float* const* outRows) {
+        if (!rows || !outRows) nRows = 0;
+        if (nRows > kLines) nRows = kLines;
+        if ((!out && !outBands && nRows <= 0) || frames <= 0) return;
         // 版が変わっていれば目標を取り込む（浮動小数の書きは版の release より前、読みは acquire の後）。
         const int v = version_.load(std::memory_order_acquire);
         if (v != seen_) {
@@ -243,18 +263,18 @@ private:
             float sum = 0.0f;
             for (int b = 0; b < kNumBands; ++b) {
                 float* base = lineBuf_.data() + bandStride_ * static_cast<std::size_t>(b);
-                float f[kLines]; float bsum = 0.0f, bL = 0.0f, bR = 0.0f;
+                float f[kLines]; float bsum = 0.0f;
+                float rsum[kLines] = {};                 // 行ごとの符号付きの和（nRows ≤ kLines）
                 for (int i = 0; i < kLines; ++i) {
                     const float y = base[lineOff_[i] + static_cast<std::size_t>(linePos_[b][i])];
                     bsum += y;
-                    bL += (i & 1) ? -y : y;              // Hadamard の行 1（bit0）
-                    bR += (i & 2) ? -y : y;              // Hadamard の行 2（bit1）
+                    for (int r = 0; r < nRows; ++r) rsum[r] += y * signTab_[rows[r] & (kLines - 1)][i];
                     f[i] = y * gainCur_[b][i];
                 }
                 sum += bsum;
-                if (outBands)  outBands[b][n]  = bsum * oNorm;
-                if (outBandsL) outBandsL[b][n] = bL * oNorm;
-                if (outBandsR) outBandsR[b][n] = bR * oNorm;
+                if (outBands) outBands[b][n] = bsum * oNorm;
+                for (int r = 0; r < nRows; ++r)
+                    if (outRows[r * kNumBands + b]) outRows[r * kNumBands + b][n] = rsum[r] * oNorm;
                 // 高速 Walsh–Hadamard（無損失の混合）。
                 for (int len = 1; len < kLines; len <<= 1)
                     for (int j = 0; j < kLines; j += len << 1)
@@ -377,7 +397,12 @@ private:
             for (int b = 0; b < kNumBands; ++b) { for (int i = 0; i < kLines; ++i) { gainCur_[b][i] = g[b][i]; gainTgt_[b][i] = g[b][i]; } inGainCur_[b] = ig[b]; inGainTgt_[b] = ig[b]; }
             diffCur_ = diffTgt_ = diffusionFor(rt);
             // 実際に聞く出力（L/R）で測る。M は線どうしの相関で量が違う（上の■）。
-            renderImpl(in.data(), nRun, nullptr, nullptr, pl, pr);
+            {
+                const int rows[2] = { 1, 2 };
+                float* ptr[2 * kNumBands];
+                for (int b = 0; b < kNumBands; ++b) { ptr[b] = pl[b]; ptr[kNumBands + b] = pr[b]; }
+                renderImpl(in.data(), nRun, nullptr, nullptr, rows, 2, ptr);
+            }
             double e = 0.0, tail = 0.0;
             for (int i = 0; i < nRun; ++i) {
                 float l = 0.0f, r = 0.0f;
@@ -419,6 +444,7 @@ private:
     float pendGain_[kNumBands][kLines] = {};
     float inGainCur_[kNumBands] = {}, inGainTgt_[kNumBands] = {}, pendInGain_[kNumBands] = {};
     float rt60_[kNumBands] = {};
+    float signTab_[kLines][kLines] = {};   // Hadamard の符号（行 × 線）
     float diffCur_ = 0.6f, diffTgt_ = 0.6f, pendDiff_ = 0.6f;
     static constexpr int kCal = 7;
     float calT60_[kCal] = {};          // 校正点の T60（s、対数等間隔）

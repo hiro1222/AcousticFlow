@@ -173,6 +173,9 @@ ACOUSTIC_API void AF_VoiceSetFdnMix(AF_VoiceHandle voice, AF_FdnMixHandle mix);
 ACOUSTIC_API void AF_VoiceSetFdnSends(AF_VoiceHandle voice, const int* rooms, const float* gains, int n);
 /* 尾の量だけを置く（IR を組まない道）。directGain / targetRatio は AF_VoiceRebuildTail と同じ意味。 */
 ACOUSTIC_API void AF_VoiceSetTailAmount(AF_VoiceHandle voice, float directGain, float targetRatio);
+/* 【手順 5】尾の開始（ms、直接音からの相対）。最初の壁の反射の到達（AF_VoiceProgram.itdgMs）を毎フレーム渡す。
+ *   送りの前の遅延で作り、変えるときはチャンク内で新旧を線形に混ぜる（段もピッチの動きも付けない）。0〜240。 */
+ACOUSTIC_API void AF_VoiceSetFdnOnsetMs(AF_VoiceHandle voice, float ms);
 
 /* ── 方向バス（2026-09-04）──
  *   反射・回折のタップを 1 本ずつ両耳化せず、リスナー座標で固定した N 本のレーン（水平の環）へ隣り合う
@@ -193,6 +196,14 @@ ACOUSTIC_API void AF_DirectionBusRender(AF_DirectionBusHandle bus, int frames, f
 ACOUSTIC_API float AF_DirectionBusRms(AF_DirectionBusHandle bus);
 /* この音源の反射・回折タップを方向バスへ預ける。bus=NULL で自前の両耳化に戻る（既定）。次の SetTaps から効く。 */
 ACOUSTIC_API void AF_VoiceSetDirectionBus(AF_VoiceHandle voice, AF_DirectionBusHandle bus);
+
+/* ── 尾の FDN と方向バス（手順 6）── */
+/* 【手順 6】方向バスを差す（NULL で L/R の 2 本に戻る）。レーンごとに独立した Hadamard の行を、部屋ごとの向きの重みで
+ *   レーンへ送る（ITD は向きから Woodworth、量は HRIR の平均パワーで等パワーのパンに揃える）。
+ *   ★AudioListener で AF_FdnMixRender → AF_DirectionBusRender の順に呼ぶこと（同じブロックで受ける）。 */
+ACOUSTIC_API void AF_FdnMixSetDirectionBus(AF_FdnMixHandle mix, AF_DirectionBusHandle bus, float headCircumferenceCm);
+/* 部屋の尾が来る向き（リスナー座標、+x 右 / +z 前）と広がり（0 点〜1 一様）。AF_SceneFdnRoomWeights の outDirSpread4 から。 */
+ACOUSTIC_API void AF_FdnMixSetListenerDirection(AF_FdnMixHandle mix, int room, float dx, float dy, float dz, float spread);
 
 /* タップ集合を差し替える。切替は次のブロックからクロスフェードして行われる。 */
 ACOUSTIC_API void AF_VoiceSetTaps(AF_VoiceHandle voice, const AF_VoiceTap* taps, int count);

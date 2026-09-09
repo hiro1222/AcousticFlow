@@ -3209,6 +3209,106 @@ void testFdnColour() {
     check("[FDN・色] 帯域の色が 10log10(RT60_b/T̄) に ±1.5 dB で乗る", worst <= 1.5f, buf);
 }
 
+// ================================ [FDN・方向] レーンごとの独立した行と方向バスへの送り（手順 6）
+void testFdnLanes() {
+    std::printf("\n[FDN・方向] レーンごとの独立した Hadamard の行と、方向バスへの送り（手順 6）\n");
+    const int fs = 48000, blk = 512;
+    const float rt[6] = { 0.6f, 0.6f, 0.6f, 0.6f, 0.6f, 0.6f };
+    char buf[200];
+    // ── 1. 行 1〜8 のエネルギーが揃い、行どうしが無相関 ──
+    {
+        af::dsp::FdnTail fdn(fs);
+        fdn.setRt60(rt);
+        const int n = fs * 2;
+        const int rows[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+        std::vector<float> out(static_cast<std::size_t>(8) * 6 * n, 0.0f);
+        float* ptr[48];
+        for (int r = 0; r < 8; ++r) for (int b = 0; b < 6; ++b) ptr[r * 6 + b] = out.data() + (static_cast<std::size_t>(r) * 6 + b) * n;
+        std::vector<float> in(static_cast<std::size_t>(blk), 0.0f);
+        for (int p = 0; p < n; p += blk) {
+            const int m = std::min(blk, n - p);
+            std::fill(in.begin(), in.end(), 0.0f);
+            if (p == 0) in[0] = 1.0f;
+            float* pp[48]; for (int k = 0; k < 48; ++k) pp[k] = ptr[k] + p;
+            fdn.renderBandsRows(in.data(), m, rows, 8, pp);
+        }
+        std::vector<float> sig(static_cast<std::size_t>(8) * n, 0.0f);
+        double e[8] = {};
+        for (int r = 0; r < 8; ++r)
+            for (int i = 0; i < n; ++i) {
+                float v = 0.0f; for (int b = 0; b < 6; ++b) v += ptr[r * 6 + b][i];
+                sig[static_cast<std::size_t>(r) * n + i] = v; e[r] += static_cast<double>(v) * v;
+            }
+        double eMin = 1e30, eMax = 0.0, cMax = 0.0;
+        for (int r = 0; r < 8; ++r) { eMin = std::min(eMin, e[r]); eMax = std::max(eMax, e[r]); }
+        for (int r1 = 0; r1 < 8; ++r1) for (int r2 = r1 + 1; r2 < 8; ++r2) {
+            double c = 0.0;
+            for (int i = 0; i < n; ++i) c += static_cast<double>(sig[static_cast<std::size_t>(r1) * n + i]) * sig[static_cast<std::size_t>(r2) * n + i];
+            cMax = std::max(cMax, std::fabs(c) / std::sqrt(std::max(e[r1] * e[r2], 1e-30)));
+        }
+        std::snprintf(buf, sizeof(buf), "(エネルギーの幅 %.2f dB、相関の最大 %.3f)", 10.0 * std::log10(eMax / std::max(eMin, 1e-30)), cMax);
+        check("[FDN・方向] 行 1〜8 のエネルギーが揃う（±1.5 dB）", 10.0 * std::log10(eMax / std::max(eMin, 1e-30)) <= 1.5, buf);
+        check("[FDN・方向] 行どうしの相関が 0.2 未満（無相関＝方向ごとに別のノイズ）", cMax < 0.2, buf);
+    }
+    // ── 2. 方向バスへ（HRIR 無し＝そのまま耳へ）: 片耳のエネルギー 0.5、右 90° の点は右耳が ITD ぶん先 ──
+    auto run = [&](float dx, float dz, float spread, double* eL, double* eR, int* lagPeak, float switchAtSec, double* maxStepDb) {
+        af::dsp::DirectionBus bus(fs, 8, blk);
+        af::dsp::FdnRoomMix mix(fs, blk, 0.6f);
+        const int r = mix.addRoom(1.0f, rt, false);
+        mix.setDirectionBus(&bus, 57.0f);
+        const float one[6] = { 1, 1, 1, 1, 1, 1 };
+        mix.setListenerWeight(r, one);
+        const float d0[3] = { 0.0f, 0.0f, 1.0f };
+        const float d[3] = { dx, 0.0f, dz };
+        mix.setListenerDirection(r, (switchAtSec > 0.0f) ? d0 : d, spread);
+        const int n = fs * 3;
+        std::vector<float> in(static_cast<std::size_t>(blk), 0.0f), L(static_cast<std::size_t>(n), 0.0f), R(static_cast<std::size_t>(n), 0.0f);
+        double prev = -1.0; *maxStepDb = 0.0;
+        for (int p = 0; p < n; p += blk) {
+            const int m = std::min(blk, n - p);
+            if (switchAtSec > 0.0f) {
+                for (int i = 0; i < m; ++i) in[static_cast<std::size_t>(i)] = 0.1f * std::sin(2.0f * 3.14159265f * 220.0f * (p + i) / fs);
+                if (p >= static_cast<int>(switchAtSec * fs) && p < static_cast<int>(switchAtSec * fs) + blk) mix.setListenerDirection(r, d, spread);
+            } else {
+                std::fill(in.begin(), in.end(), 0.0f);
+                if (p == 0) in[0] = 1.0f;
+            }
+            mix.add(r, in.data(), m, 1.0f);
+            mix.render(m, nullptr, nullptr);
+            bus.render(m, L.data() + p, R.data() + p);
+            if (switchAtSec > 0.0f && p >= fs / 2) {
+                double q = 0.0; for (int i = 0; i < m; ++i) q += static_cast<double>(L[static_cast<std::size_t>(p + i)]) * L[static_cast<std::size_t>(p + i)];
+                const double rms = std::sqrt(q / m);
+                if (prev > 0.0) *maxStepDb = std::max(*maxStepDb, std::fabs(20.0 * std::log10(std::max(rms, 1e-12) / prev)));
+                prev = rms;
+            }
+        }
+        *eL = 0.0; *eR = 0.0;
+        for (int i = 0; i < n; ++i) { *eL += static_cast<double>(L[static_cast<std::size_t>(i)]) * L[static_cast<std::size_t>(i)]; *eR += static_cast<double>(R[static_cast<std::size_t>(i)]) * R[static_cast<std::size_t>(i)]; }
+        // 右耳に対する左耳の遅れ: c(lag) = Σ L[i]·R[i − lag] が最大の lag（正なら左が遅い）。
+        double best = -1.0; *lagPeak = 0;
+        for (int lag = -60; lag <= 60; ++lag) {
+            double c = 0.0;
+            for (int i = 100; i < n - 100; ++i) c += static_cast<double>(L[static_cast<std::size_t>(i)]) * R[static_cast<std::size_t>(i - lag)];
+            if (c > best) { best = c; *lagPeak = lag; }
+        }
+    };
+    {
+        double eL, eR, st; int lag;
+        run(0.0f, 1.0f, 1.0f, &eL, &eR, &lag, 0.0f, &st);
+        std::snprintf(buf, sizeof(buf), "(一様: 左 %.2f dB / 右 %.2f dB)", 10.0 * std::log10(eL), 10.0 * std::log10(eR));
+        check("[FDN・方向] 一様（自室）で片耳のエネルギーが 0.5（−3 dB ±2）", std::fabs(10.0 * std::log10(eL) + 3.0) <= 2.0 && std::fabs(10.0 * std::log10(eR) + 3.0) <= 2.0, buf);
+        run(1.0f, 0.0f, 0.0f, &eL, &eR, &lag, 0.0f, &st);
+        std::snprintf(buf, sizeof(buf), "(右 90° の点: 左 %.2f dB / 右 %.2f dB、左耳の遅れ %d サンプル ＝ %.2f ms。Woodworth 57 cm は 0.68 ms)",
+                      10.0 * std::log10(eL), 10.0 * std::log10(eR), lag, lag * 1000.0 / fs);
+        check("[FDN・方向] 右 90° の点でも片耳のエネルギーは 0.5（HRIR 無しなので量は変わらず ITD だけ）", std::fabs(10.0 * std::log10(eL) + 3.0) <= 2.0 && std::fabs(10.0 * std::log10(eR) + 3.0) <= 2.0, buf);
+        check("[FDN・方向] 右 90° の点は左耳が 0.45〜0.95 ms 遅れる（Woodworth）", lag >= 22 && lag <= 46, buf);
+        run(1.0f, 0.0f, 0.0f, &eL, &eR, &lag, 1.0f, &st);
+        std::snprintf(buf, sizeof(buf), "(鳴らしながら正面 → 右 90° へ切り替え: 隣り合うブロックの RMS 比の最大 %.2f dB)", st);
+        check("[FDN・方向] 向きを切り替えても隣り合うブロックの段差が 3 dB 以下", st <= 3.0, buf);
+    }
+}
+
 int main() {
     std::printf("=== DSP 数値回帰テスト（段4: C++ 移行）===\n");
     testFft();
@@ -3234,6 +3334,7 @@ int main() {
     testFdnTail();
     testFdnRoomMix();
     testFdnColour();
+    testFdnLanes();
 
     std::printf("\n----\n");
     if (g_failures == 0) {
