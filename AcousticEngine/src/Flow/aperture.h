@@ -55,9 +55,13 @@ namespace acoustic {
 namespace flow {
 
 struct Visibility {
+    static constexpr int kMaxShadowers = 8;
     float visible = 1.0f;                 // 見える割合 0..1
     float shadowTau6[kNumBands] = {1, 1, 1, 1, 1, 1};   // 遮っている物の透過率（寄与の重み付き平均）。遮る物が無ければ 1
     int   shadowers = 0;                  // 影を落とした箱の数
+    int   shadowBox[kMaxShadowers] = {};  // 影を落とした箱の番号（寄与の大きい順ではない。回折の候補に使う）
+    // ★回折（diffraction.h）の候補はこの箱から取る。中心の直線を遮る箱で取ると、影の境（円盤の半分が隠れている所）で
+    //   中心線が板を外れた瞬間に候補が空になり、隠れている半分の回折が消えて 0.6 dB 戻った（段 6 の実測、62°）。
 };
 
 namespace detail {
@@ -102,7 +106,9 @@ inline Visibility discVisibility(const Surfaces& surf, const MaterialTable& mats
     if (r <= 1e-4f) {
         for (int i : cand) {
             if (segmentIntersectsObb(L, S, surf.at(i).obb)) {
-                out.visible = 0.0f; ++out.shadowers;
+                out.visible = 0.0f;
+                if (out.shadowers < Visibility::kMaxShadowers) out.shadowBox[out.shadowers] = i;
+                ++out.shadowers;
                 const AcousticMaterial& m = mats.get(surf.at(i).material);
                 for (int b = 0; b < kNumBands; ++b) out.shadowTau6[b] *= splitAt(m, b).transmit;   // 複数なら積
             }
@@ -167,6 +173,7 @@ inline Visibility discVisibility(const Surfaces& surf, const MaterialTable& mats
     double wsum = 0.0; double tau[kNumBands] = {};
     for (std::size_t ci = 0; ci < cand.size(); ++ci) {
         if (shadowWeight[ci] <= 0.0) continue;
+        if (out.shadowers < Visibility::kMaxShadowers) out.shadowBox[out.shadowers] = cand[ci];
         ++out.shadowers; wsum += shadowWeight[ci];
         const AcousticMaterial& m = mats.get(surf.at(cand[ci]).material);
         for (int b = 0; b < kNumBands; ++b) tau[b] += shadowWeight[ci] * splitAt(m, b).transmit;

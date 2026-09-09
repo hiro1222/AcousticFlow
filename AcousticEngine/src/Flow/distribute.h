@@ -42,6 +42,7 @@
 #include <cmath>
 #include "Core/vec3.h"
 #include "Flow/aperture.h"
+#include "Flow/diffraction.h"
 #include "Flow/emitter.h"
 #include "Flow/energy_trace.h"
 #include "Flow/mix.h"
@@ -54,6 +55,7 @@ namespace flow {
 struct DistributeInput {
     const TraceResult* trace = nullptr;
     const Visibility* visibility = nullptr;   // nullptr なら見通し 1（検査用）
+    const Diffraction* diffraction = nullptr; // nullptr か valid=false なら回折 0
     Vec3 sourcePos{0, 0, 0};
     const Listener* listener = nullptr;
     int listenerRoom = -1;                 // −1 なら FDN の送りを作らない
@@ -85,7 +87,8 @@ public:
             raw[kTransmit][b] = T.freeDirect6[b] * (1.0f - vis) * Vis.shadowTau6[b];
             raw[kEarly][b]    = T.early6[b];
             raw[kLate][b]     = T.late6[b];
-            raw[kDiffract][b] = 0.0f;                          // 段 6
+            // 回折: 遮られた分 (1−vis) が最寄りの稜線を回る。前川の帯域別の減衰 g²（追記 B「遮られた直接音の代わり」）
+            raw[kDiffract][b] = (in.diffraction && in.diffraction->valid) ? T.freeDirect6[b] * (1.0f - vis) * in.diffraction->energy6[b] : 0.0f;
             out.energy6[b] = raw[kDirect][b] + raw[kEarly][b] + raw[kLate][b] + raw[kTransmit][b] + raw[kDiffract][b];
         }
 
@@ -122,7 +125,10 @@ public:
         } else {
             for (int b = 0; b < kNumBands; ++b) out.component6[kLate][b] += raw[kLate][b];
         }
-        for (int b = 0; b < kNumBands; ++b) out.component6[kDiffract][b] += raw[kDiffract][b];
+        if (in.diffraction && in.diffraction->valid)
+            emitTap(TapKind::Diffract, kDiffract, in.diffraction->pathSec, in.diffraction->dirLocal, 0.0f);   // 方向は稜線の点
+        else
+            for (int b = 0; b < kNumBands; ++b) out.component6[kDiffract][b] += raw[kDiffract][b];
         out.onsetSec = (T.firstReflectSec > 0.0f) ? T.firstReflectSec : T.directSec;
     }
 

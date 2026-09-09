@@ -19,6 +19,7 @@
 #include "../AcousticEngine/src/Flow/surfaces.h"
 #include "../AcousticEngine/src/Flow/energy_trace.h"
 #include "../AcousticEngine/src/Flow/response.h"
+#include "../AcousticEngine/src/Flow/diffraction.h"
 #include "../AcousticEngine/src/Flow/distribute.h"
 #include "../AcousticEngine/src/Flow/mix_to_voice.h"
 #include "../AcousticEngine/src/Flow/world.h"
@@ -690,6 +691,120 @@ void testAperture() {
     }
 }
 
+// ================================ [回折] diffraction（段 6）
+void testDiffraction() {
+    std::printf("\n[回折] 前川式 ── 稜線を回る経路、帯域のハイ落ち、扉の開きに対する立ち上がりと連続性\n");
+    MaterialTable mats;
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    const int matId = mats.add(wall);
+    const int leafId = mats.add(AcousticMaterial::woodDoor());
+    Surfaces s;
+    for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) s.add(sb.obb, matId, false);
+    Listener lis; lis.pos = Vec3(0, 1.6f, -3.0f); lis.forward = Vec3(0, 0, 1); lis.up = Vec3(0, 1, 0);
+    const Vec3 L = lis.pos;
+    char buf[220];
+
+    // 1) 仕切りの裏の点音源: 有効、δ > 0、低域が高域より通る、方向は戸口の縁（右）、到達は直接より後
+    {
+        const Vec3 S(3.0f, 1.6f, 3.0f);
+        const Visibility v = discVisibility(s, mats, L, S, 0.0f);
+        const Diffraction d = edgeDiffraction(s, lis, S, v);
+        float gain[kNumBands]; maekawa::gainBands(d.delta, gain, true);
+        std::snprintf(buf, sizeof(buf), "(δ %.3f m、125Hz %.1f dB / 4k %.1f dB、方向 local (%.2f, %.2f, %.2f)、回折点 (%.2f, %.2f, %.2f))",
+                      d.delta, afti::dB(d.energy6[0]), afti::dB(d.energy6[5]), d.dirLocal.x, d.dirLocal.y, d.dirLocal.z, d.point.x, d.point.y, d.point.z);
+        check("[回折] 仕切りの裏の音源: 稜線を回る経路が見つかり δ > 0、到達は直接より後", d.valid && d.delta > 0.0f && d.pathSec > length(S - L) / kSpeedOfSound, buf);
+        check("[回折] 低域ほど通る（125 Hz > 4 kHz）、量は前川式そのもの", d.energy6[0] > d.energy6[5] && std::fabs(d.energy6[3] - gain[3] * gain[3]) < 1e-6f, buf);
+        check("[回折] 方向は戸口の縁（リスナーから見て右、前）", d.dirLocal.x > 0.05f && d.dirLocal.z > 0.5f, buf);
+        const Visibility vOpen = discVisibility(s, mats, L, Vec3(0, 1.6f, 3.0f), 0.0f);
+        check("[回折] 見通しがあれば回折は無効", !edgeDiffraction(s, lis, Vec3(0, 1.6f, 3.0f), vOpen).valid);
+    }
+
+    // 2) 扉 0→90°: 直接 + 回折 + 透過 の合計（自由音場に対する dB）。
+    //    閉は透過だけ。回折が立つ角度は早い（枠の厚み 0.2 m を板の自由端が抜ける約 3°）。★その 1 段は物理（滑らかにしない）。
+    //    立った後は連続（1° で 3 dB 未満）で、影の境（53〜68°）でも跳ばない。
+    {
+        const Vec3 S(0, 1.6f, 3.0f);
+        const int leaf = s.add(doorLeaf(0.0f), leafId, true);
+        int firstDiff = -1, rampEnd = -1, worstDeg = -1; double prevDb = -999.0, worstAfter = 0.0, stepAt = 0.0, closedDb = 0.0, at20Lo = 0, at20Hi = 0; bool monoAfter = true;
+        std::printf("      角度→合計(dB):");
+        for (int deg = 0; deg <= 90; ++deg) {
+            s.at(leaf).obb = doorLeaf(static_cast<float>(deg));
+            const Visibility v = discVisibility(s, mats, L, S, 0.2f);
+            const Diffraction d = edgeDiffraction(s, lis, S, v);
+            double tot = 0.0;
+            for (int b = 0; b < kNumBands; ++b) {
+                const double e = v.visible + (1.0 - v.visible) * ((d.valid ? d.energy6[b] : 0.0f) + v.shadowTau6[b]);
+                tot += e / kNumBands;
+            }
+            const double db = afti::dB(tot);
+            if (deg % 5 == 0 || (deg >= 8 && deg <= 16) || (deg >= 50 && deg <= 70)) std::printf(" %d:%.1f", deg, db);
+            if (deg == 0) closedDb = db;
+            if (deg == 20) { at20Lo = d.valid ? d.energy6[0] : 0; at20Hi = d.valid ? d.energy6[5] : 0; }
+            // 「最初の 1 段」= 回折が立ち始めてから閉より 6 dB 上がるまで（枠を抜ける約 2°）。物理なので跳んでよい。
+            //   その後は連続でなければならない。
+            if (d.valid && firstDiff < 0) { firstDiff = deg; stepAt = db - prevDb; }
+            if (firstDiff >= 0 && rampEnd < 0 && db > closedDb + 6.0) { rampEnd = deg; stepAt = db - closedDb; }
+            else if (rampEnd >= 0 && deg > rampEnd) {
+                if (db < prevDb - 0.3) { monoAfter = false; std::printf(" [%d°で %.2f dB 戻り]", deg, prevDb - db); }
+                if (std::fabs(db - prevDb) > worstAfter) { worstAfter = std::fabs(db - prevDb); worstDeg = deg; }
+            }
+            prevDb = db;
+        }
+        // ★回折が立つ角度は枠の厚みで決まる: 板の自由端が枠の奥行き（半厚み 0.1 m）＋板の半厚み 0.03 を抜ける
+        //   sinθ > 0.13 → θ ≈ 7.5°。それまでの隙間は mm で、波長より小さく前川の範囲外（透過だけ）。余裕 +5° で 12°。
+        //   0.2 m の壁ならこれが物理。10 cm の壁の家の扉なら 4° 前後で立つ。
+        const int expectFirst = static_cast<int>(std::asin(0.13f) * 180.0f / 3.14159265f) + 5;
+        std::printf("\n");
+        // 診断: 段差が出た角度で、候補の稜線ごとの経路を並べる（AF_DIFF_DEBUG があるとき）
+        if (std::getenv("AF_DIFF_DEBUG") && worstDeg > 0) {
+            for (int deg = worstDeg - 1; deg <= worstDeg; ++deg) {
+                s.at(leaf).obb = doorLeaf(static_cast<float>(deg));
+                const Visibility v = discVisibility(s, mats, L, S, 0.2f);
+                const Diffraction d = edgeDiffraction(s, lis, S, v);
+                std::printf("      %d°: 見通し %.3f 遮る物 %d / 回折 %s 箱 %d 稜線 %d δ %.3f w %.2f 点 (%.3f, %.3f, %.3f)\n",
+                            deg, v.visible, v.shadowers, d.valid ? "有効" : "無効", d.box, d.edge, d.delta, d.weight, d.point.x, d.point.y, d.point.z);
+                const Obb& b = s.at(leaf).obb;
+                for (int e = 0; e < 12; ++e) {
+                    Vec3 A, B, ow; detail::boxEdge(b, e, A, B, ow);
+                    const float halfMin = std::min(b.halfExtents.x, std::min(b.halfExtents.y, b.halfExtents.z));
+                    const Vec3 P = (A + B) * 0.5f + Vec3(0, 1.6f - (A.y + B.y) * 0.5f, 0) * ((std::fabs(B.y - A.y) > 1e-3f) ? 1.0f : 0.0f) + ow * ((std::min(halfMin, 0.03f) + kEps) * 1.41421356f);
+                    float penOwn = std::max(segmentObbPenetration(L, P, b), segmentObbPenetration(P, S, b));
+                    float penOther = 0.0f;
+                    for (int j = 0; j < s.count(); ++j) if (j != leaf) penOther = std::max(penOther, std::max(segmentObbPenetration(L, P, s.at(j).obb), segmentObbPenetration(P, S, s.at(j).obb)));
+                    std::printf("         稜線 %2d: P (%.3f, %.2f, %.3f) 長さ %.3f 自箱の貫通 %.3f 他の貫通 %.3f\n", e, P.x, P.y, P.z, length(P - L) + length(S - P), penOwn, penOther);
+                }
+            }
+        }
+        std::snprintf(buf, sizeof(buf), "(閉 %.1f dB、回折は %d° から立ち %d° で 1 段 %+.1f dB（幾何の見込み %d° 以内）、以後の 1° あたり最大 %.2f dB（%d°）、90° %.1f dB)", closedDb, firstDiff, rampEnd, stepAt, expectFirst, worstAfter, worstDeg, prevDb);
+        check("[回折] 扉: 閉は透過だけ（−20 dB 以下）、回折は板の自由端が枠を抜けた角度で 1 段立つ（その段は物理、4° 以内）", closedDb < -20.0 && firstDiff > 0 && rampEnd > 0 && rampEnd <= expectFirst && rampEnd - firstDiff <= 4, buf);
+        check("[回折] 扉: 立った後は単調に増え、1° で 3 dB も跳ばない（影の境 53〜68° でも）", monoAfter && worstAfter < 3.0, buf);
+        std::snprintf(buf, sizeof(buf), "(20°: 125Hz %.1f dB / 4k %.1f dB)", afti::dB(at20Lo), afti::dB(at20Hi));
+        check("[回折] 扉 20°: 回折は低域が通り高域が落ちる（鮮明さの「高域の通り」の材料）", at20Lo > 0 && at20Lo > 2.0 * at20Hi, buf);
+    }
+
+    // 3) 世界を通す: 扉 20° で回折のタップがあり、方向は右、帳簿は保存
+    {
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        w.addBox(doorLeaf(20.0f), lm, true);
+        w.raysPerEmitter = 128;
+        w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w.addEmitter(Vec3(0, 1.6f, 3.0f), 0.2f);
+        w.build();
+        const float dt = 512.0f / 48000.0f;
+        for (int k = 0; k < 5; ++k) w.update(dt);
+        const Mix& m = *w.mix(e);
+        int diffTap = -1;
+        for (int i = 0; i < m.tapCount; ++i) if (m.taps[i].kind == TapKind::Diffract) diffTap = i;
+        double dif = 0, dir = 0; for (int b = 0; b < kNumBands; ++b) { dif += m.component6[kDiffract][b]; dir += m.component6[kDirect][b]; }
+        std::snprintf(buf, sizeof(buf), "(回折 %.2e、直接 %.2e、タップ %d 本、回折の方向 local x %.2f)", dif, dir, m.tapCount, diffTap >= 0 ? m.taps[diffTap].dirLocal.x : 0.0f);
+        check("[回折] 世界: 扉 20° で回折のタップが立ち（直接は 0）、方向は隙間の側", diffTap >= 0 && dif > 0.0 && dir == 0.0 && m.taps[diffTap].dirLocal.x > 0.0f, buf);
+        check("[回折] 世界: 帳簿は回折を入れても保存", m.conserves(0.01f));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -698,7 +813,7 @@ int main() {
     struct { const char* name; void (*fn)(); } suites[] = {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
-        {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture},
+        {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction},
     };
     for (const auto& s : suites) if (!only || std::strcmp(only, s.name) == 0) s.fn();
     return afti::finish("Flow");

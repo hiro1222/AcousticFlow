@@ -124,6 +124,7 @@ public:
     const Mix* mix(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].mix : nullptr; }
     const TraceResult* trace(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].trace : nullptr; }
     const Visibility* visibility(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].vis : nullptr; }
+    const Diffraction* diffraction(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].diff : nullptr; }
 
     // ── FDN の器 ──
     void bindFdn(af::dsp::FdnRoomMix* fdn) {
@@ -156,8 +157,10 @@ public:
             // 見通し（解析）。幅は見込み角で点へ寄せた物。
             const float rEff = s.em.effectiveRadius(s.trace.directDist, 1.0f);
             s.vis = discVisibility(surfaces, rules.materials, listener_.pos, s.em.pos, rEff);
+            // 回折（段 6）: 遮られた分が最寄りの稜線を回る。見通しが 1 なら要らない。
+            s.diff = edgeDiffraction(surfaces, listener_, s.em.pos, s.vis);
             DistributeInput in;
-            in.trace = &s.trace; in.visibility = &s.vis; in.sourcePos = s.em.pos; in.listener = &listener_;
+            in.trace = &s.trace; in.visibility = &s.vis; in.diffraction = &s.diff; in.sourcePos = s.em.pos; in.listener = &listener_;
             in.listenerRoom = lroom; in.weights = &rules.weights; in.response = &response; in.dt = dt;
             s.mixer.run(in, s.mix);
         }
@@ -177,6 +180,7 @@ private:
         Mix          mix;
         TraceResult  trace;
         Visibility   vis;
+        Diffraction  diff;
         bool         used = false;
     };
     bool valid(int id) const { return id >= 0 && id < static_cast<int>(slots_.size()) && slots_[static_cast<std::size_t>(id)].used; }
