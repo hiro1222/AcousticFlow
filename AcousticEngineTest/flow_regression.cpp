@@ -18,6 +18,8 @@
 #include "../AcousticEngine/src/Flow/mix.h"
 #include "../AcousticEngine/src/Flow/surfaces.h"
 #include "../AcousticEngine/src/Flow/energy_trace.h"
+#include "../AcousticEngine/src/Flow/response.h"
+#include "../AcousticEngine/src/Flow/distribute.h"
 
 using namespace acoustic;
 using namespace acoustic::flow;
@@ -326,6 +328,105 @@ void testEnergyTrace() {
           A0.early6[2] == 0.0f && A1.late6[2] == 0.0f && std::fabs(A0.reflected6(2) - A1.reflected6(2)) < 1e-6f);
 }
 
+// ================================ [速度] response（段 3）
+void testResponse() {
+    std::printf("\n[速度] 量は即時・形は 40 ms・0 からの立ち上がり\n");
+    Follower6 f; f.reset();
+    const float dt = 512.0f / 48000.0f;
+    const float x0[6] = {1, 1, 1, 1, 1, 1};
+    float out[6];
+    f.update(x0, dt, 0.0f, 0.04f, out);
+    check("[速度] 最初のフレームは目標そのまま（0 から色を壊さず立ち上がる）", std::fabs(out[0] - 1.0f) < 1e-6f && std::fabs(out[5] - 1.0f) < 1e-6f);
+    const float x1[6] = {4, 4, 4, 4, 4, 4};                  // 量が 4 倍、形は同じ
+    f.update(x1, dt, 0.0f, 0.04f, out);
+    check("[速度] 量（levelSec=0）は 1 フレームで追いつく", std::fabs(out[0] - 4.0f) < 1e-5f);
+    const float x2[6] = {4, 4, 4, 4, 0, 0};                  // 量 16（前は 24）、形が変わる（高域が消える）
+    f.update(x2, dt, 0.0f, 0.04f, out);
+    // 期待: 量は即時に 16。形の 4k は 1/6 から 0 へ一次遅れ → 16 × (1/6) × exp(−dt/τ) = 2.042
+    const float expect4k = 16.0f * (1.0f / 6.0f) * std::exp(-dt / 0.04f);
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "(1 フレーム後の 4k: %.3f、一次遅れの式 %.3f、目標 0。量の和 %.2f)", out[5], expect4k, out[0] + out[1] + out[2] + out[3] + out[4] + out[5]);
+    check("[速度] 形（colourSec=40 ms）は 1 フレーム（10.7 ms）では追いつかず、一次遅れの式どおり", std::fabs(out[5] - expect4k) < 1e-3f, buf);
+    check("[速度] 形が動いている間も量の和は保たれる", std::fabs((out[0] + out[1] + out[2] + out[3] + out[4] + out[5]) - 16.0f) < 1e-3f);
+    for (int k = 0; k < 40; ++k) f.update(x2, dt, 0.0f, 0.04f, out);     // 430 ms 後
+    check("[速度] 40 ms の一次遅れは 430 ms でほぼ追いつく（4k が 1e-3 未満）", out[5] < 1e-3f);
+    const float z[6] = {0, 0, 0, 0, 0, 0};
+    f.update(z, dt, 0.0f, 0.04f, out);
+    check("[速度] 目標が 0 でも形は前の値を保つ（0 除算しない）", out[0] == 0.0f && f.shape[0] > 0.0f);
+    check("[速度] τ=0 の係数は 1、τ=dt の係数は 1−1/e", followCoef(dt, 0.0f) == 1.0f && std::fabs(followCoef(dt, dt) - 0.6321f) < 1e-3f);
+}
+
+// ================================ [配分] distribute（段 3、最小形）
+void testDistribute() {
+    std::printf("\n[配分] 受け取った物を 1 回ずつ出す・重みは出口だけ・歩行の連続性\n");
+    MaterialTable mats;
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.0f; wall.scattering[b] = 0.5f; }
+    const int matId = mats.add(wall);
+    const float half = 3.5f, h = 3.0f;
+    Surfaces box = closedBox(half, h, matId);
+    Listener L; L.pos = Vec3(-1.0f, 1.2f, 1.5f); L.forward = Vec3(0, 0, 1); L.prevPos = L.pos;
+    const Vec3 S(1.5f, 1.6f, -1.0f);
+    TraceParams prm; prm.rays = 256; prm.maxBounces = 40; prm.mixingSec = 0.03f; prm.seed = 11u;
+    EnergyTrace tr;
+    WorldWeights W; Response rs;
+    const float dt = 512.0f / 48000.0f;
+    EmitterMixer mixer; mixer.reset();
+    Mix mix;
+    auto step = [&](int room) {
+        const TraceResult T = tr.run(box, mats, S, L.pos, prm);
+        DistributeInput in; in.trace = &T; in.sourcePos = S; in.listener = &L; in.listenerRoom = room;
+        in.weights = &W; in.response = &rs; in.dt = dt;
+        mixer.run(in, mix);
+    };
+    step(0);
+    char buf[200];
+    check("[配分] 帳簿: 受け取った 4 つを 1 回ずつ出した（conserves）", mix.conserves(0.01f));
+    check("[配分] タップ 3 本（直接・透過・初期）と送り 1 本", mix.tapCount == 3 && mix.sendCount == 1 && mix.sends[0].room == 0);
+    check("[配分] 直接のタップに方向があり、初期のタップは方向なし（広がり 1）",
+          length(mix.taps[0].dirLocal) > 0.99f && mix.taps[2].kind == TapKind::Early && length(mix.taps[2].dirLocal) == 0.0f && mix.taps[2].spread == 1.0f);
+    check("[配分] 尾の開始は最初の反射の到達（直接より後）", mix.onsetSec > mix.taps[0].delaySec);
+
+    // 世界の重み: 出口だけに効き、帳簿は生のまま。
+    W.w[kLate] = 2.0f;
+    step(0);
+    const float sendE = mix.sends[0].e6[2], rawLate = mix.component6[kLate][2];
+    std::snprintf(buf, sizeof(buf), "(後期の重み 2: 送り %.3e、帳簿 %.3e、比 %.2f)", sendE, rawLate, sendE / rawLate);
+    check("[配分] 重み 2 は送りを 2 倍にし、帳簿は変えない（conserves が通る）", std::fabs(sendE / rawLate - 2.0f) < 1e-3f && mix.conserves(0.01f), buf);
+    W.w[kLate] = 1.0f;
+
+    // 部屋が無ければ送りは作らないが、帳簿は受け取った通り。
+    step(-1);
+    check("[配分] 部屋が −1 なら送りを作らず、帳簿は保存", mix.sendCount == 0 && mix.conserves(0.01f));
+
+    // 歩行の連続性: 静止で 0、1.4 m/s で歩いても小さい。成分ごとの出口のレベルで測る。
+    auto levelDb = [&](int comp) {
+        double e = 0.0;
+        if (comp == kLate) { for (int b = 0; b < kNumBands; ++b) e += mix.sends[0].e6[b]; }
+        else { for (int i = 0; i < mix.tapCount; ++i) if (static_cast<int>(mix.taps[i].kind) == (comp == kDirect ? 0 : comp == kEarly ? 1 : 3)) for (int b = 0; b < kNumBands; ++b) e += mix.taps[i].e6[b]; }
+        return afti::dB(e);
+    };
+    mixer.reset();
+    for (int k = 0; k < 10; ++k) step(0);                       // 立ち上がりを流す
+    double still[3] = {0, 0, 0}, prev[3];
+    for (int c = 0; c < 3; ++c) prev[c] = levelDb(c == 0 ? kDirect : c == 1 ? kEarly : kLate);
+    for (int k = 0; k < 30; ++k) {
+        step(0);
+        for (int c = 0; c < 3; ++c) { const double v = levelDb(c == 0 ? kDirect : c == 1 ? kEarly : kLate); still[c] = std::max(still[c], std::fabs(v - prev[c])); prev[c] = v; }
+    }
+    std::snprintf(buf, sizeof(buf), "(静止 30 フレーム: 直接 %.4f / 初期 %.4f / 後期 %.4f dB)", still[0], still[1], still[2]);
+    check("[配分] 静止なら 3 成分とも揺れない（0.001 dB 未満）", still[0] < 1e-3 && still[1] < 1e-3 && still[2] < 1e-3, buf);
+    double walk[3] = {0, 0, 0};
+    const float stepM = 1.4f * dt;                                // 1.4 m/s
+    for (int k = 0; k < 60; ++k) {
+        L.pos = L.pos + Vec3(0, 0, -stepM);                       // 音源へ向かって歩く（z 1.5 → 0.6）
+        step(0);
+        for (int c = 0; c < 3; ++c) { const double v = levelDb(c == 0 ? kDirect : c == 1 ? kEarly : kLate); walk[c] = std::max(walk[c], std::fabs(v - prev[c])); prev[c] = v; }
+    }
+    std::snprintf(buf, sizeof(buf), "(1.4 m/s で 60 フレーム: 直接 %.3f / 初期 %.3f / 後期 %.3f dB per frame)", walk[0], walk[1], walk[2]);
+    check("[配分] 歩いても隣り合うフレームの段差が 0.5 dB 未満（初期・後期は種の固定＋50 ms）", walk[1] < 0.5 && walk[2] < 0.5, buf);
+}
+
 }  // namespace
 
 int main() {
@@ -333,7 +434,7 @@ int main() {
     const char* only = std::getenv("AF_ONLY");
     struct { const char* name; void (*fn)(); } suites[] = {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
-        {"trace", testEnergyTrace},
+        {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
     };
     for (const auto& s : suites) if (!only || std::strcmp(only, s.name) == 0) s.fn();
     return afti::finish("Flow");
