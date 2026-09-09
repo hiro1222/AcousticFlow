@@ -932,6 +932,45 @@ namespace AcousticFlow.EditorTools
             if (shader != null) r.sharedMaterial = new Material(shader) { color = c };
         }
 
+        // ════════════════ 新コア（Flow）の試聴シーン ════════════════
+        //   段 4「一周を鳴らす」: 閉じた部屋 7×7×3 m を歩く。扉なし。
+        //   部屋の箱は BoxCollider（Cube の既定）。AcousticWorld が拾う。Main Camera（AudioListener 付き）に FlowWalker。
+        [MenuItem("AcousticFlow/Flow (新コア)/Room Walk (部屋を歩く)")]
+        public static void FlowRoomWalkScene()
+        {
+            var scene = NewScene();
+            const float w = 7f, h = 3f, d = 7f, t = 0.2f;
+            MakeBox("Floor",   new Vector3(0, -t * 0.5f, 0),       new Vector3(w + 2 * t, t, d + 2 * t));
+            MakeBox("Ceiling", new Vector3(0, h + t * 0.5f, 0),    new Vector3(w + 2 * t, t, d + 2 * t));
+            MakeBox("Wall_W",  new Vector3(-w * 0.5f - t * 0.5f, h * 0.5f, 0), new Vector3(t, h, d + 2 * t));
+            MakeBox("Wall_E",  new Vector3( w * 0.5f + t * 0.5f, h * 0.5f, 0), new Vector3(t, h, d + 2 * t));
+            MakeBox("Wall_S",  new Vector3(0, h * 0.5f, -d * 0.5f - t * 0.5f), new Vector3(w + 2 * t, h, t));
+            MakeBox("Wall_N",  new Vector3(0, h * 0.5f,  d * 0.5f + t * 0.5f), new Vector3(w + 2 * t, h, t));
+            // 天井は中から見えるように裏返さない（見た目だけ。音は箱の外側の面で当たる）
+            var cam = Camera.main;
+            if (cam != null)
+            {
+                cam.transform.position = new Vector3(-1f, 1.6f, 1.5f);
+                cam.transform.rotation = Quaternion.LookRotation(new Vector3(1f, 0f, -1f));
+                if (cam.GetComponent<AudioListener>() == null) cam.gameObject.AddComponent<AudioListener>();
+                cam.gameObject.AddComponent<FlowWalker>();
+            }
+            var src = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            src.name = "AF_Source_Main";
+            src.transform.position = new Vector3(1.5f, 1.6f, -1f);
+            src.transform.localScale = Vector3.one * 0.4f;
+            Object.DestroyImmediate(src.GetComponent<Collider>());        // 音源の球は壁にしない
+            var a = src.AddComponent<AudioSource>();
+            var clip = AssetDatabase.LoadAssetAtPath<AudioClip>(kTestClipPath);
+            if (clip != null) a.clip = clip; else Debug.LogWarning("[AcousticFlow] クリップが見つかりません: " + kTestClipPath);
+            src.AddComponent<WorldVoice>();
+            Tint(src.transform, new Color(1f, 0.5f, 0.2f));
+            var world = new GameObject("AcousticWorld").AddComponent<AcousticWorld>();
+            world.defaultMaterial = AcousticMaterialPreset.Default;
+            Save(scene, "Flow_RoomWalk.unity",
+                 "新コア 段 4。閉じた部屋 7×7×3 m を WASD で歩く（右ドラッグで向く）。AF ツール ▸ 情報 に帳簿が出る。");
+        }
+
         private static void Save(UnityEngine.SceneManagement.Scene scene, string fileName, string note)
         {
             const string dir = "Assets/Scenes";

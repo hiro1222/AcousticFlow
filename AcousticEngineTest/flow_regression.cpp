@@ -20,6 +20,8 @@
 #include "../AcousticEngine/src/Flow/energy_trace.h"
 #include "../AcousticEngine/src/Flow/response.h"
 #include "../AcousticEngine/src/Flow/distribute.h"
+#include "../AcousticEngine/src/Flow/mix_to_voice.h"
+#include "../AcousticEngine/src/Flow/world.h"
 
 using namespace acoustic;
 using namespace acoustic::flow;
@@ -427,6 +429,145 @@ void testDistribute() {
     check("[配分] 歩いても隣り合うフレームの段差が 0.5 dB 未満（初期・後期は種の固定＋50 ms）", walk[1] < 0.5 && walk[2] < 0.5, buf);
 }
 
+// ================================ [世界] world（段 4）
+World* makeWorldBox(float half, float h, float alpha) {
+    World* w = new World();
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = alpha; wall.transmission[b] = 0.0f; wall.scattering[b] = 0.5f; }
+    const int mat = w->rules.materials.add(wall);
+    const float t = 0.2f;
+    auto add = [&](Vec3 c, Vec3 he) { w->addBox(Obb::axisAligned(c, he), mat, false); };
+    add(Vec3(0, -t, 0), Vec3(half + t, t, half + t));
+    add(Vec3(0, h + t, 0), Vec3(half + t, t, half + t));
+    add(Vec3(-half - t, h * 0.5f, 0), Vec3(t, h * 0.5f, half + t));
+    add(Vec3(half + t, h * 0.5f, 0), Vec3(t, h * 0.5f, half + t));
+    add(Vec3(0, h * 0.5f, -half - t), Vec3(half + t, h * 0.5f, t));
+    add(Vec3(0, h * 0.5f, half + t), Vec3(half + t, h * 0.5f, t));
+    return w;
+}
+void testWorld() {
+    std::printf("\n[世界] 1 フレームの流れ・部屋・帳簿・FDN の結び\n");
+    World* w = makeWorldBox(3.5f, 3.0f, 0.2f);
+    w->raysPerEmitter = 256;
+    w->setListener(Vec3(-1.0f, 1.2f, 1.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+    const int e = w->addEmitter(Vec3(1.5f, 1.6f, -1.0f), 0.0f);
+    w->build();
+    char buf[200];
+    std::snprintf(buf, sizeof(buf), "(部屋 %d、リスナーの部屋 %d、体積 %.0f m3、RT60 500Hz %.2f s)", w->roomCount(), w->roomAt(w->listener().pos), w->roomCount() ? w->probe(0).volume : 0.0f, w->roomCount() ? w->probe(0).rt60[2] : 0.0f);
+    check("[世界] 閉じた箱は部屋 1 個、リスナーも音源もその中", w->roomCount() == 1 && w->roomAt(w->listener().pos) == 0 && w->roomAt(Vec3(1.5f, 1.6f, -1.0f)) == 0, buf);
+    check("[世界] 外の点は −1", w->roomAt(Vec3(50, 50, 50)) == -1);
+    af::dsp::FdnRoomMix fdn(48000, 512, 0.6f);
+    w->bindFdn(&fdn);
+    check("[世界] FDN を結ぶと部屋が器に足される", fdn.roomCount() == 1 && w->fdnRoomOfProbe()[0] == 0);
+    const float dt = 512.0f / 48000.0f;
+    for (int k = 0; k < 20; ++k) w->update(dt);
+    const Mix* m = w->mix(e);
+    check("[世界] 更新後の配分は帳簿が保存されている", m && m->conserves(0.01f));
+    check("[世界] 音源の部屋が入っている", w->emitter(e)->room == 0);
+    const Mix m1 = *m; w->update(dt); const Mix m2 = *w->mix(e);
+    bool same = true; for (int b = 0; b < kNumBands; ++b) if (m1.energy6[b] != m2.energy6[b]) same = false;
+    check("[世界] 静止していれば帳簿がフレーム間で一致（種の固定）", same);
+    const int e2 = w->addEmitter(Vec3(-2.0f, 1.0f, -2.0f), 0.3f);
+    w->update(dt);
+    check("[世界] 2 本目の音源も配分される", w->mix(e2) && w->mix(e2)->conserves(0.01f) && w->mix(e2)->tapCount == 3);
+    w->removeEmitter(e2);
+    check("[世界] 消した音源の番号は使い回される", w->addEmitter(Vec3(0, 1, 0), 0.0f) == e2);
+    delete w;
+}
+
+// ================================ [橋] mix_to_voice（段 4）── 出力のエネルギーが配分と一致する
+void testBridge() {
+    std::printf("\n[橋] 配分を DSP へ写して鳴らし、出力のエネルギーが帳簿と一致するか\n");
+    const int fs = 48000, block = 512;
+    World* w = makeWorldBox(3.5f, 3.0f, 0.2f);
+    w->raysPerEmitter = 512;
+    w->setListener(Vec3(-1.0f, 1.2f, 1.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+    const int e = w->addEmitter(Vec3(1.5f, 1.6f, -1.0f), 0.0f);
+    w->build();
+    af::dsp::FdnRoomMix fdn(fs, block, 0.6f);
+    w->bindFdn(&fdn);
+    const float dt = static_cast<float>(block) / fs;
+    for (int k = 0; k < 30; ++k) w->update(dt);
+    const Mix mix = *w->mix(e);
+
+    // 鳴らす: 直接だけ／タップ全部／全部（FDN 込み）の 3 通り。インパルス 1 発、2.5 秒。
+    auto renderEnergy = [&](bool tapsOn, bool lateOn, double* outTotal, double* tapPart, double* fdnPart) {
+        WorldWeights W;
+        W.w[kEarly] = tapsOn ? 1.0f : 0.0f; W.w[kTransmit] = tapsOn ? 1.0f : 0.0f; W.w[kLate] = lateOn ? 1.0f : 0.0f;
+        w->rules.weights = W;
+        for (int k = 0; k < 30; ++k) w->update(dt);       // 重みは出口だけなので即時。念のため流す
+        af::dsp::VoiceRenderer::Config vc; vc.sampleRate = fs; vc.maxFrames = block; vc.tailSeconds = 1.0f;
+        af::dsp::VoiceRenderer v(vc);
+        v.setOutputGain(1.0f); v.setHrtfEnabled(false); v.setTailLevel(1.0f);
+        af::dsp::FdnRoomMix fdn2(fs, block, 0.6f);
+        w->bindFdn(&fdn2);
+        w->update(dt);                                     // ★器を差し替えたら 1 回回す（listenerWeight を置く。置かないと既定 0 で無音）
+        v.setFdnMix(&fdn2);
+        w->applyToVoice(e, v, fs);
+        // ★インパルスは 300 ms に置く。タップの差し替え（30 ms）と送りの傾斜は 0 から立ち上がるので、
+        //   0 秒に置くと頭に当たってほぼ 0 になる（旧手順 5 の検査で踏んだのと同じ）。
+        const int impulseAt = (fs * 3 / 10 / block) * block;
+        const int total = impulseAt + fs * 5 / 2;
+        std::vector<float> in(block, 0.0f), l(block), r(block), fl(block), fr(block);
+        double eTap = 0.0, eFdn = 0.0;
+        for (int p = 0; p < total; p += block) {
+            std::fill(in.begin(), in.end(), 0.0f);
+            if (p == impulseAt) in[0] = 1.0f;
+            v.render(in.data(), block, l.data(), r.data(), nullptr);
+            std::fill(fl.begin(), fl.end(), 0.0f); std::fill(fr.begin(), fr.end(), 0.0f);
+            fdn2.render(block, fl.data(), fr.data());
+            for (int i = 0; i < block; ++i) { eTap += static_cast<double>(l[i]) * l[i] + static_cast<double>(r[i]) * r[i]; eFdn += static_cast<double>(fl[i]) * fl[i] + static_cast<double>(fr[i]) * fr[i]; }
+        }
+        *outTotal = eTap + eFdn; *tapPart = eTap; *fdnPart = eFdn;
+    };
+    double tot, tap, fd;
+    // 参考: 器に直接インパルスを入れたときの出力エネルギー（送りの経路を通さない）。1.0 が校正どおり。
+    {
+        af::dsp::FdnRoomMix fd0(fs, block, 0.6f);
+        const int r0 = fd0.addRoom(fdnLineScale(w->probe(0)), w->probe(0).rt60, false);
+        const float one[6] = {1, 1, 1, 1, 1, 1};
+        fd0.setListenerWeight(r0, one);
+        std::vector<float> in(block, 0.0f), l(block), r(block);
+        double e = 0.0;
+        const int at = (fs * 3 / 10 / block) * block, tot0 = at + fs * 5 / 2;
+        for (int p = 0; p < tot0; p += block) {
+            std::fill(in.begin(), in.end(), 0.0f);
+            if (p == at) in[0] = 1.0f;
+            fd0.add(r0, in.data(), block, 1.0f);
+            std::fill(l.begin(), l.end(), 0.0f); std::fill(r.begin(), r.end(), 0.0f);
+            fd0.render(block, l.data(), r.data());
+            for (int i = 0; i < block; ++i) e += static_cast<double>(l[i]) * l[i] + static_cast<double>(r[i]) * r[i];
+        }
+        std::printf("      参考: 器に直接インパルス 1 → 両耳の出力エネルギー %.3f（%+.2f dB。RT60 500Hz %.2f s、lineScale %.2f）\n",
+                    e, afti::dB(e), w->probe(0).rt60[2], fdnLineScale(w->probe(0)));
+    }
+    // ★期待値は**帯域幅で重み付けした平均**。白色のインパルスのエネルギーは帯域幅なりに散る（4k 帯が 88%）。
+    //   DSP は帯域ごとに g_b² を掛けるので、総出力 = Σ_b (E_b K) · bw_b / Σbw。単純平均で書いて FDN が −2.1 dB に見えた
+    //   （直接は帯域が平らなので単純平均でも合ってしまい、気づかなかった）。world_rules::bandWidthHz の注記そのもの。
+    auto bwMean = [&](int comp) {
+        double num = 0.0, den = 0.0;
+        for (int b = 0; b < kNumBands; ++b) { const double bw = bandWidthHz(b, static_cast<float>(fs)); num += mix.component6[comp][b] * kEnergyToAmp * bw; den += bw; }
+        return num / den;
+    };
+    // 直接だけ
+    renderEnergy(false, false, &tot, &tap, &fd);
+    const double expDirectMean = bwMean(kDirect);
+    char buf[200];
+    std::snprintf(buf, sizeof(buf), "(直接だけ: 出力 %.3e 対 帳簿 %.3e、%+.2f dB。FDN %.1e)", tap, expDirectMean, afti::dB(tap / expDirectMean), fd);
+    check("[橋] 直接だけを鳴らした出力エネルギーが帳簿 × K と ±0.5 dB", std::fabs(afti::dB(tap / expDirectMean)) < 0.5 && fd < expDirectMean * 1e-3, buf);
+    // 全部
+    renderEnergy(true, true, &tot, &tap, &fd);
+    const double expLate = bwMean(kLate);
+    const double expTaps = bwMean(kDirect) + bwMean(kEarly) + bwMean(kTransmit);
+    std::snprintf(buf, sizeof(buf), "(全部: タップ %.3e 対 %.3e（%+.2f dB）、FDN %.3e 対 %.3e（%+.2f dB）)", tap, expTaps, afti::dB(tap / expTaps), fd, expLate, afti::dB(fd / expLate));
+    check("[橋] タップ（直接＋初期＋透過）の出力が帳簿と ±0.5 dB", std::fabs(afti::dB(tap / expTaps)) < 0.5, buf);
+    check("[橋] FDN（後期）の出力が帳簿と ±1.5 dB（校正の残り +1.3 dB の中）", std::fabs(afti::dB(fd / expLate)) < 1.5, buf);
+    const double ratioDb = afti::dB(fd / tap);
+    std::snprintf(buf, sizeof(buf), "(後期/タップ %+.1f dB。7×7×3 m、α 0.2、距離 3.6 m)", ratioDb);
+    check("[橋] 後期の量は 0 でも支配でもない（−20〜+10 dB の間）", ratioDb > -20.0 && ratioDb < 10.0, buf);
+    delete w;
+}
+
 }  // namespace
 
 int main() {
@@ -435,6 +576,7 @@ int main() {
     struct { const char* name; void (*fn)(); } suites[] = {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
+        {"world", testWorld}, {"bridge", testBridge},
     };
     for (const auto& s : suites) if (!only || std::strcmp(only, s.name) == 0) s.fn();
     return afti::finish("Flow");

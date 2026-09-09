@@ -12,6 +12,7 @@
 set(ACOUSTIC_SOURCES
     src/Export/scene_api.cpp
     src/Export/voice_api.cpp
+    src/Export/world_api.cpp
     src/Core/material.cpp
 )
 
