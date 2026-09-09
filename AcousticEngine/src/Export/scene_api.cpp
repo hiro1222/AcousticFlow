@@ -6,7 +6,9 @@
 #include "acoustic_scene.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <string>
 #include <vector>
@@ -78,9 +80,45 @@ AcousticMaterial makeMaterial(const float* transmission, const float* absorption
 
 extern "C" {
 
-AF_SceneHandle AF_SceneCreate(void) { return new (std::nothrow) SceneBox(); }
+// ── 消した器の墓地 ──
+//   ホスト（Unity）は Play を止めるとき AF_SceneDestroy を主スレッドで呼ぶが、AudioListener の OnAudioFilterRead は
+//   まだ走っていて AF_SceneCapturePushAudio が来る（クラッシュ 2026-08-24 / 09-09 の片方）。ホストの順番に頼らず、
+//   器を 2 秒残して closing で弾く。ワーカーは即座に止める（畳む仕事は待つ）。数は 4 までに抑える（回帰は場面を
+//   何百と作って壊すので、残しすぎるとメモリが膨らむ。実機で場面を壊すのは Play の切り替えだけ）。
+namespace {
+struct RetiredBox { SceneBox* box; std::chrono::steady_clock::time_point at; };
+std::mutex gGraveMx;
+std::vector<RetiredBox> gGrave;
+void purgeGrave() {
+    std::vector<SceneBox*> toDelete;
+    {
+        std::lock_guard<std::mutex> lk(gGraveMx);
+        const auto now = std::chrono::steady_clock::now();
+        std::size_t i = 0;
+        while (i < gGrave.size()) {
+            const bool old = (now - gGrave[i].at) > std::chrono::seconds(2);
+            const bool tooMany = gGrave.size() > 4;
+            if (old || tooMany) { toDelete.push_back(gGrave[i].box); gGrave.erase(gGrave.begin() + static_cast<std::ptrdiff_t>(i)); }
+            else ++i;
+        }
+    }
+    for (SceneBox* b : toDelete) delete b;
+}
+}  // namespace
 
-void AF_SceneDestroy(AF_SceneHandle scene) { delete asBox(scene); }   // 仕事を待ってから畳む
+AF_SceneHandle AF_SceneCreate(void) { purgeGrave(); return new (std::nothrow) SceneBox(); }
+
+void AF_SceneDestroy(AF_SceneHandle scene) {
+    SceneBox* b = asBox(scene);
+    if (!b) return;
+    b->closing.store(true, std::memory_order_release);
+    b->setAsync(false);                       // 仕事を待ってからワーカーを畳む（従来どおり即座に）
+    {
+        std::lock_guard<std::mutex> lk(gGraveMx);
+        gGrave.push_back(RetiredBox{ b, std::chrono::steady_clock::now() });
+    }
+    purgeGrave();
+}
 
 int AF_MaterialPresetBands(int preset, float* outTransmission,
                            float* outAbsorption, float* outScattering) {
@@ -946,7 +984,8 @@ int AF_SceneCaptureStatus(AF_SceneHandle scene, int* outFramesHeld) {
 
 void AF_SceneCapturePushAudio(AF_SceneHandle scene, const float* interleavedStereo, int frames) {
     SceneBox* b = asBox(scene);
-    if (b) b->scene.capturePushAudio(interleavedStereo, frames);   // オーディオスレッド。ロック無し（capture.h）
+    if (!b || b->closing.load(std::memory_order_acquire)) return;   // 消した器（墓地に 2 秒残る）には触らない
+    b->scene.capturePushAudio(interleavedStereo, frames);            // オーディオスレッド。ロック無し（capture.h）
 }
 
 int AF_SceneCaptureWrite(AF_SceneHandle scene, const char* path,

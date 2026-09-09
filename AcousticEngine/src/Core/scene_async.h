@@ -97,6 +97,10 @@ private:
 class SceneBox {
 public:
     Scene scene;
+    // 閉じる印。AF_SceneDestroy が立てる。オーディオスレッドから来る AF_SceneCapturePushAudio はこれを見て帰る。
+    //   器そのものは AF_SceneDestroy の後も 2 秒残す（scene_api.cpp の墓地）── Play を止めた瞬間に
+    //   まだ走っているオーディオの呼び出しが解放済みの器へ触らないように。
+    std::atomic<bool> closing{false};
 
     SceneBox() = default;
     ~SceneBox() { setAsync(false); }

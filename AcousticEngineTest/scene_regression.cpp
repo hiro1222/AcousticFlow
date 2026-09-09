@@ -9616,6 +9616,45 @@ void testFdnWiring() {
     AF_SceneDestroy(s);
 }
 
+// ================================ [堅牢] 録音の器とオーディオスレッド（AF_ONLY=teardown）
+//   Unity のクラッシュ（2026-08-24、09-09）はどちらも AF_SceneCapturePushAudio だった。
+//   (1) 消した器へ押す（Play を止めた瞬間、オーディオスレッドがまだ走っている）
+//   (2) 録ったまま begin し直す（保存 → 再開）最中に押す
+void testCaptureTeardown() {
+    std::printf("\n[堅牢] 録音の器とオーディオスレッド（消した器へ押す／録ったまま再開）\n");
+    // (1) 消した直後の器へ押す。器は 2 秒残り closing で弾くので、落ちずに帰る。
+    {
+        AF_SceneHandle s = AF_SceneCreate();
+        AF_SceneCaptureBegin(s, 60, 30, 4, 48000, 1);
+        std::vector<float> pcm(1024 * 2, 0.1f);
+        AF_SceneCapturePushAudio(s, pcm.data(), 1024);
+        AF_SceneDestroy(s);
+        for (int k = 0; k < 20; ++k) AF_SceneCapturePushAudio(s, pcm.data(), 1024);   // 主スレッドの後を追う呼び出しの真似
+        check("[堅牢] 消した直後の場面へ録音の音声を押しても落ちない（器は 2 秒残して closing で弾く）", true);
+    }
+    // (2) 別スレッドで押し続けながら begin を繰り返す。
+    {
+        AF_SceneHandle s = AF_SceneCreate();
+        AF_SceneCaptureBegin(s, 60, 30, 4, 48000, 1);
+        std::atomic<bool> run{true};
+        std::atomic<long> pushed{0};
+        std::thread audio([&]() {
+            std::vector<float> pcm(1024 * 2, 0.2f);
+            while (run.load()) { AF_SceneCapturePushAudio(s, pcm.data(), 1024); pushed.fetch_add(1); }
+        });
+        for (int k = 0; k < 20; ++k) {
+            AF_SceneCaptureBegin(s, 60 + k, 30, 4, 48000, 1);   // 録ったまま再開（容量も変わる）
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        run.store(false);
+        audio.join();
+        AF_SceneDestroy(s);
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "(再開 20 回の間に %ld 回押した)", pushed.load());
+        check("[堅牢] 録ったまま 20 回再開しても落ちない（begin は止めて 30 ms 待ってから確保し直す）", pushed.load() > 0, buf);
+    }
+}
+
 // 【探り】既知の不具合の現状を数字で採る（AF_ONLY=issues でだけ走る。合否は付けない）
 //   docs/SOUND_REVIEW_2026-09-04.md §2.3 の #5 #6 #7 #12。直す前に「いまどうか」を測る物差し。
 // ─────────────────────────────────────────────────────────────────────
@@ -14117,6 +14156,7 @@ int main() {
         else if (std::strcmp(only, "step") == 0) diagnoseDoorStaircase();
         else if (std::strcmp(only, "fdn") == 0) testFdnWiring();
         else if (std::strcmp(only, "faces") == 0) testFaceReflections();
+        else if (std::strcmp(only, "teardown") == 0) testCaptureTeardown();
         std::printf("\n[AF_ONLY=%s] %d 件中 失敗 %d\n", only, g_checks, g_failures);
         return (g_failures == 0) ? 0 : 1;
     }
@@ -14225,6 +14265,7 @@ int main() {
     testApertureOpenness();
     testDoorContinuity();
     testFdnWiring();
+    testCaptureTeardown();
     testPerInstanceMaterial();
     testVoiceApi();
     testRobustness();

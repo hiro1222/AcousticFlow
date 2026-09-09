@@ -129,6 +129,14 @@ constexpr float kPcmMarginSeconds = 2.0f;
 class Capture {
 public:
     void begin(const CaptureConfig& cfg) {
+        // ★録ったまま begin し直す（保存 → 再開）と、オーディオスレッドが pushAudio で古い pcm_ に書いている最中に
+        //   pcm_.assign で確保し直して落ちる（Unity のクラッシュ 2026-08-24 と 09-09、どちらも AF_SceneCapturePushAudio）。
+        //   先に止めて、走っている 1 回ぶん（DSP 1 ブロック ≒ 21 ms）を待ってから確保する。再開は稀なので 30 ms は許す。
+        if (active_) {
+            active_ = false;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        }
         cfg_ = cfg;
         if (cfg_.prerollFrames < 1) cfg_.prerollFrames = 1;
         if (cfg_.postrollFrames < 0) cfg_.postrollFrames = 0;
@@ -234,11 +242,15 @@ public:
     /* ── オーディオスレッド: ロックも確保もしない ─────────────── */
     void pushAudio(const float* interleavedStereo, int frames) {
         if (!active_ || pcmCap_ == 0 || !interleavedStereo || frames <= 0) return;
+        // 容量と先頭は 1 回だけ読む（begin が触るのは active_ を落として 30 ms 待った後だが、念のため途中で変わっても混ぜない）。
+        const size_t cap = pcmCap_;
+        std::int16_t* pcm = pcm_.data();
+        if (cap == 0 || !pcm) return;
         size_t w = pcmWrite_.load(std::memory_order_relaxed);
         for (int i = 0; i < frames * 2; ++i) {
             float v = interleavedStereo[i];
             v = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
-            pcm_[w % pcmCap_] = static_cast<std::int16_t>(v * 32767.0f);
+            pcm[w % cap] = static_cast<std::int16_t>(v * 32767.0f);
             ++w;
         }
         pcmWrite_.store(w, std::memory_order_release);
