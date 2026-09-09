@@ -9164,3 +9164,33 @@ FDN 側は IR もエコグラムも使わず、部屋グラフの Sabine（開�
 
 - 09-09 13:13 と 08-24 の Unity クラッシュは同じ場所（`AF_SceneCapturePushAudio`＝常時録っている録音の器へオーディオスレッドが音声を押す所）でした。Play 停止で場面を消した直後の呼び出しと、保存→再開の確保し直しの 2 つ。どちらもエンジン側で塞ぎました（`c19d0e9`。回帰 [堅牢] 2 件）。ホストは触っていません。
 - DLL を配備しました（hash B734B3C8…。手順 3〜6 ＋ この修正）。抜け殻の `Unity.exe` が古い DLL を掴んでいたので、古い方は脇へ移して差し替えています。
+
+---
+
+# 【サウンド→ゲームシステム】音の計算は音響エンジン(C++)だけにしました ── そちらに影響が出るかもしれない点
+
+2026-09-09 の決定: **C# が持つのは「音の面の操作」だけ**（何を鳴らすか・切り替え・計器の読み出し）。信号を作る側には触らない。私のレーンのシーンからは C# の畳み込み器（IrConvolver）を外しました（`1ad99e6`）。
+
+## そちらへの影響 ── いまのところ無し。ただし将来の相談があります
+
+**IrConvolver.cs は消していません。** そちら（BellGame）が構造的に使っているためです:
+
+| 使っている所 | 中身 |
+|---|---|
+| `OutdoorTailGate.irVoices` | `IrConvolver[]` の serialized フィールド（消すとシーン/プレハブの参照が壊れる） |
+| `BellGameDoorLab` / `BellGameStages` | シーン生成で `AddComponent<IrConvolver>()` |
+| `IrConvolver.Solo` | 23 箇所 |
+| `demo.useCppDsp` | 8 箇所で書き込み |
+| `WorldSet.IsWorldPart` / `DoorHush` / `BellGameSourceList` | 型で判定 |
+
+`useCppDsp` のフィールドも残してあります（値は常に true。書き込んでも無害）。`IrConvolver.Solo` / `Scope` もそのままです（成分ソロと計器は「操作」側なので新方針に合致）。
+
+## 知っておいてほしい落とし穴（こちらが 3 回踏みました）
+
+- **`IrConvolver.Awake` は無効でも走ります。**AudioSource の clip / loop / spatialBlend / playOnAwake を握って `Play()` します。C++ 経路で鳴らしていても、AudioSource の面倒は C# 側でした。
+- **クリップが空だと `ir_silence`（無音 1 秒）を差し込みます。**再生自体はできてしまうので「鳴っているのに無音」が黙って起きます。こちらの `SetupAudio` は `ir_silence` を「クリップ無し」として扱うようにしました。
+- **`IrConvolver` は IR 専用ではありません。**中に C# の FDN（`TailMode.Fdn`・16 本の遅延線）もあります。今回入れた FDN（`tailModel=1`・部屋ごと・帯域別 RT60）とは別物です。
+
+## 相談
+
+そちらが `IrConvolver` への依存を外せるなら、ファイルごと消して片付けたいです。急ぎではありません。外せる見込みがあるか、いつ頃かだけ教えてください。
