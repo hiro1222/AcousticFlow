@@ -16,6 +16,8 @@
 #include "../AcousticEngine/src/Flow/probe.h"
 #include "../AcousticEngine/src/Flow/emitter.h"
 #include "../AcousticEngine/src/Flow/mix.h"
+#include "../AcousticEngine/src/Flow/surfaces.h"
+#include "../AcousticEngine/src/Flow/energy_trace.h"
 
 using namespace acoustic;
 using namespace acoustic::flow;
@@ -228,6 +230,102 @@ void testInstruments() {
     check("[物差し] 波形の飛びは平常の 4 倍以上に出る", clicked > 4.0 * calm, buf);
 }
 
+// ================================ [レイ] energy_trace（段 2）
+//   閉じた箱（7×14×3 m、扉なし）で: 保存則、直接 1/(4πd²)、反射の総量が部屋定数 4/R と合うこと、
+//   壁越しの透過、種の固定で静止なら揺れないこと、初期／後期の境。
+Surfaces closedBox(const float half, const float h, int material, float t = 0.2f) {
+    Surfaces s;
+    auto add = [&](Vec3 c, Vec3 he) { s.add(Obb::axisAligned(c, he), material); };
+    add(Vec3(0, -t, 0), Vec3(half + t, t, half + t));
+    add(Vec3(0, h + t, 0), Vec3(half + t, t, half + t));
+    add(Vec3(-half - t, h * 0.5f, 0), Vec3(t, h * 0.5f, half + t));
+    add(Vec3(half + t, h * 0.5f, 0), Vec3(t, h * 0.5f, half + t));
+    add(Vec3(0, h * 0.5f, -half - t), Vec3(half + t, h * 0.5f, t));
+    add(Vec3(0, h * 0.5f, half + t), Vec3(half + t, h * 0.5f, t));
+    return s;
+}
+void testEnergyTrace() {
+    std::printf("\n[レイ] 保存則・直接音・部屋定数・透過・種の固定・初期と後期\n");
+    MaterialTable mats;
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.0f; wall.scattering[b] = 0.5f; }
+    const int matId = mats.add(wall);
+    const float half = 3.5f, h = 3.0f;                       // 7 × 7 × 3 m（部屋定数の式は等方な箱ほど合う）
+    Surfaces box = closedBox(half, h, matId);
+    const Vec3 S(1.5f, 1.6f, -1.0f), L(-1.0f, 1.2f, 1.5f);
+    TraceParams prm; prm.rays = 4096; prm.maxBounces = 40; prm.mixingSec = 0.03f; prm.seed = 7u;
+    EnergyTrace tr;
+    const TraceResult R = tr.run(box, mats, S, L, prm);
+    char buf[200];
+
+    // 保存則（レイ側の帳簿）
+    double worst = 0.0;
+    for (int b = 0; b < kNumBands; ++b) {
+        const double lhs = R.absorbed6[b] + R.remainder6[b] + R.escaped6[b];
+        worst = std::max(worst, std::fabs(lhs - R.emitted6[b]) / std::max(R.emitted6[b], 1e-9));
+    }
+    std::snprintf(buf, sizeof(buf), "(放射 %.3f = 吸収 %.3f + 残り %.4f + 逃げ %.4f、ずれ %.2e、ヒット %d)",
+                  R.emitted6[2], R.absorbed6[2], R.remainder6[2], R.escaped6[2], worst, R.hits);
+    check("[レイ] 保存則: 放射 = 吸収 + 打ち切りの残り + 逃げ（全帯域 1e-4 以内）", worst < 1e-4f, buf);
+    check("[レイ] 閉じた箱からは逃げない", R.escaped6[2] == 0.0f);
+
+    // 直接音: 見通しで 1/(4πd²)
+    const float d = length(L - S);
+    const float expect = 1.0f / (4.0f * 3.14159265f * d * d);
+    std::snprintf(buf, sizeof(buf), "(d %.2f m: 直接 %.3e 対 1/4πd² %.3e、横切り %d 枚)", d, R.direct6[2], expect, R.directCrossings);
+    check("[レイ] 見通しの直接音は 1/(4πd²)（空気吸収を除いて 0.1%）", std::fabs(R.direct6[2] / expect - 1.0f) < 0.01f && R.directCrossings == 0, buf);
+
+    // 部屋定数: 反射の総量 ≈ 4(1−ᾱ)/(Sᾱ)（拡散音場の古典式）。
+    const float Sarea = 2.0f * ((2 * half) * (2 * half) + 2.0f * (2 * half) * h);
+    const float alpha = 0.2f;
+    const float expectRev = 4.0f * (1.0f - alpha) / (Sarea * alpha);
+    const float gotRev = R.reflected6(2);
+    const double ratioDb = afti::dB(gotRev / expectRev);
+    std::snprintf(buf, sizeof(buf), "(反射の総量 %.3e 対 4(1-a)/(S a) %.3e、%+.2f dB。初期 %.1f%% 後期 %.1f%%)",
+                  gotRev, expectRev, ratioDb, 100.0f * R.early6[2] / gotRev, 100.0f * R.late6[2] / gotRev);
+    check("[レイ] 反射の総量が部屋定数の式と ±1.5 dB で合う（同じ S と α から）", std::fabs(ratioDb) < 1.5, buf);
+    check("[レイ] 初期にも後期にもエネルギーが入る", R.early6[2] > 0.0f && R.late6[2] > 0.0f);
+    std::snprintf(buf, sizeof(buf), "(最初の反射 %.1f ms、直接 %.1f ms)", R.firstReflectSec * 1000.0f, R.directSec * 1000.0f);
+    check("[レイ] 最初の反射は直接音より後に届く", R.firstReflectSec > R.directSec, buf);
+
+    // 種の固定: 同じ入力なら同じ出力（ビット一致）。
+    const TraceResult R2 = tr.run(box, mats, S, L, prm);
+    // ★memcmp で構造体を比べない: double と float が混ざるとパディングが入り、そこは初期化されない。
+    auto same = [](const TraceResult& a, const TraceResult& b) {
+        for (int i = 0; i < kNumBands; ++i)
+            if (a.direct6[i] != b.direct6[i] || a.transmit6[i] != b.transmit6[i] || a.early6[i] != b.early6[i] || a.late6[i] != b.late6[i]
+                || a.emitted6[i] != b.emitted6[i] || a.absorbed6[i] != b.absorbed6[i] || a.remainder6[i] != b.remainder6[i]) return false;
+        return a.firstReflectSec == b.firstReflectSec && a.hits == b.hits && a.neeVisible == b.neeVisible;
+    };
+    check("[レイ] 同じ種・同じ幾何なら結果がビット一致（静止で揺れない）", same(R, R2));
+    // 2 cm 動いたときの変化は小さい（相関した標本）。新しい種だと分散ぶん動く。
+    const TraceResult R3 = tr.run(box, mats, S, L + Vec3(0.02f, 0, 0), prm);
+    TraceParams prm2 = prm; prm2.seed = 8u;
+    const TraceResult R4 = tr.run(box, mats, S, L, prm2);
+    const double stepSame = std::fabs(afti::dB(R3.reflected6(2) / R.reflected6(2)));
+    const double stepSeed = std::fabs(afti::dB(R4.reflected6(2) / R.reflected6(2)));
+    std::snprintf(buf, sizeof(buf), "(2 cm 動いて %.3f dB、種を変えると %.3f dB)", stepSame, stepSeed);
+    check("[レイ] 2 cm の移動での変化は 0.3 dB 未満（種を固定した相関標本）", stepSame < 0.3, buf);
+
+    // 透過: 音源と聞き手の間に板を置く。直接が消え、透過に τ の積が出る。
+    AcousticMaterial leaf = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { leaf.absorption[b] = 0.1f; leaf.transmission[b] = 0.01f; }
+    const int leafId = mats.add(leaf);
+    Surfaces box2 = closedBox(half, h, matId);
+    box2.add(Obb::axisAligned(Vec3(0, h * 0.5f, 0.25f), Vec3(half, h * 0.5f, 0.02f)), leafId);   // 間仕切り
+    const TraceResult T = tr.run(box2, mats, S, L, prm);
+    std::snprintf(buf, sizeof(buf), "(横切り %d 枚: 直接 %.2e、透過 %.2e = 1/4πd² × %.3f)", T.directCrossings, T.direct6[2], T.transmit6[2], T.transmit6[2] / expect);
+    check("[レイ] 板を挟むと直接が 0 になり透過に τ が掛かる（0.01）", T.directCrossings == 1 && T.direct6[2] == 0.0f && std::fabs(T.transmit6[2] / expect - 0.01f) < 0.002f, buf);
+    check("[レイ] 板を挟んでも反射の総量は残る（板の向こうで反射して抜けてくる）", T.reflected6(2) > 0.0f && T.reflected6(2) < gotRev);
+
+    // 初期／後期の境: mixing を 0 にすると全部後期、大きくすると全部初期。
+    TraceParams p0 = prm; p0.mixingSec = 0.0f;
+    TraceParams p1 = prm; p1.mixingSec = 10.0f;
+    const TraceResult A0 = tr.run(box, mats, S, L, p0), A1 = tr.run(box, mats, S, L, p1);
+    check("[レイ] 境が 0 なら全部後期、境が大きければ全部初期（総量は同じ）",
+          A0.early6[2] == 0.0f && A1.late6[2] == 0.0f && std::fabs(A0.reflected6(2) - A1.reflected6(2)) < 1e-6f);
+}
+
 }  // namespace
 
 int main() {
@@ -235,6 +333,7 @@ int main() {
     const char* only = std::getenv("AF_ONLY");
     struct { const char* name; void (*fn)(); } suites[] = {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
+        {"trace", testEnergyTrace},
     };
     for (const auto& s : suites) if (!only || std::strcmp(only, s.name) == 0) s.fn();
     return afti::finish("Flow");
