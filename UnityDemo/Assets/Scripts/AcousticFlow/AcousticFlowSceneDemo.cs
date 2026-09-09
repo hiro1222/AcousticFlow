@@ -485,18 +485,13 @@ namespace AcousticFlow
                  + "解決するまで OFF のまま。")]
         public bool useBtmDiffraction = false;
 
-        [Header("DSP 経路 (段4)")]
-        [Tooltip("ON: 畳み込み・HRTF・後期尾を **C++ エンジン側**(VoiceConvolver)で回す。\n"
-                 + "OFF: **Unity C# 側**(IrConvolver)で回す。Y キー切替。\n\n"
-                 + "同じタップ束(SourceTaps.BandGain)を食わせているので、両者は同じ音が出るはず。\n"
-                 + "つまり聞こえ方の調整（透過/回折のゲインと LPF、平滑化）はどちらでも同じに効く。\n\n"
-                 + "★**既定は ON（C++ 経路）**。エンジンが本体で、C# 側は比較用という位置づけ。\n"
-                 + "  以前は『C++ 経路が耳で未検証』を理由に OFF を既定にしていたが、\n"
-                 + "  残響が減って聞こえる件（直接音の二重計上）を直して確認済みなので入れ替えた。\n"
-                 + "  比較したいときだけ Y で C# 側へ落とす。\n"
-                 + "  なお扉のタップ補間は C++ 側にしか無いので、\n"
-                 + "  『開けた瞬間ガタっと変わる』の確認は ON 側でしかできない。\n"
-                 + "  VoiceConvolver が載っていない古いシーンでは自動で C# 側に落ちて警告が出る。")]
+        [Header("DSP 経路")]
+        [Tooltip("★2026-09-09 以降、意味を持たない旗です（常に true）。\n\n"
+                 + "音の計算は音響エンジン(C++ VoiceConvolver)だけが行います。"
+                 + "比較用に置いていた C# の畳み込み器(IrConvolver 一式)は削除しました。\n"
+                 + "C# が持つのは「音の面の操作」だけ ── 何を鳴らすか(AudioSource のクリップ)、"
+                 + "切り替え、計器の読み出し(Solo / Scope)。信号を作る側には触りません。\n\n"
+                 + "シーンの serialize に載っているので消していません。")]
         public bool useCppDsp = true;
 
         [Header("可視化")]
@@ -1388,8 +1383,6 @@ namespace AcousticFlow
         //   （以前は Wwise の State にしか送っていなかったので、畳み込み経路では H が何もしていなかった）。
         private void ApplyHrtfFlag()
         {
-            foreach (var c in FindObjectsByType<IrConvolver>(FindObjectsInactive.Include, FindObjectsSortMode.None))
-                c.enableHrtf = useHrtf;
             foreach (var c in FindObjectsByType<VoiceConvolver>(FindObjectsInactive.Include, FindObjectsSortMode.None))
                 c.enableHrtf = useHrtf;
         }
@@ -1401,31 +1394,23 @@ namespace AcousticFlow
             return (float)System.Math.Sqrt(s / System.Math.Max(1, x.Length));
         }
 
-        // ── DSP 経路の切替（C# の IrConvolver ⇔ C++ の VoiceConvolver）──
-        //   同じ GameObject に両方載せておき、**片方だけ enabled にする**。
-        //   Unity は無効な MonoBehaviour の OnAudioFilterRead を呼ばないので、
-        //   これだけで経路が入れ替わる（AudioSource は共有のまま＝再生位置がズレない）。
-        private IrConvolver _hudIr;       // HUD 表示用（音には使わない）
-        private VoiceConvolver _hudVoice; // HUD 表示用（音には使わない）
+        // ── 音を作る部品（音響エンジンへの入口）──
+        //   2026-09-09 まではここに C# の畳み込み器（IrConvolver）も居て、同じ GameObject に
+        //   両方載せて片方だけ enabled にしていた。C# の畳み込み器は削除したので、いまは 1 本だけ。
+        private VoiceConvolver _hudVoice; // 表示用（追従の定数などを読む。音には使わない）
 
         // ★音の計算は**音響エンジン（C++）だけ**（2026-09-09 決定）。C# は「音の面の操作」だけを持つ。
-        //   C# 経路（IrConvolver）との A/B は終わり。このレーンのシーンからは C# の畳み込み器を外した。
-        //   ⚠ useCppDsp のフィールドは残す（BellGame レーンが書き込んでいる）。値は常に true。
-        //   ⚠ IrConvolver.cs 自体も残す（同じ理由）。場面に居たら**無効にして黙らせる**だけ。
+        //   C# の畳み込み器（IrConvolver 一式）は BellGame ごと削除した。切り替えるものはもう無い。
+        //   ⚠ useCppDsp のフィールドだけは残す（値は常に true）。シーンの serialize に載っているのと、
+        //     「どちらで鳴っているか」を問う古い呼び手が居ても嘘にならないため。
         private void SetDspPath(bool cpp)
         {
             useCppDsp = true;
-            // ★FindObjectsInactive.Include が要る。無効な側も拾って確実に黙らせるため。
-            var irs = FindObjectsByType<IrConvolver>(
-                FindObjectsInactive.Include, FindObjectsSortMode.None);
             var voices = FindObjectsByType<VoiceConvolver>(
                 FindObjectsInactive.Include, FindObjectsSortMode.None);
-            int nIr = irs.Length, nVoice = voices.Length;
-            foreach (var c in irs) c.enabled = false;
+            int nVoice = voices.Length;
             foreach (var c in voices) c.enabled = true;
-            // HUD で追従の定数を出すのに使う。欄が別のコンポーネントに散っているので、
-            //   ここで拾っておく（毎フレーム Find すると重い）。
-            _hudIr = (irs.Length > 0) ? irs[0] : null;
+            // 表示で追従の定数を出すのに使う（毎フレーム Find すると重いので拾っておく）。
             _hudVoice = (voices.Length > 0) ? voices[0] : null;
 
             if (nVoice == 0)
@@ -1435,10 +1420,6 @@ namespace AcousticFlow
                                + "メニュー AcousticFlow > Test Scenes でシーンを作り直してください。");
                 return;
             }
-            if (nIr > 0)
-                Debug.LogWarning($"[AcousticFlowScene] C# の畳み込み器(IrConvolver)が {nIr} 個ありますが無効にしました。"
-                                 + "音の計算は音響エンジン(C++)だけが行います。シーンから外してください"
-                                 + "（AcousticFlow > Test Scenes で作り直すと外れます）。");
             Debug.Log($"[AcousticFlowScene] 音の計算: 音響エンジン(C++) / VoiceConvolver {nVoice} 本");
         }
 
@@ -1489,15 +1470,15 @@ namespace AcousticFlow
             // P：扉の定点 ON/OFF（聴き比べ用。sharedTailBus が ON のときだけ効く）。
             if (Input.GetKeyDown(KeyCode.P)) portalTail = !portalTail;
             // 1〜4：成分のソロ（直接音／反射／回折／後期尾）。
-            //   ★「何が定位を持っているか」を耳で切り分けるための口。仕組み（IrConvolver.Solo）は
+            //   ★「何が定位を持っているか」を耳で切り分けるための口。仕組み（Solo）は
             //     前からあったのに**キーが無く、実行中に切り替えられなかった**。
             //     2026-09-03「閉扉で壁の奥の定位が反転する」を追うときに、F（早期反射のエミッタ）だけでは
             //     足りず、尾と回折を個別に落とせないと切り分けられないと分かって足した。
             //   ⚠ F と 2 は別物。F はエンジンの像源抽出そのもの、2 は畳み込み器の中の反射タップの通過。
-            if (Input.GetKeyDown(KeyCode.Alpha1)) IrConvolver.Solo.PassDirect = !IrConvolver.Solo.PassDirect;
-            if (Input.GetKeyDown(KeyCode.Alpha2)) IrConvolver.Solo.PassReflect = !IrConvolver.Solo.PassReflect;
-            if (Input.GetKeyDown(KeyCode.Alpha3)) IrConvolver.Solo.PassDiffract = !IrConvolver.Solo.PassDiffract;
-            if (Input.GetKeyDown(KeyCode.Alpha4)) IrConvolver.Solo.PassTail = !IrConvolver.Solo.PassTail;
+            if (Input.GetKeyDown(KeyCode.Alpha1)) Solo.PassDirect = !Solo.PassDirect;
+            if (Input.GetKeyDown(KeyCode.Alpha2)) Solo.PassReflect = !Solo.PassReflect;
+            if (Input.GetKeyDown(KeyCode.Alpha3)) Solo.PassDiffract = !Solo.PassDiffract;
+            if (Input.GetKeyDown(KeyCode.Alpha4)) Solo.PassTail = !Solo.PassTail;
             // M：音源の AudioSource を一括ミュート/復帰（尾やクリックだけ聞く用）。畳み込み器はそのまま走る。
             if (Input.GetKeyDown(KeyCode.M)) SetMuted(!_muted);
             // V：回折二次音源（開口ごとの F タップ）の ON/OFF。設定は毎フレーム渡しているので旗だけ返す。
@@ -2911,10 +2892,10 @@ namespace AcousticFlow
             GUILayout.Label($"音: {(useAltClip && altClip != null ? $"差し替え ({altClip.name})" : "各音源のクリップ")}"
                             + (_muted ? "  ミュート中 (M)" : ""), style);
             GUILayout.Label($"音源配置: {(_stacked ? "重ね(1点)" : "展開")}", style);
-            GUILayout.Label($"成分ソロ: 1直接 {(IrConvolver.Solo.PassDirect ? "ON " : "OFF")}"
-                            + $" / 2反射 {(IrConvolver.Solo.PassReflect ? "ON " : "OFF")}"
-                            + $" / 3回折 {(IrConvolver.Solo.PassDiffract ? "ON " : "OFF")}"
-                            + $" / 4尾 {(IrConvolver.Solo.PassTail ? "ON " : "OFF")}"
+            GUILayout.Label($"成分ソロ: 1直接 {(Solo.PassDirect ? "ON " : "OFF")}"
+                            + $" / 2反射 {(Solo.PassReflect ? "ON " : "OFF")}"
+                            + $" / 3回折 {(Solo.PassDiffract ? "ON " : "OFF")}"
+                            + $" / 4尾 {(Solo.PassTail ? "ON " : "OFF")}"
                             + $"   (F=早期反射 {(enableEarlyReflections ? "ON" : "OFF")}・模型 {(earlyReflectModel == 1 ? "面の線" : "像源レイ")})", style);
             {
                 // 扉の定点の状態。効いていない理由があればそれも出す（黙って効かないのがいちばん困る）。
@@ -2984,8 +2965,7 @@ namespace AcousticFlow
             //   欄が VoiceConvolver / IrConvolver / ここ に散っているので 1 行にまとめて出す。
             //   ※出しているのは「つまみの値」であって到達時刻ではない。到達時刻は上の実測。
             {
-                float alpha = (_hudVoice != null) ? _hudVoice.tailEnvSmoothing
-                            : (_hudIr != null ? _hudIr.tailEnvSmoothing : 0.6f);
+                float alpha = (_hudVoice != null) ? _hudVoice.tailEnvSmoothing : 0.6f;
                 int nf = (_hudVoice != null) ? _hudVoice.tailRebuildEveryFrames : 8;
                 float stepMs = nf * (1000f / 60f);
                 float xfMs = (_hudVoice != null) ? _hudVoice.tailCrossfadeMs : 0f;
@@ -3083,13 +3063,13 @@ namespace AcousticFlow
         private int _spikeRate;
         private void DrawAudioHealth(GUIStyle style)
         {
-            float blockMs = IrConvolver.Scope.BlockDurMs;
+            float blockMs = Scope.BlockDurMs;
             if (blockMs <= 0f) return;
             float total = 0f; int voices = 0;
-            int maxIdx = Mathf.Min(IrConvolver.Scope.MeteredMax, IrConvolver.Scope.MaxMeteredSources - 1);
+            int maxIdx = Mathf.Min(Scope.MeteredMax, Scope.MaxMeteredSources - 1);
             for (int i = 0; i <= maxIdx; i++)
             {
-                float ms = IrConvolver.Scope.BlockMs[i];
+                float ms = Scope.BlockMs[i];
                 if (ms <= 0f) continue;
                 total += ms; voices++;
             }
@@ -3097,13 +3077,13 @@ namespace AcousticFlow
             _spikeTimer += Time.unscaledDeltaTime;
             if (_spikeTimer >= 1f)
             {
-                _spikeRate = IrConvolver.Scope.StepSpikes - _spikePrev;
-                _spikePrev = IrConvolver.Scope.StepSpikes;
+                _spikeRate = Scope.StepSpikes - _spikePrev;
+                _spikePrev = Scope.StepSpikes;
                 _spikeTimer = 0f;
             }
             float load = total / blockMs * 100f;
-            float calm = IrConvolver.Scope.StepRatioCalm;
-            float now = IrConvolver.Scope.StepRatio;
+            float calm = Scope.StepRatioCalm;
+            float now = Scope.StepRatio;
             float times = calm > 1e-6f ? now / calm : 0f;
             GUILayout.Label(
                 $"音声スレッド: 負荷 {load:F0}%（音源 {voices} 本 計 {total:F2} ms / バッファ {blockMs:F1} ms）"

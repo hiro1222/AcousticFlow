@@ -16,7 +16,7 @@
  *
  * 値の出どころ:
  *   AcousticFlowSceneDemo.Status（PublishMonitors() が毎フレーム更新）
- *   IrConvolver.Scope（audio thread が書く段ごとの RMS）
+ *   Scope（audio thread が書く段ごとの RMS）
  *   ★Status の配列は参照共有（ゼロGC）なので、参照を持つと次のフレームで上書きされる。
  *     必ず値を写すこと。
  */
@@ -140,11 +140,11 @@ namespace AcousticFlow.EditorTools
             DiffDelta[w] = AcousticFlowSceneDemo.Status.DiffDelta;
             SourceLevel[w] = AcousticFlowSceneDemo.Status.SourceLevel;
 
-            RmsDirect[w] = IrConvolver.Scope.RmsDirect;
-            RmsEarly[w] = IrConvolver.Scope.RmsEarly;
-            RmsScatter[w] = IrConvolver.Scope.RmsScatter;
-            RmsTail[w] = IrConvolver.Scope.RmsTail;
-            RmsOut[w] = IrConvolver.Scope.RmsOut;
+            RmsDirect[w] = Scope.RmsDirect;
+            RmsEarly[w] = Scope.RmsEarly;
+            RmsScatter[w] = Scope.RmsScatter;
+            RmsTail[w] = Scope.RmsTail;
+            RmsOut[w] = Scope.RmsOut;
 
             TapCount[w] = AcousticFlowSceneDemo.Status.TapCount;
             ErActive[w] = AcousticFlowSceneDemo.Status.ErActive;

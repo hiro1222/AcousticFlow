@@ -201,21 +201,11 @@ namespace AcousticFlow
             return false;
         }
 
-        // ★C# 経路(IrConvolver)と同時に有効にしない。
-        //   両方が OnAudioFilterRead を返すと、同じ音源が二重に鳴る（実際に踏んだ）。
-        //   AcousticFlowSceneDemo.SetDspPath は起動時と Y キーでしか呼ばれないので、
-        //   インスペクタでチェックを手で入れると排他が効かない。どこから有効にされても
-        //   不変条件（鳴らすのは常に片方だけ）が保たれるよう、ここで相手を降ろす。
-        //   ※ 同じ GameObject とは限らないので探索で拾う（OnEnable は滅多に呼ばれない）。
-        private void OnEnable()
-        {
-            int downed = 0;
-            foreach (var ir in FindObjectsByType<IrConvolver>(FindObjectsSortMode.None))
-                if (ir.enabled) { ir.enabled = false; downed++; }
-            if (downed > 0)
-                Debug.Log($"[VoiceConvolver] C++ 経路を有効にしたので C# 経路(IrConvolver) {downed} 個を"
-                          + "降ろしました（両方鳴らすと二重になります。Y キーで切り替え）");
-        }
+        // 【2026-09-09】ここには「C# の畳み込み器(IrConvolver)を降ろす」排他の番人が居た。
+        //   同じ音源に両方が OnAudioFilterRead を返すと二重に鳴るため。C# の畳み込み器は
+        //   削除した（音の計算は音響エンジンだけ）ので、番人ごと不要になった。
+        //   ★同じ GameObject に OnAudioFilterRead を持つ部品をもう 1 つ足すときは、
+        //     同じ罠が復活する。足す側が「自分だけが音を書く」を保証すること。
 
         private void Awake()
         {
@@ -301,7 +291,7 @@ namespace AcousticFlow
 
             Native.AF_VoiceSetOutputGain(_voice, outputGain);
             // 【道具A】尾のゲート。IrConvolver 側と同じ意味にそろえる。
-            Native.AF_VoiceSetTailLevel(_voice, IrConvolver.Solo.PassTail ? tailLevel : 0f);
+            Native.AF_VoiceSetTailLevel(_voice, Solo.PassTail ? tailLevel : 0f);
             Native.AF_VoiceSetScatterDiffusion(_voice, scatterDiffusion);
             Native.AF_VoiceSetHrtfEnabled(_voice, enableHrtf ? 1 : 0);
 
@@ -333,12 +323,12 @@ namespace AcousticFlow
             int nb = AcousticEngine.NumBands;
             // 【道具A】経路単位のソロ／ミュート。既定（素通し）のときは判定ごと飛ばす。
             //   落としたぶんは詰めて渡すので、エンジンには「そのタップは無かった」ように見える。
-            bool soloOn = !IrConvolver.Solo.IsDefault;
+            bool soloOn = !Solo.IsDefault;
             int w = 0;
             for (int i = 0; i < n; i++)
             {
                 if (soloOn && ts.Type != null && i < ts.Type.Length
-                    && !IrConvolver.Solo.AllowsType(ts.Type[i])) continue;
+                    && !Solo.AllowsType(ts.Type[i])) continue;
                 int o = i * nb;
                 float rl = (i == 0) ? 1f : reflectionLevel;
                 var t = new Native.AFVoiceTap
@@ -535,18 +525,18 @@ namespace AcousticFlow
             rmsDirect = m.rmsDirect; rmsEarly = m.rmsEarly; rmsScatter = m.rmsScatter;
             rmsTail = m.rmsTail; rmsOut = m.rmsOut;
 
-            // ★HUD と Output Scope が読む段別メーターは IrConvolver.Scope の static。
+            // ★HUD と Output Scope が読む段別メーターは Scope の static。
             //   ここへも書かないと、C++ 経路へ切り替えた瞬間に数値が固まって
             //   「切り替えたのに何も変わらない」ように見える。**同じ計器で A/B する**ために
             //   平滑係数も IrConvolver と同じ 0.3 に揃える。
             const float k = 0.3f;
-            IrConvolver.Scope.SampleRate = _sampleRate;
-            IrConvolver.Scope.TailPartitions = tailPartitions;
-            IrConvolver.Scope.RmsDirect  = Mathf.Lerp(IrConvolver.Scope.RmsDirect,  m.rmsDirect,  k);
-            IrConvolver.Scope.RmsEarly   = Mathf.Lerp(IrConvolver.Scope.RmsEarly,   m.rmsEarly,   k);
-            IrConvolver.Scope.RmsScatter = Mathf.Lerp(IrConvolver.Scope.RmsScatter, m.rmsScatter, k);
-            IrConvolver.Scope.RmsTail    = Mathf.Lerp(IrConvolver.Scope.RmsTail,    m.rmsTail,    k);
-            IrConvolver.Scope.RmsOut     = Mathf.Lerp(IrConvolver.Scope.RmsOut,     m.rmsOut,     k);
+            Scope.SampleRate = _sampleRate;
+            Scope.TailPartitions = tailPartitions;
+            Scope.RmsDirect  = Mathf.Lerp(Scope.RmsDirect,  m.rmsDirect,  k);
+            Scope.RmsEarly   = Mathf.Lerp(Scope.RmsEarly,   m.rmsEarly,   k);
+            Scope.RmsScatter = Mathf.Lerp(Scope.RmsScatter, m.rmsScatter, k);
+            Scope.RmsTail    = Mathf.Lerp(Scope.RmsTail,    m.rmsTail,    k);
+            Scope.RmsOut     = Mathf.Lerp(Scope.RmsOut,     m.rmsOut,     k);
 
             for (int f = 0; f < frames; f++)
             {
@@ -580,34 +570,34 @@ namespace AcousticFlow
                 if (blkRms > 1e-5f)
                 {
                     float ratio = maxStep / blkRms;
-                    IrConvolver.Scope.StepRatio = ratio;
-                    float calm = IrConvolver.Scope.StepRatioCalm;
+                    Scope.StepRatio = ratio;
+                    float calm = Scope.StepRatioCalm;
                     if (calm <= 0f) calm = ratio;
                     // 平常値はゆっくり追う（跳ねを平常に取り込まないよう、上がるときだけ鈍く）。
                     float a = (ratio > calm) ? 0.002f : 0.02f;
-                    IrConvolver.Scope.StepRatioCalm = calm + (ratio - calm) * a;
-                    if (ratio > calm * 4f) IrConvolver.Scope.StepSpikes++;
+                    Scope.StepRatioCalm = calm + (ratio - calm) * a;
+                    if (ratio > calm * 4f) Scope.StepSpikes++;
                 }
-                IrConvolver.Scope.BlockDurMs = _sampleRate > 0
+                Scope.BlockDurMs = _sampleRate > 0
                     ? frames * 1000f / _sampleRate : 0f;
             }
 
-            if (sourceIndex >= 0 && sourceIndex < IrConvolver.Scope.MaxMeteredSources)
+            if (sourceIndex >= 0 && sourceIndex < Scope.MaxMeteredSources)
             {
                 float ms = (float)((System.Diagnostics.Stopwatch.GetTimestamp() - meterT0) * 1000.0
                                    / System.Diagnostics.Stopwatch.Frequency);
-                IrConvolver.Scope.BlockMs[sourceIndex] =
-                    Mathf.Lerp(IrConvolver.Scope.BlockMs[sourceIndex], ms, k);
-                IrConvolver.Scope.BlockFrames[sourceIndex] = frames;
-                if (sourceIndex > IrConvolver.Scope.MeteredMax) IrConvolver.Scope.MeteredMax = sourceIndex;
+                Scope.BlockMs[sourceIndex] =
+                    Mathf.Lerp(Scope.BlockMs[sourceIndex], ms, k);
+                Scope.BlockFrames[sourceIndex] = frames;
+                if (sourceIndex > Scope.MeteredMax) Scope.MeteredMax = sourceIndex;
                 // 【道具A】音源ごとの出力。★消す前の量を出す（比べるために要る）。
-                IrConvolver.Scope.OutRms[sourceIndex] =
-                    Mathf.Lerp(IrConvolver.Scope.OutRms[sourceIndex], m.rmsOut, k);
+                Scope.OutRms[sourceIndex] =
+                    Mathf.Lerp(Scope.OutRms[sourceIndex], m.rmsOut, k);
             }
 
             // 【道具A】音源ごとのミュート／ソロ。★計算は止めない
             //   （止めるとエンジン側の遅延線が進まず、解除で音が飛ぶ＝連続性の事故になる）。
-            if (!IrConvolver.Solo.AllowsSource(sourceIndex)) Array.Clear(data, 0, data.Length);
+            if (!Solo.AllowsSource(sourceIndex)) Array.Clear(data, 0, data.Length);
         }
     }
 }

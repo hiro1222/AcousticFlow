@@ -6,7 +6,7 @@
  * 既存の Output Monitor との違い:
  *   Output Monitor は AcousticEngine_GetOutputLevels＝Wwise の出力レベルを読む。
  *   IR 畳み込み経路は Wwise を通らない（Unity の OnAudioFilterRead で自前出力する）ので、
- *   あちらには何も映らない。こちらは IrConvolver.Scope＝畳み込み器が実際に書いた波形を読む。
+ *   あちらには何も映らない。こちらは Scope＝畳み込み器が実際に書いた波形を読む。
  *
  * 段別 RMS を併記しているのが要点:
  *   直接 / 早期(鏡面) / 散乱(拡散) / 後期尾 のどれが鳴っていて、どれが鳴っていないかが
@@ -46,7 +46,7 @@ namespace AcousticFlow.EditorTools
                 return;
             }
 
-            int sr = IrConvolver.Scope.SampleRate;
+            int sr = Scope.SampleRate;
             if (sr <= 0)
             {
                 EditorGUILayout.HelpBox(
@@ -77,15 +77,15 @@ namespace AcousticFlow.EditorTools
             Rect r = GUILayoutUtility.GetRect(10f, 10000f, 120f, 100000f);
             EditorGUI.DrawRect(r, new Color(0.09f, 0.09f, 0.11f));
 
-            int len = IrConvolver.Scope.BufferLength;
+            int len = Scope.BufferLength;
             int count = Mathf.Clamp(Mathf.RoundToInt(_windowMs * 0.001f * sr), 16, len - 1);
 
             // 表示の開始位置。クリック同期ならトリガ位置から、そうでなければ「今」から遡る。
             int start;
-            if (_syncToClick && IrConvolver.Scope.TriggerPos >= 0)
-                start = IrConvolver.Scope.TriggerPos;
+            if (_syncToClick && Scope.TriggerPos >= 0)
+                start = Scope.TriggerPos;
             else
-                start = (IrConvolver.Scope.WritePos - count + len) % len;
+                start = (Scope.WritePos - count + len) % len;
 
             Handles.BeginGUI();
 
@@ -100,8 +100,8 @@ namespace AcousticFlow.EditorTools
                 Handles.DrawLine(new Vector3(x, r.y), new Vector3(x, r.yMax));
             }
 
-            DrawChannel(IrConvolver.Scope.L, start, count, len, r, new Color(0.35f, 0.75f, 1f, 0.9f), -1);
-            DrawChannel(IrConvolver.Scope.R, start, count, len, r, new Color(1f, 0.55f, 0.35f, 0.9f), 1);
+            DrawChannel(Scope.L, start, count, len, r, new Color(0.35f, 0.75f, 1f, 0.9f), -1);
+            DrawChannel(Scope.R, start, count, len, r, new Color(1f, 0.55f, 0.35f, 0.9f), 1);
 
             Handles.EndGUI();
 
@@ -158,27 +158,27 @@ namespace AcousticFlow.EditorTools
             EditorGUILayout.Space(4);
             EditorGUILayout.LabelField("段別レベル（RMS）", EditorStyles.boldLabel);
 
-            Meter("直接音", IrConvolver.Scope.RmsDirect, new Color(0.95f, 0.85f, 0.3f));
-            Meter("早期反射(鏡面)", IrConvolver.Scope.RmsEarly, new Color(0.4f, 0.85f, 1f));
-            Meter("散乱(拡散)", IrConvolver.Scope.RmsScatter, new Color(0.6f, 1f, 0.6f));
-            Meter("後期尾", IrConvolver.Scope.RmsTail, new Color(1f, 0.55f, 0.35f));
-            Meter("最終出力", IrConvolver.Scope.RmsOut, new Color(0.9f, 0.9f, 0.9f));
+            Meter("直接音", Scope.RmsDirect, new Color(0.95f, 0.85f, 0.3f));
+            Meter("早期反射(鏡面)", Scope.RmsEarly, new Color(0.4f, 0.85f, 1f));
+            Meter("散乱(拡散)", Scope.RmsScatter, new Color(0.6f, 1f, 0.6f));
+            Meter("後期尾", Scope.RmsTail, new Color(1f, 0.55f, 0.35f));
+            Meter("最終出力", Scope.RmsOut, new Color(0.9f, 0.9f, 0.9f));
 
             EditorGUILayout.Space(2);
-            int parts = IrConvolver.Scope.TailPartitions;
+            int parts = Scope.TailPartitions;
             EditorGUILayout.LabelField(
                 parts > 0
-                    ? $"実測尾: 有効（{IrConvolver.Scope.ActiveParts}/{parts} パーティション稼働）　"
-                      + $"早期↔後期の境目 {IrConvolver.Scope.SplitMs:F0} ms（mixing time √V）"
+                    ? $"実測尾: 有効（{Scope.ActiveParts}/{parts} パーティション稼働）　"
+                      + $"早期↔後期の境目 {Scope.SplitMs:F0} ms（mixing time √V）"
                     : "実測尾: IR 未設定（tailMode が Measured でない / 帯域別エコグラムが無い / 尾のエネルギーが0）",
                 EditorStyles.miniLabel);
 
             // ※ ここは必ず毎回同じ数だけ描く。値の有無で描画を分けると、Layout パスと
             //    Repaint パスの間に audio thread が値を書き換えたときコントロール数が食い違い、
             //    "Getting control N's position in a group with only N controls" で落ちる。
-            float tail = IrConvolver.Scope.RmsTail;
-            float early = IrConvolver.Scope.RmsEarly + IrConvolver.Scope.RmsScatter;
-            float dr = IrConvolver.Scope.RmsDirect;
+            float tail = Scope.RmsTail;
+            float early = Scope.RmsEarly + Scope.RmsScatter;
+            float dr = Scope.RmsDirect;
 
             EditorGUILayout.LabelField(
                 early > 1e-6f ? $"尾 / 早期 = {tail / early:F2}（空間感の目安。小さいほど乾く）" : "尾 / 早期 = —",
@@ -186,7 +186,7 @@ namespace AcousticFlow.EditorTools
 
             // 目標比（知覚圧縮後）と、実際にレンダリングされた尾/直接パワー比を並べる。
             // 較正が正しければ「実測 尾/直接」≒「√目標」になるはず。
-            float target = Mathf.Max(0f, IrConvolver.Scope.TailToDirectRatio);
+            float target = Mathf.Max(0f, Scope.TailToDirectRatio);
             EditorGUILayout.LabelField(
                 dr > 1e-6f
                     ? $"尾 / 直接 = {tail / dr:F2}（目標比 {target:F2} → 目標 尾/直接 {Mathf.Sqrt(target):F2}）"
@@ -194,7 +194,7 @@ namespace AcousticFlow.EditorTools
                 EditorStyles.miniLabel);
 
             // 圧縮の効きを見る。物理そのままだと部屋間で振れ幅が大きすぎるので指数で寄せている。
-            float phys = Mathf.Max(0f, IrConvolver.Scope.PhysicalRatio);
+            float phys = Mathf.Max(0f, Scope.PhysicalRatio);
             EditorGUILayout.LabelField(
                 phys > 1e-6f
                     ? $"物理比 (r/r_c)² = {phys:F2} → 知覚圧縮後 {target:F2}"

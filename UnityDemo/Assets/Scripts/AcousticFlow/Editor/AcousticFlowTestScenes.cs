@@ -403,12 +403,11 @@ namespace AcousticFlow.EditorTools
             // 直進では絶対に届かず、必ず開口を回り込むことになる。
             var srcPos = new Vector3(-4f, 1.6f, 5f);
             var srcs0 = AddDemo(listener, srcPos, AcousticMaterialPreset.Opaque);
-            var conv = srcs0[0].GetComponent<IrConvolver>();
+            var conv = srcs0[0].GetComponent<VoiceConvolver>();
 
             // 回折だけを残す。
             conv.reflectionLevel = 1f;      // 'F'(回折)タップは直接音と同じ音量で鳴らす
-            conv.tailLevel = 0f;            // 後期残響なし
-            conv.enableReverbTail = false;
+            conv.tailLevel = 0f;            // 後期残響なし（旧 IrConvolver の enableReverbTail は tailLevel=0 と同義）
             var demo = Object.FindObjectOfType<AcousticFlowSceneDemo>();
             if (demo != null)
             {

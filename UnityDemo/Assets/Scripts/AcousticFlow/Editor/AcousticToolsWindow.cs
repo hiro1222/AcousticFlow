@@ -59,7 +59,7 @@ namespace AcousticFlow.EditorTools
             EditorApplication.update -= Repaint;
             SceneView.duringSceneGui -= OnSceneGui;
             // 窓を閉じたらソロは必ず解除する。切ったまま忘れると「音が出ない」で悩む。
-            IrConvolver.Solo.Reset();
+            Solo.Reset();
         }
 
         private void OnGUI()
@@ -105,14 +105,6 @@ namespace AcousticFlow.EditorTools
                 if (d != demo.hudDetail) { Undo.RecordObject(demo, "hudDetail"); demo.hudDetail = d; EditorUtility.SetDirty(demo); }
                 GUILayout.Label("(ビルドで見るとき用)", EditorStyles.miniLabel);
             }
-            // ★C# の畳み込み器が場面に残っていたら言う（2026-09-09 以降、音の計算は音響エンジンだけ）。
-            //   IrConvolver は名前に反して中に C# の FDN も持っているので、残っていると「どちらの尾か」が濁る。
-            var ir = Object.FindFirstObjectByType<IrConvolver>(FindObjectsInactive.Include);
-            if (ir != null)
-                EditorGUILayout.HelpBox("C# の畳み込み器(IrConvolver)が場面に残っています（無効にしてあります）。"
-                    + "音の計算は音響エンジン(C++)だけです。AcousticFlow ▸ Test Scenes でシーンを作り直すと外れます。",
-                    MessageType.Warning);
-
             var tb = Object.FindFirstObjectByType<TailBusRenderer>();
             if (!playing)
             {
@@ -152,16 +144,11 @@ namespace AcousticFlow.EditorTools
             //   デモの M キーは Inspector の sources に並んだ物しか触らないので、一覧で見分ける。
             foreach (var a in all)
             {
+                // ★音を作るのは音響エンジン(C++)の VoiceConvolver だけ。AudioSource は「何を鳴らすか」を持つ入口で、
+                //   その中身（data）を VoiceConvolver がエンジンへ渡し、返ってきた音で上書きする。
                 var vc = a.GetComponent<VoiceConvolver>();
-                var ic = a.GetComponent<IrConvolver>();
-                // ★同じ GameObject に C++ と C# の畳み込み器が**両方**載っていて、SetDspPath が enabled を排他で切り替える。
-                //   無効な側は OnAudioFilterRead が来ないので音は作らないが、IrConvolver.Awake は無効でも走り、
-                //   AudioSource の clip / loop / spatialBlend を握っている（C++ で鳴らしていても、そこだけ C# 側）。
-                string dsp = (vc != null && vc.enabled) ? "C++ 畳み込み器(有効)"
-                           : (ic != null && ic.enabled) ? "C# 畳み込み器(有効)"
-                           : (vc != null || ic != null) ? "畳み込み器はあるが両方とも無効"
-                           : "素通し（畳み込み器なし）";
-                if (vc != null && ic != null) dsp += "  ※C++/C# 両方載っている（排他で切替）";
+                string dsp = (vc == null) ? "★音響エンジンに繋がっていない（VoiceConvolver なし）"
+                           : vc.enabled ? "音響エンジン(C++)" : "★VoiceConvolver が無効";
                 string outRms = (vc != null) ? "  出力 " + Db(vc.rmsOut) : "";
                 // ★クリップ名を必ず出す。畳み込み器は clip が空だと "ir_silence"（無音 1 秒）を差し込んで
                 //   再生してしまうので、「鳴っているのに何も聞こえない」が起きる。名前で見分ける。
@@ -435,7 +422,7 @@ namespace AcousticFlow.EditorTools
 
             int len, num;
             AudioSettings.GetDSPBufferSize(out len, out num);
-            int sr = IrConvolver.Scope.SampleRate > 0 ? IrConvolver.Scope.SampleRate : AudioSettings.outputSampleRate;
+            int sr = Scope.SampleRate > 0 ? Scope.SampleRate : AudioSettings.outputSampleRate;
             float periodMs = (sr > 0) ? (len * 1000f / sr) : 0f;
 
             EditorGUILayout.LabelField("DSP ブロック " + len + " サンプル × " + num
@@ -445,11 +432,11 @@ namespace AcousticFlow.EditorTools
             // コストは「遮蔽された音源数」で効くので、本数からの推定は実際と数倍ずれる。
             float total = 0f;
             int active = 0;
-            int maxIdx = Mathf.Min(IrConvolver.Scope.MeteredMax, IrConvolver.Scope.MaxMeteredSources - 1);
+            int maxIdx = Mathf.Min(Scope.MeteredMax, Scope.MaxMeteredSources - 1);
             for (int i = 0; i <= maxIdx; i++)
             {
-                if (IrConvolver.Scope.BlockMs[i] <= 0f) continue;
-                total += IrConvolver.Scope.BlockMs[i];
+                if (Scope.BlockMs[i] <= 0f) continue;
+                total += Scope.BlockMs[i];
                 active++;
             }
 
@@ -481,10 +468,10 @@ namespace AcousticFlow.EditorTools
             EditorGUILayout.Space(6f);
             EditorGUILayout.LabelField("音源ごとの実費", EditorStyles.boldLabel);
             float worst = 0.0001f;
-            for (int i = 0; i <= maxIdx; i++) worst = Mathf.Max(worst, IrConvolver.Scope.BlockMs[i]);
+            for (int i = 0; i <= maxIdx; i++) worst = Mathf.Max(worst, Scope.BlockMs[i]);
             for (int i = 0; i <= maxIdx; i++)
             {
-                float ms = IrConvolver.Scope.BlockMs[i];
+                float ms = Scope.BlockMs[i];
                 if (ms <= 0f) continue;
                 string name = (AcousticFlowSceneDemo.Status.SourceNames != null
                                && i < AcousticFlowSceneDemo.Status.SourceNames.Length)
@@ -514,8 +501,8 @@ namespace AcousticFlow.EditorTools
         private int _selSource;
         private Vector2 _srcScroll;
         private bool _drawPaths = true;
-        private readonly int[] _order = new int[IrConvolver.Solo.MaxSources];
-        private readonly float[] _metric = new float[IrConvolver.Solo.MaxSources];
+        private readonly int[] _order = new int[Solo.MaxSources];
+        private readonly float[] _metric = new float[Solo.MaxSources];
 
         private void DrawSources()
         {
@@ -528,7 +515,7 @@ namespace AcousticFlow.EditorTools
             string[] names = AcousticFlowSceneDemo.Status.SourceNames;
             int n = (names != null) ? names.Length : 0;
             if (n <= 0 || taps == null) { EditorGUILayout.HelpBox("音源がまだありません。", MessageType.Warning); return; }
-            n = Mathf.Min(n, IrConvolver.Solo.MaxSources);
+            n = Mathf.Min(n, Solo.MaxSources);
 
             // --- 並べ替えの基準 ---
             // ★2 つの意味がある。混ぜると読めなくなるので明示的に切り替える。
@@ -542,20 +529,20 @@ namespace AcousticFlow.EditorTools
                 GUILayout.FlexibleSpace();
                 _drawPaths = GUILayout.Toggle(_drawPaths, "Scene に経路", EditorStyles.toolbarButton, GUILayout.Width(84f));
                 if (GUILayout.Button("すべて解除", EditorStyles.toolbarButton, GUILayout.Width(70f)))
-                { IrConvolver.Solo.Reset(); SceneView.RepaintAll(); }
+                { Solo.Reset(); SceneView.RepaintAll(); }
             }
 
             // --- 経路単位のゲート ---
             using (new EditorGUILayout.HorizontalScope())
             {
                 GUILayout.Label("経路", GUILayout.Width(34f));
-                IrConvolver.Solo.PassDirect = GUILayout.Toggle(IrConvolver.Solo.PassDirect, "直接 D", "Button", GUILayout.Width(60f));
-                IrConvolver.Solo.PassReflect = GUILayout.Toggle(IrConvolver.Solo.PassReflect, "反射 R", "Button", GUILayout.Width(60f));
-                IrConvolver.Solo.PassDiffract = GUILayout.Toggle(IrConvolver.Solo.PassDiffract, "回折 F", "Button", GUILayout.Width(60f));
-                IrConvolver.Solo.PassTail = GUILayout.Toggle(IrConvolver.Solo.PassTail, "尾", "Button", GUILayout.Width(44f));
+                Solo.PassDirect = GUILayout.Toggle(Solo.PassDirect, "直接 D", "Button", GUILayout.Width(60f));
+                Solo.PassReflect = GUILayout.Toggle(Solo.PassReflect, "反射 R", "Button", GUILayout.Width(60f));
+                Solo.PassDiffract = GUILayout.Toggle(Solo.PassDiffract, "回折 F", "Button", GUILayout.Width(60f));
+                Solo.PassTail = GUILayout.Toggle(Solo.PassTail, "尾", "Button", GUILayout.Width(44f));
                 GUILayout.FlexibleSpace();
             }
-            if (!IrConvolver.Solo.IsDefault)
+            if (!Solo.IsDefault)
                 EditorGUILayout.HelpBox("いま経路を切っています。窓を閉じれば自動で戻ります。", MessageType.Warning);
 
             // --- 寄与度を測って並べる ---
@@ -563,7 +550,7 @@ namespace AcousticFlow.EditorTools
             for (int i = 0; i < n; i++)
             {
                 _order[i] = i;
-                _metric[i] = (_sortBy == SortBy.OutRms) ? IrConvolver.Scope.OutRms[i] : PathGain(taps, i);
+                _metric[i] = (_sortBy == SortBy.OutRms) ? Scope.OutRms[i] : PathGain(taps, i);
                 worst = Mathf.Max(worst, _metric[i]);
             }
             for (int a = 0; a < n - 1; a++)          // 音源は多くて数十本なので単純な選択ソートで足りる
@@ -579,11 +566,11 @@ namespace AcousticFlow.EditorTools
                 bool sel = (i == _selSource);
                 using (new EditorGUILayout.HorizontalScope(sel ? EditorStyles.helpBox : GUIStyle.none))
                 {
-                    bool solo = (IrConvolver.Solo.Only == i);
+                    bool solo = (Solo.Only == i);
                     bool newSolo = GUILayout.Toggle(solo, "S", "Button", GUILayout.Width(22f));
-                    if (newSolo != solo) { IrConvolver.Solo.Only = newSolo ? i : -1; SceneView.RepaintAll(); }
+                    if (newSolo != solo) { Solo.Only = newSolo ? i : -1; SceneView.RepaintAll(); }
 
-                    IrConvolver.Solo.Mute[i] = GUILayout.Toggle(IrConvolver.Solo.Mute[i], "M", "Button", GUILayout.Width(22f));
+                    Solo.Mute[i] = GUILayout.Toggle(Solo.Mute[i], "M", "Button", GUILayout.Width(22f));
 
                     string nm = (names[i] != null) ? names[i] : ("音源" + i);
                     if (GUILayout.Button(nm, EditorStyles.label, GUILayout.Width(120f)))
@@ -593,7 +580,7 @@ namespace AcousticFlow.EditorTools
                     EditorGUI.DrawRect(br, new Color(0.16f, 0.16f, 0.18f));
                     float v = Mathf.Clamp01(_metric[i] / worst);
                     EditorGUI.DrawRect(new Rect(br.x, br.y, br.width * v, br.height),
-                                       IrConvolver.Solo.AllowsSource(i) ? new Color(0.55f, 0.75f, 1f)
+                                       Solo.AllowsSource(i) ? new Color(0.55f, 0.75f, 1f)
                                                                         : new Color(0.4f, 0.4f, 0.45f));
                     GUILayout.Label(AcousticHistory.ToDb(_metric[i]).ToString("F1") + " dB",
                                     EditorStyles.miniLabel, GUILayout.Width(56f));
@@ -618,7 +605,7 @@ namespace AcousticFlow.EditorTools
             for (int i = 0; i < ts.Count && i < AcousticFlowSceneDemo.SourceTaps.MaxTaps; i++)
             {
                 char ty = (ts.Type != null && i < ts.Type.Length) ? ts.Type[i] : 'D';
-                bool passed = IrConvolver.Solo.AllowsType(ty);
+                bool passed = Solo.AllowsType(ty);
                 using (new EditorGUILayout.HorizontalScope())
                 {
                     var st = new GUIStyle(EditorStyles.miniLabel);
@@ -671,7 +658,7 @@ namespace AcousticFlow.EditorTools
             for (int i = 0; i < ts.Count && i < AcousticFlowSceneDemo.SourceTaps.MaxTaps; i++)
             {
                 char ty = (ts.Type != null && i < ts.Type.Length) ? ts.Type[i] : 'D';
-                if (!IrConvolver.Solo.AllowsType(ty)) continue;
+                if (!Solo.AllowsType(ty)) continue;
                 Vector3 p = (ts.Arrival != null && i < ts.Arrival.Length) ? ts.Arrival[i] : ear;
 
                 // 直接=緑 / 反射=黄 / 回折=水色。強いタップほど濃く太く。
