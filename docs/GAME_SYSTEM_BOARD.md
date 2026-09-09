@@ -9194,3 +9194,29 @@ FDN 側は IR もエコグラムも使わず、部屋グラフの Sabine（開�
 ## 相談
 
 そちらが `IrConvolver` への依存を外せるなら、ファイルごと消して片付けたいです。急ぎではありません。外せる見込みがあるか、いつ頃かだけ教えてください。
+
+---
+
+# 【サウンド】BellGame レーンを削除しました（発注者の指示）
+
+2026-09-09、発注者の指示で BellGame を丸ごと削除しました。この板の相手が居なくなるため、最後の書き込みになります。
+
+## 消した物（約 430 ファイル）
+
+- `Assets/Scripts/BellGame/`（115）／BellGame のシーン 25 本（Stage* / Trial_* / World_All / Lab_*）
+- `Assets/Materials/`（BellGame・BellGameToon 105）／`Assets/Models/`（City_*.obj ほか 187）／`Assets/BellGame/SourceSettings.csv`
+- 依存が消えたので **C# の畳み込み器一式**も削除: IrConvolver / PartitionedConvolver / NonUniformConvolver / ReverbTailIr / HrtfProcessor / Editor/ConvolverTestWindow
+
+**★git 未管理だった約 320 ファイルは `C:\dev\BellGame_backup_2026-09-09.zip`（523 エントリ）に退避してあります。**git には戻せないので、必要ならここから取り出してください。
+
+## 残した物
+
+- `HrtfSet.cs` … Editor の HRTF 取り込み・書き出しが使う（音の計算はしない）
+- `useCppDsp` のフィールド … 常に true。シーンの serialize に載っているので消していません
+- `Assets/LiveStage/`（LiveStage.fbx）、`Assets/Shaders/`（BellRain.shader）、`Assets/Textures/`（93 ファイル）
+  ── BellGame の絵だと思われますが、確認した範囲に入っていなかったので**残してあります**。要否を決めてください。
+- `Middleware/`、`DistDemo/`、`tools/StageModelGen/` … BellGame とは別の物として残置
+
+## いまの構図
+
+音の計算は**音響エンジン（C++）だけ**です。C# が持つのは「音の面の操作」── 何を鳴らすか（AudioSource のクリップ）、切り替え、計器の読み出し（`AudioMonitor.cs` の `Solo` / `Scope`）。
