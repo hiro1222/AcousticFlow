@@ -89,7 +89,7 @@ namespace AcousticFlow.EditorTools
             _infoScroll = EditorGUILayout.BeginScrollView(_infoScroll);
 
             // ── 後期の尾（聞き比べの主役）──
-            EditorGUILayout.LabelField("後期の尾", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField("後期の尾（この作品の尾 ＝ tailModel）", EditorStyles.boldLabel);
             using (new EditorGUILayout.HorizontalScope())
             {
                 GUILayout.Label("模型", GUILayout.Width(60f));
@@ -105,6 +105,18 @@ namespace AcousticFlow.EditorTools
                 if (d != demo.hudDetail) { Undo.RecordObject(demo, "hudDetail"); demo.hudDetail = d; EditorUtility.SetDirty(demo); }
                 GUILayout.Label("(ビルドで見るとき用)", EditorStyles.miniLabel);
             }
+            // ★噛み合わせ: tailModel=1（FDN）は **VoiceConvolver（C++ 経路）にしか実装が無い**。
+            //   C# 経路（IrConvolver）に落ちていると、切り替えても何も起きない。
+            if (demo.tailModel == 1 && !demo.useCppDsp)
+                EditorGUILayout.HelpBox("DSP 経路が C#（IrConvolver）です。FDN は C++ の VoiceConvolver にしか無いので、"
+                    + "この組み合わせでは何も起きません。Y キーで C++ に切り替えてください。", MessageType.Error);
+            // ★C# 側にも古い FDN がある（IrConvolver.TailMode.Fdn。RT60 スカラ 1 本・音源ごと・比較用の残置）。
+            //   今回の FDN（部屋ごと・帯域別 RT60・戸口で配線）とは**別物**。名前が似ているので並べて出す。
+            var ir = Object.FindFirstObjectByType<IrConvolver>(FindObjectsInactive.Include);
+            EditorGUILayout.LabelField("  C# 側の尾（参考）", ir == null ? "IrConvolver が場面に無い"
+                : "IrConvolver.tailMode = " + ir.tailMode
+                + (demo.useCppDsp ? "（C# 経路のときだけ効く。いまは C++ なので鳴っていない）" : "（いま効いている）"));
+
             var tb = Object.FindFirstObjectByType<TailBusRenderer>();
             if (!playing)
             {
@@ -146,7 +158,14 @@ namespace AcousticFlow.EditorTools
             {
                 var vc = a.GetComponent<VoiceConvolver>();
                 var ic = a.GetComponent<IrConvolver>();
-                string dsp = (vc != null) ? "C++ 畳み込み器" : (ic != null) ? "C# 畳み込み器" : "素通し（畳み込み器なし）";
+                // ★同じ GameObject に C++ と C# の畳み込み器が**両方**載っていて、SetDspPath が enabled を排他で切り替える。
+                //   無効な側は OnAudioFilterRead が来ないので音は作らないが、IrConvolver.Awake は無効でも走り、
+                //   AudioSource の clip / loop / spatialBlend を握っている（C++ で鳴らしていても、そこだけ C# 側）。
+                string dsp = (vc != null && vc.enabled) ? "C++ 畳み込み器(有効)"
+                           : (ic != null && ic.enabled) ? "C# 畳み込み器(有効)"
+                           : (vc != null || ic != null) ? "畳み込み器はあるが両方とも無効"
+                           : "素通し（畳み込み器なし）";
+                if (vc != null && ic != null) dsp += "  ※C++/C# 両方載っている（排他で切替）";
                 string outRms = (vc != null) ? "  出力 " + Db(vc.rmsOut) : "";
                 // ★クリップ名を必ず出す。畳み込み器は clip が空だと "ir_silence"（無音 1 秒）を差し込んで
                 //   再生してしまうので、「鳴っているのに何も聞こえない」が起きる。名前で見分ける。
