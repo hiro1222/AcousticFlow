@@ -45,6 +45,7 @@
 #include "Flow/diffraction.h"
 #include "Flow/emitter.h"
 #include "Flow/energy_trace.h"
+#include "Flow/image_sources.h"
 #include "Flow/mix.h"
 #include "Flow/response.h"
 #include "Flow/world_rules.h"
@@ -56,6 +57,7 @@ struct DistributeInput {
     const TraceResult* trace = nullptr;
     const Visibility* visibility = nullptr;   // nullptr なら見通し 1（検査用）
     const Diffraction* diffraction = nullptr; // nullptr か valid=false なら回折 0
+    const ImageSet* images = nullptr;         // nullptr か count=0 なら初期は方向なしの 1 本
     Vec3 sourcePos{0, 0, 0};
     const Listener* listener = nullptr;
     int listenerRoom = -1;                 // −1 なら FDN の送りを作らない
@@ -115,7 +117,24 @@ public:
         };
         emitTap(TapKind::Direct,   kDirect,   T.directSec, dirLocal, 0.0f);
         emitTap(TapKind::Transmit, kTransmit, T.directSec, dirLocal, 0.5f);
-        emitTap(TapKind::Early,    kEarly,    (T.firstReflectSec > 0.0f) ? T.firstReflectSec : T.directSec, Vec3(0, 0, 0), 1.0f);
+        // 初期: ISM の虚像へ配る（方向と正規化重み。段 7）。虚像が無ければ方向なしの 1 本。
+        //   各虚像 = 初期の総量 × 正規化重み（設計文書「各虚像エネルギー = レイ総量 × ISM正規化重み」）。
+        //   広がりは 1 − 可視率（面の縁で半分隠れた虚像は半分ぼやける）。帳簿の初期は総量を 1 回だけ。
+        const ImageSet* im = in.images;
+        if (im && im->count > 0) {
+            for (int i = 0; i < im->count; ++i) {
+                const ImageSource& src = im->img[i];
+                MixTap* t = out.pushTap();
+                if (!t) break;
+                t->kind = TapKind::Early; t->delaySec = src.pathSec;
+                t->dirLocal = in.listener->toLocal(src.pos - in.listener->pos);
+                t->spread = 1.0f - src.validity;
+                for (int b = 0; b < kNumBands; ++b) t->e6[b] = sm[kEarly][b] * W.w[kEarly] * src.weight6[b];
+            }
+            for (int b = 0; b < kNumBands; ++b) out.component6[kEarly][b] += raw[kEarly][b];
+        } else {
+            emitTap(TapKind::Early, kEarly, (T.firstReflectSec > 0.0f) ? T.firstReflectSec : T.directSec, Vec3(0, 0, 0), 1.0f);
+        }
         if (in.listenerRoom >= 0) {
             FdnSend* s = out.pushSend();
             if (s) {
@@ -129,7 +148,9 @@ public:
             emitTap(TapKind::Diffract, kDiffract, in.diffraction->pathSec, in.diffraction->dirLocal, 0.0f);   // 方向は稜線の点
         else
             for (int b = 0; b < kNumBands; ++b) out.component6[kDiffract][b] += raw[kDiffract][b];
-        out.onsetSec = (T.firstReflectSec > 0.0f) ? T.firstReflectSec : T.directSec;
+        // 尾の開始 = 最初の虚像の到達（ITDG）。虚像が無ければレイの最初の反射、それも無ければ直接。
+        out.onsetSec = (im && im->count > 0 && im->firstSec > 0.0f) ? im->firstSec
+                     : (T.firstReflectSec > 0.0f) ? T.firstReflectSec : T.directSec;
     }
 
 private:

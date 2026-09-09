@@ -78,6 +78,8 @@ typedef struct AF_MixInfo {
     int   raysTraced, hits;
     float visibleFraction;     /* 見通しの割合 0..1（段 5 aperture） */
     int   shadowers;           /* 影を落とした箱の数 */
+    int   imageCount;          /* 有効な虚像の数（段 7 ISM） */
+    int   imageCandidates;     /* 検討した虚像の数 */
 } AF_MixInfo;
 /* 戸口の数と、戸口 i の素通しの割合（1 − 板の覆い。Update の後に読む）。 */
 ACOUSTIC_API int   AF_WorldApertureCount(AF_WorldHandle w);

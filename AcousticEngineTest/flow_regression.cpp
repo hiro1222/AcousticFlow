@@ -3,10 +3,12 @@
  * 期待値は「絶対値」でなく「関係」で書く（保存則、単調、一致、静止で 0）。
  * 段が進むごとにここへ足す。AF_ONLY=<name> で 1 つだけ走らせられる。
  */
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <vector>
 
 #include "test_instruments.h"
@@ -20,6 +22,7 @@
 #include "../AcousticEngine/src/Flow/energy_trace.h"
 #include "../AcousticEngine/src/Flow/response.h"
 #include "../AcousticEngine/src/Flow/diffraction.h"
+#include "../AcousticEngine/src/Flow/image_sources.h"
 #include "../AcousticEngine/src/Flow/distribute.h"
 #include "../AcousticEngine/src/Flow/mix_to_voice.h"
 #include "../AcousticEngine/src/Flow/world.h"
@@ -472,7 +475,7 @@ void testWorld() {
     check("[世界] 静止していれば帳簿がフレーム間で一致（種の固定）", same);
     const int e2 = w->addEmitter(Vec3(-2.0f, 1.0f, -2.0f), 0.3f);
     w->update(dt);
-    check("[世界] 2 本目の音源も配分される", w->mix(e2) && w->mix(e2)->conserves(0.01f) && w->mix(e2)->tapCount == 3);
+    check("[世界] 2 本目の音源も配分される", w->mix(e2) && w->mix(e2)->conserves(0.01f) && w->mix(e2)->tapCount >= 3);
     w->removeEmitter(e2);
     check("[世界] 消した音源の番号は使い回される", w->addEmitter(Vec3(0, 1, 0), 0.0f) == e2);
     delete w;
@@ -561,7 +564,25 @@ void testBridge() {
     // 全部
     renderEnergy(true, true, &tot, &tap, &fd);
     const double expLate = bwMean(kLate);
-    const double expTaps = bwMean(kDirect) + bwMean(kEarly) + bwMean(kTransmit);
+    // ★タップの期待は**干渉を含めて**出す（段 7 で必要になった）。隣り合う 2 面のコーナーの虚像は A→B と B→A の
+    //   2 経路が同じ長さで同時に届き、DSP は振幅で足す（その対は +3 dB。物理でもそう）。帳簿はエネルギー（非干渉の和）
+    //   なので、同じ遅延サンプルのタップは振幅で足してから二乗し、帯域幅で重み付けして総量にする。
+    //   段 6 までは初期が 1 本だったので単純和で合っていた（+1.51 dB ずれて気づいた）。
+    auto expTapsCoherent = [&]() {
+        std::map<int, std::array<double, 6>> amp;
+        float dSec = 0.0f;
+        for (int i = 0; i < mix.tapCount; ++i) if (mix.taps[i].kind == TapKind::Direct) { dSec = mix.taps[i].delaySec; break; }
+        for (int i = 0; i < mix.tapCount; ++i) {
+            const int d = std::max(0, static_cast<int>(std::lround((mix.taps[i].delaySec - dSec) * fs)));
+            auto& a = amp[d];
+            for (int b = 0; b < kNumBands; ++b) a[static_cast<std::size_t>(b)] += std::sqrt(std::max(0.0f, mix.taps[i].e6[b]) * kEnergyToAmp);
+        }
+        double e = 0.0, den = 0.0;
+        for (int b = 0; b < kNumBands; ++b) den += bandWidthHz(b, static_cast<float>(fs));
+        for (const auto& kv : amp) for (int b = 0; b < kNumBands; ++b) e += kv.second[static_cast<std::size_t>(b)] * kv.second[static_cast<std::size_t>(b)] * bandWidthHz(b, static_cast<float>(fs)) / den;
+        return e;
+    };
+    const double expTaps = expTapsCoherent();
     std::snprintf(buf, sizeof(buf), "(全部: タップ %.3e 対 %.3e（%+.2f dB）、FDN %.3e 対 %.3e（%+.2f dB）)", tap, expTaps, afti::dB(tap / expTaps), fd, expLate, afti::dB(fd / expLate));
     check("[橋] タップ（直接＋初期＋透過）の出力が帳簿と ±0.5 dB", std::fabs(afti::dB(tap / expTaps)) < 0.5, buf);
     check("[橋] FDN（後期）の出力が帳簿と ±1.5 dB（校正の残り +1.3 dB の中）", std::fabs(afti::dB(fd / expLate)) < 1.5, buf);
@@ -805,6 +826,103 @@ void testDiffraction() {
     }
 }
 
+// ================================ [虚像] image_sources（段 7）
+void testImageSources() {
+    std::printf("\n[虚像] ISM ── 鏡映の位置、正規化、戸口を通る妥当性、歩行と面の縁での連続性\n");
+    MaterialTable mats;
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    const int matId = mats.add(wall);
+    char buf[220];
+
+    // 1) 閉じた箱: 1 次の虚像は 6 面ぶん。床の虚像は y を鏡映。重みは帯域ごとに Σ = 1。最初の到達は直接より後。
+    {
+        Surfaces box = closedBox(3.5f, 3.0f, matId);
+        std::vector<Face> faces; collectFaces(box, mats, faces);
+        Listener lis; lis.pos = Vec3(-1.0f, 1.2f, 1.5f); lis.forward = Vec3(0, 0, 1); lis.up = Vec3(0, 1, 0);
+        const Vec3 S(1.5f, 1.6f, -1.0f);
+        ImageSet im; buildImages(box, faces, lis, S, 0.15f, 0.06f, im);
+        int order1 = 0; bool floorOk = false; float sum[kNumBands] = {};
+        for (int i = 0; i < im.count; ++i) {
+            if (im.img[i].order == 1) ++order1;
+            if (im.img[i].order == 1 && std::fabs(im.img[i].pos.y + 1.6f) < 1e-3f && std::fabs(im.img[i].pos.x - 1.5f) < 1e-3f) floorOk = true;
+            for (int b = 0; b < kNumBands; ++b) sum[b] += im.img[i].weight6[b];
+        }
+        float worst = 0.0f; for (int b = 0; b < kNumBands; ++b) worst = std::max(worst, std::fabs(sum[b] - 1.0f));
+        std::snprintf(buf, sizeof(buf), "(面 %d、検討 %d、有効 %d（1 次 %d）、Σ重み のずれ %.2e、最初の虚像 %.1f ms 対 直接 %.1f ms)",
+                      static_cast<int>(faces.size()), im.candidates, im.count, order1, worst, im.firstSec * 1000.0f, length(S - lis.pos) / kSpeedOfSound * 1000.0f);
+        check("[虚像] 閉じた箱: 36 面のうち 1 次の虚像が 6 本、床の虚像は y を鏡映した位置", faces.size() == 36 && order1 == 6 && floorOk, buf);
+        check("[虚像] 重みは帯域ごとに Σ = 1（正規化）、2 次の虚像も入る", worst < 1e-4f && im.count > 6, buf);
+        check("[虚像] 最初の虚像の到達は直接より後（尾の開始 = ITDG の材料）", im.firstSec > length(S - lis.pos) / kSpeedOfSound, buf);
+    }
+
+    // 2) 戸口: 向こうの部屋の音源。扉を閉めると虚像は全部無効（脚が板に遮られる）、開ければ向こうの壁の虚像が見える。
+    {
+        Surfaces s;
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) s.add(sb.obb, matId, false);
+        const int leafId = mats.add(AcousticMaterial::woodDoor());
+        std::vector<Face> faces; collectFaces(s, mats, faces);
+        Listener lis; lis.pos = Vec3(0, 1.6f, -3.0f); lis.forward = Vec3(0, 0, 1); lis.up = Vec3(0, 1, 0);
+        const Vec3 S(0, 1.6f, 3.0f);
+        ImageSet open; buildImages(s, faces, lis, S, 0.2f, 0.06f, open);
+        int farWall = 0; for (int i = 0; i < open.count; ++i) if (open.img[i].pos.z > 7.0f) ++farWall;
+        const int leaf = s.add(doorLeaf(0.0f), leafId, true);
+        ImageSet closed; buildImages(s, faces, lis, S, 0.2f, 0.06f, closed);
+        std::snprintf(buf, sizeof(buf), "(開: 有効 %d（うち向こうの壁の虚像 %d）／閉: 有効 %d。面 %d)", open.count, farWall, closed.count, static_cast<int>(faces.size()));
+        check("[虚像] 戸口が開いていれば向こうの部屋の壁の虚像が見える（「向こうの部屋の初期反射」）", open.count > 0 && farWall > 0, buf);
+        check("[虚像] 扉を閉めると虚像は全部無効（脚が板に遮られる。板そのものは面に数えない）", closed.count == 0, buf);
+        s.at(leaf).active = false;
+        // 面の縁での連続性: リスナーを x 方向へ 2 cm ずつずらすと、向こうの壁の虚像は戸口の縁で消えていく。
+        //   ★可視率そのものは速く動く: 戸口（3 m 先）の縁の影が 14 m 先の虚像の円盤（r 0.2）を横切るので、
+        //     2 cm の移動が円盤の上では 9 cm（てこ）。これは物理（近い縁の向こうの遠い小さな音源は速く隠れる）。
+        //     揺れとして効くのは**正規化した重み**（初期のエネルギーの取り分）で、遠い虚像は 1/d² で取り分が小さい。
+        //     検査は 可視率が単調 と 重みの 2 cm あたりの動き < 0.05（初期の 5%）。
+        float prevV = -1.0f, prevW = -1.0f, worstW = 0.0f; bool mono = true;
+        for (float x = 0.0f; x <= 2.0f; x += 0.02f) {
+            lis.pos = Vec3(x, 1.6f, -3.0f);
+            ImageSet im; buildImages(s, faces, lis, S, 0.2f, 0.06f, im);
+            float v = 0.0f, wgt = 0.0f;
+            for (int i = 0; i < im.count; ++i) if (im.img[i].order == 1 && im.img[i].pos.z > 7.0f) { v = std::max(v, im.img[i].validity); wgt += im.img[i].weight6[2]; }
+            if (prevV >= 0.0f) { if (v > prevV + 1e-3f) mono = false; worstW = std::max(worstW, std::fabs(wgt - prevW)); }
+            prevV = v; prevW = wgt;
+        }
+        std::snprintf(buf, sizeof(buf), "(x=0→2 m で向こうの壁の虚像の可視率が 1→%.3f（単調）、正規化した重みの 2 cm あたり最大 %.4f)", prevV, worstW);
+        check("[虚像] 横へ歩くと向こうの壁の虚像は戸口の縁で単調に消え、初期の取り分は 2 cm で 5% も動かない", mono && prevV < 0.05f && worstW < 0.05f, buf);
+    }
+
+    // 3) 世界を通す: 閉じた箱で初期のタップが虚像の数だけ立ち、方向は単位、和は初期の総量（帳簿は保存）。歩いても重みは揺れない。
+    {
+        World* w = makeWorldBox(3.5f, 3.0f, 0.2f);
+        w->raysPerEmitter = 128;
+        w->setListener(Vec3(-1.0f, 1.2f, 1.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w->addEmitter(Vec3(1.5f, 1.6f, -1.0f), 0.0f);
+        w->build();
+        const float dt = 512.0f / 48000.0f;
+        for (int k = 0; k < 10; ++k) w->update(dt);
+        const Mix& m = *w->mix(e);
+        int early = 0; bool unit = true; double eSum = 0.0, eRaw = 0.0;
+        for (int i = 0; i < m.tapCount; ++i) if (m.taps[i].kind == TapKind::Early) { ++early; if (std::fabs(length(m.taps[i].dirLocal) - 1.0f) > 1e-3f) unit = false; for (int b = 0; b < kNumBands; ++b) eSum += m.taps[i].e6[b]; }
+        for (int b = 0; b < kNumBands; ++b) eRaw += m.component6[kEarly][b];
+        std::snprintf(buf, sizeof(buf), "(初期のタップ %d 本 = 虚像 %d、Σe6 %.3e 対 帳簿の初期 %.3e、尾の開始 %.1f ms)", early, w->images(e)->count, eSum, eRaw, m.onsetSec * 1000.0f);
+        check("[虚像] 世界: 初期のタップは虚像の数、方向は単位、和は初期の総量（平滑後）", early == w->images(e)->count && early >= 6 && unit && std::fabs(afti::dB(eSum / eRaw)) < 0.5, buf);
+        check("[虚像] 世界: 帳簿は虚像に割っても保存、尾の開始は最初の虚像", m.conserves(0.01f) && std::fabs(m.onsetSec - w->images(e)->firstSec) < 1e-6f, buf);
+        // 歩行: 重みの最大の段差
+        double worst = 0.0; std::vector<float> prevW;
+        Vec3 L = w->listener().pos;
+        for (int k = 0; k < 60; ++k) {
+            L = L + Vec3(0, 0, -1.4f * dt); w->setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0)); w->update(dt);
+            const ImageSet* im = w->images(e);
+            std::vector<float> cur(static_cast<std::size_t>(im->count));
+            for (int i = 0; i < im->count; ++i) { float sw = 0; for (int b = 0; b < kNumBands; ++b) sw += im->img[i].weight6[b]; cur[static_cast<std::size_t>(i)] = sw / kNumBands; }
+            if (prevW.size() == cur.size()) for (std::size_t i = 0; i < cur.size(); ++i) worst = std::max(worst, static_cast<double>(std::fabs(cur[i] - prevW[i])));
+            prevW = cur;
+        }
+        std::snprintf(buf, sizeof(buf), "(1.4 m/s で 60 フレーム: 虚像の重みの 1 フレームあたり最大 %.4f)", worst);
+        check("[虚像] 世界: 歩いても虚像の重みが 1 フレームで 0.05 も動かない", worst < 0.05, buf);
+        delete w;
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -813,7 +931,7 @@ int main() {
     struct { const char* name; void (*fn)(); } suites[] = {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
-        {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction},
+        {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
     };
     for (const auto& s : suites) if (!only || std::strcmp(only, s.name) == 0) s.fn();
     return afti::finish("Flow");

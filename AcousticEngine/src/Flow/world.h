@@ -42,6 +42,7 @@
 #include "Flow/distribute.h"
 #include "Flow/emitter.h"
 #include "Flow/energy_trace.h"
+#include "Flow/image_sources.h"
 #include "Flow/mix.h"
 #include "Flow/mix_to_voice.h"
 #include "Flow/probe.h"
@@ -86,6 +87,7 @@ public:
         probes_.clear();
         for (const rooms::Room& rm : res.rooms) probes_.push_back(probeFromRoom(rm, res.grid.cell));
         apertures_ = res.apertures;
+        collectFaces(surfaces, rules.materials, faces_);          // ISM の面（静的な箱の 6 面）
         dirty_ = false;
         ++buildCount_;
         if (fdn_) { fdn_ = nullptr; fdnRoomOf_.assign(probes_.size(), -1); fdnStale_ = true; }
@@ -125,6 +127,8 @@ public:
     const TraceResult* trace(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].trace : nullptr; }
     const Visibility* visibility(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].vis : nullptr; }
     const Diffraction* diffraction(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].diff : nullptr; }
+    const ImageSet* images(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].images : nullptr; }
+    int faceCount() const { return static_cast<int>(faces_.size()); }
 
     // ── FDN の器 ──
     void bindFdn(af::dsp::FdnRoomMix* fdn) {
@@ -159,8 +163,11 @@ public:
             s.vis = discVisibility(surfaces, rules.materials, listener_.pos, s.em.pos, rEff);
             // 回折（段 6）: 遮られた分が最寄りの稜線を回る。見通しが 1 なら要らない。
             s.diff = edgeDiffraction(surfaces, listener_, s.em.pos, s.vis);
+            // 虚像（段 7）: 初期の方向と正規化重み。経路長は 境 + 3 m まで（境ちょうどだと出入りで揺れる）。
+            buildImages(surfaces, faces_, listener_, s.em.pos, rEff, mixingSec + 3.0f / kSpeedOfSound, s.images);
             DistributeInput in;
-            in.trace = &s.trace; in.visibility = &s.vis; in.diffraction = &s.diff; in.sourcePos = s.em.pos; in.listener = &listener_;
+            in.trace = &s.trace; in.visibility = &s.vis; in.diffraction = &s.diff; in.images = &s.images;
+            in.sourcePos = s.em.pos; in.listener = &listener_;
             in.listenerRoom = lroom; in.weights = &rules.weights; in.response = &response; in.dt = dt;
             s.mixer.run(in, s.mix);
         }
@@ -181,6 +188,7 @@ private:
         TraceResult  trace;
         Visibility   vis;
         Diffraction  diff;
+        ImageSet     images;
         bool         used = false;
     };
     bool valid(int id) const { return id >= 0 && id < static_cast<int>(slots_.size()) && slots_[static_cast<std::size_t>(id)].used; }
@@ -251,6 +259,7 @@ private:
     rooms::Builder builder_;
     std::vector<Probe> probes_;
     std::vector<rooms::Aperture> apertures_;
+    std::vector<Face> faces_;
     std::vector<OpeningState> openings_;
     std::vector<float> openFrac_;
     Listener listener_;

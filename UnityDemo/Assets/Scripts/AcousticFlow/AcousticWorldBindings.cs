@@ -18,6 +18,8 @@ namespace AcousticFlow
         public int raysTraced, hits;
         public float visibleFraction;   // 見通しの割合 0..1（段 5）
         public int shadowers;
+        public int imageCount;          // 有効な虚像の数（段 7）
+        public int imageCandidates;
     }
 
     public static class NativeWorld

@@ -106,7 +106,7 @@ namespace AcousticFlow.EditorTools
                 string pct(int c) { return tot > 1e-12 ? (100.0 * comp[c] / tot).ToString("F0") + "%" : "-"; }
                 EditorGUILayout.LabelField("  " + v.name, "部屋 " + mi.room + "   総量 " + Db2(tot) + "（1/m²、出力 1 に対して）   見通し " + mi.visibleFraction.ToString("F2") + "（遮る物 " + mi.shadowers + "）   壁の横切り " + mi.directCrossings + " 枚");
                 EditorGUILayout.LabelField("     配分", "直接 " + pct(0) + " / 初期 " + pct(1) + " / 後期 " + pct(2) + " / 回折 " + pct(3) + " / 透過 " + pct(4)
-                    + "   タップ " + mi.tapCount + " 送り " + mi.sendCount);
+                    + "   タップ " + mi.tapCount + " 送り " + mi.sendCount + "   虚像 " + mi.imageCount + "/" + mi.imageCandidates);
                 EditorGUILayout.LabelField("     時刻", "直接 " + (mi.directSec * 1000f).ToString("F1") + " ms   最初の反射 " + (mi.firstReflectSec * 1000f).ToString("F1") + " ms   尾の開始 " + (mi.onsetSec * 1000f).ToString("F1") + " ms"
                     + "   レイ " + mi.raysTraced + " 本 / ヒット " + mi.hits);
             }
