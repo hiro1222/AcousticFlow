@@ -1335,6 +1335,11 @@ namespace AcousticFlow
                 _srcClipOrig[i] = a.clip;
                 // 空間化は畳み込み器がやる。Unity 側の 3D 減衰が重なると距離の数字が合わなくなるので 2D に固定。
                 a.spatialBlend = 0f;
+                // ★loop と playOnAwake は、消した C# の畳み込み器（IrConvolver.Awake）が面倒を見ていた。
+                //   消したときに引き継ぎ忘れると、素材が一度鳴って止まる（聞き比べの途中で音が無くなる）。
+                //   鳴らし始めるのはここ 1 か所だけにする（playOnAwake は切る）。
+                a.loop = true;
+                a.playOnAwake = false;
                 a.mute = _muted;
                 if (useAltClip && altClip != null) a.clip = altClip;
                 // ★"ir_silence" は C# の畳み込み器が「クリップが空のとき」に差し込む無音 1 秒。
