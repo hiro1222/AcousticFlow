@@ -337,6 +337,52 @@ void testEnergyTrace() {
     const TraceResult A0 = tr.run(box, mats, S, L, p0), A1 = tr.run(box, mats, S, L, p1);
     check("[レイ] 境が 0 なら全部後期、境が大きければ全部初期（総量は同じ）",
           A0.early6[2] == 0.0f && A1.late6[2] == 0.0f && std::fabs(A0.reflected6(2) - A1.reflected6(2)) < 1e-6f);
+    // ── BVH と総当たりが同じ答えを出すこと（GPU へ持っていく木の担保）──
+    //   ★木は枝刈りするだけで、当てるのは今までと同じ OBB の判定。だから答えは変わらないはず。
+    //     変わるとしたら ①active の扱い ②葉を回る順（同点の勝者）③横切りの積の順 の 3 か所。
+    //     ここが崩れたら、GPU 版と CPU 版を突き合わせる土台が無くなる。
+    {
+        AcousticMaterial wall = AcousticMaterial::defaultWall();
+        for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.scattering[b] = 0.5f; wall.transmission[b] = 0.05f; }
+        MaterialTable mats; const int matId = mats.add(wall);
+        Surfaces box = closedBox(3.5f, 3.0f, matId);
+        // 中に箱を撒く（木が枝分かれする数にする）
+        afti::Xorshift rnd;
+        for (int k = 0; k < 24; ++k) {
+            const Vec3 c(rnd.next() * 2.5f, 1.0f + rnd.next() * 0.8f, rnd.next() * 2.5f);
+            box.add(Obb::axisAligned(c, Vec3(0.2f, 0.4f, 0.2f)), matId, false);
+        }
+        box.at(7).active = false;        // 消した箱が木に混ざらないか
+        const int trials = 400;
+        int hitDiff = 0, idxDiff = 0, crossDiff = 0; double tWorst = 0.0, tauWorst = 0.0;
+        for (int k = 0; k < trials; ++k) {
+            const Vec3 o(rnd.next() * 3.0f, 1.0f + rnd.next(), rnd.next() * 3.0f);
+            Vec3 d(rnd.next(), rnd.next() * 0.5f, rnd.next());
+            if (length(d) < 1e-3f) d = Vec3(0, 0, 1);
+            d = normalized(d);
+            box.clearBvh();
+            const SurfaceHit a = box.nearest(o, d, 100.0f, -1);
+            float ta[kNumBands]; int ca = 0;
+            box.transmittance(o, o + d * 6.0f, -1, mats, ta, &ca);
+            box.rebuildBvh();
+            const SurfaceHit b2 = box.nearest(o, d, 100.0f, -1);
+            float tb[kNumBands]; int cb = 0;
+            box.transmittance(o, o + d * 6.0f, -1, mats, tb, &cb);
+            if (a.hit != b2.hit) ++hitDiff;
+            if (a.hit && b2.hit) {
+                if (a.index != b2.index) ++idxDiff;
+                tWorst = std::max(tWorst, static_cast<double>(std::fabs(a.t - b2.t)));
+            }
+            if (ca != cb) ++crossDiff;
+            for (int b = 0; b < kNumBands; ++b) tauWorst = std::max(tauWorst, static_cast<double>(std::fabs(ta[b] - tb[b])));
+        }
+        box.rebuildBvh();
+        std::snprintf(buf, sizeof(buf), "(%d 本: 当たり有無の差 %d、当たった箱の差 %d、t の差 %.2e、横切り数の差 %d、τ の差 %.2e／ノード %d・葉に入った箱 %d)",
+                      trials, hitDiff, idxDiff, tWorst, crossDiff, tauWorst, box.bvh().nodeCount(), box.bvh().itemCount());
+        check("[レイ] BVH と総当たりが同じ答え（当たった箱・t・横切りの数・τ）",
+              hitDiff == 0 && idxDiff == 0 && tWorst == 0.0 && crossDiff == 0 && tauWorst == 0.0, buf);
+    }
+
     // ── レイ 1 本が独立していること（GPU へ移すための担保。段 1）──
     //   ★GPU は 1 スレッド = 1 本で走らせ、あとで足し合わせる。だから
     //     ①1 本の結果が他の本に依らない ②足す順を変えても答えが変わらない
@@ -1213,6 +1259,25 @@ void testBudget() {
             // レイの費用の形（GPU へ移す価値を判断するため）。本数と跳ね返りで割る。
             //   ★1 本あたりの費用が本数に対して一定なら、そのまま並列化で線形に効く。
             std::printf("        レイの費用の形（当たり点ごとに影レイ 1 本＝次イベント推定）:\n");
+            // 木と総当たりの分かれ目（箱の数を振る）。GPU 前提でも、CPU の基準実装は速いほうがよい。
+            std::printf("        木と総当たりの分かれ目（レイ 256 本・跳ね 20）:\n");
+            for (int nb2 : {6, 12, 24, 48, 96}) {
+                Surfaces sb = closedBox(3.5f, 3.0f, matId);
+                afti::Xorshift rr;
+                for (int k = 6; k < nb2; ++k)
+                    sb.add(Obb::axisAligned(Vec3(rr.next() * 2.8f, 1.0f + rr.next() * 0.8f, rr.next() * 2.8f),
+                                            Vec3(0.15f, 0.3f, 0.15f)), matId, false);
+                TraceParams pp{256, 20, 0.03f, 7u, 1, 0};
+                sb.clearBvh();
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int q = 0; q < 5; ++q) { volatile auto r2 = tr.run(sb, mats, S, lis.pos, pp); (void)r2; }
+                const double msBrute = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 5.0;
+                const auto t1 = std::chrono::steady_clock::now();
+                for (int q = 0; q < 5; ++q) { sb.rebuildBvh(); volatile auto r2 = tr.run(sb, mats, S, lis.pos, pp); (void)r2; }
+                const double msTree = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count() / 5.0;
+                std::printf("          箱 %3d : 総当たり %7.3f ms / 木 %7.3f ms（木の作り直し込み）  %+5.0f%%\n",
+                            nb2, msBrute, msTree, (msTree / msBrute - 1.0) * 100.0);
+            }
             for (int nr : {128, 512, 2048}) {
                 for (int nb : {8, 20, 40}) {
                     TraceParams pp{nr, nb, 0.03f, 7u, 1, 0};

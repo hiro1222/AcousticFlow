@@ -185,6 +185,10 @@ public:
     // ── 1 フレーム ──
     void update(float dt) {
         if (dirty_) build();
+        // ★当たり判定の木を毎フレーム作り直す。動く箱があるので、作った木をそのまま持つと
+        //   包みが古くなり、当たるべき箱を枝刈りで捨てる。数十個なら作り直しでも数 us。
+        //   木があれば nearest / transmittance が木を歩く。答えは総当たりと 1 ビットも変わらない（検査で担保）。
+        surfaces.rebuildBvh();
         listener_.beginFrame(dt);
         updateOpenings();
         now_ += dt;

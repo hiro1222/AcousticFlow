@@ -30,8 +30,10 @@
 #ifndef ACOUSTICFLOW_FLOW_SURFACES_H
 #define ACOUSTICFLOW_FLOW_SURFACES_H
 
+#include <algorithm>
 #include <vector>
 #include "Core/aabb.h"
+#include "Flow/surface_bvh.h"
 #include "Core/material.h"
 #include "Core/vec3.h"
 #include "Flow/world_rules.h"
@@ -68,15 +70,27 @@ public:
     const Surface& at(int i) const { return list_[static_cast<std::size_t>(i)]; }
 
     /// 最近ヒット。skip の箱は無視する。
+    /// 木を作り直す。動く箱があるので**毎フレーム**呼ぶ（World::update の頭）。
+    ///   ★呼ばなければ総当たりのまま。木があれば木を歩く。答えは同じ（検査で担保）。
+    void rebuildBvh() {
+        bvh_.build(count(),
+                   [this](int i) { return obbAabb(list_[static_cast<std::size_t>(i)].obb); },
+                   [this](int i) { return list_[static_cast<std::size_t>(i)].active; });
+    }
+    void clearBvh() { bvh_.clear(); }
+    const SurfaceBvh& bvh() const { return bvh_; }
+
     SurfaceHit nearest(const Vec3& origin, const Vec3& dir, float maxDist, int skip = -1) const {
         SurfaceHit best; best.t = maxDist;
-        for (int i = 0; i < count(); ++i) {
-            if (i == skip || !list_[static_cast<std::size_t>(i)].active) continue;
+        auto test = [&](int i) {
+            if (i == skip || !list_[static_cast<std::size_t>(i)].active) return;
             float t; Vec3 n;
             if (rayIntersectsObb(origin, dir, list_[static_cast<std::size_t>(i)].obb, best.t, t, n) && t < best.t && t > 0.0f) {
                 best.hit = true; best.t = t; best.normal = n; best.index = i;
             }
-        }
+        };
+        if (!bvh_.empty()) bvh_.traverseRay(origin, dir, best.t, test);
+        else for (int i = 0; i < count(); ++i) test(i);
         if (best.hit) best.point = origin + dir * best.t;
         return best;
     }
@@ -90,12 +104,21 @@ public:
         const float len = length(d);
         if (len <= kEps) { if (crossings) *crossings = 0; return; }
         const Vec3 dir = d * (1.0f / len);
-        for (int i = 0; i < count(); ++i) {
-            if (i == skip || !list_[static_cast<std::size_t>(i)].active) continue;
+        // ★横切った箱を**添字の昇順**に並べてから掛ける。積は順で末尾が変わるので、
+        //   木で拾った順のまま掛けると総当たりと一致しなくなる。
+        int hitIdx[32]; int nh = 0;
+        auto test = [&](int i) {
+            if (i == skip || !list_[static_cast<std::size_t>(i)].active) return;
             float t; Vec3 nrm;
-            if (!rayIntersectsObb(p0, dir, list_[static_cast<std::size_t>(i)].obb, len, t, nrm)) continue;
-            if (t <= 0.0f || t >= len) continue;
-            const AcousticMaterial& m = mats.get(list_[static_cast<std::size_t>(i)].material);
+            if (!rayIntersectsObb(p0, dir, list_[static_cast<std::size_t>(i)].obb, len, t, nrm)) return;
+            if (t <= 0.0f || t >= len) return;
+            if (nh < 32) hitIdx[nh++] = i;
+        };
+        if (!bvh_.empty()) bvh_.traverseRay(p0, dir, len, test);
+        else for (int i = 0; i < count(); ++i) test(i);
+        std::sort(hitIdx, hitIdx + nh);
+        for (int k = 0; k < nh; ++k) {
+            const AcousticMaterial& m = mats.get(list_[static_cast<std::size_t>(hitIdx[k])].material);
             for (int b = 0; b < kNumBands; ++b) out6[b] *= splitAt(m, b).transmit;
             ++n;
         }
@@ -104,6 +127,7 @@ public:
 
 private:
     std::vector<Surface> list_;
+    SurfaceBvh bvh_;
 };
 
 }  // namespace flow
