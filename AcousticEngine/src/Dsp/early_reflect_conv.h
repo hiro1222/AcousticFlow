@@ -59,6 +59,12 @@ public:
     // 1 タップ。audio thread で毎サンプル sqrt を呼ばないよう、構築時に畳んである。
     struct Tap {
         int delaySamples = 0;
+        // ★素性。フレームをまたいで「同じタップ」を繋ぐための番号（呼び出し側が決める）。
+        //   −1 なら従来どおり遅延の近さで貪欲に繋ぐ。
+        //   直接・透過・回折・最初の虚像は 1 ms 以内に並ぶことがあり、遅延の許容 256 サンプル
+        //   （5.3 ms）では区別できない。区別できないと、扉が開いて直接音が起き上がる瞬間に
+        //   回折タップと入れ替わり、乗り換えの 30 ms だけ音が凹む（実測 −2.5 dB／55°）。
+        int id = -1;
         float g[kNumBands] = {0, 0, 0, 0, 0, 0};   // 6帯域それぞれのゲイン
         float panL = 0.70710678f, panR = 0.70710678f;
         float gSpec = 1.0f;    // √(1-s) 鏡面（方向つき）
@@ -167,12 +173,28 @@ public:
         to_.assign(from_.begin(), from_.end());          // まず現状を写す
         for (RtTap& t : to_) t.setGain(0.0f);            // 相手のいない現タップは 0 へ落とす
 
+        // ①素性のあるタップを先に繋ぐ。②残りだけを遅延の近さで繋ぐ。
+        //   ①を先にしないと、素性のあるタップの相手を素性の無いタップに取られる。
+        taken_.assign(static_cast<std::size_t>(nNew), false);
         for (int j = 0; j < nNew; ++j) {
+            const Tap& nt = p->taps[static_cast<std::size_t>(j)];
+            if (nt.id < 0) continue;
+            for (int i = 0; i < nCur; ++i) {
+                if (matched_[static_cast<std::size_t>(i)] || from_[static_cast<std::size_t>(i)].id != nt.id) continue;
+                matched_[static_cast<std::size_t>(i)] = true;
+                taken_[static_cast<std::size_t>(j)] = true;
+                to_[static_cast<std::size_t>(i)] = RtTap::from(nt);
+                break;
+            }
+        }
+        for (int j = 0; j < nNew; ++j) {
+            if (taken_[static_cast<std::size_t>(j)]) continue;
             const Tap& nt = p->taps[static_cast<std::size_t>(j)];
             int best = -1;
             float bestD = kMatchDelayTolerance;
-            for (int i = 0; i < nCur; ++i) {
-                if (matched_[static_cast<std::size_t>(i)]) continue;
+            // 素性のあるタップは、素性の合う相手がいなければ**新規**。遅延で拾うと別物と繋がる。
+            for (int i = 0; nt.id < 0 && i < nCur; ++i) {
+                if (matched_[static_cast<std::size_t>(i)] || from_[static_cast<std::size_t>(i)].id >= 0) continue;
                 const float d = std::fabs(from_[static_cast<std::size_t>(i)].delay
                                           - static_cast<float>(nt.delaySamples));
                 if (d < bestD) { bestD = d; best = i; }
@@ -277,22 +299,32 @@ public:
                 bool onHrtfBus = false;
                 if (hrtfActive) { const float hw = a.hrtfW + (b.hrtfW - a.hrtfW) * t; onHrtfBus = hw > 0.0f; }
                 if (!onHrtfBus) {
-                    int off[2];
+                    // ★ITD は**小数のまま**隣り合う 2 サンプルへ分けて書く。
+                    //   丸めて 1 か所に書くと、方向が連続に動いて ed が半サンプルの境を跨ぐたびに
+                    //   書き先が 1 サンプル跳び、そのタップの寄与が不連続になる ＝ ぷつぷつ。
+                    //   虚像（ISM）を入れて方向つきのタップが 25 本になったら実機で聞こえた（段 9-b）。
+                    //   読む側（バスを使わない earUse の経路）は元から補間していて、書く側だけ丸めていた。
+                    //   1 サンプル ＝ 21 µs は ITD の弁別閾（10〜20 µs）より粗いので、分けるのは定位にも効く。
+                    int off[2]; float fr[2];
                     for (int e = 0; e < 2; ++e) {
-                        const float ed = a.earDelay[e] + (b.earDelay[e] - a.earDelay[e]) * t;
-                        int o = static_cast<int>(ed + 0.5f);
-                        off[e] = (o < 0) ? 0 : (o > kLaneItdMax ? kLaneItdMax : o);
+                        float ed = a.earDelay[e] + (b.earDelay[e] - a.earDelay[e]) * t;
+                        ed = (ed < 0.0f) ? 0.0f : (ed > static_cast<float>(kLaneItdMax - 1) ? static_cast<float>(kLaneItdMax - 1) : ed);
+                        off[e] = static_cast<int>(ed);
+                        fr[e] = ed - static_cast<float>(off[e]);
                     }
+                    auto scatter = [&](int lane, float gain) {
+                        for (int e = 0; e < 2; ++e) {
+                            float* row = outLanes + static_cast<std::size_t>(lane * 2 + e) * laneStride;
+                            row[off[e]]     += gain * (1.0f - fr[e]);
+                            row[off[e] + 1] += gain * fr[e];
+                        }
+                    };
                     if (a.laneUse && t < 1.0f)
                         for (int q = 0; q < 2; ++q)
-                            if (a.lane[q] >= 0)
-                                for (int e = 0; e < 2; ++e)
-                                    outLanes[(a.lane[q] * 2 + e) * laneStride + off[e]] += sp * a.laneW[q] * (1.0f - t);
+                            if (a.lane[q] >= 0) scatter(a.lane[q], sp * a.laneW[q] * (1.0f - t));
                     if (b.laneUse)
                         for (int q = 0; q < 2; ++q)
-                            if (b.lane[q] >= 0)
-                                for (int e = 0; e < 2; ++e)
-                                    outLanes[(b.lane[q] * 2 + e) * laneStride + off[e]] += sp * b.laneW[q] * t;
+                            if (b.lane[q] >= 0) scatter(b.lane[q], sp * b.laneW[q] * t);
                     continue;
                 }
             }
@@ -410,6 +442,7 @@ private:
     // 実行時のタップ。遅延を**小数**で持つのが Tap との違い（補間するため）。
     struct RtTap {
         float delay = 0.0f;
+        int   id = -1;                        // 素性（Tap::id の写し）
         float g[kNumBands] = {0, 0, 0, 0, 0, 0};
         float panL = 0.70710678f, panR = 0.70710678f;
         float gSpec = 1.0f, gDiff = 0.0f;
@@ -424,6 +457,7 @@ private:
         static RtTap from(const Tap& t) {
             RtTap r;
             r.delay = static_cast<float>(t.delaySamples);
+            r.id = t.id;
             for (int b = 0; b < kNumBands; ++b) r.g[b] = t.g[b];
             r.panL = t.panL; r.panR = t.panR;
             r.gSpec = t.gSpec; r.gDiff = t.gDiff;
@@ -527,7 +561,8 @@ private:
 
     // 補間の両端。オーディオスレッドだけが触る。長さは常に等しい。
     std::vector<RtTap> from_, to_;
-    std::vector<bool> matched_;    // beginBlock の対応付け用（確保を繰り返さないよう保持）
+    std::vector<bool> matched_;  // beginBlock の対応付け用（確保を繰り返さないよう保持）
+    std::vector<bool> taken_;    // 同上。素性で繋がった新タップの印
     std::atomic<TapSet*> pending_{nullptr};
     std::atomic<TapSet*> retired_{nullptr};
     bool lerping_ = false;

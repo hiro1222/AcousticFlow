@@ -66,6 +66,7 @@ inline void applyMixToVoice(const Mix& m, af::dsp::VoiceRenderer& v, int sampleR
         if (n >= Mix::kMaxTaps) return;
         af::dsp::EarlyReflectConv::Tap& d = taps[n++];
         d = af::dsp::EarlyReflectConv::Tap{};
+        d.id = t.id;                        // 素性をそのまま渡す（DSP はこれでフレームをまたいで繋ぐ）
         d.delaySamples = std::max(0, static_cast<int>(std::lround((t.delaySec - directSec) * sampleRate)));
         for (int b = 0; b < kNumBands; ++b) d.g[b] = ampFromEnergy(t.e6[b]);
         const float len = length(t.dirLocal);

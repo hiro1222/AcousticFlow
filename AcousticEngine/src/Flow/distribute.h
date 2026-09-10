@@ -106,35 +106,50 @@ public:
         // ── 出す: 受け取った物を 1 回ずつ。帳簿の内訳は生、出口は 平滑 × 重み ──
         const Vec3 toSrc = in.sourcePos - in.listener->pos;
         const Vec3 dirLocal = (length(toSrc) > kEps) ? in.listener->toLocal(toSrc) : Vec3(0, 0, 0);
-        auto emitTap = [&](TapKind kind, int comp, float delaySec, const Vec3& dir, float spread) {
+        auto emitTap = [&](TapKind kind, int comp, float delaySec, const Vec3& dir, float spread, int id) {
             MixTap* t = out.pushTap();
             if (!t) return;
-            t->kind = kind; t->delaySec = delaySec; t->dirLocal = dir; t->spread = spread;
+            t->kind = kind; t->id = id; t->delaySec = delaySec; t->dirLocal = dir; t->spread = spread;
             for (int b = 0; b < kNumBands; ++b) {
                 out.component6[comp][b] += raw[comp][b];
                 t->e6[b] = sm[comp][b] * W.w[comp];
             }
         };
-        emitTap(TapKind::Direct,   kDirect,   T.directSec, dirLocal, 0.0f);
-        emitTap(TapKind::Transmit, kTransmit, T.directSec, dirLocal, 0.5f);
-        // 初期: ISM の虚像へ配る（方向と正規化重み。段 7）。虚像が無ければ方向なしの 1 本。
-        //   各虚像 = 初期の総量 × 正規化重み（設計文書「各虚像エネルギー = レイ総量 × ISM正規化重み」）。
+        emitTap(TapKind::Direct,   kDirect,   T.directSec, dirLocal, 0.0f, 1);
+        emitTap(TapKind::Transmit, kTransmit, T.directSec, dirLocal, 0.5f, 2);
+        // 初期: ISM の虚像へ配る（方向と正規化重み。段 7）。**方向の分かっている割合だけ**を虚像へ、
+        //   残りは方向なしの 1 本へ回す。正規化重み（Σ=1）は「どの虚像へ」しか言えないので、
+        //   全部が僅かにしか見えていないとき（妥当 0.0004）でも満額が虚像に乗り、扉が開いて
+        //   虚像が 0→4 本に生えた瞬間に初期反射が丸ごと方向つきに切り替わっていた（実測 2.0 dB／55°）。
         //   広がりは 1 − 可視率（面の縁で半分隠れた虚像は半分ぼやける）。帳簿の初期は総量を 1 回だけ。
         const ImageSet* im = in.images;
+        float dirFrac[kNumBands] = {};
+        if (im && im->count > 0)
+            for (int b = 0; b < kNumBands; ++b) dirFrac[b] = std::min(1.0f, std::max(0.0f, im->directional6[b]));
+        // 方向なしの残り。虚像が無ければ丸ごとここ（＝従来の 1 本と同じ）。到達はレイの最初の反射で固定
+        //   ── 虚像の出入りで到達が動くと、素性で繋いだこのタップの遅延が掃引される。
+        {
+            MixTap* t = out.pushTap();
+            if (t) {
+                t->kind = TapKind::Early; t->id = 4;
+                t->delaySec = (T.firstReflectSec > 0.0f) ? T.firstReflectSec : T.directSec;
+                t->dirLocal = Vec3(0, 0, 0); t->spread = 1.0f;
+                for (int b = 0; b < kNumBands; ++b) t->e6[b] = sm[kEarly][b] * W.w[kEarly] * (1.0f - dirFrac[b]);
+            }
+        }
         if (im && im->count > 0) {
             for (int i = 0; i < im->count; ++i) {
                 const ImageSource& src = im->img[i];
                 MixTap* t = out.pushTap();
                 if (!t) break;
                 t->kind = TapKind::Early; t->delaySec = src.pathSec;
+                t->id = 16 + src.face[0] * 256 + (src.face[1] + 1);   // 面の組で決まる素性（並び順に依らない）
                 t->dirLocal = in.listener->toLocal(src.pos - in.listener->pos);
                 t->spread = 1.0f - src.validity;
-                for (int b = 0; b < kNumBands; ++b) t->e6[b] = sm[kEarly][b] * W.w[kEarly] * src.weight6[b];
+                for (int b = 0; b < kNumBands; ++b) t->e6[b] = sm[kEarly][b] * W.w[kEarly] * dirFrac[b] * src.weight6[b];
             }
-            for (int b = 0; b < kNumBands; ++b) out.component6[kEarly][b] += raw[kEarly][b];
-        } else {
-            emitTap(TapKind::Early, kEarly, (T.firstReflectSec > 0.0f) ? T.firstReflectSec : T.directSec, Vec3(0, 0, 0), 1.0f);
         }
+        for (int b = 0; b < kNumBands; ++b) out.component6[kEarly][b] += raw[kEarly][b];   // 帳簿は 1 回だけ
         if (in.listenerRoom >= 0) {
             FdnSend* s = out.pushSend();
             if (s) {
@@ -145,7 +160,7 @@ public:
             for (int b = 0; b < kNumBands; ++b) out.component6[kLate][b] += raw[kLate][b];
         }
         if (in.diffraction && in.diffraction->valid)
-            emitTap(TapKind::Diffract, kDiffract, in.diffraction->pathSec, in.diffraction->dirLocal, 0.0f);   // 方向は稜線の点
+            emitTap(TapKind::Diffract, kDiffract, in.diffraction->pathSec, in.diffraction->dirLocal, 0.0f, 3);   // 方向は稜線の点
         else
             for (int b = 0; b < kNumBands; ++b) out.component6[kDiffract][b] += raw[kDiffract][b];
         // 尾の開始 = 最初の虚像の到達（ITDG）。虚像が無ければレイの最初の反射、それも無ければ直接。

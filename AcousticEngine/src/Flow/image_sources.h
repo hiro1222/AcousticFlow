@@ -76,6 +76,11 @@ struct ImageSet {
     int   count = 0;
     float firstSec = -1.0f;             // 有効な虚像の最短の到達
     int   candidates = 0;               // 検討した虚像の数（費用の目安）
+    // ★方向の分かっている割合（帯域別 0..1）＝ 実際に通っている鏡面経路 ÷ 通れば届くはずの鏡面経路。
+    //   正規化重みは Σ=1 なので「どの虚像へ」しか言えない。「そもそも鏡面で届いているのか」は
+    //   この割合が持つ。全部が僅かにしか見えていない（妥当 0.0004）ときに重み 0.32 が立つ、
+    //   という段 7 の穴をここで塞ぐ。残りは方向なしの初期タップへ回る（distribute）。
+    float directional6[kNumBands] = {};
 };
 
 /// 静的な箱の面を並べる。
@@ -181,23 +186,27 @@ inline void buildImages(const Surfaces& surf, const std::vector<Face>& faces, co
     const Vec3 L = listener.pos;
     const float r = std::max(rDisc, 0.15f);
     const float maxLen = maxPathSec * kSpeedOfSound;
-    double sumW[kNumBands] = {};
+    double sumW[kNumBands] = {}, sumFull[kNumBands] = {};
     auto consider = [&](const Vec3& C, const Face* f1, const Face* f2, int order) {
-        if (out.count >= ImageSet::kMaxImages) return;
         ++out.candidates;
         const float d = length(C - L);
         if (d <= kEps || d > maxLen) return;
+        // 「通れば届くはずの量」は妥当性より先に数える（満室で切るときも数える）。
+        //   ここを数えないと割合がいつも 1 になり、見えていない虚像が満額で鳴る。
+        float pot[kNumBands];
+        for (int b = 0; b < kNumBands; ++b) {
+            pot[b] = f1->reflect6[b] / (d * d);
+            if (f2) pot[b] *= f2->reflect6[b];
+            sumFull[b] += pot[b];
+        }
+        if (out.count >= ImageSet::kMaxImages) return;
         const float v = detail::imageVisibility(surf, L, C, r, S, f1, f2);
         if (v <= 1e-4f) return;
         ImageSource& im = out.img[out.count++];
         im.pos = C; im.dist = d; im.pathSec = d / kSpeedOfSound; im.validity = v; im.order = order;
         im.face[0] = static_cast<int>(f2 ? (f2 - faces.data()) : (f1 - faces.data()));
         im.face[1] = f2 ? static_cast<int>(f1 - faces.data()) : -1;
-        for (int b = 0; b < kNumBands; ++b) {
-            float w = v / (d * d) * f1->reflect6[b];
-            if (f2) w *= f2->reflect6[b];
-            im.weight6[b] = w; sumW[b] += w;
-        }
+        for (int b = 0; b < kNumBands; ++b) { im.weight6[b] = pot[b] * v; sumW[b] += pot[b] * v; }
         if (out.firstSec < 0.0f || im.pathSec < out.firstSec) out.firstSec = im.pathSec;
     };
     // 1 次: 音源とリスナーが同じ側の面
@@ -215,6 +224,9 @@ inline void buildImages(const Surfaces& surf, const std::vector<Face>& faces, co
             consider(S2, &f1, &f2, 2);
         }
     }
+    // 方向の分かっている割合（正規化の前に取る。正規化すると消える量）
+    for (int b = 0; b < kNumBands; ++b)
+        out.directional6[b] = (sumFull[b] > 1e-30) ? static_cast<float>(std::min(1.0, sumW[b] / sumFull[b])) : 0.0f;
     // 正規化（帯域ごとに Σ = 1）
     for (int b = 0; b < kNumBands; ++b) {
         if (sumW[b] <= 1e-30) { for (int i = 0; i < out.count; ++i) out.img[i].weight6[b] = 0.0f; continue; }

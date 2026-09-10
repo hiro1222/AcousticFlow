@@ -196,6 +196,7 @@ public:
     }
 
     /// 反射タップの軽量な両耳化。既定 ON。切ると従来の等パワーパンに戻る（A/B 用）。
+    int liveTapCount() const { return early_.liveTapCount(); }   // 診断用
     void setEarCuesEnabled(bool on) { earCues_ = on; }
     bool earCuesEnabled() const { return earCues_; }
 

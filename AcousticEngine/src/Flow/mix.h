@@ -52,6 +52,13 @@ enum class TapKind : std::uint8_t { Direct = 0, Early = 1, Diffract = 2, Transmi
 
 struct MixTap {
     TapKind kind = TapKind::Direct;
+    // ★素性（identity）。DSP がフレームをまたいでタップを繋ぐときの手がかり。
+    //   直接・透過・回折・初期はほぼ同じ遅延に並ぶので、遅延の近さで繋ぐと入れ替わる
+    //   （EarlyReflectConv の許容は 5.3 ms ＝ その 4 本が丸ごと入る）。入れ替わると
+    //   大きいタップが小さいタップのゲインへ向かって補間し、乗り換えの 30 ms だけ音が凹む。
+    //   固定の番号: 1 直接 / 2 透過 / 3 回折 / 4 初期（虚像なしの 1 本）
+    //   虚像は面の組で決める（16 + 面0×256 + 面1+1）── 並び順が変わっても同じ虚像は同じ番号。
+    int     id = -1;
     float   delaySec = 0.0f;                 // 到達（秒）
     float   e6[kNumBands] = {};              // エネルギー（帯域別）
     Vec3    dirLocal{0, 0, 0};               // リスナー座標の到来方向（単位）。ゼロ = 方向なし

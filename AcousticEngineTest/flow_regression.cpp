@@ -504,13 +504,15 @@ void testBridge() {
         WorldWeights W;
         W.w[kEarly] = tapsOn ? 1.0f : 0.0f; W.w[kTransmit] = tapsOn ? 1.0f : 0.0f; W.w[kLate] = lateOn ? 1.0f : 0.0f;
         w->rules.weights = W;
-        for (int k = 0; k < 30; ++k) w->update(dt);       // 重みは出口だけなので即時。念のため流す
         af::dsp::VoiceRenderer::Config vc; vc.sampleRate = fs; vc.maxFrames = block; vc.tailSeconds = 1.0f;
         af::dsp::VoiceRenderer v(vc);
         v.setOutputGain(1.0f); v.setHrtfEnabled(false); v.setTailLevel(1.0f);
+        // ★器を作るのも繋ぐのも update より**先**。ここを逆にすると、2 回目以降の冒頭 30 フレームが
+        //   前回の呼び出しで消えた fdn2（スタック上）を指したまま回り、World::updateFdn が解放済みの
+        //   FdnTail に setRt60 する ＝ 解放後使用。ヒープの並び次第で落ちる（実際に落ちた）。
         af::dsp::FdnRoomMix fdn2(fs, block, 0.6f);
         w->bindFdn(&fdn2);
-        w->update(dt);                                     // ★器を差し替えたら 1 回回す（listenerWeight を置く。置かないと既定 0 で無音）
+        for (int k = 0; k < 31; ++k) w->update(dt);       // 重みを流す＋listenerWeight を置く（置かないと既定 0 で無音）
         v.setFdnMix(&fdn2);
         w->applyToVoice(e, v, fs);
         // ★インパルスは 300 ms に置く。タップの差し替え（30 ms）と送りの傾斜は 0 から立ち上がるので、
@@ -528,6 +530,7 @@ void testBridge() {
             for (int i = 0; i < block; ++i) { eTap += static_cast<double>(l[i]) * l[i] + static_cast<double>(r[i]) * r[i]; eFdn += static_cast<double>(fl[i]) * fl[i] + static_cast<double>(fr[i]) * fr[i]; }
         }
         *outTotal = eTap + eFdn; *tapPart = eTap; *fdnPart = eFdn;
+        w->bindFdn(&fdn);       // ★fdn2 は今から消える。世界に生きている器を持たせてから返る
     };
     double tot, tap, fd;
     // 参考: 器に直接インパルスを入れたときの出力エネルギー（送りの経路を通さない）。1.0 が校正どおり。
@@ -929,11 +932,20 @@ void testImageSources() {
         const float dt = 512.0f / 48000.0f;
         for (int k = 0; k < 10; ++k) w->update(dt);
         const Mix& m = *w->mix(e);
-        int early = 0; bool unit = true; double eSum = 0.0, eRaw = 0.0;
-        for (int i = 0; i < m.tapCount; ++i) if (m.taps[i].kind == TapKind::Early) { ++early; if (std::fabs(length(m.taps[i].dirLocal) - 1.0f) > 1e-3f) unit = false; for (int b = 0; b < kNumBands; ++b) eSum += m.taps[i].e6[b]; }
+        // 初期のタップ ＝ 虚像の数 ＋ 方向なしの残り 1 本（id 4）。虚像のほうは方向が単位。
+        int early = 0, plain = 0; bool unit = true; double eSum = 0.0, eRaw = 0.0;
+        for (int i = 0; i < m.tapCount; ++i) if (m.taps[i].kind == TapKind::Early) {
+            ++early;
+            if (m.taps[i].id == 4) ++plain;
+            else if (std::fabs(length(m.taps[i].dirLocal) - 1.0f) > 1e-3f) unit = false;
+            for (int b = 0; b < kNumBands; ++b) eSum += m.taps[i].e6[b];
+        }
         for (int b = 0; b < kNumBands; ++b) eRaw += m.component6[kEarly][b];
-        std::snprintf(buf, sizeof(buf), "(初期のタップ %d 本 = 虚像 %d、Σe6 %.3e 対 帳簿の初期 %.3e、尾の開始 %.1f ms)", early, w->images(e)->count, eSum, eRaw, m.onsetSec * 1000.0f);
-        check("[虚像] 世界: 初期のタップは虚像の数、方向は単位、和は初期の総量（平滑後）", early == w->images(e)->count && early >= 6 && unit && std::fabs(afti::dB(eSum / eRaw)) < 0.5, buf);
+        double dirFrac = 0.0; for (int b = 0; b < kNumBands; ++b) dirFrac += w->images(e)->directional6[b] / kNumBands;
+        std::snprintf(buf, sizeof(buf), "(初期のタップ %d 本 = 虚像 %d ＋ 方向なし %d、方向の割合 %.3f、Σe6 %.3e 対 帳簿の初期 %.3e、尾の開始 %.1f ms)",
+                      early, w->images(e)->count, plain, dirFrac, eSum, eRaw, m.onsetSec * 1000.0f);
+        check("[虚像] 世界: 初期のタップは虚像＋方向なしの残り、虚像の方向は単位、和は初期の総量（平滑後）",
+              early == w->images(e)->count + 1 && plain == 1 && early >= 6 && unit && std::fabs(afti::dB(eSum / eRaw)) < 0.5, buf);
         check("[虚像] 世界: 帳簿は虚像に割っても保存、尾の開始は最初の虚像", m.conserves(0.01f) && std::fabs(m.onsetSec - w->images(e)->firstSec) < 1e-6f, buf);
         // 歩行: 重みの最大の段差
         double worst = 0.0; std::vector<float> prevW;
@@ -1156,17 +1168,231 @@ void testBudget() {
     }
 }
 
+/// 【探り】扉の角度ごとに成分の生の量を出す（段差の出所を見るための測り）
+void testDoorSweep() {
+    std::printf("\n[探り] 扉の角度ごとの成分（生・帯域幅平均でなく単純和。段差の出所）\n");
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    World w;
+    const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+    for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+    const int leaf = w.addBox(doorLeaf(0.0f), lm, true);
+    w.raysPerEmitter = 256;
+    { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 1;
+      const char* bd = std::getenv("AF_BUDGET"); w.budget.cfg.totalRays = bd ? std::atoi(bd) : 0; }
+    { const char* cv = std::getenv("AF_COMP");
+      if (cv) { const int keep = std::atoi(cv); for (int c = 0; c < kNumComponents; ++c) w.rules.weights.w[c] = (c == keep) ? 1.0f : 0.0f; } }
+    w.setListener(Vec3(0, 1.6f, -4.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+    const int e = w.addEmitter(Vec3(0, 1.6f, 3.0f), 0.2f);
+    w.build();
+    const int fs = 48000, block = 512;
+    const float dt = static_cast<float>(block) / fs;
+    af::dsp::FdnRoomMix fdn(fs, block, 0.6f);
+    w.bindFdn(&fdn);
+    af::dsp::VoiceRenderer::Config vc; vc.sampleRate = fs; vc.maxFrames = block; vc.tailSeconds = 1.0f;
+    af::dsp::VoiceRenderer v(vc);
+    v.setOutputGain(1.0f); v.setTailLevel(1.0f); v.setFdnMix(&fdn);
+    af::dsp::HrtfSet hrtf = af::dsp::HrtfSet::createSynthetic(fs);
+    af::dsp::DirectionBus bus(fs, 8, block);
+    v.setHrtfEnabled(true); v.setHrtfSet(&hrtf);
+    bus.setHrtfSet(&hrtf, 57.0f); v.setDirectionBus(&bus); fdn.setDirectionBus(&bus, 57.0f);
+    afti::SineSum sig(fs, block);
+    std::vector<float> sin_(block), sl(block), sr(block), gl(block), gr(block), smix(block);
+    auto envF = [](const char* k, float d) { const char* v = std::getenv(k); return v ? static_cast<float>(std::atof(v)) : d; };
+    const float from = envF("AF_FROM", 45.0f), to = envF("AF_TO", 75.0f), stepDeg = envF("AF_STEP", 0.32f);
+    std::printf("        %6s %8s %10s %10s %10s %10s %10s %8s %8s %3s | %s\n",
+                "角度", "見通し", "直接", "回折", "透過", "初期", "後期", "帳簿dB", "実音dB", "本", "回折の稜線 δ 隙間 重み");
+    double prev = -1.0, prevR = -1.0, pV = -1.0, pF = -1.0, pB = -1.0;
+    const bool quiet = std::getenv("AF_LOUD") == nullptr;   // 既定は要約だけ。AF_LOUD=1 で全行
+    double wR = 0.0, wL = 0.0; float wRd = -1.0f, wLd = -1.0f; int rowN = 0;
+    const bool walk = std::getenv("AF_WALK") != nullptr;   // 回帰と同じ足取り（扉 30°/s と 1.4 m/s を連動）
+    for (float deg = from; deg <= to + 1e-4f; deg += stepDeg) {
+        if (walk) w.setListener(Vec3(0, 1.6f, -4.0f + 1.4f * (deg / 30.0f)), Vec3(0, 0, 1), Vec3(0, 1, 0));
+        w.setBoxTransform(leaf, doorLeaf(deg));
+        w.update(dt);
+        const Mix* mx = w.mix(e); const Visibility* vs = w.visibility(e); const Diffraction* df = w.diffraction(e);
+        double tot = 0.0, cm[kNumComponents] = {};
+        for (int c = 0; c < kNumComponents; ++c) { for (int b = 0; b < kNumBands; ++b) cm[c] += mx->component6[c][b]; tot += cm[c]; }
+        const double step = (prev > 0.0 && tot > 0.0) ? afti::dB(tot / prev) : 0.0;
+        // 実際に鳴らして、そのブロックの実効値も並べる（帳簿が滑らかでも描画が跳ぶことがある）
+        w.applyToVoice(e, v, fs);
+        for (int i = 0; i < block; ++i) sin_[static_cast<std::size_t>(i)] = sig.next();
+        v.render(sin_.data(), block, sl.data(), sr.data(), nullptr);
+        std::fill(gl.begin(), gl.end(), 0.0f); std::fill(gr.begin(), gr.end(), 0.0f);
+        fdn.render(block, gl.data(), gr.data());
+        const double eVoice = afti::energy(sl.data(), block) / block, eFdn = afti::energy(gl.data(), block) / block;
+        for (int i = 0; i < block; ++i) smix[static_cast<std::size_t>(i)] = sl[static_cast<std::size_t>(i)] + gl[static_cast<std::size_t>(i)];
+        std::fill(gl.begin(), gl.end(), 0.0f); std::fill(gr.begin(), gr.end(), 0.0f);
+        bus.render(block, gl.data(), gr.data());
+        const double eBus = afti::energy(gl.data(), block) / block;
+        for (int i = 0; i < block; ++i) smix[static_cast<std::size_t>(i)] += gl[static_cast<std::size_t>(i)];
+        const double re = afti::energy(smix.data(), block) / block;
+        const double rstep = (prevR > 0.0 && re > 0.0) ? afti::dB(re / prevR) : 0.0;
+        const double sVoice = (pV > 0.0 && eVoice > 0.0) ? afti::dB(eVoice / pV) : 0.0;
+        const double sFdn = (pF > 0.0 && eFdn > 0.0) ? afti::dB(eFdn / pF) : 0.0;
+        const double sBus = (pB > 0.0 && eBus > 0.0) ? afti::dB(eBus / pB) : 0.0;
+        pV = eVoice; pF = eFdn; pB = eBus;
+        if (!quiet) std::printf("        %6.2f %8.4f %10.3e %10.3e %10.3e %10.3e %10.3e %+8.2f %+8.2f %3d | 声%+6.2f 尾%+6.2f 束%+6.2f | %d/%d d=%.3f a=%.3f w=%.2f\n",
+                    deg, vs->visible, cm[kDirect], cm[kDiffract], cm[kTransmit], cm[kEarly], cm[kLate], step, rstep, mx->tapCount, sVoice, sFdn, sBus,
+                    df->valid ? df->box : -1, df->valid ? df->edge : -1, df->valid ? df->delta : 0.0f,
+                    df->valid ? df->gapWidth : 0.0f, df->valid ? df->weight : 0.0f);
+        if (!quiet) std::printf("             回折の点 (%.3f %.3f %.3f) 向き (%+.3f %+.3f %+.3f) 経路 %.4fs\n",
+                    df->point.x, df->point.y, df->point.z, df->dirLocal.x, df->dirLocal.y, df->dirLocal.z, df->pathSec);
+        const ImageSet* ims = w.images(e);
+        if (!quiet) std::printf("             虚像 %d:", ims->count);
+        for (int i = 0; quiet ? false : (i < ims->count && i < 8); ++i)
+            std::printf("  [%d次 %.3fs 妥当%.4f 重み%.4f]", ims->img[i].order, ims->img[i].pathSec, ims->img[i].validity, ims->img[i].weight6[2]);
+        if (!quiet) std::printf("\n");
+        if (++rowN > 20) { if (std::fabs(rstep) > wR) { wR = std::fabs(rstep); wRd = deg; }
+                           if (std::fabs(step) > wL) { wL = std::fabs(step); wLd = deg; } }
+        prev = tot; prevR = re;
+    }
+    std::printf("        最悪: 実音 %.2f dB（%.1f 度）／帳簿 %.2f dB（%.1f 度）\n", wR, wRd, wL, wLd);
+}
+
+void testClicks() {
+    std::printf("\n[ぷつぷつ] 鳴らしながら波形の不連続を測る（正弦の和・ブロック同期）\n");
+    const int fs = 48000, block = 512;
+    const float dt = static_cast<float>(block) / fs;
+    char buf[240];
+
+    // 台本: 扉のある 2 部屋。リスナーが戸口へ 1.4 m/s で歩き、同時に扉が 30°/s で開く。
+    //   ★Unity と同じ配線で測る（HRTF と方向バスを繋ぐ）。ここを外すと harness では跳ねが出ず、
+    //     実機だけで「ぶつぶつ」になる ── 段 9-b で実際にそうなった。
+    //   which: 0 全部 / 1 虚像なし / 2 分散なし / 3 予算なし / 4 方向バスなし / 5 HRTF なし
+    //          6..10 成分をひとつだけ残す（直接・初期・後期・回折・透過）
+    //   motion: 0 歩き＋扉 / 1 歩きだけ / 2 扉だけ / 3 静止
+    auto run = [&](int which, int motion, double* outCalm, double* outWorst, int* outSpikes, double* outBlockStep) {
+        AcousticMaterial wall = AcousticMaterial::defaultWall();
+        for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        const int leaf = w.addBox(doorLeaf(0.0f), lm, true);
+        w.raysPerEmitter = 256;
+        w.budget.cfg.totalRays = (which == 3) ? 0 : 1536;
+        w.rayGroups = (which == 2 || which == 3) ? 1 : 4;
+        if (which == 1) w.budget.cfg.fullSlots = 0;                    // 簡易に落として虚像を作らせない
+        if (which >= 6) for (int c = 0; c < kNumComponents; ++c) w.rules.weights.w[c] = (c == which - 6) ? 1.0f : 0.0f;
+        Vec3 L(0, 1.6f, -4.0f);
+        w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w.addEmitter(Vec3(0, 1.6f, 3.0f), 0.2f);
+        w.build();
+        af::dsp::FdnRoomMix fdn(fs, block, 0.6f);
+        w.bindFdn(&fdn);
+        af::dsp::VoiceRenderer::Config vc; vc.sampleRate = fs; vc.maxFrames = block; vc.tailSeconds = 1.0f;
+        af::dsp::VoiceRenderer v(vc);
+        v.setOutputGain(1.0f); v.setTailLevel(1.0f);
+        v.setFdnMix(&fdn);
+        // Unity と同じ配線: HRTF（合成）と方向バス（8 レーン）
+        af::dsp::HrtfSet hrtf = af::dsp::HrtfSet::createSynthetic(fs);
+        af::dsp::DirectionBus bus(fs, 8, block);
+        const bool useBus = (which != 4), useHrtf = (which != 5);
+        v.setHrtfEnabled(useHrtf);
+        if (useHrtf) v.setHrtfSet(&hrtf);
+        if (useBus) { bus.setHrtfSet(&hrtf, 57.0f); v.setDirectionBus(&bus); fdn.setDirectionBus(&bus, 57.0f); }
+        afti::SineSum sig(fs, block);
+        std::vector<float> in(block), l(block), r(block), fl(block), fr(block), mix(block);
+        double calm = 0.0, worst = 0.0, worstBlock = 0.0; int spikes = 0, nb = 0; float worstAtDeg = -1.0f, worstAtZ = 0.0f;
+        double prevE = -1.0;
+        const int frames = 240;                              // 4 秒
+        for (int k = 0; k < frames; ++k) {
+            const float t = k * dt;
+            if (k > 30) {                                     // 立ち上がりを流してから動かす
+                const float el = t - 30 * dt;
+                if (motion == 0 || motion == 1) { L.z = -4.0f + 1.4f * el; w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0)); }
+                if (motion == 0 || motion == 2) w.setBoxTransform(leaf, doorLeaf(std::min(90.0f, 30.0f * el)));
+            }
+            w.update(dt);
+            if (w.fdnStale()) { w.bindFdn(&fdn); }
+            w.applyToVoice(e, v, fs);
+            for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = sig.next();
+            v.render(in.data(), block, l.data(), r.data(), nullptr);
+            std::fill(fl.begin(), fl.end(), 0.0f); std::fill(fr.begin(), fr.end(), 0.0f);
+            fdn.render(block, fl.data(), fr.data());          // FDN → 方向バス（バスがあるとき）
+            for (int i = 0; i < block; ++i) mix[static_cast<std::size_t>(i)] = l[static_cast<std::size_t>(i)] + fl[static_cast<std::size_t>(i)];
+            if (useBus) {
+                std::fill(fl.begin(), fl.end(), 0.0f); std::fill(fr.begin(), fr.end(), 0.0f);
+                bus.render(block, fl.data(), fr.data());       // Unity では AudioListener で 1 回
+                for (int i = 0; i < block; ++i) mix[static_cast<std::size_t>(i)] += fl[static_cast<std::size_t>(i)];
+            }
+            if (k < 40) continue;                             // 器の立ち上がりは測らない
+            const double s = afti::sampleStepRatio(mix.data(), block);
+            const double e2 = afti::energy(mix.data(), block) / block;
+            if (nb < 20) calm = std::max(calm, s);            // 動き出す前の平常値
+            else {
+                if (s > worst) worst = s;
+                if (s > 4.0 * std::max(calm, 1e-6)) ++spikes;
+                if (prevE > 0.0 && e2 > 0.0) {
+                    const double st = std::fabs(afti::dB(e2 / prevE));
+                    if (st > worstBlock) { worstBlock = st; worstAtDeg = std::min(90.0f, 30.0f * (t - 30 * dt)); worstAtZ = L.z; }
+                }
+            }
+            prevE = e2;
+            ++nb;
+        }
+        if (which == 0 && (motion == 0 || motion == 2))
+            std::printf("      %s: 最悪の段差 %.2f dB は 扉 %.1f 度・耳 z=%.2f で\n",
+                        (motion == 2) ? "扉だけ" : "歩き＋扉", worstBlock, worstAtDeg, worstAtZ);
+        *outCalm = calm; *outWorst = worst; *outSpikes = spikes; *outBlockStep = worstBlock;
+    };
+
+    double calm, worst, blockStep; int spikes;
+
+    run(0, 3, &calm, &worst, &spikes, &blockStep);
+    std::snprintf(buf, sizeof buf, "静止: ブロック間の段差 %.4f dB（≤ 0.01）", blockStep);
+    check(buf, blockStep <= 0.01);
+
+    run(0, 1, &calm, &worst, &spikes, &blockStep);
+    std::snprintf(buf, sizeof buf, "歩き 1.4 m/s: 跳ね %.1f 倍・%d 回、段差 %.2f dB", worst / std::max(calm, 1e-6), spikes, blockStep);
+    check(buf, spikes == 0);
+
+    run(0, 0, &calm, &worst, &spikes, &blockStep);
+    std::snprintf(buf, sizeof buf, "歩き＋扉 30°/s: 跳ね %.1f 倍・%d 回、段差 %.2f dB", worst / std::max(calm, 1e-6), spikes, blockStep);
+    check(buf, spikes == 0);
+
+    // ── 切り分け（何を外すと段差が減るか）。44 通り回すので既定では出さない（AF_LOUD=1 で出す）──
+    if (std::getenv("AF_LOUD") == nullptr) return;
+    std::printf("      切り分け（ブロック間の段差 dB。★方向バス × HRTF の組で ITD の丸めが出る）:\n");
+    std::printf("        %-22s %8s %8s %8s %8s\n", "", "静止", "歩き", "扉", "歩き+扉");
+    static const char* kName[11] = {"全部", "虚像なし（簡易）", "分散なし", "予算なし・分散なし", "方向バスなし", "HRTF なし",
+                                    "直接だけ", "初期だけ", "後期だけ", "回折だけ", "透過だけ"};
+    for (int which = 0; which < 11; ++which) {
+        double bs[4]; double c, w2; int sp;
+        for (int m = 0; m < 4; ++m) run(which, (m == 0) ? 3 : (m == 1) ? 1 : (m == 2) ? 2 : 0, &c, &w2, &sp, &bs[m]);
+        std::printf("        %-22s %8.3f %8.3f %8.3f %8.3f\n", kName[which], bs[0], bs[1], bs[2], bs[3]);
+    }
+}
+
+
 }  // namespace
 
 int main() {
     std::printf("=== 新コア（Flow）の数値回帰テスト ===\n");
     const char* only = std::getenv("AF_ONLY");
-    struct { const char* name; void (*fn)(); } suites[] = {
+    struct { const char* name; void (*fn)(); bool optIn; } suites[] = {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
-        {"budget", testBudget},
+        {"budget", testBudget}, {"clicks", testClicks},
+        {"doorsweep", testDoorSweep, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
-    for (const auto& s : suites) if (!only || std::strcmp(only, s.name) == 0) s.fn();
+    for (const auto& s : suites) {
+        // AF_ONLY はコンマ区切りで複数指定できる（例 AF_ONLY=world,bridge）
+        bool named = false;
+        if (only) {
+            const std::size_t ln = std::strlen(s.name);
+            for (const char* q = only; *q; ) {
+                const char* c = std::strchr(q, ',');
+                const std::size_t len = c ? static_cast<std::size_t>(c - q) : std::strlen(q);
+                if (len == ln && std::strncmp(q, s.name, ln) == 0) { named = true; break; }
+                if (!c) break;
+                q = c + 1;
+            }
+        }
+        // 組の名前は stderr へ（stdout は溜まるので、落ちたときに最後に見えるのは古い行になる。
+        //  段 9-b で bridge の解放後使用を追ったとき、これが無くて場所が分からなかった）。
+        if (named || (!only && !s.optIn)) { std::fprintf(stderr, "-> %s\n", s.name); s.fn(); std::fflush(stdout); }
+    }
     return afti::finish("Flow");
 }
