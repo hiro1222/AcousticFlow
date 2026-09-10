@@ -60,6 +60,14 @@ int AF_WorldAddMaterialPreset(AF_WorldHandle w, int preset) {
     return W->rules.materials.add(presetMaterial(preset));
 }
 
+void AF_WorldSetLeakModel(AF_WorldHandle w, int model) {
+    acoustic::flow::World* W = asWorld(w); if (!W) return;
+    W->leakModel = model;
+}
+int AF_WorldLeakModel(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->leakModel : 0;
+}
+
 void AF_WorldSetRoomCell(AF_WorldHandle w, float meters) {
     acoustic::flow::World* W = asWorld(w); if (!W) return;
     W->setRoomCell(meters);

@@ -1168,6 +1168,56 @@ void testBudget() {
     }
 }
 
+// ================================ [漏れ] 閉じた扉から回折が漏れるか（AF_ONLY=leak）
+void testLeakModels() {
+    std::printf("\n[漏れ] 閉じた扉の回折 ── 模型 0 今のまま / 1 厚みの割合 / 2 口の空き具合 / 3 両方\n");
+    char buf[220];
+    // 場面は回帰の 2 部屋。扉は閉じたまま、耳を戸口の前で左右に振る。
+    //   ★「漏れが聞こえる位置と聞こえない位置がある」という試聴報告を数字にする物差し。
+    auto sweep = [&](int model, double* outMax, int* outOn, int* outOff) {
+        AcousticMaterial wall = AcousticMaterial::defaultWall();
+        for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+        World w;
+        w.leakModel = model;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        w.addBox(doorLeaf(0.0f), lm, true);                 // 閉じたまま動かさない
+        w.raysPerEmitter = 128; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+        w.setListener(Vec3(0, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w.addEmitter(Vec3(0, 1.6f, 3.0f), 0.2f);
+        w.build();
+        const float dt = 1.0f / 60.0f;
+        double mx = 0.0; int on = 0, off = 0;
+        for (int k = 0; k <= 24; ++k) {
+            const float x = -3.0f + 0.25f * k;
+            w.setListener(Vec3(x, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+            w.update(dt);
+            const Mix* m = w.mix(e);
+            double d = 0.0, tr = 0.0;
+            for (int b = 0; b < kNumBands; ++b) { d += m->component6[kDiffract][b]; tr += m->component6[kTransmit][b]; }
+            if (d > tr) ++on; else ++off;                    // 板を透るぶんより回折が大きい ＝ 漏れが立っている
+            mx = std::max(mx, d / std::max(tr, 1e-30));
+        }
+        *outMax = mx; *outOn = on; *outOff = off;
+    };
+    for (int model = 0; model <= 3; ++model) {
+        double mx; int on, off;
+        sweep(model, &mx, &on, &off);
+        std::snprintf(buf, sizeof(buf), "(25 か所のうち漏れが透過を超えた所 %d、最大 透過の %.1f 倍 ＝ %+.1f dB)",
+                      on, mx, afti::dB(mx));
+        std::printf("      模型 %d %s\n", model, buf);
+        if (model == 1 || model == 3) {
+            std::snprintf(buf, sizeof(buf), "模型 %d（厚みの割合）: 閉じた扉から回折が漏れない（漏れた所 %d、最大 %+.1f dB）",
+                          model, on, afti::dB(mx));
+            check(buf, on == 0);
+        }
+        if (model == 0) {
+            std::snprintf(buf, sizeof(buf), "模型 0（今のまま）: 漏れが残っていることを確かめる（漏れた所 %d）", on);
+            check(buf, on > 0);      // ★基準点。ここが 0 になったら、この検査は何も見張っていない
+        }
+    }
+}
+
 /// 【探り】扉の角度ごとに成分の生の量を出す（段差の出所を見るための測り）
 void testDoorSweep() {
     std::printf("\n[探り] 扉の角度ごとの成分（生・帯域幅平均でなく単純和。段差の出所）\n");
@@ -1374,7 +1424,7 @@ int main() {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
-        {"budget", testBudget}, {"clicks", testClicks},
+        {"budget", testBudget}, {"clicks", testClicks}, {"leak", testLeakModels},
         {"doorsweep", testDoorSweep, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {

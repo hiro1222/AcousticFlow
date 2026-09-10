@@ -87,7 +87,8 @@ inline void boxEdge(const Obb& b, int e, Vec3& A, Vec3& B, Vec3& outward) {
 
 /// 遮られた直接音の回折。見通し（aperture の Visibility）が 1 なら valid=false（要らない）。
 ///   候補の箱は Visibility が数えた「円盤に影を落とした箱」（中心線でなく円盤に揃える。aperture.h の注記）。
-inline Diffraction edgeDiffraction(const Surfaces& surf, const Listener& listener, const Vec3& S, const Visibility& vis) {
+inline Diffraction edgeDiffraction(const Surfaces& surf, const Listener& listener, const Vec3& S, const Visibility& vis,
+                                   int leakModel = 0) {
     Diffraction out;
     if (vis.visible >= 0.999f) return out;
     const Vec3 L = listener.pos;
@@ -138,18 +139,37 @@ inline Diffraction edgeDiffraction(const Surfaces& surf, const Listener& listene
             //       奥の稜線は板の陰に入って見えなくなる。0/1 だと見えなくなった瞬間に手前の稜線へ乗り換え、
             //       隙間が 0.18 → 0.08 m へ跳んで **2.6 dB 落ちた**（19°、実測）。半厚みから厚みまでで消せば連続。
             //       厚みぶん貫く「板の面を通る」経路は 0 のままなので、閉扉で回折が立つ件は防げたまま。
+            //     ★★ leakModel=1（漏れの案 A）: 上の「0.2 m 以上貫く」という前提が**薄い板で破れる**。
+            //       扉の板は厚み 6 cm しかないので、板の面を真っ直ぐ通る脚でも貫通は 6 cm で止まり、
+            //       許容 7 cm の中に収まって w=0.19 が残る。閉じた扉から回折が漏れていた正体はこれ
+            //       （実測: 閉扉・耳 x=0 で回折 −44.6 dB、同じ場面の後期が −41 dB）。
+            //       案 A は許容を固定の 7 cm でなく**その箱自身の薄さ**に対する割合で測る。
+            //         割合 = 貫通 ÷ 箱のいちばん薄い辺の長さ
+            //       半分まで潜るのは「掠め」、厚みぶん潜ったら「通過」。板でも壁でも同じ言い方になる。
+            //       12° の扉で 9 mm 掠める例は 9/60 = 0.15 で通り、板の面を通る例は 60/60 = 1.0 で落ちる。
             const float ownerTol = std::min(halfMin, 0.03f) + kEps;
-            float pen = 0.0f, ownerPen = 0.0f;
+            float pen = 0.0f, ownerPen = 0.0f, othersW = 1.0f;
             for (int j = 0; j < surf.count(); ++j) {
                 if (!surf.at(j).active) continue;
                 const float pj = std::max(segmentObbPenetration(L, P, surf.at(j).obb), segmentObbPenetration(P, S, surf.at(j).obb));
                 if (j == i) { ownerPen = pj; continue; }
                 pen = std::max(pen, pj);
-                if (pen >= 0.07f) break;
+                if (pj <= 0.0f) continue;
+                float wj;
+                if (leakModel == 1 || leakModel == 3) {
+                    const Vec3& he = surf.at(j).obb.halfExtents;
+                    const float thin = 2.0f * std::min(he.x, std::min(he.y, he.z));
+                    const float ratio = pj / std::max(1e-3f, thin);
+                    wj = std::min(1.0f, std::max(0.0f, (1.0f - ratio) / 0.5f));
+                } else {
+                    wj = std::min(1.0f, std::max(0.0f, (0.07f - pj) / 0.05f));
+                }
+                othersW = std::min(othersW, wj);
+                if (othersW <= 0.0f) break;
             }
             const float ownerW = std::min(1.0f, std::max(0.0f, (2.0f * ownerTol - ownerPen) / ownerTol));
             if (ownerW <= 0.0f) continue;
-            const float w = std::min(1.0f, std::max(0.0f, (0.07f - pen) / 0.05f)) * ownerW;
+            const float w = othersW * ownerW;
             if (w <= 0.0f) continue;
             // ★候補は**出てくる量そのもの**で選ぶ（経路の長さで選ばない）。
             //   隙間の通り（段 9）を掛けると、経路の長さがほぼ同じで隙間の広さが違う稜線が並ぶ

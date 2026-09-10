@@ -137,6 +137,11 @@ int main(int argc, char** argv) {
         AF_WorldSetWeights(w, w5);
         std::printf("  成分の重み: 直接 %.2f 初期 %.2f 後期 %.2f 回折 %.2f 透過 %.2f\n", w5[0], w5[1], w5[2], w5[3], w5[4]);
     }
+    // 漏れの模型（0 今のまま / 1 案A 厚みの割合 / 2 案B 口の空き具合）
+    if (const char* lm = std::getenv("AF_LEAK")) {
+        AF_WorldSetLeakModel(w, std::atoi(lm));
+        std::printf("  漏れの模型: %d\n", AF_WorldLeakModel(w));
+    }
     AF_WorldBuild(w);
     {
         float req = 0.0f, eff = 0.0f; double vox = 0.0, maxVox = 0.0;
@@ -241,6 +246,8 @@ int main(int argc, char** argv) {
                         listenSweep ? (-3.0f + 6.0f * u) : deg, mi.visibleFraction, dB(cm[0]), dB(cm[1]), dB(cm[2]), dB(cm[3]), dB(cm[4]),
                         AF_WorldEmitterTier(w, emitter), AF_WorldEmitterRays(w, emitter), mi.imageCount,
                         di.valid ? di.box : -1, di.valid ? di.edge : -1, di.delta, di.gapWidth, di.weight, mi.shadowers);
+            if (di.valid) std::printf("             回折点 (%.3f %.3f %.3f) 経路 %.4fs\n",
+                                      di.point[0], di.point[1], di.point[2], di.pathSec);
             nextReport += total / 12;
         }
         pos += n;

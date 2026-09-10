@@ -97,6 +97,14 @@ public:
         ++buildCount_;
         if (fdn_) { fdn_ = nullptr; fdnRoomOf_.assign(probes_.size(), -1); fdnStale_ = true; }
     }
+    /// 閉じた扉から漏れる回折の扱い（試聴で A/B するための切り替え。既定 0 = 今まで）。
+    ///   0 今のまま           脚の貫通を固定の 7 cm と比べる。厚み 6 cm の板は通り抜けても 0.19 残る
+    ///   1 案A: 厚みの割合    貫通をその箱自身の薄さと比べる。板を通り抜けたら 0、角を掠めたら 1
+    ///   2 案B: 口の空き具合  回折のエネルギーに戸口の openFrac を掛ける。閉じるほど連続に消える
+    ///   3 A と B の両方
+    ///   ★どちらも角度に二値を置かない。1 は経路の幾何、2 は口の帳簿。効く場面が違うので両方置く。
+    ///   ★2 は戸口（rooms::Aperture）が要る。部屋が割れていない場面では何も起きない。
+    int leakModel = 0;
     bool fdnStale() const { return fdnStale_; }
     /// 部屋グラフのボクセル一辺(m)。**戸口の幅を数ボクセルで割れる大きさ**にすること。
     ///   粗いと戸口で部屋が割れず、2 部屋が 1 部屋に潰れる（＝扉を閉めても響きが変わらない）。
@@ -208,7 +216,18 @@ public:
             const float rEff = s.em.effectiveRadius(s.trace.directDist, light ? 0.0f : 1.0f);
             s.vis = discVisibility(surfaces, rules.materials, listener_.pos, s.em.pos, rEff);
             // 回折（段 6）: 遮られた分が最寄りの稜線を回る。見通しが 1 なら要らない。
-            s.diff = edgeDiffraction(surfaces, listener_, s.em.pos, s.vis);
+            s.diff = edgeDiffraction(surfaces, listener_, s.em.pos, s.vis, leakModel);
+            // 案B: 回折の量に戸口の空き具合を掛ける。回折点にいちばん近い戸口を使う。
+            //   ★量にだけ掛ける（候補の選び方は変えない）。選び方まで変えると案A と混ざって切り分けが効かない。
+            if ((leakModel == 2 || leakModel == 3) && s.diff.valid) {
+                float openF = 1.0f, bestD2 = 1e9f;
+                for (std::size_t a = 0; a < apertures_.size(); ++a) {
+                    const Vec3 d = s.diff.point - apertures_[a].rectCenter;
+                    const float d2 = dot(d, d);
+                    if (d2 < bestD2) { bestD2 = d2; openF = apertureOpenFrac(static_cast<int>(a)); }
+                }
+                for (int b = 0; b < kNumBands; ++b) s.diff.energy6[b] *= openF;
+            }
             // 虚像（段 7）: 初期の方向と正規化重み。簡易は作らない（方向なしの 1 本に落ちる）。
             if (light) s.images.count = 0;
             else buildImages(surfaces, faces_, listener_, s.em.pos, rEff, mixingSec + 3.0f / kSpeedOfSound, s.images);

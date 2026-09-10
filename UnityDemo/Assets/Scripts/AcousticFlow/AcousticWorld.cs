@@ -50,6 +50,12 @@ namespace AcousticFlow
         [Header("レイと予算（段 8）")]
         [Tooltip("予算が無制限（totalRays = 0）のときの 1 音源の本数")]
         public int raysPerEmitter = 256;
+
+        // 閉じた扉から漏れる回折の扱い（試聴の A/B）。0 は厚さ 6 cm の板を通り抜ける経路が許容 7 cm に
+        // 収まって残るので漏れる。1 は貫通を箱自身の薄さと比べる。2 は回折の量に戸口の空き具合を掛ける。
+        // 実行中に変えられる。角度に二値は置いていない。
+        [Tooltip("閉じた扉から漏れる回折。0 今のまま / 1 厚みの割合 / 2 口の空き具合 / 3 両方。実行中に変えられる")]
+        [Range(0, 3)] public int leakModel = 0;
         public int maxBounces = 40;
         [Tooltip("1 フレームの総レイ数。0 で無制限。音源が増えても総量は変わらない（設計文書 Ⅶ）")]
         public int totalRays = 1536;
@@ -120,6 +126,7 @@ namespace AcousticFlow
             }
             CollectBoxes();
             NativeWorld.AF_WorldSetRays(_world, raysPerEmitter, maxBounces);
+            NativeWorld.AF_WorldSetLeakModel(_world, leakModel);
             NativeWorld.AF_WorldSetHeadCm(_world, headCircumferenceCm);
             NativeWorld.AF_WorldSetWorkers(_world, workers);       // 起動時に 1 回（スレッドを毎フレーム作り直さない）
             _appliedWorkers = workers;
@@ -234,6 +241,7 @@ namespace AcousticFlow
             NativeWorld.AF_WorldSetWeights(_world, _w5);
             NativeWorld.AF_WorldSetResponse(_world, levelSec, colourSec, statSec, directionSec);
             NativeWorld.AF_WorldSetRays(_world, raysPerEmitter, maxBounces);
+            NativeWorld.AF_WorldSetLeakModel(_world, leakModel);   // 実行中に切り替えられる（試聴の A/B）
             NativeWorld.AF_WorldSetBudget(_world, totalRays, fullSlots, lightSlots, probesPerFrame);
             NativeWorld.AF_WorldSetRayGroups(_world, rayGroups);
             if (workers != _appliedWorkers) { NativeWorld.AF_WorldSetWorkers(_world, workers); _appliedWorkers = workers; }
