@@ -1241,6 +1241,68 @@ void testLeakModels() {
     }
 }
 
+/// 【探り】扉の脇へ歩いたときの定位と跳び（AF_ONLY=doorside）
+///   扉を AF_DOOR_DEG（既定 20）度で止め、耳を戸口の前で左右に振る。
+///   出す物: 方向を持つタップと方向なしのタップの取り分、回折の向き、1 歩ごとの変化。
+///   ★「定位が完全に消えて両耳から聞こえる」「右へずれると音が変わる瞬間がある」を数字にする。
+void testDoorSide() {
+    const char* dd = std::getenv("AF_DOOR_DEG");
+    const float deg = dd ? static_cast<float>(std::atof(dd)) : 20.0f;
+    std::printf("\n[探り] 扉 %.0f 度で脇へ歩く ── 定位の取り分と跳び\n", deg);
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    World w;
+    const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+    for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+    const int leaf = w.addBox(doorLeaf(deg, -0.5f, 1.0f, 3.0f, 0.06f, 0.004f), lm, true);
+    (void)leaf;
+    w.raysPerEmitter = 256; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+    w.setListener(Vec3(0, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+    const int e = w.addEmitter(Vec3(0, 1.6f, 3.0f), 0.2f);
+    w.build();
+    const float dt = 1.0f / 60.0f;
+    std::printf("        %7s | %8s %8s %8s | %8s | %-22s | %s\n",
+                "耳の x", "方向あり", "方向なし", "尾", "回折%", "回折の向き(右,上,前)", "1歩の変化");
+    double prevTot = -1.0;
+    float prevDir[3] = {0, 0, 0};
+    for (int k = 0; k <= 24; ++k) {
+        const float x = -3.0f + 0.25f * k;
+        w.setListener(Vec3(x, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+        for (int q = 0; q < 4; ++q) w.update(dt);
+        const Mix* mx = w.mix(e);
+        const Diffraction* df = w.diffraction(e);
+        // タップを「方向を持つ物」と「方向なし」に分ける。尾は送りなので別に数える。
+        double withDir = 0.0, noDir = 0.0, tail = 0.0, diffE = 0.0;
+        for (int i = 0; i < mx->tapCount; ++i) {
+            const MixTap& t = mx->taps[i];
+            double se = 0.0; for (int b = 0; b < kNumBands; ++b) se += t.e6[b];
+            if (length(t.dirLocal) > 0.5f) withDir += se; else noDir += se;
+            if (t.kind == TapKind::Diffract) diffE += se;
+        }
+        for (int i = 0; i < mx->sendCount; ++i)
+            for (int b = 0; b < kNumBands; ++b) tail += mx->sends[i].e6[b];
+        const double tot = withDir + noDir + tail;
+        if (tot <= 0.0) continue;
+        // 1 歩（0.25 m）の変化: 総量の dB と、回折の向きが振れた角度
+        char chg[80] = "";
+        if (prevTot > 0.0) {
+            const double dbStep = afti::dB(tot / prevTot);
+            float dot3 = prevDir[0] * df->dirLocal.x + prevDir[1] * df->dirLocal.y + prevDir[2] * df->dirLocal.z;
+            dot3 = std::min(1.0f, std::max(-1.0f, dot3));
+            const float turn = (df->valid && (prevDir[0] != 0.0f || prevDir[2] != 0.0f))
+                             ? std::acos(dot3) * 180.0f / 3.14159265f : 0.0f;
+            std::snprintf(chg, sizeof(chg), "%+6.2f dB  向き %5.1f 度", dbStep, turn);
+        }
+        std::printf("        %7.2f | %7.1f%% %7.1f%% %7.1f%% | %7.2f%% | %s | %s\n",
+                    x, withDir / tot * 100.0, noDir / tot * 100.0, tail / tot * 100.0, diffE / tot * 100.0,
+                    df->valid ? "見つかった" : "── 無し ──", chg);
+        if (df->valid) std::printf("                                                              (%+.3f %+.3f %+.3f) 箱%d/稜%d\n",
+                                   df->dirLocal.x, df->dirLocal.y, df->dirLocal.z, df->box, df->edge);
+        prevTot = tot;
+        if (df->valid) { prevDir[0] = df->dirLocal.x; prevDir[1] = df->dirLocal.y; prevDir[2] = df->dirLocal.z; }
+    }
+}
+
 /// 【探り】壁の陰を横切るときの緩衝（AF_ONLY=wallshadow）
 ///   扉ではなく**ただの壁**。壁の端を回り込む所でリスナーを歩かせ、
 ///   直接音が消えて回折に入れ替わるまでに何度かかるかを測る。
@@ -1505,7 +1567,7 @@ int main() {
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
         {"budget", testBudget}, {"clicks", testClicks}, {"leak", testLeakModels},
-        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
+        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {
         // AF_ONLY はコンマ区切りで複数指定できる（例 AF_ONLY=world,bridge）
