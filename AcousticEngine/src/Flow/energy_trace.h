@@ -86,11 +86,21 @@ inline float airEnergy(int band, float dist) {
     return std::pow(10.0f, -static_cast<float>(rooms::kAirDbPerM[band]) * dist * 0.1f);
 }
 
+struct TraceGroups { static constexpr int kMax = 8; };
+
 struct TraceParams {
-    int   rays = 256;               // 予算（budget が音源ごとに決める）
+    int   rays = 256;               // 予算（budget が音源ごとに決める）。この本数で割った 1 本の重み 1/rays を使う
     int   maxBounces = 24;
     float mixingSec = 0.03f;        // 初期／後期の境（到達時刻）。世界が probe から出す（3 × 平均自由行程 / c）
     std::uint32_t seed = 1u;        // 音源ごとに固定
+    // ── フレーム分散（設計文書 Ⅶ「レイ更新のフレーム分散。総予算は固定」）──
+    //   1 フレームで rays 本 全部を飛ばすと 512 本で 6 ms 掛かる（実測、1 本 12 µs）。
+    //   rays 本を group 個の組に分け、毎フレーム 1 組だけ飛ばして、他の組は前回の結果を使う。
+    //   ★組ごとの結果は幾何が同じなら毎回同じ（レイの種を「音源 × レイ番号」で作るので、
+    //     どの組に入っていても同じレイは同じ道を通る）。だから静止していれば合計も一定＝揺れない。
+    //   動いたときは group フレーム（既定 4 = 43 ms @ 60fps）で全部が入れ替わる。遅れの閾値 70 ms の下。
+    int   groups = 1;               // 1 で分散なし（全部を毎フレーム）
+    int   group = 0;                // 今フレームに飛ばす組（0..groups-1）
 };
 
 struct TraceResult {
@@ -106,6 +116,27 @@ struct TraceResult {
     int   raysTraced = 0, hits = 0, neeVisible = 0;
 
     float reflected6(int b) const { return early6[b] + late6[b]; }
+
+    /// 組ごとの結果を足し合わせる（フレーム分散。反射の集計と帳簿は加算、直接と時刻は最後に測った物）。
+    static void sumGroups(const TraceResult* parts, int n, TraceResult& out) {
+        out = TraceResult{};
+        float firstBest = -1.0f;
+        for (int k = 0; k < n; ++k) {
+            const TraceResult& p = parts[k];
+            for (int b = 0; b < kNumBands; ++b) {
+                out.early6[b] += p.early6[b]; out.late6[b] += p.late6[b];
+                out.emitted6[b] += p.emitted6[b]; out.absorbed6[b] += p.absorbed6[b];
+                out.remainder6[b] += p.remainder6[b]; out.escaped6[b] += p.escaped6[b];
+            }
+            out.raysTraced += p.raysTraced; out.hits += p.hits; out.neeVisible += p.neeVisible;
+            if (p.firstReflectSec > 0.0f && (firstBest < 0.0f || p.firstReflectSec < firstBest)) firstBest = p.firstReflectSec;
+            if (p.directDist > 0.0f) {   // 直接は決定的なので、どの組でも同じ（最後に書いた物を採る）
+                for (int b = 0; b < kNumBands; ++b) out.freeDirect6[b] = p.freeDirect6[b];
+                out.directSec = p.directSec; out.directDist = p.directDist; out.directCrossings = p.directCrossings;
+            }
+        }
+        out.firstReflectSec = firstBest;
+    }
 };
 
 class EnergyTrace {
@@ -126,9 +157,14 @@ public:
         }
         // ── 2) 反射（レイ + NEE）──
         const int N = std::max(1, prm.rays);
-        const float e0 = 1.0f / static_cast<float>(N);          // 1 本 = 出力の 1/N
-        std::uint32_t rng = prm.seed * 2654435761u + 0x9E3779B9u;
-        for (int i = 0; i < N; ++i) {
+        const float e0 = 1.0f / static_cast<float>(N);          // 1 本 = 出力の 1/N（分散していても割るのは総数）
+        const int G = std::max(1, prm.groups);
+        const int g0 = ((prm.group % G) + G) % G;
+        for (int i = g0; i < N; i += G) {
+            // ★レイごとに種を作る（音源 × レイ番号）。逐次の 1 本の流れにすると、組で間引いたとき
+            //   同じレイ番号が別の道を通ってしまい、静止していても合計が組ごとに変わる（＝揺れる）。
+            std::uint32_t rng = (prm.seed * 2654435761u + 0x9E3779B9u) ^ (static_cast<std::uint32_t>(i) * 2246822519u);
+            rng = rng * 747796405u + 2891336453u;
             float e[kNumBands];
             for (int b = 0; b < kNumBands; ++b) { e[b] = e0; R.emitted6[b] += e0; }
             Vec3 pos = source;

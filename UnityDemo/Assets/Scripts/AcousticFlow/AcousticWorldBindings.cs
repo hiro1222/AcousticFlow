@@ -58,6 +58,12 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldFdnStale(IntPtr w);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldApplyVoice(IntPtr w, int emitter, IntPtr voice, int sampleRate);
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldMixInfo(IntPtr w, int emitter, out AFMixInfo info);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetBudget(IntPtr w, int totalRays, int fullSlots, int lightSlots, int probesPerFrame);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetRayGroups(IntPtr w, int rayGroups);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetWorkers(IntPtr w, int workers);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldSpentRays(IntPtr w);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldEmitterTier(IntPtr w, int emitter);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldEmitterRays(IntPtr w, int emitter);
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldApertureCount(IntPtr w);
         [DllImport(Dll, CallingConvention = Cc)] public static extern float AF_WorldApertureOpenFrac(IntPtr w, int aperture);
     }

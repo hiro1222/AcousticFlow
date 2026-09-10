@@ -47,9 +47,23 @@ namespace AcousticFlow
         [Tooltip("動く箱として扱う Collider（SwingDoor の下と非キネマティックの Rigidbody は自動で動く扱い）")]
         public List<Collider> dynamicColliders = new List<Collider>();
 
-        [Header("レイ（段 8 で予算に置き換わる）")]
+        [Header("レイと予算（段 8）")]
+        [Tooltip("予算が無制限（totalRays = 0）のときの 1 音源の本数")]
         public int raysPerEmitter = 256;
         public int maxBounces = 40;
+        [Tooltip("1 フレームの総レイ数。0 で無制限。音源が増えても総量は変わらない（設計文書 Ⅶ）")]
+        public int totalRays = 1536;
+        [Tooltip("厳密の枠。ここに入った音源だけ 幅・虚像・回折を全部解く")]
+        public int fullSlots = 6;
+        [Tooltip("簡易の枠。点音源として少ない本数で解く（虚像は作らない）")]
+        public int lightSlots = 10;
+        [Tooltip("保持のうち毎フレーム解き直す本数（順繰り）。0 で眠らせたまま")]
+        public int probesPerFrame = 1;
+        [Tooltip("レイをこの数の組に分け、毎フレーム 1 組だけ飛ばす（設計文書 Ⅶ のフレーム分散）。1 で分散なし。\n"
+                 + "静止していれば組を回しても揺れない（組ごとの結果は同じ）。動くと この数のフレームで入れ替わる（4 = 43 ms @ 60fps）")]
+        [Range(1, 8)] public int rayGroups = 4;
+        [Tooltip("音源ごとのループを回すスレッド数。1 で直列（既定）。★Unity は既に全コアを使うので上げるのは測ってから")]
+        public int workers = 1;
         public float headCircumferenceCm = 57f;
 
         [Header("世界の重み（五成分に 1 つずつ。1 = 物理どおり）")]
@@ -70,6 +84,9 @@ namespace AcousticFlow
         public int ApertureCount => _world != IntPtr.Zero ? NativeWorld.AF_WorldApertureCount(_world) : 0;
         public float ApertureOpenFrac(int i) => _world != IntPtr.Zero ? NativeWorld.AF_WorldApertureOpenFrac(_world, i) : 1f;
         public float UpdateMs { get; private set; }
+        public int SpentRays => _world != IntPtr.Zero ? NativeWorld.AF_WorldSpentRays(_world) : 0;
+        public int TierOf(WorldVoice v) => (_world != IntPtr.Zero && v != null && v.EmitterId >= 0) ? NativeWorld.AF_WorldEmitterTier(_world, v.EmitterId) : 2;
+        public int RaysOf(WorldVoice v) => (_world != IntPtr.Zero && v != null && v.EmitterId >= 0) ? NativeWorld.AF_WorldEmitterRays(_world, v.EmitterId) : 0;
         public int BoxCount => _boxes.Count;
         public int DynamicCount { get; private set; }
         public IReadOnlyList<WorldVoice> Voices => _voices;
@@ -82,6 +99,7 @@ namespace AcousticFlow
         private TailBusRenderer _tail;
         private int _sampleRate = 48000;
         private int _maxFrames = 1024;
+        private int _appliedWorkers = 1;
         private readonly float[] _w5 = new float[5];
 
         private void OnEnable()
@@ -103,6 +121,8 @@ namespace AcousticFlow
             CollectBoxes();
             NativeWorld.AF_WorldSetRays(_world, raysPerEmitter, maxBounces);
             NativeWorld.AF_WorldSetHeadCm(_world, headCircumferenceCm);
+            NativeWorld.AF_WorldSetWorkers(_world, workers);       // 起動時に 1 回（スレッドを毎フレーム作り直さない）
+            _appliedWorkers = workers;
             NativeWorld.AF_WorldBuild(_world);
 
             if (listener != null)
@@ -214,6 +234,9 @@ namespace AcousticFlow
             NativeWorld.AF_WorldSetWeights(_world, _w5);
             NativeWorld.AF_WorldSetResponse(_world, levelSec, colourSec, statSec, directionSec);
             NativeWorld.AF_WorldSetRays(_world, raysPerEmitter, maxBounces);
+            NativeWorld.AF_WorldSetBudget(_world, totalRays, fullSlots, lightSlots, probesPerFrame);
+            NativeWorld.AF_WorldSetRayGroups(_world, rayGroups);
+            if (workers != _appliedWorkers) { NativeWorld.AF_WorldSetWorkers(_world, workers); _appliedWorkers = workers; }
             foreach (var v in _voices)
                 if (v != null && v.EmitterId >= 0)
                     NativeWorld.AF_WorldSetEmitter(_world, v.EmitterId, new AFVector3(v.transform.position), v.radius, v.operated ? 1 : 0, v.loudness);

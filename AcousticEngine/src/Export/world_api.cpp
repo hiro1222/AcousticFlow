@@ -99,6 +99,22 @@ void AF_WorldSetRays(AF_WorldHandle w, int rays, int bounces) {
     if (rays > 0) W->raysPerEmitter = rays;
     if (bounces > 0) W->maxBounces = bounces;
 }
+void AF_WorldSetBudget(AF_WorldHandle w, int totalRays, int fullSlots, int lightSlots, int probesPerFrame) {
+    acoustic::flow::World* W = asWorld(w); if (!W) return;
+    W->budget.cfg.totalRays = (totalRays < 0) ? 0 : totalRays;
+    if (fullSlots > 0) W->budget.cfg.fullSlots = fullSlots;
+    if (lightSlots > 0) W->budget.cfg.lightSlots = lightSlots;
+    if (probesPerFrame >= 0) W->budget.cfg.probesPerFrame = probesPerFrame;
+}
+void AF_WorldSetRayGroups(AF_WorldHandle w, int g) {
+    acoustic::flow::World* W = asWorld(w); if (!W) return;
+    W->rayGroups = (g < 1) ? 1 : (g > acoustic::flow::TraceGroups::kMax ? acoustic::flow::TraceGroups::kMax : g);
+}
+void AF_WorldSetWorkers(AF_WorldHandle w, int workers) { if (acoustic::flow::World* W = asWorld(w)) W->setWorkers(workers); }
+int  AF_WorldSpentRays(AF_WorldHandle w) { acoustic::flow::World* W = asWorld(w); return W ? W->spentRays() : 0; }
+int  AF_WorldEmitterTier(AF_WorldHandle w, int e) { acoustic::flow::World* W = asWorld(w); return W ? W->tierOf(e) : 2; }
+int  AF_WorldEmitterRays(AF_WorldHandle w, int e) { acoustic::flow::World* W = asWorld(w); return W ? W->raysOf(e) : 0; }
+
 void AF_WorldSetWeights(AF_WorldHandle w, const float* w5) {
     acoustic::flow::World* W = asWorld(w); if (!W) return;
     for (int c = 0; c < acoustic::flow::kNumComponents; ++c) W->rules.weights.w[c] = w5 ? w5[c] : 1.0f;

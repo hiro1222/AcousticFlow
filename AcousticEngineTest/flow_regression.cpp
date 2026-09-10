@@ -4,6 +4,8 @@
  * 段が進むごとにここへ足す。AF_ONLY=<name> で 1 つだけ走らせられる。
  */
 #include <array>
+#include <chrono>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +24,7 @@
 #include "../AcousticEngine/src/Flow/energy_trace.h"
 #include "../AcousticEngine/src/Flow/response.h"
 #include "../AcousticEngine/src/Flow/diffraction.h"
+#include "../AcousticEngine/src/Flow/budget.h"
 #include "../AcousticEngine/src/Flow/image_sources.h"
 #include "../AcousticEngine/src/Flow/distribute.h"
 #include "../AcousticEngine/src/Flow/mix_to_voice.h"
@@ -923,6 +926,210 @@ void testImageSources() {
     }
 }
 
+// ================================ [予算] budget（段 8）
+void testBudget() {
+    std::printf("\n[予算] 総レイ数の固定・優先度・ヒステリシス・保持と探り・並列でビット一致\n");
+    char buf[220];
+    // 1) 点数と順位: 操作対象が最優先、次に距離、音量、変化量
+    {
+        Budget b; b.cfg.totalRays = 1000; b.cfg.fullSlots = 2; b.cfg.lightSlots = 2; b.cfg.promoteSec = 0.0f; b.cfg.demoteSec = 0.0f;
+        Emitter e[5];
+        for (int i = 0; i < 5; ++i) { e[i].id = i; e[i].loudness = 1.0f; e[i].pos = Vec3(0, 0, 2.0f + i); }
+        e[4].operated = true;                              // いちばん遠いが操作対象
+        e[1].loudness = 0.2f;                              // 近いが小さい
+        e[2].change = 4.0f;                                // 動いている
+        std::vector<const Emitter*> ems; for (int i = 0; i < 5; ++i) ems.push_back(&e[i]);
+        std::vector<BudgetSlot> sl;
+        b.update(ems, Vec3(0, 0, 0), 1.0f / 60.0f, 1.0f, 256, sl);
+        std::snprintf(buf, sizeof(buf), "(順位: 操作対象(遠い) %d、静かで近い %d、動いている %d、点数 %.3f / %.3f / %.3f)",
+                      sl[4].wantSlot, sl[1].wantSlot, sl[2].wantSlot, sl[4].score, sl[1].score, sl[2].score);
+        check("[予算] 操作対象はいちばん遠くても 1 位（Ⅶ の優先度 1）", sl[4].wantSlot == 0, buf);
+        check("[予算] 音量が小さい音源は同じ距離でも下がる（優先度 3）", sl[1].wantSlot > sl[0].wantSlot, buf);
+        check("[予算] 動いている音源は静止した同距離より上がる（優先度 4 = 変化量）", sl[2].score > sl[3].score, buf);
+        const int spent = Budget::spentRays(sl, 5);
+        int nFull = 0, nHold = 0;
+        for (int i = 0; i < 5; ++i) { if (sl[i].tier == Tier::Full) ++nFull; if (sl[i].tier == Tier::Hold) ++nHold; }
+        std::snprintf(buf, sizeof(buf), "(厳密 %d / 保持 %d、飛ばした %d 本（総予算 1000）)", nFull, nHold, spent);
+        check("[予算] 厳密は枠のぶんだけ、漏れた音源は保持（0 本）、合計は総予算を大きく超えない", nFull == 2 && nHold == 1 && spent <= 1000 + b.cfg.minPerEmitter, buf);
+    }
+    // 2) ヒステリシス: 昇格 0.5 s / 降格 1.0 s
+    {
+        Budget b; b.cfg.totalRays = 1000; b.cfg.fullSlots = 1; b.cfg.lightSlots = 0;
+        Emitter a, c; a.id = 0; c.id = 1; a.loudness = 1.0f; c.loudness = 0.5f;
+        a.pos = Vec3(0, 0, 1); c.pos = Vec3(0, 0, 2);
+        std::vector<const Emitter*> ems{&a, &c};
+        std::vector<BudgetSlot> sl;
+        const float dt = 1.0f / 60.0f; float t = 0.0f;
+        for (int k = 0; k < 60; ++k) { t += dt; b.update(ems, Vec3(0, 0, 0), dt, t, 256, sl); }
+        check("[予算] 最初は点数の高い方が厳密", sl[0].tier == Tier::Full && sl[1].tier == Tier::Hold);
+        // 入れ替える（c を近く大きく）。昇格は 0.5 s 掛かる
+        c.loudness = 1.0f; c.pos = Vec3(0, 0, 0.5f);
+        int upFrames = -1, downFrames = -1;
+        for (int k = 0; k < 120; ++k) {
+            t += dt; b.update(ems, Vec3(0, 0, 0), dt, t, 256, sl);
+            if (upFrames < 0 && sl[1].tier == Tier::Full) upFrames = k + 1;
+            if (downFrames < 0 && sl[0].tier != Tier::Full) downFrames = k + 1;
+        }
+        std::snprintf(buf, sizeof(buf), "(昇格 %d フレーム = %.2f s（0.5 s）、降格 %d フレーム = %.2f s（1.0 s）)", upFrames, upFrames * dt, downFrames, downFrames * dt);
+        check("[予算] 昇格は 0.5 s、降格は 1.0 s 続けて条件を満たしてから（段の境で行き来しない）",
+              upFrames > 25 && upFrames < 35 && downFrames > 55 && downFrames < 65, buf);
+    }
+    // 3) 探り: 保持の音源が順繰りに解き直される
+    {
+        Budget b; b.cfg.totalRays = 600; b.cfg.fullSlots = 1; b.cfg.lightSlots = 0; b.cfg.promoteSec = 0.0f; b.cfg.demoteSec = 0.0f; b.cfg.probesPerFrame = 1;
+        Emitter e[4]; std::vector<const Emitter*> ems;
+        for (int i = 0; i < 4; ++i) { e[i].id = i; e[i].loudness = 1.0f; e[i].pos = Vec3(0, 0, 1.0f + i); ems.push_back(&e[i]); }
+        std::vector<BudgetSlot> sl;
+        const float dt = 1.0f / 60.0f; float t = 0.0f;
+        int probed[4] = {};
+        for (int k = 0; k < 12; ++k) {
+            t += dt; b.update(ems, Vec3(0, 0, 0), dt, t, 256, sl);
+            for (int i = 0; i < 4; ++i) if (sl[i].probing) ++probed[i];
+        }
+        std::snprintf(buf, sizeof(buf), "(12 フレームで探られた回数: %d / %d / %d / %d（保持は 3 本）)", probed[0], probed[1], probed[2], probed[3]);
+        check("[予算] 保持の 3 本が順繰りに探られる（12 フレームで各 4 回）", probed[1] == 4 && probed[2] == 4 && probed[3] == 4 && probed[0] == 0, buf);
+    }
+    // 4) 世界: 総予算を絞ると合計が収まり、保持の音源は最後の答えを保つ。並列でも直列とビット一致。
+    {
+        World* w = makeWorldBox(3.5f, 3.0f, 0.2f);
+        // ★ヒステリシスは既定のまま（0.5 / 1.0 s）。段は最初のフレームで決まる（primed）ので待つ必要がない。
+        //   ここで promoteSec=0 にすると、下の「保持は最後の答えを保つ」で音源を動かした瞬間に
+        //   変化量で点数が跳ねて即昇格し、検査の意味が消える（実際に踏んだ）。
+        w->budget.cfg.totalRays = 512; w->budget.cfg.fullSlots = 1; w->budget.cfg.lightSlots = 1;
+        w->setListener(Vec3(-1.0f, 1.2f, 1.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+        int ids[4];
+        for (int i = 0; i < 4; ++i) ids[i] = w->addEmitter(Vec3(1.0f - 0.5f * i, 1.6f, -1.0f + 0.4f * i), 0.0f);
+        w->build();
+        const float dt = 512.0f / 48000.0f;
+        for (int k = 0; k < 10; ++k) w->update(dt);
+        int tiers[4]; float held[6];
+        int fullId = -1, holdId = -1;
+        for (int i = 0; i < 4; ++i) {
+            tiers[i] = w->tierOf(ids[i]);
+            if (tiers[i] == 0 && fullId < 0) fullId = ids[i];
+            if (tiers[i] == 2 && holdId < 0) holdId = ids[i];
+        }
+        std::snprintf(buf, sizeof(buf), "(段 %d/%d/%d/%d、飛ばした %d 本（総予算 512）。厳密の本数 %d)", tiers[0], tiers[1], tiers[2], tiers[3], w->spentRays(), fullId >= 0 ? w->raysOf(fullId) : 0);
+        check("[予算] 世界: 厳密・簡易・保持に分かれ、飛ばした本数が総予算に収まる", w->spentRays() <= 512 + 64 && fullId >= 0 && holdId >= 0, buf);
+        // 保持の音源を動かしても Mix は変わらない（最後の答えを保つ）。
+        //   ★探りを切って測る ── 探りが有効なら保持の音源も順繰りに解き直されるので変わる（それが探りの仕事。上の 3 で検査）。
+        w->budget.cfg.probesPerFrame = 0;
+        w->update(dt);
+        for (int b = 0; b < kNumBands; ++b) held[b] = w->mix(holdId)->energy6[b];
+        w->setEmitter(holdId, Vec3(3.0f, 1.6f, 3.0f), 0.0f, false, 1.0f);
+        w->update(dt);
+        bool same = true; for (int b = 0; b < kNumBands; ++b) if (w->mix(holdId)->energy6[b] != held[b]) same = false;
+        std::snprintf(buf, sizeof(buf), "(保持の音源 %d: 段 %d、本数 %d、総量 500Hz %.4e → %.4e)", holdId, w->tierOf(holdId), w->raysOf(holdId), held[2], w->mix(holdId)->energy6[2]);
+        check("[予算] 保持の音源は解かないので最後の答えを保つ（探りを切ったとき。素通しにも無音にもならない）", same && w->raysOf(holdId) == 0, buf);
+        // 探りを戻すと、保持の音源も順繰りに更新される（扉が開いても眠らない）
+        w->budget.cfg.probesPerFrame = 1;
+        for (int k = 0; k < 6; ++k) w->update(dt);
+        bool moved = false; for (int b = 0; b < kNumBands; ++b) if (w->mix(holdId)->energy6[b] != held[b]) moved = true;
+        check("[予算] 探りを戻すと保持の音源も数フレームで更新される（扉が開いても眠らない）", moved);
+        // 並列（4 スレッド）でも直列とビット一致
+        World* w2 = makeWorldBox(3.5f, 3.0f, 0.2f);
+        w2->budget.cfg.totalRays = 512; w2->budget.cfg.fullSlots = 4; w2->budget.cfg.lightSlots = 0;
+        w2->setListener(Vec3(-1.0f, 1.2f, 1.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+        int ids2[4]; for (int i = 0; i < 4; ++i) ids2[i] = w2->addEmitter(Vec3(1.0f - 0.5f * i, 1.6f, -1.0f + 0.4f * i), 0.0f);
+        w2->build();
+        for (int k = 0; k < 10; ++k) w2->update(dt);
+        std::vector<float> serial;
+        for (int i = 0; i < 4; ++i) for (int b = 0; b < kNumBands; ++b) serial.push_back(w2->mix(ids2[i])->energy6[b]);
+        w2->setWorkers(4);
+        for (int k = 0; k < 10; ++k) w2->update(dt);
+        bool bitEqual = true; std::size_t p = 0;
+        for (int i = 0; i < 4; ++i) for (int b = 0; b < kNumBands; ++b, ++p) if (w2->mix(ids2[i])->energy6[b] != serial[p]) bitEqual = false;
+        std::snprintf(buf, sizeof(buf), "(スレッド %d、音源 4 本)", w2->workers());
+        check("[予算] 4 スレッドで解いても直列とビット一致（音源ごとに自分の枠しか触らない）", bitEqual && w2->workers() == 4, buf);
+        delete w2; delete w;
+    }
+    // 5) フレーム分散: 静止していれば分散していても揺れない（組の合計が一定）。動けば数フレームで入れ替わる。
+    {
+        World* w = makeWorldBox(3.5f, 3.0f, 0.2f);
+        w->budget.cfg.totalRays = 0; w->raysPerEmitter = 256; w->rayGroups = 4;
+        w->setListener(Vec3(-1.0f, 1.2f, 1.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w->addEmitter(Vec3(1.5f, 1.6f, -1.0f), 0.0f);
+        w->build();
+        const float dt = 512.0f / 48000.0f;
+        for (int k = 0; k < 8; ++k) w->update(dt);              // 組を一周させる
+        double worst = 0.0; float prev[6];
+        for (int b = 0; b < kNumBands; ++b) prev[b] = w->mix(e)->energy6[b];
+        for (int k = 0; k < 20; ++k) {
+            w->update(dt);
+            for (int b = 0; b < kNumBands; ++b) { worst = std::max(worst, std::fabs(afti::dB(w->mix(e)->energy6[b] / prev[b]))); prev[b] = w->mix(e)->energy6[b]; }
+        }
+        std::snprintf(buf, sizeof(buf), "(組 4、静止 20 フレームの帳簿の段差 最大 %.4f dB、レイ %d 本/フレーム（総数 256）)", worst, w->trace(e)->raysTraced / 4);
+        check("[予算] フレーム分散: 静止していれば組を回しても揺れない（レイの種はレイ番号で作る）", worst < 1e-3, buf);
+        // 分散なしと合計が一致する（同じレイを全部足したのと同じ）
+        World* w1 = makeWorldBox(3.5f, 3.0f, 0.2f);
+        w1->budget.cfg.totalRays = 0; w1->raysPerEmitter = 256; w1->rayGroups = 1;
+        w1->setListener(Vec3(-1.0f, 1.2f, 1.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e1 = w1->addEmitter(Vec3(1.5f, 1.6f, -1.0f), 0.0f);
+        w1->build();
+        for (int k = 0; k < 8; ++k) w1->update(dt);
+        double diff = 0.0;
+        for (int b = 0; b < kNumBands; ++b) diff = std::max(diff, std::fabs(afti::dB(w->mix(e)->energy6[b] / w1->mix(e1)->energy6[b])));
+        std::snprintf(buf, sizeof(buf), "(組 4 と 組 1 の帳簿の差 最大 %.4f dB)", diff);
+        check("[予算] フレーム分散: 組に分けても合計は分散なしと一致（同じレイを足しているだけ）", diff < 1e-3, buf);
+        delete w1; delete w;
+    }
+    // 6) 費用（参考。合否は付けない）: 音源を増やしても 1 フレームの時間が伸びないか
+    {
+        std::printf("      費用（1 フレームの主スレッド、7×7×3 m の箱。厳密 6 / 簡易 10）:\n");
+        std::printf("        音源  分散なし・予算1536   分散 4 組・予算1536   ＋スレッド 4\n");
+        for (int n : {1, 4, 12, 24}) {
+            double ms[3] = {};
+            for (int mode = 0; mode < 3; ++mode) {
+                World* w = makeWorldBox(3.5f, 3.0f, 0.2f);
+                w->raysPerEmitter = 256;
+                w->budget.cfg.totalRays = 1536; w->budget.cfg.fullSlots = 6; w->budget.cfg.lightSlots = 10;
+                w->rayGroups = (mode == 0) ? 1 : 4;
+                if (mode == 2) w->setWorkers(4);
+                w->setListener(Vec3(-1.0f, 1.2f, 1.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+                afti::Xorshift rng;
+                for (int i = 0; i < n; ++i) w->addEmitter(Vec3(rng.next() * 3.0f, 1.0f + rng.next() * 0.5f, rng.next() * 3.0f), 0.0f);
+                w->build();
+                const float dt = 512.0f / 48000.0f;
+                for (int k = 0; k < 3; ++k) w->update(dt);            // 温める
+                const int reps = 10;
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int k = 0; k < reps; ++k) w->update(dt);
+                ms[mode] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+                delete w;
+            }
+            std::printf("        %3d   %8.2f ms          %8.2f ms      %8.2f ms\n", n, ms[0], ms[1], ms[2]);
+        }
+        // 内訳（音源 1 本、厳密 512 本）: レイ／見通し／回折／虚像 をそれぞれ単体で回す
+        {
+            MaterialTable mats;
+            AcousticMaterial wall = AcousticMaterial::defaultWall();
+            for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.0f; wall.scattering[b] = 0.5f; }
+            const int matId = mats.add(wall);
+            Surfaces box = closedBox(3.5f, 3.0f, matId);
+            std::vector<Face> faces; collectFaces(box, mats, faces);
+            Listener lis; lis.pos = Vec3(-1.0f, 1.2f, 1.5f); lis.forward = Vec3(0, 0, 1); lis.up = Vec3(0, 1, 0);
+            const Vec3 S(1.5f, 1.6f, -1.0f);
+            const int reps = 20;
+            auto timeIt = [&](const char* name, const std::function<void()>& fn) {
+                fn();
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int k = 0; k < reps; ++k) fn();
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+                std::printf("        %-16s %7.3f ms\n", name, ms);
+            };
+            std::printf("      内訳（音源 1 本、箱 6 個・面 36）:\n");
+            EnergyTrace tr; TraceParams prm; prm.rays = 512; prm.maxBounces = 40; prm.mixingSec = 0.03f; prm.seed = 7u;
+            timeIt("レイ 512 本", [&] { volatile auto r = tr.run(box, mats, S, lis.pos, prm); (void)r; });
+            timeIt("見通し（幅 0.2）", [&] { volatile auto v = discVisibility(box, mats, lis.pos, S, 0.2f); (void)v; });
+            Visibility vv = discVisibility(box, mats, lis.pos, S, 0.2f);
+            timeIt("回折", [&] { volatile auto d = edgeDiffraction(box, lis, S, vv); (void)d; });
+            ImageSet im;
+            timeIt("虚像（1・2 次）", [&] { buildImages(box, faces, lis, S, 0.2f, 0.06f, im); });
+            std::printf("        虚像: 検討 %d / 有効 %d\n", im.candidates, im.count);
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -932,6 +1139,7 @@ int main() {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
+        {"budget", testBudget},
     };
     for (const auto& s : suites) if (!only || std::strcmp(only, s.name) == 0) s.fn();
     return afti::finish("Flow");

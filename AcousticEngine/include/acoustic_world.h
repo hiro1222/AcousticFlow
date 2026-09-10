@@ -49,6 +49,20 @@ ACOUSTIC_API void AF_WorldSetEmitter(AF_WorldHandle w, int emitter, AF_Vector3 p
 
 /* ── 設定 ── */
 ACOUSTIC_API void AF_WorldSetRays(AF_WorldHandle w, int raysPerEmitter, int maxBounces);
+/* 予算（段 8）。totalRays = 0 で無制限（音源ごとに raysPerEmitter）。
+ * fullSlots / lightSlots は 厳密 / 簡易 の枠。漏れた音源は「保持」（最後の答えを保つ。素通しではない）。
+ * 昇格 0.5 s / 降格 1.0 s のヒステリシスと、保持を順繰りに解き直す探り（既定 1 本/フレーム）は中で持つ。 */
+ACOUSTIC_API void AF_WorldSetBudget(AF_WorldHandle w, int totalRays, int fullSlots, int lightSlots, int probesPerFrame);
+/* レイ更新のフレーム分散（設計文書 Ⅶ）。rayGroups 個の組に分け、毎フレーム 1 組だけ飛ばす（1 で分散なし、上限 8）。
+ * 組ごとの結果は幾何が同じなら同じなので、静止していれば合計は一定＝揺れない。動けば rayGroups フレームで入れ替わる。 */
+ACOUSTIC_API void AF_WorldSetRayGroups(AF_WorldHandle w, int rayGroups);
+/* 音源ごとのループを複数コアへ。workers <= 1 で直列（既定）。★Unity は既に全コアを使うので明示のときだけ。 */
+ACOUSTIC_API void AF_WorldSetWorkers(AF_WorldHandle w, int workers);
+/* 今フレームに実際に飛ばしたレイの総数（費用の目安）。 */
+ACOUSTIC_API int  AF_WorldSpentRays(AF_WorldHandle w);
+/* 音源の段（0 厳密 / 1 簡易 / 2 保持）と本数。 */
+ACOUSTIC_API int  AF_WorldEmitterTier(AF_WorldHandle w, int emitter);
+ACOUSTIC_API int  AF_WorldEmitterRays(AF_WorldHandle w, int emitter);
 ACOUSTIC_API void AF_WorldSetWeights(AF_WorldHandle w, const float* w5);          /* 直接・初期・後期・回折・透過。NULL で全部 1 */
 ACOUSTIC_API void AF_WorldSetResponse(AF_WorldHandle w, float levelSec, float colourSec, float statSec, float directionSec);
 ACOUSTIC_API void AF_WorldSetHeadCm(AF_WorldHandle w, float headCircumferenceCm);

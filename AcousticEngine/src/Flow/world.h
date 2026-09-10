@@ -34,8 +34,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <vector>
 #include "Core/room_graph.h"
+#include "Core/worker_pool.h"
+#include "Flow/budget.h"
 #include "Dsp/fdn_room_mix.h"
 #include "Dsp/voice_renderer.h"
 #include "Flow/aperture.h"
@@ -58,7 +61,9 @@ public:
     WorldRules rules;
     Surfaces   surfaces;
     Response   response;
-    int   raysPerEmitter = 256;     // 段 8 で予算が決める
+    Budget     budget;              // 段 8（cfg.totalRays = 0 で無制限＝raysPerEmitter をそのまま）
+    int   raysPerEmitter = 256;     // 予算が無制限のときの 1 音源の本数
+    int   rayGroups = 4;            // レイをこの数の組に分け、毎フレーム 1 組だけ飛ばす（1 で分散なし）
     int   maxBounces = 40;
     float headCm = 57.0f;
 
@@ -146,33 +151,75 @@ public:
         if (dirty_) build();
         listener_.beginFrame(dt);
         updateOpenings();
+        now_ += dt;
         const int lroom = roomAt(listener_.pos);
         const float mixingSec = mixingSecFor(lroom);
-        EnergyTrace tracer;
+
+        // 生きている音源を集め、予算で段と本数を決める（段 8）。
+        live_.clear(); liveIdx_.clear();
         for (std::size_t i = 0; i < slots_.size(); ++i) {
             Slot& s = slots_[i];
             if (!s.used || !s.em.active) continue;
             s.em.beginFrame(dt);
             s.em.room = roomAt(s.em.pos);
+            live_.push_back(&s.em); liveIdx_.push_back(static_cast<int>(i));
+        }
+        budget.update(live_, listener_.pos, dt, now_, raysPerEmitter, budgetSlots_);
+        const int n = static_cast<int>(live_.size());
+
+        // 音源ごとの解き（互いに独立で、自分の枠にしか書かない → 並列化できる。既定は直列）。
+        auto solve = [&](int k) {
+            Slot& s = slots_[static_cast<std::size_t>(liveIdx_[static_cast<std::size_t>(k)])];
+            const BudgetSlot& bs = budgetSlots_[static_cast<std::size_t>(k)];
+            s.tier = static_cast<int>(bs.tier);
+            s.rays = bs.rays;
+            if (bs.rays <= 0) return;                     // 保持: 最後の答えを保つ（Mix を触らない）
+            const bool light = (bs.tier != Tier::Full);
             TraceParams prm;
-            prm.rays = raysPerEmitter; prm.maxBounces = maxBounces; prm.mixingSec = mixingSec;
+            prm.rays = bs.rays; prm.maxBounces = light ? std::min(maxBounces, 12) : maxBounces; prm.mixingSec = mixingSec;
             prm.seed = static_cast<std::uint32_t>(s.em.id + 1) * 0x9E3779B1u;    // 音源ごとに固定
-            s.trace = tracer.run(surfaces, rules.materials, s.em.pos, listener_.pos, prm);
-            // 見通し（解析）。幅は見込み角で点へ寄せた物。
-            const float rEff = s.em.effectiveRadius(s.trace.directDist, 1.0f);
+            // フレーム分散（設計文書 Ⅶ）: 組を 1 つだけ飛ばし、残りは前回の結果を使う。
+            //   本数が変わったら組を全部作り直す（重み 1/rays が変わるので混ぜられない）。
+            const int G = std::max(1, std::min(rayGroups, TraceGroups::kMax));
+            prm.groups = G;
+            prm.group = s.groupNext % G;
+            if (s.groupRays != bs.rays || s.groupCount != G) {
+                for (int k = 0; k < G; ++k) s.parts[k] = tracer_.run(surfaces, rules.materials, s.em.pos, listener_.pos, TraceParams{prm.rays, prm.maxBounces, prm.mixingSec, prm.seed, G, k});
+                s.groupRays = bs.rays; s.groupCount = G;
+            } else {
+                s.parts[prm.group] = tracer_.run(surfaces, rules.materials, s.em.pos, listener_.pos, prm);
+            }
+            s.groupNext = (s.groupNext + 1) % G;
+            TraceResult::sumGroups(s.parts, G, s.trace);
+            // 見通し（解析）。幅は見込み角で点へ寄せた物。簡易は手を掛けない（detail 0 で点）。
+            const float rEff = s.em.effectiveRadius(s.trace.directDist, light ? 0.0f : 1.0f);
             s.vis = discVisibility(surfaces, rules.materials, listener_.pos, s.em.pos, rEff);
             // 回折（段 6）: 遮られた分が最寄りの稜線を回る。見通しが 1 なら要らない。
             s.diff = edgeDiffraction(surfaces, listener_, s.em.pos, s.vis);
-            // 虚像（段 7）: 初期の方向と正規化重み。経路長は 境 + 3 m まで（境ちょうどだと出入りで揺れる）。
-            buildImages(surfaces, faces_, listener_, s.em.pos, rEff, mixingSec + 3.0f / kSpeedOfSound, s.images);
+            // 虚像（段 7）: 初期の方向と正規化重み。簡易は作らない（方向なしの 1 本に落ちる）。
+            if (light) s.images.count = 0;
+            else buildImages(surfaces, faces_, listener_, s.em.pos, rEff, mixingSec + 3.0f / kSpeedOfSound, s.images);
             DistributeInput in;
             in.trace = &s.trace; in.visibility = &s.vis; in.diffraction = &s.diff; in.images = &s.images;
             in.sourcePos = s.em.pos; in.listener = &listener_;
             in.listenerRoom = lroom; in.weights = &rules.weights; in.response = &response; in.dt = dt;
             s.mixer.run(in, s.mix);
-        }
+        };
+        if (pool_ && pool_->size() > 1 && n > 1) pool_->parallelFor(n, solve);
+        else for (int k = 0; k < n; ++k) solve(k);
+        spentRays_ = Budget::spentRays(budgetSlots_, n);
         updateFdn();
     }
+
+    /// 音源ごとのループを複数コアへ（0/1 で直列。既定は直列。★Unity は既に全コアを使っているので黙って増やさない）。
+    void setWorkers(int workers) {
+        if (workers <= 1) { pool_.reset(); return; }
+        pool_ = std::make_unique<WorkerPool>(workers);
+    }
+    int  workers() const { return pool_ ? pool_->size() : 1; }
+    int  spentRays() const { return spentRays_; }
+    int  tierOf(int id) const { return valid(id) ? slots_[static_cast<std::size_t>(id)].tier : 2; }
+    int  raysOf(int id) const { return valid(id) ? slots_[static_cast<std::size_t>(id)].rays : 0; }
 
     /// 配分を VoiceRenderer へ（橋）。
     void applyToVoice(int id, af::dsp::VoiceRenderer& v, int sampleRate) const {
@@ -189,6 +236,10 @@ private:
         Visibility   vis;
         Diffraction  diff;
         ImageSet     images;
+        int          tier = 2, rays = 0;
+        // フレーム分散（段 8）: 組ごとの結果を持ち、毎フレーム 1 組だけ更新して足し合わせる
+        TraceResult  parts[TraceGroups::kMax];
+        int          groupNext = 0, groupRays = -1, groupCount = 0;
         bool         used = false;
     };
     bool valid(int id) const { return id >= 0 && id < static_cast<int>(slots_.size()) && slots_[static_cast<std::size_t>(id)].used; }
@@ -269,6 +320,14 @@ private:
     bool dirty_ = true;
     bool fdnStale_ = false;
     int  buildCount_ = 0;
+    // 段 8
+    EnergyTrace tracer_;
+    std::vector<const Emitter*> live_;
+    std::vector<int> liveIdx_;
+    std::vector<BudgetSlot> budgetSlots_;
+    std::unique_ptr<WorkerPool> pool_;
+    float now_ = 0.0f;
+    int   spentRays_ = 0;
 };
 
 }  // namespace flow
