@@ -56,6 +56,14 @@ namespace AcousticFlow
         // 実行中に変えられる。角度に二値は置いていない。
         [Tooltip("閉じた扉から漏れる回折。0 旧 / 1 厚みの割合（既定。10°以降は 0 と同じ）/ 2 口の空き具合（戸口の方向が薄まる）/ 3 両方。実行中に変えられる")]
         [Range(0, 3)] public int leakModel = 1;
+
+        // レイを GPU で解く（既定 切）。音は作らない ── GPU が出すのは幾何と統計だけで、
+        // 音にするのは今までどおりエンジン。ホストのデバイスは借りず、エンジンが自前で持つ。
+        // GPU が無い機械や積めない場合は黙って CPU のまま動く（GpuActive で実際の状態が読める）。
+        // ★本数が少ないと転送の手間が勝つ。効くのは raysPerEmitter を桁で増やしたとき。
+        [Tooltip("レイを GPU で解く（既定 切）。本数を増やすときに効く。実際に使えているかは下の表示で確認")]
+        public bool gpuTrace = false;
+        public bool GpuActive { get; private set; }
         public int maxBounces = 40;
         [Tooltip("1 フレームの総レイ数。0 で無制限。音源が増えても総量は変わらない（設計文書 Ⅶ）")]
         public int totalRays = 1536;
@@ -242,6 +250,8 @@ namespace AcousticFlow
             NativeWorld.AF_WorldSetResponse(_world, levelSec, colourSec, statSec, directionSec);
             NativeWorld.AF_WorldSetRays(_world, raysPerEmitter, maxBounces);
             NativeWorld.AF_WorldSetLeakModel(_world, leakModel);   // 実行中に切り替えられる（試聴の A/B）
+            NativeWorld.AF_WorldSetGpuTrace(_world, gpuTrace ? 1 : 0);
+            GpuActive = NativeWorld.AF_WorldGpuActive(_world) != 0;
             NativeWorld.AF_WorldSetBudget(_world, totalRays, fullSlots, lightSlots, probesPerFrame);
             NativeWorld.AF_WorldSetRayGroups(_world, rayGroups);
             if (workers != _appliedWorkers) { NativeWorld.AF_WorldSetWorkers(_world, workers); _appliedWorkers = workers; }

@@ -49,6 +49,10 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetEmitter(IntPtr w, int emitter, AFVector3 pos, float radius, int operated, float loudness);
 
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetRays(IntPtr w, int raysPerEmitter, int maxBounces);
+        // レイを GPU で解くか（0 切／1 入）。音は作らない。GPU が出すのは幾何と統計だけ。
+        [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetGpuTrace(IntPtr w, int on);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern int  AF_WorldGpuActive(IntPtr w);
+
         // 閉じた扉から漏れる回折の扱い（試聴の A/B 用）。0 今のまま / 1 厚みの割合 / 2 口の空き具合 / 3 両方
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetLeakModel(IntPtr w, int model);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetWeights(IntPtr w, float[] w5);

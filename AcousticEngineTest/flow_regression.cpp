@@ -1595,6 +1595,8 @@ void testManySources() {
     w.raysPerEmitter = 256;
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     { const char* tr = std::getenv("AF_TOTAL_RAYS"); if (tr) w.budget.cfg.totalRays = std::atoi(tr); }
+    { const char* gp = std::getenv("AF_GPU"); if (gp) w.gpuTrace = std::atoi(gp); }
+    { const char* mp = std::getenv("AF_MAX_PER"); if (mp) w.budget.cfg.maxPerEmitter = std::atoi(mp); }
     w.setListener(Vec3(0, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
     // 奥の部屋に音源を並べる（戸口の向こう。扉の効きが全部に乗る配置）。
     const char* sr = std::getenv("AF_SRC_R");
@@ -1717,6 +1719,8 @@ void testManySources() {
       std::printf("        → 中央 %.2f ms / 95%% %.2f ms / 最大 %.2f ms、16.7 ms 超え %d / %d フレーム\n",
                   msAll[m/2], msAll[m*95/100], msAll[m-1], over, static_cast<int>(m)); }
     std::printf("        → 全群の引き直し: 合計 %d 回 / 1 フレーム最大 %d 本（音源 %d 本中）\n", reTraceTotal, reTraceMax, N);
+    std::printf("        → GPU: %s（%s）\n", w.gpuActive() ? "入" : "切",
+                w.gpuActive() ? w.gpuAdapter().c_str() : w.gpuError().c_str());
     std::printf("        → 1 フレームの update: 平均 %.2f ms / 最大 %.2f ms（音源 %d 本、群 %d）\n", msSum / frames, msMax, N, w.rayGroups);
     std::printf("        → 答えが古くなった最大 %d フレーム（%.0f ms）、音源ごとの平均 %.1f フレーム\n",
                 worst, worst * dt * 1000.0f, meanWorst / N);

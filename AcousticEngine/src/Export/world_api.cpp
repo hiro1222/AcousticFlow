@@ -60,6 +60,23 @@ int AF_WorldAddMaterialPreset(AF_WorldHandle w, int preset) {
     return W->rules.materials.add(presetMaterial(preset));
 }
 
+void AF_WorldSetGpuTrace(AF_WorldHandle w, int on) {
+    acoustic::flow::World* W = asWorld(w); if (!W) return;
+    W->gpuTrace = on;
+}
+int AF_WorldGpuActive(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return (W && W->gpuActive()) ? 1 : 0;
+}
+int AF_WorldGpuInfo(AF_WorldHandle w, char* buf, int bufBytes) {
+    acoustic::flow::World* W = asWorld(w);
+    if (!W || !buf || bufBytes <= 0) return 0;
+    const std::string& s = W->gpuActive() ? W->gpuAdapter() : W->gpuError();
+    const int n = static_cast<int>(s.size() < static_cast<std::size_t>(bufBytes - 1) ? s.size() : static_cast<std::size_t>(bufBytes - 1));
+    for (int i = 0; i < n; ++i) buf[i] = s[static_cast<std::size_t>(i)];
+    buf[n] = 0;
+    return n;
+}
+
 void AF_WorldSetLeakModel(AF_WorldHandle w, int model) {
     acoustic::flow::World* W = asWorld(w); if (!W) return;
     W->leakModel = model;

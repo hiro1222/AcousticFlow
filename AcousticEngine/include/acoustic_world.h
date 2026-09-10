@@ -80,6 +80,15 @@ ACOUSTIC_API void AF_WorldSetHeadCm(AF_WorldHandle w, float headCircumferenceCm)
  *   2 案B（半開きの回折まで下がり、戸口の方向が消える）/ 3 両方
  *   ★どちらも角度に二値を置かない。1 は経路の幾何、2 は口の帳簿。2 は戸口が要る。 */
 ACOUSTIC_API void AF_WorldSetLeakModel(AF_WorldHandle w, int model);
+/* レイを GPU で解くか（0 切／1 入。既定 0）。
+ *   ★音は作らない。GPU が出すのは幾何と統計だけで、音にするのはエンジン（CPU）。
+ *   ★ホストのデバイスは借りない。エンジンが自前で持つ。
+ *   ★GPU が無い機械や積めない場合は黙って CPU のまま動く。実際に使えているかは
+ *     AF_WorldGpuActive で見る（1 を置いても 0 が返ることがある）。 */
+ACOUSTIC_API void AF_WorldSetGpuTrace(AF_WorldHandle w, int on);
+ACOUSTIC_API int  AF_WorldGpuActive(AF_WorldHandle w);
+/* GPU の名前（診断）。使えないときは失敗の理由が入る。戻り値は書いた文字数。 */
+ACOUSTIC_API int  AF_WorldGpuInfo(AF_WorldHandle w, char* buf, int bufBytes);
 ACOUSTIC_API int  AF_WorldLeakModel(AF_WorldHandle w);
 
 /* ── 1 フレーム ── */

@@ -52,6 +52,7 @@
 #include "Flow/response.h"
 #include "Flow/surfaces.h"
 #include "Flow/trace_scene.h"
+#include "Gpu/trace_gpu.h"
 #include "Flow/world_rules.h"
 
 namespace acoustic {
@@ -121,6 +122,20 @@ public:
     ///     （実測: 広がりが 1 m より近くで 4.8 ms から縮まず 5.1 ms へ戻る）。
     ///   ★費用は候補の数で効く（箱 6 面なら 1 次 6・2 次 30・3 次 120）。厳密の段だけに掛ける。
     int imageOrder = 2;
+    /// レイを GPU で解くか（0 切／1 入。**既定 0**）。2026-09-10。
+    ///   ★音は作らない。GPU が出すのは幾何と統計（レイの当たりと帳簿）だけで、
+    ///     音にするのは今までどおりエンジン（CPU）。決めごと（音の計算はエンジンだけ）と当たらない。
+    ///   ★ホスト（Unity）のデバイスは借りない。エンジンが自前で持つので、
+    ///     検査と AfFlowWav が Unity 無しで回せる。
+    ///   ★CPU とビット一致はしない（丸めも sin/cos も違う）。実測で初期・後期とも ±0.05 dB。
+    ///     静止していれば毎フレーム同じ、という性質は種の式が同じなので保てる。
+    ///   ★GPU が無い機械や、シェーダが積めない場合は黙って CPU のまま動く。
+    ///   ★入れている間はワーカーを使わない（器が 1 つなので、複数スレッドから同時に流せない）。
+    int gpuTrace = 0;
+    /// GPU の道が実際に使えているか（診断）。gpuTrace=1 でも false なら CPU で回っている。
+    bool gpuActive() const { return gpuReady_ && gpuTrace != 0; }
+    const std::string& gpuAdapter() const { return gpuTracer_.adapterName(); }
+    const std::string& gpuError() const { return gpuTracer_.error(); }
     bool fdnStale() const { return fdnStale_; }
     /// 部屋グラフのボクセル一辺(m)。**戸口の幅を数ボクセルで割れる大きさ**にすること。
     ///   粗いと戸口で部屋が割れず、2 部屋が 1 部屋に潰れる（＝扉を閉めても響きが変わらない）。
@@ -193,6 +208,9 @@ public:
         // ★レイが見る場面を平らな配列にして 1 フレームに 1 回だけ組む。
         //   音源ごとに組み直すと箱の数 × 音源の数だけ無駄が出る。GPU へ送るのもこの 1 つ。
         buildTraceScene(surfaces, rules.materials, traceScene_);
+        // GPU の道（既定は切）。1 回だけ積んで、以後は毎フレーム場面を送るだけ。
+        if (gpuTrace != 0 && !gpuTried_) { gpuTried_ = true; gpuReady_ = gpuTracer_.init(); }
+        if (gpuActive() && !gpuTracer_.upload(traceScene_)) gpuReady_ = false;   // 送れなくなったら CPU へ戻る
         listener_.beginFrame(dt);
         updateOpenings();
         now_ += dt;
@@ -228,10 +246,10 @@ public:
             prm.groups = G;
             prm.group = s.groupNext % G;
             if (s.groupRays != bs.rays || s.groupCount != G) {
-                for (int k = 0; k < G; ++k) s.parts[k] = tracer_.run(traceScene_, s.em.pos, listener_.pos, TraceParams{prm.rays, prm.maxBounces, prm.mixingSec, prm.seed, G, k});
+                for (int k = 0; k < G; ++k) s.parts[k] = runTrace(s.em.pos, TraceParams{prm.rays, prm.maxBounces, prm.mixingSec, prm.seed, G, k});
                 s.groupRays = bs.rays; s.groupCount = G;
             } else {
-                s.parts[prm.group] = tracer_.run(traceScene_, s.em.pos, listener_.pos, prm);
+                s.parts[prm.group] = runTrace(s.em.pos, prm);
             }
             s.groupNext = (s.groupNext + 1) % G;
             TraceResult::sumGroups(s.parts, G, s.trace);
@@ -267,7 +285,10 @@ public:
             in.listenerRoom = lroom; in.weights = &rules.weights; in.response = &response; in.dt = dt;
             s.mixer.run(in, s.mix);
         };
-        if (pool_ && pool_->size() > 1 && n > 1) pool_->parallelFor(n, solve);
+        // ★GPU が入っているときは並列にしない。計算の器が 1 つしかないので、
+        //   複数のスレッドから同時に流すと出力バッファを取り合う。
+        //   そもそも GPU 側が桁で速いので、主スレッドから順に流しても足りる。
+        if (pool_ && pool_->size() > 1 && n > 1 && !gpuActive()) pool_->parallelFor(n, solve);
         else for (int k = 0; k < n; ++k) solve(k);
         spentRays_ = Budget::spentRays(budgetSlots_, n);
         updateFdn();
@@ -382,6 +403,19 @@ private:
     bool dirty_ = true;
     bool fdnStale_ = false;
     TraceScene   traceScene_;   // レイが見る平らな場面（毎フレーム組み直す）
+    mutable gpu::GpuTracer gpuTracer_;
+    bool gpuTried_ = false, gpuReady_ = false;
+
+    /// レイを 1 音源ぶん解く。GPU が入っていれば GPU、そうでなければ CPU。
+    ///   ★直接音はどちらでも CPU で出す（決定的なので GPU へ持っていく理由が無い）。
+    TraceResult runTrace(const Vec3& src, const TraceParams& prm) const {
+        if (!gpuActive()) return tracer_.run(traceScene_, src, listener_.pos, prm);
+        TraceResult R;
+        fillDirect(traceScene_, src, listener_.pos, R);
+        if (!gpuTracer_.run(traceScene_, src, listener_.pos, prm, R))
+            return tracer_.run(traceScene_, src, listener_.pos, prm);   // 流せなければ CPU で出し直す
+        return R;
+    }
     int  buildCount_ = 0;
     // 段 8
     EnergyTrace tracer_;

@@ -151,6 +151,19 @@ struct RayPartial {
     int    hits = 0, neeVisible = 0;
 };
 
+/// 自由音場の直接音（決定的）。★レイを飛ばさない。GPU の道でも**ここは CPU で出す**。
+///   決定的に出せる物を GPU へ持っていく理由が無い。転送と読み戻しのほうが高くつく。
+inline void fillDirect(const TraceScene& sc, const Vec3& source, const Vec3& listener, TraceResult& R) {
+    const float d = std::max(length(listener - source), kEps);
+    float tr[kNumBands]; int crossings = 0;
+    sceneTransmittance(sc, source, listener, -1, tr, &crossings);   // 枚数だけ使う（τ は aperture の物）
+    R.directCrossings = crossings;
+    R.directDist = d;
+    R.directSec = d / kSpeedOfSound;
+    const float geo = 1.0f / (4.0f * kPi * d * d);
+    for (int b = 0; b < kNumBands; ++b) R.freeDirect6[b] = geo * airEnergy(b, d);
+}
+
 /// レイ 1 本を追う（純粋な関数）。i は**全体での本数の中の番号**で、種はここから作る。
 ///   受ける物は全部読み取り専用。書くのは out だけ。
 inline void traceRay(const TraceScene& sc,
@@ -245,17 +258,7 @@ public:
     TraceResult run(const TraceScene& sc,
                     const Vec3& source, const Vec3& listener, const TraceParams& prm) const {
         TraceResult R;
-        // ── 1) 自由音場の直接（決定的）──
-        {
-            const float d = std::max(length(listener - source), kEps);
-            float tr[kNumBands]; int crossings = 0;
-            sceneTransmittance(sc, source, listener, -1, tr, &crossings);   // 枚数だけ使う（τ は aperture の物）
-            R.directCrossings = crossings;
-            R.directDist = d;
-            R.directSec = d / kSpeedOfSound;
-            const float geo = 1.0f / (4.0f * kPi * d * d);
-            for (int b = 0; b < kNumBands; ++b) R.freeDirect6[b] = geo * airEnergy(b, d);
-        }
+        fillDirect(sc, source, listener, R);
         // ── 2) 反射（レイ + NEE）──
         //   ★1 本ずつ独立した取り分に書き、**本の順に**足し合わせる。
         //     こうしておくと 1 本が純粋な関数になり、そのまま GPU の 1 スレッドに載る（段 1）。
