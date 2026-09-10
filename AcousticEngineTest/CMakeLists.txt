@@ -24,6 +24,12 @@ target_compile_definitions(SceneRegressionTest PRIVATE
 add_executable(AfRenderWav render_wav.cpp)
 target_link_libraries(AfRenderWav PRIVATE AcousticEngine)
 
+# 同じ場面を**新コア（AF_World）だけ**で鳴らす版。旧と同じ寸法・同じ信号・同じ長さなので、
+#   出た 2 本の WAV を AfAnalyzeWav でそのまま突き合わせられる（段 10 の前の突き合わせ用）。
+#   ★旧コアの入口を 1 つも呼ばないので、段 10 で render_wav.cpp を消してもこちらは残る。
+add_executable(AfFlowWav render_wav_flow.cpp)
+target_link_libraries(AfFlowWav PRIVATE AcousticEngine)
+
 # DSP(段4: C++移行) の数値回帰テスト。
 # ヘッダを直接取り込むので DLL には依存しない（移行中は API がまだ生えていないため）。
 add_executable(DspRegressionTest dsp_regression.cpp)

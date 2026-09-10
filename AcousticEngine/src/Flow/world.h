@@ -98,6 +98,19 @@ public:
         if (fdn_) { fdn_ = nullptr; fdnRoomOf_.assign(probes_.size(), -1); fdnStale_ = true; }
     }
     bool fdnStale() const { return fdnStale_; }
+    /// 部屋グラフのボクセル一辺(m)。**戸口の幅を数ボクセルで割れる大きさ**にすること。
+    ///   粗いと戸口で部屋が割れず、2 部屋が 1 部屋に潰れる（＝扉を閉めても響きが変わらない）。
+    ///   build() の前に置く。
+    void setRoomCell(float meters) { builder_.setCell(meters); dirty_ = true; }
+    float roomCellRequested() const { return builder_.cell(); }
+    /// 実際に使われた一辺。総ボクセル数が上限を超えると 1.5 倍ずつ粗くなるので、要求と食い違うことがある。
+    ///   ★食い違ったら音の結果が変わっている。呼び出し側が 2 つを比べて気づけるように分けてある。
+    float roomCellEffective() const { return builder_.result().grid.cell; }
+    double roomVoxels() const {
+        const rooms::Grid& g = builder_.result().grid;
+        return static_cast<double>(g.nx) * g.ny * g.nz;
+    }
+    double roomMaxVoxels() const { return static_cast<double>(builder_.maxVoxels()); }
     int  roomCount() const { return static_cast<int>(probes_.size()); }
     const Probe& probe(int r) const { return probes_[static_cast<std::size_t>(r)]; }
     int  apertureCount() const { return static_cast<int>(apertures_.size()); }

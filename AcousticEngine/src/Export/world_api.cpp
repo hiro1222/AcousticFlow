@@ -60,6 +60,18 @@ int AF_WorldAddMaterialPreset(AF_WorldHandle w, int preset) {
     return W->rules.materials.add(presetMaterial(preset));
 }
 
+void AF_WorldSetRoomCell(AF_WorldHandle w, float meters) {
+    acoustic::flow::World* W = asWorld(w); if (!W) return;
+    W->setRoomCell(meters);
+}
+void AF_WorldRoomCellInfo(AF_WorldHandle w, float* req, float* eff, double* vox, double* maxVox) {
+    acoustic::flow::World* W = asWorld(w); if (!W) return;
+    if (req) *req = W->roomCellRequested();
+    if (eff) *eff = W->roomCellEffective();
+    if (vox) *vox = W->roomVoxels();
+    if (maxVox) *maxVox = W->roomMaxVoxels();
+}
+
 int AF_WorldAddBox(AF_WorldHandle w, AF_Vector3 c, AF_Vector3 he, AF_Vector3 ax, AF_Vector3 ay, int material, int dynamic) {
     acoustic::flow::World* W = asWorld(w); if (!W) return -1;
     return W->addBox(makeObb(c, he, ax, ay), material, dynamic != 0);
@@ -157,6 +169,18 @@ int AF_WorldMixInfo(AF_WorldHandle w, int e, AF_MixInfo* out) {
     const acoustic::flow::ImageSet* im = W->images(e);
     out->imageCount = im ? im->count : 0;
     out->imageCandidates = im ? im->candidates : 0;
+    return 1;
+}
+int AF_WorldDiffractionInfo(AF_WorldHandle w, int e, AF_DiffractionInfo* out) {
+    acoustic::flow::World* W = asWorld(w); if (!W || !out) return 0;
+    const acoustic::flow::Diffraction* d = W->diffraction(e);
+    if (!d) return 0;
+    out->valid = d->valid ? 1 : 0;
+    out->box = d->box; out->edge = d->edge;
+    out->delta = d->delta; out->gapWidth = d->gapWidth; out->weight = d->weight; out->pathSec = d->pathSec;
+    for (int b = 0; b < 6; ++b) { out->energy6[b] = d->energy6[b]; out->gapOpen6[b] = d->gapOpen6[b]; }
+    out->point[0] = d->point.x; out->point[1] = d->point.y; out->point[2] = d->point.z;
+    out->dirLocal[0] = d->dirLocal.x; out->dirLocal[1] = d->dirLocal.y; out->dirLocal[2] = d->dirLocal.z;
     return 1;
 }
 int   AF_WorldApertureCount(AF_WorldHandle w) { acoustic::flow::World* W = asWorld(w); return W ? W->apertureCount() : 0; }

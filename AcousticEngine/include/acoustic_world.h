@@ -34,6 +34,15 @@ ACOUSTIC_API void AF_WorldSetBoxTransform(AF_WorldHandle w, int box, AF_Vector3 
 ACOUSTIC_API void AF_WorldSetBoxActive(AF_WorldHandle w, int box, int active);
 
 /* ── 部屋（部屋グラフから自動。build は Update が必要時に呼ぶが、明示もできる） ── */
+/* 部屋グラフのボクセル一辺(m)。AF_WorldBuild の**前**に置く。既定 0.25。
+ *   ★戸口の幅を数ボクセルで割れる大きさにすること。粗いと戸口で部屋が割れず、
+ *     2 部屋が 1 部屋に潰れる（扉を閉めても響きが変わらなくなる）。 */
+ACOUSTIC_API void AF_WorldSetRoomCell(AF_WorldHandle w, float meters);
+/* 要求した一辺と、実際に使われた一辺、総ボクセル数と上限。NULL 可。
+ *   ★要求 ≠ 実際 なら、上限に収めるために粗くされている＝音の結果が変わっている。 */
+ACOUSTIC_API void AF_WorldRoomCellInfo(AF_WorldHandle w, float* outRequested, float* outEffective,
+                                       double* outVoxels, double* outMaxVoxels);
+
 ACOUSTIC_API void AF_WorldBuild(AF_WorldHandle w);
 ACOUSTIC_API int  AF_WorldRoomCount(AF_WorldHandle w);
 ACOUSTIC_API int  AF_WorldBuildCount(AF_WorldHandle w);
@@ -99,6 +108,26 @@ typedef struct AF_MixInfo {
 ACOUSTIC_API int   AF_WorldApertureCount(AF_WorldHandle w);
 ACOUSTIC_API float AF_WorldApertureOpenFrac(AF_WorldHandle w, int aperture);
 ACOUSTIC_API int AF_WorldMixInfo(AF_WorldHandle w, int emitter, AF_MixInfo* out);
+
+/* 回折の中身（診断）。旧コアの AF_SceneDebugDiffractionPath にあたる。
+ *   ★valid が 0 になる原因は 3 つあって、区別できないと追えない:
+ *     ① 見通しが 1（遮られていない ＝ 回折は不要）
+ *     ② 影を落とす箱が無い（候補が空）
+ *     ③ 候補はあったが脚が他の箱に潰されて重み 0（扉の板が経路を塞いだ、など）
+ *   weight と shadowers を並べて読めば、どれかが分かる。 */
+typedef struct AF_DiffractionInfo {
+    int   valid;
+    int   box, edge;           /* 回った箱と稜線の番号。−1 は無し */
+    float delta;               /* 迂回長 δ(m) */
+    float gapWidth;            /* 隙間の幅 a(m)。段 9-a のフレネル開口 */
+    float weight;              /* 脚の貫通による重み 0..1（1 = 脚が完全に通る） */
+    float pathSec;             /* 到達（秒） */
+    float energy6[6];          /* 帯域別のエネルギー比（前川 × 隙間の通り） */
+    float gapOpen6[6];         /* 隙間の通り 0..1（帯域別） */
+    float point[3];            /* 回折点（world） */
+    float dirLocal[3];         /* リスナー座標の到来方向 */
+} AF_DiffractionInfo;
+ACOUSTIC_API int AF_WorldDiffractionInfo(AF_WorldHandle w, int emitter, AF_DiffractionInfo* out);
 
 #ifdef __cplusplus
 }
