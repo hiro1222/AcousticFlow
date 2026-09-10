@@ -63,6 +63,9 @@ add_executable(AfDspBench dsp_bench.cpp)
 target_link_libraries(AfDspBench PRIVATE AcousticEngine)
 
 # Flow (new core, 2026-09-10) regression. Header-only + material.cpp; no DLL dependency yet.
-add_executable(FlowRegressionTest flow_regression.cpp ../AcousticEngine/src/Core/material.cpp)
+add_executable(FlowRegressionTest flow_regression.cpp ../AcousticEngine/src/Core/material.cpp
+                                  ../AcousticEngine/src/Gpu/compute_d3d11.cpp)
 target_include_directories(FlowRegressionTest PRIVATE ${CMAKE_SOURCE_DIR}/AcousticEngine/src)
 target_compile_features(FlowRegressionTest PRIVATE cxx_std_17)
+# GPU の道も検査から回す（Unity 無しで確かめられるようにするのが目的）。
+target_link_libraries(FlowRegressionTest PRIVATE d3d11 d3dcompiler dxgi)

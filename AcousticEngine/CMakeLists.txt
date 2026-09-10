@@ -10,6 +10,7 @@
 #   道を 2 本持っていると、聞こえている音がどちらの物か切り分けられない。
 
 set(ACOUSTIC_SOURCES
+    src/Gpu/compute_d3d11.cpp
     src/Export/scene_api.cpp
     src/Export/voice_api.cpp
     src/Export/world_api.cpp
@@ -25,3 +26,8 @@ target_include_directories(AcousticEngine PRIVATE src)
 
 # DLL ビルド側でだけ dllexport を有効化。
 target_compile_definitions(AcousticEngine PRIVATE ACOUSTICENGINE_EXPORTS)
+
+# GPU（D3D11 コンピュート）。エンジンが自前でデバイスを持つ ── ホストの物は借りない。
+#   ★借りない理由: 検査と AfFlowWav が Unity 無しで回せる。この作品の作り方の根っこ。
+#   dxgi は アダプタ名を読むためだけ（診断）。
+target_link_libraries(AcousticEngine PRIVATE d3d11 d3dcompiler dxgi)

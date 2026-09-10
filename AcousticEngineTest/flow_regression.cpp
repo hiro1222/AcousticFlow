@@ -29,6 +29,7 @@
 #include "../AcousticEngine/src/Flow/distribute.h"
 #include "../AcousticEngine/src/Flow/mix_to_voice.h"
 #include "../AcousticEngine/src/Flow/world.h"
+#include "../AcousticEngine/src/Gpu/compute_d3d11.h"
 
 using namespace acoustic;
 using namespace acoustic::flow;
@@ -1374,6 +1375,64 @@ void testLeakModels() {
     }
 }
 
+// ================================ [GPU] 計算デバイスの管が通るか（AF_ONLY=gpu）
+void testGpuPipe() {
+    std::printf("\n[GPU] エンジン自前の計算デバイス ── 管が通るか\n");
+    char buf[256];
+    acoustic::gpu::ComputeDevice dev;
+    if (!dev.available()) {
+        std::printf("      この機械では GPU の道が使えません（%s）。CPU のまま進みます。\n", dev.error().c_str());
+        check("[GPU] デバイスが無くても検査は続く（CPU へ落ちる道がある）", true, "(available() = false)");
+        return;
+    }
+    std::printf("      アダプタ: %s\n", dev.adapterName().c_str());
+
+    // ★まず「管」だけを確かめる。音の計算を載せる前に、
+    //   デバイス作成 → シェーダ翻訳 → 入力転送 → 実行 → 読み戻し が通ることを見る。
+    //   ここが通らないうちにレイを載せると、間違いが幾何の側か配線の側か切り分けられない。
+    static const char* kHlsl =
+        "StructuredBuffer<float> gIn : register(t0);\n"
+        "RWStructuredBuffer<float> gOut : register(u0);\n"
+        "cbuffer Cb : register(b0) { uint gCount; float gScale; uint2 gPad; };\n"
+        "[numthreads(64,1,1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID) {\n"
+        "    if (id.x >= gCount) return;\n"
+        "    gOut[id.x] = gIn[id.x] * gScale + (float)id.x;\n"
+        "}\n";
+    const bool okShader = dev.setShader(kHlsl, "main");
+    std::snprintf(buf, sizeof(buf), "(%s)", okShader ? "翻訳できた" : dev.error().c_str());
+    check("[GPU] HLSL を積める（DLL の中に文字列で持つ。ファイルを配らない）", okShader, buf);
+    if (!okShader) return;
+
+    const int n = 1000;
+    std::vector<float> in(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) in[static_cast<std::size_t>(i)] = static_cast<float>(i) * 0.5f;
+    struct Cb { unsigned int count; float scale; unsigned int pad[2]; } cb{static_cast<unsigned int>(n), 3.0f, {0, 0}};
+    const bool okIn = dev.setInput(0, in.data(), in.size() * sizeof(float), sizeof(float));
+    const bool okCb = dev.setConstants(&cb, sizeof(cb));
+    const bool okOut = dev.setOutput(in.size() * sizeof(float), sizeof(float));
+    check("[GPU] 入力・定数・出力のバッファを置ける", okIn && okCb && okOut, okIn && okCb && okOut ? "" : dev.error().c_str());
+    if (!(okIn && okCb && okOut)) return;
+
+    const int groups = (n + 63) / 64;      // ★シェーダの numthreads(64) と掛け算で n を超えるように
+    const bool okRun = dev.dispatch(groups);
+    std::vector<float> out(static_cast<std::size_t>(n), -1.0f);
+    const bool okRead = dev.readOutput(out.data(), out.size() * sizeof(float));
+    check("[GPU] 流して読み戻せる（staging を挟む）", okRun && okRead, okRun && okRead ? "" : dev.error().c_str());
+    if (!(okRun && okRead)) return;
+
+    double worst = 0.0; int bad = 0;
+    for (int i = 0; i < n; ++i) {
+        const double want = static_cast<double>(in[static_cast<std::size_t>(i)]) * 3.0 + i;
+        const double got = out[static_cast<std::size_t>(i)];
+        const double e = std::fabs(got - want);
+        if (e > 1e-4) ++bad;
+        worst = std::max(worst, e);
+    }
+    std::snprintf(buf, sizeof(buf), "(%d 要素、外れ %d 個、最大のずれ %.2e)", n, bad, worst);
+    check("[GPU] 答えが CPU の期待と合う（in*3 + 番号）", bad == 0, buf);
+}
+
 /// 【探り】壁に近づいたときの初期反射（AF_ONLY=nearwall）
 ///   面音源化の狙いのうち **「壁が近いと虚像の密度が上がり、到達が近く早くなる ＝ 奥行き感」**
 ///   が今の ISM で出ているかを測る。
@@ -1919,7 +1978,7 @@ int main() {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
-        {"budget", testBudget}, {"clicks", testClicks}, {"leak", testLeakModels},
+        {"budget", testBudget}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels},
         {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {
