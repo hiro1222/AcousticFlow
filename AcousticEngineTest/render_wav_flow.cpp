@@ -123,7 +123,10 @@ int main(int argc, char** argv) {
     const AF_Vector3 L = V(0, 1.6f, -4.0f);
     const AF_Vector3 S = V(srcX, 1.6f, 3.5f);
     AF_WorldSetListener(w, L, V(0, 0, 1), V(0, 1, 0));
-    const int emitter = AF_WorldAddEmitter(w, S, 0.2f);
+    // 音源の幅（m）。開口の半影＝角度の緩衝はこの幅の見込み角で決まる。既定 0.2
+    float srcR = 0.2f;
+    if (const char* sr = std::getenv("AF_SRC_R")) srcR = static_cast<float>(std::atof(sr));
+    const int emitter = AF_WorldAddEmitter(w, S, srcR);
     // 部屋の粒度。戸口は 1.2 m なので、割るには一辺がその 1/4 以下ほしい。
     if (const char* rc = std::getenv("AF_ROOM_CELL")) AF_WorldSetRoomCell(w, static_cast<float>(std::atof(rc)));
     // 五成分の重み（直接・初期・後期・回折・透過）。AF_WEIGHTS="1,1,0,1,1" で後期を止める、など。
