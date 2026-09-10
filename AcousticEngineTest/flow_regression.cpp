@@ -600,10 +600,18 @@ void testBridge() {
 
 // ================================ [開口] aperture（段 5）
 //   蝶番 (gapL, h/2, 0) を軸に +Z へ θ 開いた板の Obb（Test_SwingDoor と同じ置き方）。
-Obb doorLeaf(float thetaDeg, float gapL = -0.5f, float w = 1.0f, float h = 3.0f, float thick = 0.06f) {
+// ★clearance: 枠との隙間(m)。**自由端と上下だけ**に付け、蝶番側は密着させる（実際の扉と同じ）。
+//   Unity の SwingDoor は既定 0.004 m を持っている。ここを 0 にすると板が戸口を隙間なく塞ぐので、
+//   「隙間から高域だけが漏れる」という作品の前提が形として存在しなくなる。
+//   既定は 0（今までの検査の値を 1 ビットも変えないため）。漏れを測るときだけ渡す。
+Obb doorLeaf(float thetaDeg, float gapL = -0.5f, float w = 1.0f, float h = 3.0f, float thick = 0.06f,
+             float clearance = 0.0f) {
     const float th = thetaDeg * 3.14159265f / 180.0f;
+    const float c = std::max(0.0f, clearance);
+    w = std::max(0.01f, w - c);
+    h = std::max(0.01f, h - 2.0f * c);
     const Vec3 right(std::cos(th), 0.0f, std::sin(th));
-    const Vec3 hinge(gapL, h * 0.5f, 0.0f);
+    const Vec3 hinge(gapL, h * 0.5f + c, 0.0f);
     Obb b; b.center = hinge + right * (w * 0.5f); b.halfExtents = Vec3(w * 0.5f, h * 0.5f, thick * 0.5f);
     b.axisX = right; b.axisY = Vec3(0, 1, 0); b.axisZ = cross(b.axisX, b.axisY);
     return b;
@@ -1174,14 +1182,14 @@ void testLeakModels() {
     char buf[220];
     // 場面は回帰の 2 部屋。扉は閉じたまま、耳を戸口の前で左右に振る。
     //   ★「漏れが聞こえる位置と聞こえない位置がある」という試聴報告を数字にする物差し。
-    auto sweep = [&](int model, double* outMax, int* outOn, int* outOff) {
+    auto sweep = [&](int model, float clearance, double* outMax, int* outOn, int* outOff) {
         AcousticMaterial wall = AcousticMaterial::defaultWall();
         for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
         World w;
         w.leakModel = model;
         const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
         for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
-        w.addBox(doorLeaf(0.0f), lm, true);                 // 閉じたまま動かさない
+        w.addBox(doorLeaf(0.0f, -0.5f, 1.0f, 3.0f, 0.06f, clearance), lm, true);   // 閉じたまま動かさない
         w.raysPerEmitter = 128; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
         w.setListener(Vec3(0, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
         const int e = w.addEmitter(Vec3(0, 1.6f, 3.0f), 0.2f);
@@ -1200,9 +1208,12 @@ void testLeakModels() {
         }
         *outMax = mx; *outOn = on; *outOff = off;
     };
+    const char* cle = std::getenv("AF_CLEARANCE");
+    const float clr = cle ? static_cast<float>(std::atof(cle)) : 0.0f;
+    std::printf("      枠との隙間 %.3f m（Unity の SwingDoor の既定は 0.004）\n", clr);
     for (int model = 0; model <= 3; ++model) {
         double mx; int on, off;
-        sweep(model, &mx, &on, &off);
+        sweep(model, clr, &mx, &on, &off);
         std::snprintf(buf, sizeof(buf), "(25 か所のうち漏れが透過を超えた所 %d、最大 透過の %.1f 倍 ＝ %+.1f dB)",
                       on, mx, afti::dB(mx));
         std::printf("      模型 %d %s\n", model, buf);
