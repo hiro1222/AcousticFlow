@@ -1169,6 +1169,13 @@ void testBudget() {
             timeIt("見通し（幅 0.2）", [&] { volatile auto v = discVisibility(box, mats, lis.pos, S, 0.2f); (void)v; });
             Visibility vv = discVisibility(box, mats, lis.pos, S, 0.2f);
             timeIt("回折", [&] { volatile auto d = edgeDiffraction(box, lis, S, vv); (void)d; });
+            // 動く箱を 1 つ足したときの回折の費用（段 9-c で候補に常時入れたぶん）
+            {
+                Surfaces box2 = box;
+                box2.add(Obb::axisAligned(Vec3(0.0f, 1.2f, 0.0f), Vec3(0.5f, 1.2f, 0.03f)), matId, true);
+                Visibility vv2 = discVisibility(box2, mats, lis.pos, S, 0.2f);
+                timeIt("回折（動く箱 1 個）", [&] { volatile auto d = edgeDiffraction(box2, lis, S, vv2); (void)d; });
+            }
             ImageSet im;
             timeIt("虚像（1・2 次）", [&] { buildImages(box, faces, lis, S, 0.2f, 0.06f, im); });
             std::printf("        虚像: 検討 %d / 有効 %d\n", im.candidates, im.count);

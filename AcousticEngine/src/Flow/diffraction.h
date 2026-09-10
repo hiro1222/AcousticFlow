@@ -95,10 +95,22 @@ inline Diffraction edgeDiffraction(const Surfaces& surf, const Listener& listene
     const float direct = length(S - L);
     if (direct <= kEps) return out;
     std::vector<int> shadowers;
-    for (int k = 0; k < std::min(vis.shadowers, Visibility::kMaxShadowers); ++k) shadowers.push_back(vis.shadowBox[k]);
+    auto addOnce = [&](int i) {
+        for (int k : shadowers) if (k == i) return;
+        shadowers.push_back(i);
+    };
+    for (int k = 0; k < std::min(vis.shadowers, Visibility::kMaxShadowers); ++k) addOnce(vis.shadowBox[k]);
+    // ★候補は「音源の円盤に影を落とした箱」だけでは足りない（段 9-c）。
+    //   扉が 20° 開いた所で耳を左右に振ると、±1.5 m より外で回折が丸ごと消えた（実測）。
+    //   そこで影を落としているのは仕切りで、その稜線を回る脚は開いた板に潰される。
+    //   実際に音を通しているのは**板の自由端**なのに、板は円盤に影を落としていないので候補に入っていない。
+    //   動く箱は「開口に立ちはだかる物」そのものなので、影を落としていなくても常に候補に入れる。
+    //   数は場面で数個なので費用は小さい（動かない箱は増やさない）。
+    for (int i = 0; i < surf.count(); ++i)
+        if (surf.at(i).active && surf.at(i).dynamic) addOnce(i);
     if (shadowers.empty())                                       // 念のため: 円盤の影が無いのに visible<1 は無いはずだが、中心線で補う
         for (int i = 0; i < surf.count(); ++i)
-            if (surf.at(i).active && segmentIntersectsObb(L, S, surf.at(i).obb)) shadowers.push_back(i);
+            if (surf.at(i).active && segmentIntersectsObb(L, S, surf.at(i).obb)) addOnce(i);
     if (shadowers.empty()) return out;
     float best = 0.0f, bestLen = 0.0f, bestW = 0.0f, bestA = 0.0f;
     GapOpen bestGap;
