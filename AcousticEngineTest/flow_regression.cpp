@@ -1203,6 +1203,11 @@ void testLeakModels() {
             const Mix* m = w.mix(e);
             double d = 0.0, tr = 0.0;
             for (int b = 0; b < kNumBands; ++b) { d += m->component6[kDiffract][b]; tr += m->component6[kTransmit][b]; }
+            const Diffraction* dfm = w.diffraction(e);
+            if (std::getenv("AF_LOUD"))
+                std::printf("        x=%5.2f 回折 %10.3e 透過 %10.3e | %d/%d δ=%.4f a=%.4f w=%.2f\n",
+                            x, d, tr, dfm->valid ? dfm->box : -1, dfm->valid ? dfm->edge : -1,
+                            dfm->delta, dfm->gapWidth, dfm->weight);
             if (d > tr) ++on; else ++off;                    // 板を透るぶんより回折が大きい ＝ 漏れが立っている
             mx = std::max(mx, d / std::max(tr, 1e-30));
         }
