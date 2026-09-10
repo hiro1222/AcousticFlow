@@ -1175,6 +1175,11 @@ void testBudget() {
                 box2.add(Obb::axisAligned(Vec3(0.0f, 1.2f, 0.0f), Vec3(0.5f, 1.2f, 0.03f)), matId, true);
                 Visibility vv2 = discVisibility(box2, mats, lis.pos, S, 0.2f);
                 timeIt("回折（動く箱 1 個）", [&] { volatile auto d = edgeDiffraction(box2, lis, S, vv2); (void)d; });
+                // 遮る物がある配置での見通しの費用（簡易の段で点に落としている理由の検算）
+                Visibility vs3 = discVisibility(box2, mats, lis.pos, S, 0.2f);
+                std::printf("        （遮り %d 枚・見通し %.3f）\n", vs3.shadowers, vs3.visible);
+                timeIt("見通し 幅0.2（遮りあり）", [&] { volatile auto v = discVisibility(box2, mats, lis.pos, S, 0.2f); (void)v; });
+                timeIt("見通し 点（簡易の段）", [&] { volatile auto v = discVisibility(box2, mats, lis.pos, S, 0.0f); (void)v; });
             }
             ImageSet im;
             timeIt("虚像（1・2 次）", [&] { buildImages(box, faces, lis, S, 0.2f, 0.06f, im); });
@@ -1239,6 +1244,117 @@ void testLeakModels() {
             check(buf, on > 0);      // ★基準点。ここが 0 になったら、この検査は何も見張っていない
         }
     }
+}
+
+/// 【探り】音源を増やして扉を動かす（AF_ONLY=manysrc）
+///   試聴の「17 音源で扉を動かすと、開いてる途中や止めたときに音が遅くなってドロップアウトする」を数字にする。
+///   出す物: 段の数、音源ごとの「最後に解いてから何フレーム経ったか」、レイの本数、
+///           1 フレームで全群を引き直した回数（費用の山）。
+void testManySources() {
+    const char* ns = std::getenv("AF_SRC_N");
+    const int N = ns ? std::atoi(ns) : 17;
+    std::printf("\n[探り] 音源 %d 本で扉を動かす ── 段の巡りと答えの古さ\n", N);
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    World w;
+    const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+    for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+    const int leaf = w.addBox(doorLeaf(0.0f, -0.5f, 1.0f, 3.0f, 0.06f, 0.004f), lm, true);
+    w.raysPerEmitter = 256;
+    { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
+    w.setListener(Vec3(0, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+    // 奥の部屋に音源を並べる（戸口の向こう。扉の効きが全部に乗る配置）。
+    std::vector<int> ids;
+    for (int i = 0; i < N; ++i) {
+        const float t = (N > 1) ? static_cast<float>(i) / (N - 1) : 0.5f;
+        ids.push_back(w.addEmitter(Vec3(-5.0f + 10.0f * t, 1.6f, 1.0f + 4.0f * ((i % 3) * 0.5f)), 0.2f));
+    }
+    w.build();
+    const float dt = 1.0f / 60.0f;
+    // 最後に「解かれた」フレーム（rays > 0 だったフレーム）を音源ごとに覚える。
+    std::vector<int> lastSolved(static_cast<std::size_t>(N), -1);
+    std::vector<int> worstStale(static_cast<std::size_t>(N), 0);
+    double msSum = 0.0, msMax = 0.0;
+    std::vector<int> prevRays(static_cast<std::size_t>(N), -1);
+    std::vector<double> msAll;
+    std::vector<float> prevVis(static_cast<std::size_t>(N), -1.0f);
+    std::vector<double> prevTot(static_cast<std::size_t>(N), -1.0);
+    int visJump = 0, visJumpLight = 0, worstStepAt = -1, worstStepTier = -1; double worstStep = 0.0;
+    std::vector<int> prevTier(static_cast<std::size_t>(N), -1);
+    int tierChanges = 0; double stepOnChange = 0.0, stepOnSame = 0.0;
+    int reTraceTotal = 0, reTraceMax = 0;
+    std::printf("        %6s %6s | %5s %5s %5s | %8s %8s | %s\n",
+                "フレーム", "扉°", "厳密", "簡易", "保持", "最古(f)", "平均(f)", "使ったレイ");
+    const int frames = 240;
+    for (int k = 0; k < frames; ++k) {
+        // 0〜120: 30°/s で開く。120〜180: 止める。180〜240: 続きを開く。
+        float deg;
+        if (k < 120) deg = 30.0f * (k * dt);
+        else if (k < 180) deg = 30.0f * (120 * dt);
+        else deg = std::min(90.0f, 30.0f * ((k - 60) * dt));
+        w.setBoxTransform(leaf, doorLeaf(deg, -0.5f, 1.0f, 3.0f, 0.06f, 0.004f));
+        const auto t0 = std::chrono::steady_clock::now();
+        w.update(dt);
+        msSum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        { const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+          msMax = std::max(msMax, ms); if (k > 5) msAll.push_back(ms); }
+        int full = 0, light = 0, hold = 0, reTrace = 0;
+        for (int i = 0; i < N; ++i) {
+            const int t = w.tierOf(ids[static_cast<std::size_t>(i)]);
+            const int r = w.raysOf(ids[static_cast<std::size_t>(i)]);
+            // ★本数が変わった音源は、その場で**全群を引き直す**（world.h: groupRays != bs.rays）。
+            //   1 音源ぶんが 4 倍になるので、同じフレームで何本も変わると山になる。
+            if (r != prevRays[static_cast<std::size_t>(i)] && r > 0 && prevRays[static_cast<std::size_t>(i)] >= 0) ++reTrace;
+            prevRays[static_cast<std::size_t>(i)] = r;
+            if (r > 0) lastSolved[static_cast<std::size_t>(i)] = k;
+            // 見通しと総量。簡易（t==1）は円盤が点に落ちるので、扉が動く途中で 0/1 に跳びうる。
+            {
+                const Visibility* vs = w.visibility(ids[static_cast<std::size_t>(i)]);
+                const Mix* mx = w.mix(ids[static_cast<std::size_t>(i)]);
+                double tot = 0.0; for (int b = 0; b < kNumBands; ++b) tot += mx->energy6[b];
+                const float v = vs ? vs->visible : 1.0f;
+                const float pv = prevVis[static_cast<std::size_t>(i)];
+                if (pv >= 0.0f && std::fabs(v - pv) > 0.5f) { ++visJump; if (t == 1) ++visJumpLight; }
+                if (prevTot[static_cast<std::size_t>(i)] > 0.0 && tot > 0.0) {
+                    const double st = std::fabs(afti::dB(tot / prevTot[static_cast<std::size_t>(i)]));
+                    const bool changed = (prevTier[static_cast<std::size_t>(i)] >= 0 && prevTier[static_cast<std::size_t>(i)] != t);
+                    if (changed) { ++tierChanges; stepOnChange = std::max(stepOnChange, st); }
+                    else stepOnSame = std::max(stepOnSame, st);
+                    if (st > worstStep) { worstStep = st; worstStepAt = k; worstStepTier = t; }
+                }
+                prevTier[static_cast<std::size_t>(i)] = t;
+                prevVis[static_cast<std::size_t>(i)] = v; prevTot[static_cast<std::size_t>(i)] = tot;
+            }
+            if (t == 0) ++full; else if (t == 1) ++light; else ++hold;
+            const int stale = k - lastSolved[static_cast<std::size_t>(i)];
+            if (k > 10 && stale > worstStale[static_cast<std::size_t>(i)]) worstStale[static_cast<std::size_t>(i)] = stale;
+        }
+        reTraceTotal += reTrace; reTraceMax = std::max(reTraceMax, reTrace);
+        if (k % 20 == 0 && k > 0) {
+            int oldest = 0; double mean = 0.0;
+            for (int i = 0; i < N; ++i) {
+                const int stale = k - lastSolved[static_cast<std::size_t>(i)];
+                oldest = std::max(oldest, stale); mean += stale;
+            }
+            std::printf("        %6d %6.1f | %5d %5d %5d | %8d %8.1f | %d\n",
+                        k, deg, full, light, hold, oldest, mean / N, w.spentRays());
+        }
+    }
+    int worst = 0; double meanWorst = 0.0;
+    for (int i = 0; i < N; ++i) { worst = std::max(worst, worstStale[static_cast<std::size_t>(i)]); meanWorst += worstStale[static_cast<std::size_t>(i)]; }
+    std::printf("        → 段が入れ替わった回数 %d、そのフレームの最大の段差 %.2f dB（入れ替わらない所は %.2f dB）\n",
+                tierChanges, stepOnChange, stepOnSame);
+    std::printf("        → 見通しが 1 フレームで 0.5 以上跳んだ回数 %d（うち簡易の段 %d）\n", visJump, visJumpLight);
+    std::printf("        → 1 音源の総量の 1 フレーム最大の段差 %.2f dB（フレーム %d、段 %d）\n", worstStep, worstStepAt, worstStepTier);
+    { std::sort(msAll.begin(), msAll.end());
+      const std::size_t m = msAll.size();
+      int over = 0; for (double v : msAll) if (v > 16.7) ++over;
+      std::printf("        → 中央 %.2f ms / 95%% %.2f ms / 最大 %.2f ms、16.7 ms 超え %d / %d フレーム\n",
+                  msAll[m/2], msAll[m*95/100], msAll[m-1], over, static_cast<int>(m)); }
+    std::printf("        → 全群の引き直し: 合計 %d 回 / 1 フレーム最大 %d 本（音源 %d 本中）\n", reTraceTotal, reTraceMax, N);
+    std::printf("        → 1 フレームの update: 平均 %.2f ms / 最大 %.2f ms（音源 %d 本、群 %d）\n", msSum / frames, msMax, N, w.rayGroups);
+    std::printf("        → 答えが古くなった最大 %d フレーム（%.0f ms）、音源ごとの平均 %.1f フレーム\n",
+                worst, worst * dt * 1000.0f, meanWorst / N);
 }
 
 /// 【探り】扉の脇へ歩いたときの定位と跳び（AF_ONLY=doorside）
@@ -1368,6 +1484,7 @@ void testDoorSweep() {
     for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
     const int leaf = w.addBox(doorLeaf(0.0f), lm, true);
     w.raysPerEmitter = 256;
+    { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     if (const char* lk = std::getenv("AF_LEAK")) w.leakModel = std::atoi(lk);   // 漏れの模型 0/1/2/3
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 1;
       const char* bd = std::getenv("AF_BUDGET"); w.budget.cfg.totalRays = bd ? std::atoi(bd) : 0; }
@@ -1460,7 +1577,8 @@ void testClicks() {
         const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
         for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
         const int leaf = w.addBox(doorLeaf(0.0f), lm, true);
-        w.raysPerEmitter = 256;
+    w.raysPerEmitter = 256;
+    { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     if (const char* lk = std::getenv("AF_LEAK")) w.leakModel = std::atoi(lk);   // 漏れの模型 0/1/2/3
         w.budget.cfg.totalRays = (which == 3) ? 0 : 1536;
         w.rayGroups = (which == 2 || which == 3) ? 1 : 4;
@@ -1567,7 +1685,7 @@ int main() {
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
         {"budget", testBudget}, {"clicks", testClicks}, {"leak", testLeakModels},
-        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
+        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {
         // AF_ONLY はコンマ区切りで複数指定できる（例 AF_ONLY=world,bridge）
