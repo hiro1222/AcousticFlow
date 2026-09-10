@@ -1484,6 +1484,69 @@ void testGpuPipe() {
                 for (int b = 0; b < kNumBands && same; ++b) same = (rg2.early6[b] == rg.early6[b] && rg2.late6[b] == rg.late6[b]);
                 std::snprintf(buf, sizeof(buf), "(2 回目の当たり %d)", rg2.hits);
                 check("[GPU] 同じ入力なら何度流しても同じ答え（静止していれば揺れない）", same, buf);
+                // ⑤ 束ねても 1 本ずつと同じ答えか（段 2-e）
+                //   ★ここが今回いちばん危ない所。音源ごとに本数が違うと、出力の区切り（rayBase）と
+                //     組の切り上げ（blockFirst）がずれて、隣の音源の枠へ書き込む。
+                //     症状は「特定の音源だけ音が化ける」で、聞いても原因が分からない。
+                //     だから**本数をわざと 64 の倍数から外して**混ぜ、1 本ずつと突き合わせる。
+                {
+                    const int kN = 5;
+                    const int rays[kN] = {100, 512, 37, 1000, 256};      // 64 の倍数はわざと 2 つだけ
+                    const int grp[kN]  = {1, 4, 3, 4, 1};                // 群も混ぜる（詰め方の検査）
+                    const int gsel[kN] = {0, 2, 1, 0, 0};
+                    const Vec3 pos[kN] = {Vec3(1.5f, 1.6f, -1.0f), Vec3(-1.2f, 1.0f, 0.8f), Vec3(0.3f, 2.2f, -2.0f),
+                                          Vec3(2.0f, 0.6f, 2.0f), Vec3(-2.5f, 1.8f, -0.4f)};
+                    TraceResult one[kN], many[kN];
+                    acoustic::gpu::BatchJob jb[kN];
+                    for (int j = 0; j < kN; ++j) {
+                        TraceParams pj{rays[j], 20, 0.03f, static_cast<std::uint32_t>(11 + j * 7), grp[j], gsel[j]};
+                        gt.run(sc, pos[j], L, pj, one[j]);
+                        jb[j].source = pos[j]; jb[j].prm = pj; jb[j].out = &many[j];
+                    }
+                    const bool okB = gt.runBatch(sc, L, jb, kN);
+                    int badj = -1; double worstD = 0.0;
+                    for (int j = 0; j < kN && okB; ++j) {
+                        bool same = (one[j].hits == many[j].hits && one[j].raysTraced == many[j].raysTraced);
+                        for (int b = 0; b < kNumBands; ++b) {
+                            if (one[j].early6[b] != many[j].early6[b] || one[j].late6[b] != many[j].late6[b]) same = false;
+                            worstD = std::max(worstD, std::fabs(static_cast<double>(one[j].early6[b] - many[j].early6[b])));
+                        }
+                        if (!same && badj < 0) badj = j;
+                    }
+                    std::snprintf(buf, sizeof(buf), "(%d 音源を 1 回で。合わない音源 %d、初期の最大のずれ %.2e)",
+                                  kN, badj, worstD);
+                    check("[GPU] 束ねても 1 本ずつと同じ答え（本数がばらばらでも枠を越えない）", okB && badj < 0, buf);
+                }
+                // ── 速さ（束ね）。同じ本数を「1 本ずつ」と「1 回で」並べる ──
+                std::printf("      速さ（%d 音源ぶん。転送と読み戻し込み）:\n", 17);
+                std::printf("        %8s | %12s %12s | %s\n", "レイ/音源", "1 音源ずつ", "1 回で", "倍率");
+                for (int nr : {512, 2048, 8192}) {
+                    const int kM = 17;
+                    std::vector<Vec3> ps(static_cast<std::size_t>(kM));
+                    std::vector<TraceResult> rs(static_cast<std::size_t>(kM));
+                    std::vector<acoustic::gpu::BatchJob> js(static_cast<std::size_t>(kM));
+                    for (int j = 0; j < kM; ++j) {
+                        const float a = static_cast<float>(j) * 0.37f;
+                        ps[static_cast<std::size_t>(j)] = Vec3(2.0f * std::cos(a), 1.0f + 0.1f * j, 2.0f * std::sin(a));
+                        TraceParams pj{nr, 40, 0.03f, static_cast<std::uint32_t>(3 + j * 13), 1, 0};
+                        js[static_cast<std::size_t>(j)].source = ps[static_cast<std::size_t>(j)];
+                        js[static_cast<std::size_t>(j)].prm = pj;
+                        js[static_cast<std::size_t>(j)].out = &rs[static_cast<std::size_t>(j)];
+                    }
+                    gt.runBatch(sc, L, js.data(), kM);                  // 温める
+                    const auto s0 = std::chrono::steady_clock::now();
+                    for (int q = 0; q < 3; ++q)
+                        for (int j = 0; j < kM; ++j) { TraceResult t2; gt.run(sc, ps[static_cast<std::size_t>(j)], L, js[static_cast<std::size_t>(j)].prm, t2); }
+                    const double msOne = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count() / 3.0;
+                    const auto b0 = std::chrono::steady_clock::now();
+                    for (int q = 0; q < 3; ++q) {
+                        std::vector<TraceResult> tr(static_cast<std::size_t>(kM));
+                        for (int j = 0; j < kM; ++j) js[static_cast<std::size_t>(j)].out = &tr[static_cast<std::size_t>(j)];
+                        gt.runBatch(sc, L, js.data(), kM);
+                    }
+                    const double msBat = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0).count() / 3.0;
+                    std::printf("        %8d | %10.3f ms %10.3f ms | %.1f 倍\n", nr, msOne, msBat, msOne / std::max(msBat, 1e-6));
+                }
                 // ── 速さ（本題）。本数と跳ね返りを振って CPU と並べる ──
                 std::printf("      速さ（1 音源。GPU は転送と読み戻し込み）:\n");
                 std::printf("        %8s %6s | %10s %10s | %s\n", "レイ", "跳ね", "CPU", "GPU", "倍率");
@@ -1592,7 +1655,10 @@ void testManySources() {
     const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
     for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
     const int leaf = w.addBox(doorLeaf(0.0f, -0.5f, 1.0f, 3.0f, 0.06f, 0.004f), lm, true);
-    w.raysPerEmitter = 256;
+    // ★AF_RAYS は「1 音源の本数」を直に決める（上限も一緒に上げる）。
+    //   AF_MAX_PER だけを上げても、予算の元になる raysPerEmitter が 256 のままなので増えない。
+    { const char* r = std::getenv("AF_RAYS"); const int nr = r ? std::atoi(r) : 256;
+      w.raysPerEmitter = nr; w.budget.cfg.maxPerEmitter = std::max(nr, w.budget.cfg.maxPerEmitter); }
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     { const char* tr = std::getenv("AF_TOTAL_RAYS"); if (tr) w.budget.cfg.totalRays = std::atoi(tr); }
     { const char* gp = std::getenv("AF_GPU"); if (gp) w.gpuTrace = std::atoi(gp); }
@@ -1852,7 +1918,10 @@ void testDoorSweep() {
     const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
     for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
     const int leaf = w.addBox(doorLeaf(0.0f), lm, true);
-    w.raysPerEmitter = 256;
+    // ★AF_RAYS は「1 音源の本数」を直に決める（上限も一緒に上げる）。
+    //   AF_MAX_PER だけを上げても、予算の元になる raysPerEmitter が 256 のままなので増えない。
+    { const char* r = std::getenv("AF_RAYS"); const int nr = r ? std::atoi(r) : 256;
+      w.raysPerEmitter = nr; w.budget.cfg.maxPerEmitter = std::max(nr, w.budget.cfg.maxPerEmitter); }
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     if (const char* lk = std::getenv("AF_LEAK")) w.leakModel = std::atoi(lk);   // 漏れの模型 0/1/2/3
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 1;
@@ -1946,7 +2015,10 @@ void testClicks() {
         const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
         for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
         const int leaf = w.addBox(doorLeaf(0.0f), lm, true);
-    w.raysPerEmitter = 256;
+    // ★AF_RAYS は「1 音源の本数」を直に決める（上限も一緒に上げる）。
+    //   AF_MAX_PER だけを上げても、予算の元になる raysPerEmitter が 256 のままなので増えない。
+    { const char* r = std::getenv("AF_RAYS"); const int nr = r ? std::atoi(r) : 256;
+      w.raysPerEmitter = nr; w.budget.cfg.maxPerEmitter = std::max(nr, w.budget.cfg.maxPerEmitter); }
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     if (const char* lk = std::getenv("AF_LEAK")) w.leakModel = std::atoi(lk);   // 漏れの模型 0/1/2/3
         w.budget.cfg.totalRays = (which == 3) ? 0 : 1536;

@@ -10,6 +10,9 @@
  *      ここがずれると全部が化ける。だから両方を隣に書いて、同じ順で並べてある。
  *   2) レイごとの取り分（RayPartial と同じ中身）を UAV に書かせ、CPU で**本の順に**足す。
  *      GPU の中で足し込まない理由: 足す順が決まらないと答えが揺れる。順は CPU が決める。
+ *   2') **全音源を 1 回のディスパッチで流す**。音源ごとの違い（位置・本数・跳ね返り・境・種）は
+ *      定数ではなく t4 の表に置き、64 本ずつの「組」を音源の境で切り上げて並べ、
+ *      組 → 音源の表（t5）で引く。★1 音源ずつ流すと、流す手間が音源の数だけ掛かる。
  *   3) 直接音は GPU に載せない。決定的に出せる物を GPU へ持っていく理由が無い（CPU で出す）。
  *
  * ■ ビット一致しないこと
@@ -20,10 +23,13 @@
  *   ・HLSL の struct と下の Pack* の並びがずれる（いちばん多い事故）。
  *   ・numthreads(64) と組数の掛け算がレイの本数を下回ると、後ろの本が静かに欠ける。
  *   ・場面を作り直したのに転送し直さないと、古い幾何で解く。毎回 upload する。
+ *   ・音源ごとの出力の区切り（rayBase）と組の切り上げ（blockFirst）が食い違うと、
+ *     隣の音源の枠へ書き込んで**別の音源の音が化ける**。ここは表を作る側と読む側を並べて書いてある。
  */
 #ifndef ACOUSTICFLOW_GPU_TRACE_GPU_H
 #define ACOUSTICFLOW_GPU_TRACE_GPU_H
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -45,9 +51,19 @@ struct PackOut  { float earlyLo[3]; float earlyHi[3]; float lateLo[3]; float lat
                   float emitLo[3];  float emitHi[3];  float absbLo[3]; float absbHi[3];
                   float remLo[3];   float remHi[3];   float escLo[3];  float escHi[3];
                   float firstSec; std::int32_t hits, nee, pad; };
-struct PackCb   { float source[3]; float e0; float listener[3]; float mixingSec;
-                  std::uint32_t rays, maxBounces, seed, boxCount;
-                  std::uint32_t nodeCount, groups, group, itemCount; };
+struct PackEmit { float source[3]; float e0;
+                  std::uint32_t rayBase, rays, seed, groups;
+                  std::uint32_t group, maxBounces, blockFirst; float mixingSec; };
+struct PackCb   { float listener[3]; float pad0;
+                  std::uint32_t boxCount, nodeCount, itemCount, blockCount; };
+
+/// 1 回のディスパッチに載せる 1 音源ぶんの注文。
+///   out は**足し込み先**（直接音を入れた TraceResult をそのまま渡す。反射だけを足す）。
+struct BatchJob {
+    Vec3                source;
+    flow::TraceParams   prm;
+    flow::TraceResult*  out = nullptr;
+};
 
 /// GPU でレイを解く器。場面が変わるたびに upload、レイのたびに run。
 class GpuTracer {
@@ -113,33 +129,88 @@ public:
         return ok;
     }
 
-    /// 解く。直接音は CPU 側で出すので、ここは反射だけ（TraceResult の反射の欄を埋める）。
-    bool run(const flow::TraceScene& sc, const Vec3& source, const Vec3& listener,
-             const flow::TraceParams& prm, flow::TraceResult& R) {
-        if (!available()) return false;
-        const int N = std::max(1, prm.rays);
+    /// 解く（束ね）。全音源を **1 回のディスパッチ**で流す。
+    ///   ★1 音源ずつ流していた頃は、1 フレームに音源の数だけ「定数を積む → 出力を作る →
+    ///     流す → 読み戻す」を繰り返していた。この手間は本数に関係なく毎回掛かるので、
+    ///     音源が増えるほど、本数を増やすほど、計算そのものより手間の方が重くなる。
+    bool runBatch(const flow::TraceScene& sc, const Vec3& listener, BatchJob* jobs, int nJobs) {
+        if (!available() || jobs == nullptr || nJobs <= 0) return false;
+        // 1) 音源ごとの欄を組む。組（64 本ずつ）は音源の境で切り上げて並べる。
+        emit_.clear(); block_.clear();
+        emit_.reserve(static_cast<std::size_t>(nJobs));
+        std::uint32_t rayBase = 0;
+        for (int j = 0; j < nJobs; ++j) {
+            const flow::TraceParams& prm = jobs[j].prm;
+            const int N = std::max(1, prm.rays);
+            const int G = std::max(1, prm.groups);
+            const int g = ((prm.group % G) + G) % G;
+            // ★このフレームに実際に走る本数だけを並べる（走らない本を並べると読み戻しが groups 倍になる）。
+            const int cnt = (g < N) ? ((N - g + G - 1) / G) : 0;
+            PackEmit e{};
+            e.source[0] = jobs[j].source.x; e.source[1] = jobs[j].source.y; e.source[2] = jobs[j].source.z;
+            e.e0 = 1.0f / static_cast<float>(N);
+            e.rayBase = rayBase;
+            e.rays = static_cast<std::uint32_t>(cnt);
+            e.seed = prm.seed;
+            e.groups = static_cast<std::uint32_t>(G);
+            e.group = static_cast<std::uint32_t>(g);
+            e.maxBounces = static_cast<std::uint32_t>(std::max(1, prm.maxBounces));
+            e.blockFirst = static_cast<std::uint32_t>(block_.size());
+            e.mixingSec = prm.mixingSec;
+            emit_.push_back(e);
+            const int blocks = (cnt + 63) / 64;
+            for (int b = 0; b < blocks; ++b) block_.push_back(static_cast<std::uint32_t>(j));
+            rayBase += static_cast<std::uint32_t>(cnt);
+        }
+        // 2) 場面以外の入力を積む
+        bool ok = dev_.setInput(4, emit_.data(), emit_.size() * sizeof(PackEmit), sizeof(PackEmit));
+        ok = ok && dev_.setInput(5, block_.data(), block_.size() * sizeof(std::uint32_t), sizeof(std::uint32_t));
+        if (!ok) { err_ = dev_.error(); return false; }
         PackCb cb{};
-        cb.source[0] = source.x; cb.source[1] = source.y; cb.source[2] = source.z;
         cb.listener[0] = listener.x; cb.listener[1] = listener.y; cb.listener[2] = listener.z;
-        cb.e0 = 1.0f / static_cast<float>(N);
-        cb.mixingSec = prm.mixingSec;
-        cb.rays = static_cast<std::uint32_t>(N);
-        cb.maxBounces = static_cast<std::uint32_t>(std::max(1, prm.maxBounces));
-        cb.seed = prm.seed;
         cb.boxCount = static_cast<std::uint32_t>(sc.boxCount());
         cb.nodeCount = static_cast<std::uint32_t>(sc.node.size());
-        cb.groups = static_cast<std::uint32_t>(std::max(1, prm.groups));
-        cb.group = static_cast<std::uint32_t>(((prm.group % std::max(1, prm.groups)) + std::max(1, prm.groups)) % std::max(1, prm.groups));
         cb.itemCount = static_cast<std::uint32_t>(sc.item.size());
+        cb.blockCount = static_cast<std::uint32_t>(block_.size());
         if (!dev_.setConstants(&cb, sizeof(cb))) { err_ = dev_.error(); return false; }
-        out_.assign(static_cast<std::size_t>(N), PackOut{});
+        // 3) 流して読み戻す
+        if (block_.empty()) return true;                       // 走る本が 1 本も無いフレーム
+        out_.assign(static_cast<std::size_t>(rayBase), PackOut{});
         if (!dev_.setOutput(out_.size() * sizeof(PackOut), sizeof(PackOut))) { err_ = dev_.error(); return false; }
-        if (!dev_.dispatch((N + 63) / 64)) { err_ = dev_.error(); return false; }
+        if (!dev_.dispatch(static_cast<int>(block_.size()))) { err_ = dev_.error(); return false; }
         if (!dev_.readOutput(out_.data(), out_.size() * sizeof(PackOut))) { err_ = dev_.error(); return false; }
-        // ★足すのは CPU。本の順に足すので、答えは実行のたびに変わらない。
-        for (int i = 0; i < N; ++i) {
-            const PackOut& p = out_[static_cast<std::size_t>(i)];
-            if (p.hits == 0 && p.emitLo[0] == 0.0f) continue;      // その組で走らなかった本
+        // 4) 足すのは CPU。音源ごとに**本の順**に足すので、答えは実行のたびに変わらない。
+        for (int j = 0; j < nJobs; ++j) {
+            if (jobs[j].out == nullptr) continue;
+            gather(emit_[static_cast<std::size_t>(j)], *jobs[j].out);
+        }
+        return true;
+    }
+
+    /// 1 音源だけ解く（検査と、束ねる相手がいないとき用）。中身は束ねと同じ道を通る。
+    bool run(const flow::TraceScene& sc, const Vec3& source, const Vec3& listener,
+             const flow::TraceParams& prm, flow::TraceResult& R) {
+        BatchJob j; j.source = source; j.prm = prm; j.out = &R;
+        return runBatch(sc, listener, &j, 1);
+    }
+
+private:
+    ComputeDevice dev_;
+    bool ready_ = false;
+    std::string err_;
+    std::vector<PackObb>  obb_;
+    std::vector<PackNode> node_;
+    std::vector<PackItem> item_;
+    std::vector<PackMat>  mat_;
+    std::vector<PackEmit> emit_;
+    std::vector<std::uint32_t> block_;
+    std::vector<PackOut>  out_;
+
+    /// 1 音源ぶんの取り分を足す。
+    void gather(const PackEmit& e, flow::TraceResult& R) const {
+        const std::size_t base = e.rayBase;
+        for (std::uint32_t i = 0; i < e.rays; ++i) {
+            const PackOut& p = out_[base + i];      // ★詰めてあるので、並んでいる本は全部走った本
             ++R.raysTraced;
             R.hits += p.hits; R.neeVisible += p.nee;
             for (int b = 0; b < acoustic::kNumBands; ++b) {
@@ -154,18 +225,7 @@ public:
             if (p.firstSec > 0.0f && (R.firstReflectSec < 0.0f || p.firstSec < R.firstReflectSec))
                 R.firstReflectSec = p.firstSec;
         }
-        return true;
     }
-
-private:
-    ComputeDevice dev_;
-    bool ready_ = false;
-    std::string err_;
-    std::vector<PackObb>  obb_;
-    std::vector<PackNode> node_;
-    std::vector<PackItem> item_;
-    std::vector<PackMat>  mat_;
-    std::vector<PackOut>  out_;
 };
 
 }  // namespace gpu

@@ -61,7 +61,7 @@ public:
     /// HLSL を積む。entry は入口の関数名。失敗したら false（error() に理由）。
     bool setShader(const char* hlsl, const char* entry);
 
-    /// 入力の構造化バッファを置く（slot は t0, t1, ...）。stride は要素 1 個の大きさ。
+    /// 入力の構造化バッファを置く（slot は t0..t7）。stride は要素 1 個の大きさ。
     bool setInput(int slot, const void* data, std::size_t bytes, std::size_t stride);
     /// 定数（16 バイト境界に合わせた塊をそのまま渡す。b0）。
     bool setConstants(const void* data, std::size_t bytes);

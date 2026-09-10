@@ -229,13 +229,16 @@ public:
         budget.update(live_, listener_.pos, dt, now_, raysPerEmitter, budgetSlots_);
         const int n = static_cast<int>(live_.size());
 
-        // 音源ごとの解き（互いに独立で、自分の枠にしか書かない → 並列化できる。既定は直列）。
-        auto solve = [&](int k) {
+        // ── レイの注文を先に全部集める（段 2-e）──
+        //   ★「何を解くか」を決める所と「解く」所を分けた。分けないと GPU へ束ねて出せない。
+        //     決め方は前と 1 文字も変えていないので、CPU の答えも前と同じ。
+        jobs_.clear(); jobRange_.assign(static_cast<std::size_t>(n), JobRange{});
+        for (int k = 0; k < n; ++k) {
             Slot& s = slots_[static_cast<std::size_t>(liveIdx_[static_cast<std::size_t>(k)])];
             const BudgetSlot& bs = budgetSlots_[static_cast<std::size_t>(k)];
             s.tier = static_cast<int>(bs.tier);
             s.rays = bs.rays;
-            if (bs.rays <= 0) return;                     // 保持: 最後の答えを保つ（Mix を触らない）
+            if (bs.rays <= 0) continue;                   // 保持: 最後の答えを保つ（Mix を触らない）
             const bool light = (bs.tier != Tier::Full);
             TraceParams prm;
             prm.rays = bs.rays; prm.maxBounces = light ? std::min(maxBounces, 12) : maxBounces; prm.mixingSec = mixingSec;
@@ -245,13 +248,35 @@ public:
             const int G = std::max(1, std::min(rayGroups, TraceGroups::kMax));
             prm.groups = G;
             prm.group = s.groupNext % G;
+            JobRange& jr = jobRange_[static_cast<std::size_t>(k)];
+            jr.first = static_cast<int>(jobs_.size());
             if (s.groupRays != bs.rays || s.groupCount != G) {
-                for (int k = 0; k < G; ++k) s.parts[k] = runTrace(s.em.pos, TraceParams{prm.rays, prm.maxBounces, prm.mixingSec, prm.seed, G, k});
+                for (int g = 0; g < G; ++g) {
+                    TraceParams pg = prm; pg.group = g;
+                    jobs_.push_back(TraceJob{s.em.pos, pg, &s.parts[g]});
+                }
                 s.groupRays = bs.rays; s.groupCount = G;
             } else {
-                s.parts[prm.group] = runTrace(s.em.pos, prm);
+                jobs_.push_back(TraceJob{s.em.pos, prm, &s.parts[prm.group]});
             }
+            jr.count = static_cast<int>(jobs_.size()) - jr.first;
             s.groupNext = (s.groupNext + 1) % G;
+        }
+        // ── GPU なら 1 回で全部流す。CPU なら音源ごとの解きの中で（並列のまま）解く。──
+        const bool batched = gpuActive() && runTracesBatched();
+
+        // 音源ごとの解き（互いに独立で、自分の枠にしか書かない → 並列化できる。既定は直列）。
+        auto solve = [&](int k) {
+            Slot& s = slots_[static_cast<std::size_t>(liveIdx_[static_cast<std::size_t>(k)])];
+            const BudgetSlot& bs = budgetSlots_[static_cast<std::size_t>(k)];
+            if (bs.rays <= 0) return;                     // 保持: 最後の答えを保つ（Mix を触らない）
+            const bool light = (bs.tier != Tier::Full);
+            const JobRange jr = jobRange_[static_cast<std::size_t>(k)];
+            if (!batched)
+                for (int j = jr.first; j < jr.first + jr.count; ++j)
+                    *jobs_[static_cast<std::size_t>(j)].out =
+                        runTrace(jobs_[static_cast<std::size_t>(j)].src, jobs_[static_cast<std::size_t>(j)].prm);
+            const int G = std::max(1, s.groupCount);
             TraceResult::sumGroups(s.parts, G, s.trace);
             // 見通し（解析）。幅は見込み角で点へ寄せた物。
             //   ★段に関わらず**円盤のまま**解く（2026-09-10）。以前は簡易・保持を点に落としていたが、
@@ -406,8 +431,28 @@ private:
     mutable gpu::GpuTracer gpuTracer_;
     bool gpuTried_ = false, gpuReady_ = false;
 
+    /// レイの注文（どの音源の、どの組を、何本）。
+    struct TraceJob { Vec3 src; TraceParams prm; TraceResult* out; };
+    struct JobRange { int first = 0, count = 0; };
+    mutable std::vector<TraceJob>  jobs_;
+    std::vector<JobRange>  jobRange_;
+    mutable std::vector<gpu::BatchJob> gpuJobs_;
+
+    /// 集めた注文を **1 回のディスパッチ**で解く。流せなければ false（呼び出し側が CPU で解き直す）。
+    ///   ★直接音はここでも CPU で出す（決定的なので GPU へ持っていく理由が無い）。
+    bool runTracesBatched() const {
+        if (jobs_.empty()) return true;
+        gpuJobs_.clear(); gpuJobs_.reserve(jobs_.size());
+        for (std::size_t j = 0; j < jobs_.size(); ++j) {
+            *jobs_[j].out = TraceResult{};
+            fillDirect(traceScene_, jobs_[j].src, listener_.pos, *jobs_[j].out);
+            gpu::BatchJob g; g.source = jobs_[j].src; g.prm = jobs_[j].prm; g.out = jobs_[j].out;
+            gpuJobs_.push_back(g);
+        }
+        return gpuTracer_.runBatch(traceScene_, listener_.pos, gpuJobs_.data(), static_cast<int>(gpuJobs_.size()));
+    }
+
     /// レイを 1 音源ぶん解く。GPU が入っていれば GPU、そうでなければ CPU。
-    ///   ★直接音はどちらでも CPU で出す（決定的なので GPU へ持っていく理由が無い）。
     TraceResult runTrace(const Vec3& src, const TraceParams& prm) const {
         if (!gpuActive()) return tracer_.run(traceScene_, src, listener_.pos, prm);
         TraceResult R;

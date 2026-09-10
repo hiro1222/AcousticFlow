@@ -22,6 +22,8 @@
  *
  * ■ 壊れる所
  *   ・numthreads とディスパッチの組数が食い違うと、後ろのレイが走らない（静かに欠ける）。
+ *   ・組 → 音源の表と blockFirst がずれると、音源の枠を越えて書き、**隣の音源の答えが化ける**。
+ *     切り上げで余った本は「書かずに帰る」こと（0 を書くと隣の 1 本目を潰す）。
  *   ・構造化バッファの並びが C++ 側の struct と 1 バイトでもずれると、全部が化ける。
  *     Obb は float3 が 4 つ + float3 で 15 float。HLSL 側も float の並びで受ける。
  *   ・スタックの深さが足りないと木の奥が見えない（CPU と同じ 64）。
@@ -34,8 +36,8 @@ namespace gpu {
 
 /// レイの本体（cs_5_0）。入口は "main"。
 ///   t0 箱（float 15 個ずつ）／t1 木のノード（float 6 + int 4）／t2 葉の添字と材質と印
-///   t3 材質の表（反射・透過・吸収 × 6 帯域 + 散乱率）
-///   u0 レイごとの取り分
+///   t3 材質の表（反射・透過・吸収 × 6 帯域 + 散乱率）／t4 音源ごとの設定／t5 組 → 音源の表
+///   u0 レイごとの取り分（音源ごとに rayBase から rays 本ぶん）
 inline const char* kTraceKernelHlsl() {
     return R"HLSL(
 // ★6 帯域は **float3 を 2 本**で持つ（lo = 125/250/500、hi = 1k/2k/4k）。
@@ -51,18 +53,24 @@ struct GOut   { float3 earlyLo; float3 earlyHi; float3 lateLo; float3 lateHi;
                 float3 emitLo;  float3 emitHi;  float3 absbLo; float3 absbHi;
                 float3 remLo;   float3 remHi;   float3 escLo;  float3 escHi;
                 float firstSec; int hits; int nee; int pad; };
+// ★音源ごとに違う物だけを集めた欄。定数（cbuffer）に置くと 1 音源しか入らないので、
+//   ここへ移して 1 回のディスパッチで全音源を流せるようにした（本数・跳ね返り・境・種は音源ごとに違う）。
+//   rays は「このフレームに**実際に走る本数**」（フレーム分散で 1/groups に減った後の数）。
+//   走らない本を出力に並べると、その分だけ読み戻しが太る（既定 群 4 なら 4 倍）。
+struct GEmit  { float3 source; float e0; uint rayBase; uint rays; uint seed; uint groups;
+                uint group; uint maxBounces; uint blockFirst; float mixingSec; };
 
 StructuredBuffer<GObb>  gObb  : register(t0);
 StructuredBuffer<GNode> gNode : register(t1);
 StructuredBuffer<GItem> gItem : register(t2);
 StructuredBuffer<GMat>  gMat  : register(t3);
+StructuredBuffer<GEmit> gEmit : register(t4);
+StructuredBuffer<uint>  gBlock : register(t5);   // 組 → 音源の番号（組ごとに 1 個）
 RWStructuredBuffer<GOut> gOut : register(u0);
 
 cbuffer Cb : register(b0) {
-    float3 gSource;   float gE0;
-    float3 gListener; float gMixingSec;
-    uint   gRays;     uint  gMaxBounces; uint gSeed;   uint gBoxCount;
-    uint   gNodeCount; uint gGroups;     uint gGroup;  uint gItemCount;
+    float3 gListener; float gPad0;
+    uint   gBoxCount; uint gNodeCount; uint gItemCount; uint gBlockCount;
 };
 
 static const float kPi = 3.14159265358979f;
@@ -199,24 +207,33 @@ void transmitTau(float3 p0, float3 p1, int skip, out float3 tauLo, out float3 ta
 }
 
 [numthreads(64, 1, 1)]
-void main(uint3 tid : SV_DispatchThreadID) {
-    uint slot = tid.x;
-    if (slot >= gRays) return;
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    // ★どの音源の何本目か、を「組の番号」から引く。
+    //   音源ごとに本数が違うので、組を音源の境で切り上げて並べ、組 → 音源の表を CPU が作る。
+    //   通し番号から割り算で求める形にすると、本数が音源ごとに違う時点で成り立たない。
+    uint blk = gid.x;
+    if (blk >= gBlockCount) return;
+    uint j = gBlock[blk];
+    GEmit em = gEmit[j];
+    uint l = (blk - em.blockFirst) * 64u + gtid.x;
+    if (l >= em.rays) return;              // 切り上げで余った本（書かずに帰る＝隣の音源を踏まない）
+    uint slot = em.rayBase + l;
+    // ★通し番号は詰めた番号から戻す。種は**通し番号**で作るので、
+    //   どの組に入っていても同じレイは同じ道を通る（静止していれば揺れない、の根拠）。
+    uint i = em.group + l * em.groups;
     GOut o = (GOut)0;
     o.firstSec = -1.0f;
-    uint i = slot;
-    if (gGroups > 1 && (i % gGroups) != gGroup) { gOut[slot] = o; return; }
 
-    uint rng = (gSeed * 2654435761u + 0x9E3779B9u) ^ (i * 2246822519u);
+    uint rng = (em.seed * 2654435761u + 0x9E3779B9u) ^ (i * 2246822519u);
     rng = rng * 747796405u + 2891336453u;
-    float3 eLo = float3(gE0, gE0, gE0), eHi = eLo;
+    float3 eLo = float3(em.e0, em.e0, em.e0), eHi = eLo;
     o.emitLo = eLo; o.emitHi = eHi;
-    float3 pos = gSource;
+    float3 pos = em.source;
     float3 dir = uniformSphere(rng);
     float pathLen = 0.0f;
     int skip = -1;
     bool terminated = false;
-    for (uint bounce = 0; bounce < gMaxBounces; ++bounce) {
+    for (uint bounce = 0; bounce < em.maxBounces; ++bounce) {
         Hit h = nearestHit(pos, dir, 1e4f, skip);
         if (!h.hit) { o.escLo += eLo; o.escHi += eHi; terminated = true; break; }
         o.hits += 1;
@@ -246,7 +263,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             float3 cLo = max(sideLo * geo * trLo * airLo(pathLen + dL), 0.0f);
             float3 cHi = max(sideHi * geo * trHi * airHi(pathLen + dL), 0.0f);
             bool any = (cLo.x + cLo.y + cLo.z + cHi.x + cHi.y + cHi.z) > 0.0f;
-            if (tSec < gMixingSec) { o.earlyLo += cLo; o.earlyHi += cHi; }
+            if (tSec < em.mixingSec) { o.earlyLo += cLo; o.earlyHi += cHi; }
             else                   { o.lateLo  += cLo; o.lateHi  += cHi; }
             if (any) {
                 o.nee += 1;
@@ -258,7 +275,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         bool goReflect = rand01(rng) < (rMean / carry);
         eLo *= (rLo + tLo); eHi *= (rHi + tHi);
         float eMax = max(max(max(eLo.x, eLo.y), max(eLo.z, eHi.x)), max(eHi.y, eHi.z));
-        if (eMax < gE0 * 1e-4f) { o.remLo += eLo; o.remHi += eHi; terminated = true; break; }
+        if (eMax < em.e0 * 1e-4f) { o.remLo += eLo; o.remHi += eHi; terminated = true; break; }
         if (goReflect) {
             float sc = gMat[mi].scat;
             dir = (rand01(rng) < sc) ? cosineHemisphere(nFace, rng) : (dir - nFace * (2.0f * dot(dir, nFace)));

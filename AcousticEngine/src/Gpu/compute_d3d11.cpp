@@ -22,17 +22,18 @@ struct ComputeDevice::Impl {
     ID3D11DeviceContext*  ctx = nullptr;
     ID3D11ComputeShader*  cs = nullptr;
     ID3D11Buffer*         cb = nullptr;
-    ID3D11Buffer*         in[4] = {};
-    ID3D11ShaderResourceView* srv[4] = {};
+    ID3D11Buffer*         in[8] = {};
+    ID3D11ShaderResourceView* srv[8] = {};
     ID3D11Buffer*         out = nullptr;
     ID3D11UnorderedAccessView* uav = nullptr;
     ID3D11Buffer*         staging = nullptr;
     std::size_t           outBytes = 0;
+    std::size_t           outStride = 0;
     std::string           err;
     std::string           adapter;
 
     ~Impl() {
-        for (int i = 0; i < 4; ++i) { release(srv[i]); release(in[i]); }
+        for (int i = 0; i < 8; ++i) { release(srv[i]); release(in[i]); }
         release(uav); release(out); release(staging); release(cb); release(cs); release(ctx); release(dev);
     }
 
@@ -115,7 +116,7 @@ bool ComputeDevice::setShader(const char* hlsl, const char* entry) {
 }
 
 bool ComputeDevice::setInput(int slot, const void* data, std::size_t bytes, std::size_t stride) {
-    if (!available() || slot < 0 || slot >= 4) return false;
+    if (!available() || slot < 0 || slot >= 8) return false;
     return d_->makeStructured(d_->in[slot], d_->srv[slot], data, bytes, stride);
 }
 
@@ -135,6 +136,9 @@ bool ComputeDevice::setConstants(const void* data, std::size_t bytes) {
 
 bool ComputeDevice::setOutput(std::size_t bytes, std::size_t stride) {
     if (!available() || bytes == 0 || stride == 0) return false;
+    // ★大きさが同じなら作り直さない。束ねると 1 回が 20 MB を超えるので、
+    //   毎フレーム作り直すと確保と解放だけで数 ms 掛かる（音源が動いても大きさは変わらない）。
+    if (d_->out && d_->uav && d_->staging && d_->outBytes == bytes && d_->outStride == stride) return true;
     release(d_->uav); release(d_->out); release(d_->staging);
     D3D11_BUFFER_DESC bd{};
     bd.ByteWidth = static_cast<UINT>(bytes);
@@ -155,14 +159,16 @@ bool ComputeDevice::setOutput(std::size_t bytes, std::size_t stride) {
     sdsc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     if (FAILED(d_->dev->CreateBuffer(&sdsc, nullptr, &d_->staging))) { d_->err = "CreateBuffer(staging) に失敗"; return false; }
     d_->outBytes = bytes;
+    d_->outStride = stride;
     return true;
 }
 
 bool ComputeDevice::dispatch(int groupsX) {
     if (!available() || !d_->cs || !d_->uav || groupsX <= 0) return false;
     d_->ctx->CSSetShader(d_->cs, nullptr, 0);
-    ID3D11ShaderResourceView* views[4] = {d_->srv[0], d_->srv[1], d_->srv[2], d_->srv[3]};
-    d_->ctx->CSSetShaderResources(0, 4, views);
+    ID3D11ShaderResourceView* views[8] = {d_->srv[0], d_->srv[1], d_->srv[2], d_->srv[3],
+                                          d_->srv[4], d_->srv[5], d_->srv[6], d_->srv[7]};
+    d_->ctx->CSSetShaderResources(0, 8, views);
     if (d_->cb) d_->ctx->CSSetConstantBuffers(0, 1, &d_->cb);
     UINT init = 0;
     d_->ctx->CSSetUnorderedAccessViews(0, 1, &d_->uav, &init);
