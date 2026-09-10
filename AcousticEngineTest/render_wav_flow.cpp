@@ -126,7 +126,18 @@ int main(int argc, char** argv) {
     const int emitter = AF_WorldAddEmitter(w, S, 0.2f);
     // 部屋の粒度。戸口は 1.2 m なので、割るには一辺がその 1/4 以下ほしい。
     if (const char* rc = std::getenv("AF_ROOM_CELL")) AF_WorldSetRoomCell(w, static_cast<float>(std::atof(rc)));
-    // 五成分の重み（直接・初期・後期・回折・透過）。AF_WEIGHTS="1,1,0,1,1" で後期を止める、など。\n    //   ★色がどこから来ているかを切り分けるための摘み。既定は全部 1。\n    if (const char* wv = std::getenv("AF_WEIGHTS")) {\n        float w5[5] = {1, 1, 1, 1, 1}; int k = 0;\n        for (const char* q = wv; *q && k < 5; ) {\n            w5[k++] = static_cast<float>(std::atof(q));\n            const char* c = std::strchr(q, ','); if (!c) break; q = c + 1;\n        }\n        AF_WorldSetWeights(w, w5);\n        std::printf("  成分の重み: 直接 %.2f 初期 %.2f 後期 %.2f 回折 %.2f 透過 %.2f\n", w5[0], w5[1], w5[2], w5[3], w5[4]);\n    }\n    AF_WorldBuild(w);
+    // 五成分の重み（直接・初期・後期・回折・透過）。AF_WEIGHTS="1,1,0,1,1" で後期を止める、など。
+    //   ★色や広がりがどこから来ているかを切り分けるための摘み。既定は全部 1。
+    if (const char* wv = std::getenv("AF_WEIGHTS")) {
+        float w5[5] = {1, 1, 1, 1, 1}; int k = 0;
+        for (const char* q = wv; *q && k < 5; ) {
+            w5[k++] = static_cast<float>(std::atof(q));
+            const char* c = std::strchr(q, 0x2c); if (!c) break; q = c + 1;
+        }
+        AF_WorldSetWeights(w, w5);
+        std::printf("  成分の重み: 直接 %.2f 初期 %.2f 後期 %.2f 回折 %.2f 透過 %.2f\n", w5[0], w5[1], w5[2], w5[3], w5[4]);
+    }
+    AF_WorldBuild(w);
     {
         float req = 0.0f, eff = 0.0f; double vox = 0.0, maxVox = 0.0;
         AF_WorldRoomCellInfo(w, &req, &eff, &vox, &maxVox);
@@ -153,9 +164,13 @@ int main(int argc, char** argv) {
     AF_VoiceSetFdnMix(voice, fdn);
 
     AF_DirectionBusHandle bus = AF_DirectionBusCreate(kSampleRate, 8, kBlock);
-    AF_DirectionBusSetHrtf(bus, hrtf, 57.0f);
-    AF_VoiceSetDirectionBus(voice, bus);
-    AF_FdnMixSetDirectionBus(fdn, bus, 57.0f);
+    // AF_NO_BUS=1 で方向バスを外す（尾と初期が直に L/R へ出る）。尾の狭さの出所を切り分ける摘み。
+    const bool useBus = std::getenv("AF_NO_BUS") == nullptr;
+    if (useBus) {
+        AF_DirectionBusSetHrtf(bus, hrtf, 57.0f);
+        AF_VoiceSetDirectionBus(voice, bus);
+        AF_FdnMixSetDirectionBus(fdn, bus, 57.0f);
+    }
 
     const float seconds = 12.0f;
     const int total = static_cast<int>(seconds * kSampleRate);
@@ -167,14 +182,24 @@ int main(int argc, char** argv) {
 
     std::printf("  扉を 0°→90°→0° と動かしながら %.0f 秒ぶん鳴らします\n", seconds);
     std::printf("    %6s %8s %9s %9s %9s %9s %9s %5s %6s %6s | %s\n",
-                "角度", "見通し", "直接", "初期", "後期", "回折", "透過", "段", "レイ", "虚像",
+                "角度/耳x", "見通し", "直接", "初期", "後期", "回折", "透過", "段", "レイ", "虚像",
                 "回折: 箱/稜線 δ 隙間 重み 影の数");
 
+    float fixedDeg = -1.0f;
+    if (const char* dd = std::getenv("AF_DOOR_DEG")) fixedDeg = static_cast<float>(std::atof(dd));
+    const bool listenSweep = std::getenv("AF_LISTEN_SWEEP") != nullptr;
     int pos = 0, nextReport = 0;
     while (pos < total) {
         const int n = std::min(kBlock, total - pos);
         const float u = static_cast<float>(pos) / static_cast<float>(total);
-        const float deg = (u < 0.5f) ? (u * 2.0f * 90.0f) : ((1.0f - u) * 2.0f * 90.0f);
+        // AF_DOOR_DEG で扉の角度を固定し、AF_LISTEN_SWEEP でリスナーを x 方向に振る。
+        //   閉じた扉の漏れが「位置によって聞こえたり聞こえなかったり」するかを測る摘み。
+        const float deg = fixedDeg >= 0.0f ? fixedDeg
+                        : ((u < 0.5f) ? (u * 2.0f * 90.0f) : ((1.0f - u) * 2.0f * 90.0f));
+        if (listenSweep) {
+            const float lx = -3.0f + 6.0f * u;
+            AF_WorldSetListener(w, V(lx, 1.6f, -4.0f), V(0, 0, 1), V(0, 1, 0));
+        }
 
         // 扉を回す（蝶番 x=-0.6）。中心と軸を置き直すだけ。
         const float th = deg * 3.14159265f / 180.0f;
@@ -199,7 +224,7 @@ int main(int argc, char** argv) {
             outR[static_cast<std::size_t>(pos + i)] = br[static_cast<std::size_t>(i)] + fr[static_cast<std::size_t>(i)];
         }
         std::fill(fl.begin(), fl.end(), 0.0f); std::fill(fr.begin(), fr.end(), 0.0f);
-        AF_DirectionBusRender(bus, n, fl.data(), fr.data());   // ★Unity では AudioListener で 1 回
+        if (useBus) AF_DirectionBusRender(bus, n, fl.data(), fr.data());   // ★Unity では AudioListener で 1 回
         for (int i = 0; i < n; ++i) {
             outL[static_cast<std::size_t>(pos + i)] += fl[static_cast<std::size_t>(i)];
             outR[static_cast<std::size_t>(pos + i)] += fr[static_cast<std::size_t>(i)];
@@ -213,7 +238,7 @@ int main(int argc, char** argv) {
             AF_DiffractionInfo di{};
             AF_WorldDiffractionInfo(w, emitter, &di);
             std::printf("    %6.1f %8.4f %9.2f %9.2f %9.2f %9.2f %9.2f %5d %6d %6d | %d/%d d=%.3f a=%.3f w=%.2f 影%d\n",
-                        deg, mi.visibleFraction, dB(cm[0]), dB(cm[1]), dB(cm[2]), dB(cm[3]), dB(cm[4]),
+                        listenSweep ? (-3.0f + 6.0f * u) : deg, mi.visibleFraction, dB(cm[0]), dB(cm[1]), dB(cm[2]), dB(cm[3]), dB(cm[4]),
                         AF_WorldEmitterTier(w, emitter), AF_WorldEmitterRays(w, emitter), mi.imageCount,
                         di.valid ? di.box : -1, di.valid ? di.edge : -1, di.delta, di.gapWidth, di.weight, mi.shadowers);
             nextReport += total / 12;
