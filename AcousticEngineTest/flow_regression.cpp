@@ -1218,6 +1218,61 @@ void testLeakModels() {
     }
 }
 
+/// 【探り】壁の陰を横切るときの緩衝（AF_ONLY=wallshadow）
+///   扉ではなく**ただの壁**。壁の端を回り込む所でリスナーを歩かせ、
+///   直接音が消えて回折に入れ替わるまでに何度かかるかを測る。
+///   ★「角度による減算のバッファ角」に当たる物がどこで決まっているかを見るための物差し。
+void testWallShadow() {
+    std::printf("\n[探り] 壁の陰を横切る ── 直接音と回折の受け渡しに何度かかるか\n");
+    auto sweep = [&](float srcR, bool header) {
+        AcousticMaterial wall = AcousticMaterial::defaultWall();
+        for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.0001f; wall.scattering[b] = 0.5f; }
+        World w;
+        const int m = w.rules.materials.add(wall);
+        // 壁 1 枚。z=0 に置き、x∈[-6,0] を塞ぐ。端は x=0。床も天井も置かない（反射を減らして見やすく）。
+        w.addBox(Obb::axisAligned(Vec3(-3.0f, 2.0f, 0.0f), Vec3(3.0f, 2.0f, 0.15f)), m, false);
+        const Vec3 S(-2.0f, 1.6f, 3.0f);
+        w.raysPerEmitter = 64; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+        w.setListener(Vec3(0, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w.addEmitter(S, srcR);
+        w.build();
+        // 影の境: 音源 S から壁の端(0,0) を通る直線を z=-3 まで伸ばした所。
+        //   S=(-2,3) → 端(0,0) の方向は (2,-3)。z=-3 まで同じだけ進むので x=+2。
+        // ★壁は厚み 0.3 m ある。影を広く落とすのは**奥の角**(z=+0.15) なので、そこを通る線で境を出す。
+        //   z=0 で計算すると 4° ずれる（実測でそのぶん偏って見えた）。
+        const float boundaryX = 2.0f * (3.0f + 0.15f) / (3.0f - 0.15f);
+        const float dEdge = 3.0f;                       // 端からリスナーの面までの距離（z 方向）
+        const float dt = 1.0f / 60.0f;
+        float lo = 999.0f, hi = 999.0f;
+        if (header)
+            std::printf("        %8s %8s %9s %9s %9s %9s | %s\n",
+                        "耳のx", "境から°", "見通し", "直接dB", "回折dB", "和dB", "回折の δ");
+        for (int k = 0; k <= 40; ++k) {
+            const float x = 0.0f + 0.1f * k;             // 影の中(0) から明るい側(+4) へ
+            w.setListener(Vec3(x, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+            for (int q = 0; q < 3; ++q) w.update(dt);    // 追従を落ち着かせる
+            const Mix* mx = w.mix(e);
+            const Visibility* vs = w.visibility(e);
+            const Diffraction* df = w.diffraction(e);
+            double dir = 0.0, dif = 0.0;
+            for (int b = 0; b < kNumBands; ++b) { dir += mx->component6[kDirect][b]; dif += mx->component6[kDiffract][b]; }
+            // 影の境からの角度（端を頂点として、境の方向とリスナー方向のなす角）
+            const float degFromBoundary = std::atan2(x - boundaryX, dEdge) * 180.0f / 3.14159265f;
+            if (vs->visible >= 0.05f && lo > 90.0f) lo = degFromBoundary;
+            if (vs->visible >= 0.95f && hi > 90.0f) hi = degFromBoundary;
+            std::printf("        %8.2f %8.2f %9.4f %9.2f %9.2f %9.2f | %.4f\n",
+                        x, degFromBoundary, vs->visible, afti::dB(dir), afti::dB(dif), afti::dB(dir + dif),
+                        df->valid ? df->delta : 0.0f);
+        }
+        std::printf("        → 緩衝の幅: 見通し 5%% (%.2f°) から 95%% (%.2f°) まで **%.1f 度**（音源の幅 %.2f m）\n",
+                    lo, hi, hi - lo, srcR);
+    };
+    std::printf("      音源の幅 0.20 m（既定）:\n");
+    sweep(0.20f, true);
+    std::printf("      音源の幅 0.80 m:\n");
+    sweep(0.80f, false);
+}
+
 /// 【探り】扉の角度ごとに成分の生の量を出す（段差の出所を見るための測り）
 void testDoorSweep() {
     std::printf("\n[探り] 扉の角度ごとの成分（生・帯域幅平均でなく単純和。段差の出所）\n");
@@ -1425,7 +1480,7 @@ int main() {
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
         {"budget", testBudget}, {"clicks", testClicks}, {"leak", testLeakModels},
-        {"doorsweep", testDoorSweep, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
+        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {
         // AF_ONLY はコンマ区切りで複数指定できる（例 AF_ONLY=world,bridge）
