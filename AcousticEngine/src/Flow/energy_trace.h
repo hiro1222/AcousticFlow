@@ -139,6 +139,96 @@ struct TraceResult {
     }
 };
 
+/// レイ 1 本ぶんの取り分。★GPU では 1 スレッド = 1 本がこれを埋め、あとで足し合わせる形になる。
+///   ここを「共有の帳簿へ直接足す」ままにすると、スレッドごとに書き先が競合して並列化できない。
+///   1 本を純粋な関数にしておけば、CPU と GPU で同じ計算を回して突き合わせられる（段 2）。
+struct RayPartial {
+    float  early6[kNumBands] = {};
+    float  late6[kNumBands] = {};
+    double emitted6[kNumBands] = {}, absorbed6[kNumBands] = {}, remainder6[kNumBands] = {}, escaped6[kNumBands] = {};
+    float  firstReflectSec = -1.0f;
+    int    hits = 0, neeVisible = 0;
+};
+
+/// レイ 1 本を追う（純粋な関数）。i は**全体での本数の中の番号**で、種はここから作る。
+///   受ける物は全部読み取り専用。書くのは out だけ。
+inline void traceRay(const Surfaces& surf, const MaterialTable& mats,
+                     const Vec3& source, const Vec3& listener,
+                     const TraceParams& prm, int i, float e0, RayPartial& out) {
+    // ★レイごとに種を作る（音源 × レイ番号）。逐次の 1 本の流れにすると、組で間引いたとき
+    //   同じレイ番号が別の道を通ってしまい、静止していても合計が組ごとに変わる（＝揺れる）。
+    std::uint32_t rng = (prm.seed * 2654435761u + 0x9E3779B9u) ^ (static_cast<std::uint32_t>(i) * 2246822519u);
+    rng = rng * 747796405u + 2891336453u;
+    float e[kNumBands];
+    for (int b = 0; b < kNumBands; ++b) { e[b] = e0; out.emitted6[b] += e0; }
+    Vec3 pos = source;
+    Vec3 dir = uniformSphere(rng);
+    float pathLen = 0.0f;
+    int skip = -1;
+    bool terminated = false;
+    for (int bounce = 0; bounce < prm.maxBounces; ++bounce) {
+        const SurfaceHit h = surf.nearest(pos, dir, 1e4f, skip);
+        if (!h.hit) { for (int b = 0; b < kNumBands; ++b) out.escaped6[b] += e[b]; terminated = true; break; }
+        ++out.hits;
+        pathLen += h.t;
+        const AcousticMaterial& m = mats.get(surf.at(h.index).material);
+        float rMean = 0.0f, tMean = 0.0f;
+        SurfaceSplit sp[kNumBands];
+        for (int b = 0; b < kNumBands; ++b) {
+            sp[b] = splitAt(m, b);
+            out.absorbed6[b] += e[b] * sp[b].absorb;
+            rMean += sp[b].reflect; tMean += sp[b].transmit;
+        }
+        rMean /= kNumBands; tMean /= kNumBands;
+        const Vec3 nFace = (dot(h.normal, dir) < 0.0f) ? h.normal : h.normal * -1.0f;
+        // ── NEE: この当たり点からリスナーへ ──
+        {
+            const Vec3 toL = listener - h.point;
+            const float d = length(toL);
+            if (d > kEps) {
+                const Vec3 u = toL * (1.0f / d);
+                const float cosF = dot(nFace, u);
+                const bool front = cosF > 0.0f;
+                const float cosT = std::fabs(cosF);
+                const Vec3 org = h.point + (front ? nFace : nFace * -1.0f) * kEps;
+                float tr[kNumBands]; int cr = 0;
+                surf.transmittance(org, listener, h.index, mats, tr, &cr);
+                const float tSec = (pathLen + d) / kSpeedOfSound;
+                const float geo = cosT / (kPi * d * d);
+                bool any = false;
+                for (int b = 0; b < kNumBands; ++b) {
+                    const float eSide = e[b] * (front ? sp[b].reflect : sp[b].transmit);
+                    const float c = eSide * geo * tr[b] * airEnergy(b, pathLen + d);
+                    if (c <= 0.0f) continue;
+                    any = true;
+                    if (tSec < prm.mixingSec) out.early6[b] += c; else out.late6[b] += c;
+                }
+                if (any) {
+                    ++out.neeVisible;
+                    if (out.firstReflectSec < 0.0f || tSec < out.firstReflectSec) out.firstReflectSec = tSec;
+                }
+            }
+        }
+        // ── 続きの経路: 反射か透過か（確率で片方、重みは r+t）──
+        const float carry = rMean + tMean;
+        if (carry <= 1e-6f) { terminated = true; break; }
+        const bool goReflect = rand01(rng) < (rMean / carry);
+        for (int b = 0; b < kNumBands; ++b) e[b] *= (sp[b].reflect + sp[b].transmit);
+        float eMax = 0.0f; for (int b = 0; b < kNumBands; ++b) eMax = std::max(eMax, e[b]);
+        if (eMax < e0 * 1e-4f) { for (int b = 0; b < kNumBands; ++b) out.remainder6[b] += e[b]; terminated = true; break; }
+        if (goReflect) {
+            const float s = std::max(0.0f, std::min(1.0f, m.scattering[3]));   // 1 kHz の散乱率で向きを決める
+            dir = (rand01(rng) < s) ? cosineHemisphere(nFace, rng) : reflect(dir, nFace);
+            if (dot(dir, nFace) <= 0.0f) dir = cosineHemisphere(nFace, rng);
+            pos = h.point + nFace * kEps;
+        } else {
+            pos = h.point - nFace * kEps;
+        }
+        skip = h.index;
+    }
+    if (!terminated) for (int b = 0; b < kNumBands; ++b) out.remainder6[b] += e[b];
+}
+
 class EnergyTrace {
 public:
     TraceResult run(const Surfaces& surf, const MaterialTable& mats,
@@ -156,84 +246,25 @@ public:
             for (int b = 0; b < kNumBands; ++b) R.freeDirect6[b] = geo * airEnergy(b, d);
         }
         // ── 2) 反射（レイ + NEE）──
+        //   ★1 本ずつ独立した取り分に書き、**本の順に**足し合わせる。
+        //     こうしておくと 1 本が純粋な関数になり、そのまま GPU の 1 スレッドに載る（段 1）。
+        //     足す順を本の順に固定してあるので、並列で解いても結果は変わらない。
         const int N = std::max(1, prm.rays);
         const float e0 = 1.0f / static_cast<float>(N);          // 1 本 = 出力の 1/N（分散していても割るのは総数）
         const int G = std::max(1, prm.groups);
         const int g0 = ((prm.group % G) + G) % G;
         for (int i = g0; i < N; i += G) {
-            // ★レイごとに種を作る（音源 × レイ番号）。逐次の 1 本の流れにすると、組で間引いたとき
-            //   同じレイ番号が別の道を通ってしまい、静止していても合計が組ごとに変わる（＝揺れる）。
-            std::uint32_t rng = (prm.seed * 2654435761u + 0x9E3779B9u) ^ (static_cast<std::uint32_t>(i) * 2246822519u);
-            rng = rng * 747796405u + 2891336453u;
-            float e[kNumBands];
-            for (int b = 0; b < kNumBands; ++b) { e[b] = e0; R.emitted6[b] += e0; }
-            Vec3 pos = source;
-            Vec3 dir = uniformSphere(rng);
-            float pathLen = 0.0f;
-            int skip = -1;
-            bool terminated = false;
+            RayPartial p;
+            traceRay(surf, mats, source, listener, prm, i, e0, p);
             ++R.raysTraced;
-            for (int bounce = 0; bounce < prm.maxBounces; ++bounce) {
-                const SurfaceHit h = surf.nearest(pos, dir, 1e4f, skip);
-                if (!h.hit) { for (int b = 0; b < kNumBands; ++b) R.escaped6[b] += e[b]; terminated = true; break; }
-                ++R.hits;
-                pathLen += h.t;
-                const AcousticMaterial& m = mats.get(surf.at(h.index).material);
-                float rMean = 0.0f, tMean = 0.0f;
-                SurfaceSplit sp[kNumBands];
-                for (int b = 0; b < kNumBands; ++b) {
-                    sp[b] = splitAt(m, b);
-                    R.absorbed6[b] += e[b] * sp[b].absorb;
-                    rMean += sp[b].reflect; tMean += sp[b].transmit;
-                }
-                rMean /= kNumBands; tMean /= kNumBands;
-                const Vec3 nFace = (dot(h.normal, dir) < 0.0f) ? h.normal : h.normal * -1.0f;
-                // ── NEE: この当たり点からリスナーへ ──
-                {
-                    const Vec3 toL = listener - h.point;
-                    const float d = length(toL);
-                    if (d > kEps) {
-                        const Vec3 u = toL * (1.0f / d);
-                        const float cosF = dot(nFace, u);
-                        const bool front = cosF > 0.0f;
-                        const float cosT = std::fabs(cosF);
-                        const Vec3 org = h.point + (front ? nFace : nFace * -1.0f) * kEps;
-                        float tr[kNumBands]; int cr = 0;
-                        surf.transmittance(org, listener, h.index, mats, tr, &cr);
-                        const float tSec = (pathLen + d) / kSpeedOfSound;
-                        const float geo = cosT / (kPi * d * d);
-                        bool any = false;
-                        for (int b = 0; b < kNumBands; ++b) {
-                            const float eSide = e[b] * (front ? sp[b].reflect : sp[b].transmit);
-                            const float c = eSide * geo * tr[b] * airEnergy(b, pathLen + d);
-                            if (c <= 0.0f) continue;
-                            any = true;
-                            if (tSec < prm.mixingSec) R.early6[b] += c; else R.late6[b] += c;
-                        }
-                        if (any) {
-                            ++R.neeVisible;
-                            if (R.firstReflectSec < 0.0f || tSec < R.firstReflectSec) R.firstReflectSec = tSec;
-                        }
-                    }
-                }
-                // ── 続きの経路: 反射か透過か（確率で片方、重みは r+t）──
-                const float carry = rMean + tMean;
-                if (carry <= 1e-6f) { terminated = true; break; }
-                const bool goReflect = rand01(rng) < (rMean / carry);
-                for (int b = 0; b < kNumBands; ++b) e[b] *= (sp[b].reflect + sp[b].transmit);
-                float eMax = 0.0f; for (int b = 0; b < kNumBands; ++b) eMax = std::max(eMax, e[b]);
-                if (eMax < e0 * 1e-4f) { for (int b = 0; b < kNumBands; ++b) R.remainder6[b] += e[b]; terminated = true; break; }
-                if (goReflect) {
-                    const float s = std::max(0.0f, std::min(1.0f, m.scattering[3]));   // 1 kHz の散乱率で向きを決める
-                    dir = (rand01(rng) < s) ? cosineHemisphere(nFace, rng) : reflect(dir, nFace);
-                    if (dot(dir, nFace) <= 0.0f) dir = cosineHemisphere(nFace, rng);
-                    pos = h.point + nFace * kEps;
-                } else {
-                    pos = h.point - nFace * kEps;
-                }
-                skip = h.index;
+            R.hits += p.hits; R.neeVisible += p.neeVisible;
+            for (int b = 0; b < kNumBands; ++b) {
+                R.early6[b] += p.early6[b]; R.late6[b] += p.late6[b];
+                R.emitted6[b] += p.emitted6[b]; R.absorbed6[b] += p.absorbed6[b];
+                R.remainder6[b] += p.remainder6[b]; R.escaped6[b] += p.escaped6[b];
             }
-            if (!terminated) for (int b = 0; b < kNumBands; ++b) R.remainder6[b] += e[b];
+            if (p.firstReflectSec > 0.0f && (R.firstReflectSec < 0.0f || p.firstReflectSec < R.firstReflectSec))
+                R.firstReflectSec = p.firstReflectSec;
         }
         return R;
     }

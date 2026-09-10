@@ -337,6 +337,50 @@ void testEnergyTrace() {
     const TraceResult A0 = tr.run(box, mats, S, L, p0), A1 = tr.run(box, mats, S, L, p1);
     check("[レイ] 境が 0 なら全部後期、境が大きければ全部初期（総量は同じ）",
           A0.early6[2] == 0.0f && A1.late6[2] == 0.0f && std::fabs(A0.reflected6(2) - A1.reflected6(2)) < 1e-6f);
+    // ── レイ 1 本が独立していること（GPU へ移すための担保。段 1）──
+    //   ★GPU は 1 スレッド = 1 本で走らせ、あとで足し合わせる。だから
+    //     ①1 本の結果が他の本に依らない ②足す順を変えても答えが変わらない
+    //     の 2 つが要る。ここが崩れたら GPU 版と CPU 版が一致しなくなる。
+    {
+        AcousticMaterial wall = AcousticMaterial::defaultWall();
+        for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.scattering[b] = 0.5f; wall.transmission[b] = 0.01f; }
+        MaterialTable mats; const int matId = mats.add(wall);
+        Surfaces box = closedBox(3.5f, 3.0f, matId);
+        const Vec3 S(1.5f, 1.6f, -1.0f), L(-1.0f, 1.2f, 1.5f);
+        TraceParams prm{256, 20, 0.03f, 7u, 1, 0};
+        const float e0 = 1.0f / 256.0f;
+        // 順に足す（run と同じ順）
+        double fwd[kNumBands] = {}, rev[kNumBands] = {};
+        double fwdLate[kNumBands] = {}, revLate[kNumBands] = {};
+        int hitsFwd = 0, hitsRev = 0;
+        for (int i = 0; i < 256; ++i) {
+            RayPartial p; traceRay(box, mats, S, L, prm, i, e0, p);
+            hitsFwd += p.hits;
+            for (int b = 0; b < kNumBands; ++b) { fwd[b] += p.early6[b]; fwdLate[b] += p.late6[b]; }
+        }
+        // **逆順**に足す（同じ本を同じ番号で引くが、足す順だけ変える）
+        for (int i = 255; i >= 0; --i) {
+            RayPartial p; traceRay(box, mats, S, L, prm, i, e0, p);
+            hitsRev += p.hits;
+            for (int b = 0; b < kNumBands; ++b) { rev[b] += p.early6[b]; revLate[b] += p.late6[b]; }
+        }
+        double worst = 0.0;
+        for (int b = 0; b < kNumBands; ++b) {
+            if (fwd[b] > 0.0) worst = std::max(worst, std::fabs(afti::dB(rev[b] / fwd[b])));
+            if (fwdLate[b] > 0.0) worst = std::max(worst, std::fabs(afti::dB(revLate[b] / fwdLate[b])));
+        }
+        std::snprintf(buf, sizeof(buf), "(当たり 前から %d / 後ろから %d、初期と後期のずれ 最大 %.2e dB)", hitsFwd, hitsRev, worst);
+        check("[レイ] 1 本は独立していて、足す順を変えても答えが変わらない（GPU へ移す担保）",
+              hitsFwd == hitsRev && worst < 1e-6, buf);
+        // 1 本の結果が「その本だけ」で決まること: 同じ番号を単独で引いても同じ
+        RayPartial a, b2;
+        traceRay(box, mats, S, L, prm, 77, e0, a);
+        traceRay(box, mats, S, L, prm, 77, e0, b2);
+        bool same = (a.hits == b2.hits && a.neeVisible == b2.neeVisible && a.firstReflectSec == b2.firstReflectSec);
+        for (int b = 0; b < kNumBands && same; ++b) same = (a.early6[b] == b2.early6[b] && a.late6[b] == b2.late6[b]);
+        std::snprintf(buf, sizeof(buf), "(77 番の本: 当たり %d、最初の反射 %.4f ms)", a.hits, a.firstReflectSec * 1000.0f);
+        check("[レイ] 同じ番号の本は何度引いてもビット一致（種は本の番号だけで決まる）", same, buf);
+    }
 }
 
 // ================================ [速度] response（段 3）
