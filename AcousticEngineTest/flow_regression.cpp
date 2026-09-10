@@ -1166,6 +1166,20 @@ void testBudget() {
             std::printf("      内訳（音源 1 本、箱 6 個・面 36）:\n");
             EnergyTrace tr; TraceParams prm; prm.rays = 512; prm.maxBounces = 40; prm.mixingSec = 0.03f; prm.seed = 7u;
             timeIt("レイ 512 本", [&] { volatile auto r = tr.run(box, mats, S, lis.pos, prm); (void)r; });
+            // レイの費用の形（GPU へ移す価値を判断するため）。本数と跳ね返りで割る。
+            //   ★1 本あたりの費用が本数に対して一定なら、そのまま並列化で線形に効く。
+            std::printf("        レイの費用の形（当たり点ごとに影レイ 1 本＝次イベント推定）:\n");
+            for (int nr : {128, 512, 2048}) {
+                for (int nb : {8, 20, 40}) {
+                    TraceParams pp{nr, nb, 0.03f, 7u, 1, 0};
+                    TraceResult rr = tr.run(box, mats, S, lis.pos, pp);
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (int q = 0; q < 5; ++q) { volatile auto r2 = tr.run(box, mats, S, lis.pos, pp); (void)r2; }
+                    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 5.0;
+                    std::printf("          レイ %5d 跳ね %2d : %7.3f ms  当たり %6d  1 当たり %6.2f us\n",
+                                nr, nb, ms, rr.hits, ms * 1000.0 / std::max(1, rr.hits));
+                }
+            }
             timeIt("見通し（幅 0.2）", [&] { volatile auto v = discVisibility(box, mats, lis.pos, S, 0.2f); (void)v; });
             Visibility vv = discVisibility(box, mats, lis.pos, S, 0.2f);
             timeIt("回折", [&] { volatile auto d = edgeDiffraction(box, lis, S, vv); (void)d; });
