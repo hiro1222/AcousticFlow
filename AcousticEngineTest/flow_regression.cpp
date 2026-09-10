@@ -395,18 +395,20 @@ void testEnergyTrace() {
         const Vec3 S(1.5f, 1.6f, -1.0f), L(-1.0f, 1.2f, 1.5f);
         TraceParams prm{256, 20, 0.03f, 7u, 1, 0};
         const float e0 = 1.0f / 256.0f;
+        // ★レイが見るのは平らな場面だけ（GPU と同じ入力）。ここで 1 回組む。
+        TraceScene sc; box.rebuildBvh(); buildTraceScene(box, mats, sc);
         // 順に足す（run と同じ順）
         double fwd[kNumBands] = {}, rev[kNumBands] = {};
         double fwdLate[kNumBands] = {}, revLate[kNumBands] = {};
         int hitsFwd = 0, hitsRev = 0;
         for (int i = 0; i < 256; ++i) {
-            RayPartial p; traceRay(box, mats, S, L, prm, i, e0, p);
+            RayPartial p; traceRay(sc, S, L, prm, i, e0, p);
             hitsFwd += p.hits;
             for (int b = 0; b < kNumBands; ++b) { fwd[b] += p.early6[b]; fwdLate[b] += p.late6[b]; }
         }
         // **逆順**に足す（同じ本を同じ番号で引くが、足す順だけ変える）
         for (int i = 255; i >= 0; --i) {
-            RayPartial p; traceRay(box, mats, S, L, prm, i, e0, p);
+            RayPartial p; traceRay(sc, S, L, prm, i, e0, p);
             hitsRev += p.hits;
             for (int b = 0; b < kNumBands; ++b) { rev[b] += p.early6[b]; revLate[b] += p.late6[b]; }
         }
@@ -420,8 +422,8 @@ void testEnergyTrace() {
               hitsFwd == hitsRev && worst < 1e-6, buf);
         // 1 本の結果が「その本だけ」で決まること: 同じ番号を単独で引いても同じ
         RayPartial a, b2;
-        traceRay(box, mats, S, L, prm, 77, e0, a);
-        traceRay(box, mats, S, L, prm, 77, e0, b2);
+        traceRay(sc, S, L, prm, 77, e0, a);
+        traceRay(sc, S, L, prm, 77, e0, b2);
         bool same = (a.hits == b2.hits && a.neeVisible == b2.neeVisible && a.firstReflectSec == b2.firstReflectSec);
         for (int b = 0; b < kNumBands && same; ++b) same = (a.early6[b] == b2.early6[b] && a.late6[b] == b2.late6[b]);
         std::snprintf(buf, sizeof(buf), "(77 番の本: 当たり %d、最初の反射 %.4f ms)", a.hits, a.firstReflectSec * 1000.0f);

@@ -51,6 +51,7 @@
 #include "Flow/probe.h"
 #include "Flow/response.h"
 #include "Flow/surfaces.h"
+#include "Flow/trace_scene.h"
 #include "Flow/world_rules.h"
 
 namespace acoustic {
@@ -189,6 +190,9 @@ public:
         //   包みが古くなり、当たるべき箱を枝刈りで捨てる。数十個なら作り直しでも数 us。
         //   木があれば nearest / transmittance が木を歩く。答えは総当たりと 1 ビットも変わらない（検査で担保）。
         surfaces.rebuildBvh();
+        // ★レイが見る場面を平らな配列にして 1 フレームに 1 回だけ組む。
+        //   音源ごとに組み直すと箱の数 × 音源の数だけ無駄が出る。GPU へ送るのもこの 1 つ。
+        buildTraceScene(surfaces, rules.materials, traceScene_);
         listener_.beginFrame(dt);
         updateOpenings();
         now_ += dt;
@@ -224,10 +228,10 @@ public:
             prm.groups = G;
             prm.group = s.groupNext % G;
             if (s.groupRays != bs.rays || s.groupCount != G) {
-                for (int k = 0; k < G; ++k) s.parts[k] = tracer_.run(surfaces, rules.materials, s.em.pos, listener_.pos, TraceParams{prm.rays, prm.maxBounces, prm.mixingSec, prm.seed, G, k});
+                for (int k = 0; k < G; ++k) s.parts[k] = tracer_.run(traceScene_, s.em.pos, listener_.pos, TraceParams{prm.rays, prm.maxBounces, prm.mixingSec, prm.seed, G, k});
                 s.groupRays = bs.rays; s.groupCount = G;
             } else {
-                s.parts[prm.group] = tracer_.run(surfaces, rules.materials, s.em.pos, listener_.pos, prm);
+                s.parts[prm.group] = tracer_.run(traceScene_, s.em.pos, listener_.pos, prm);
             }
             s.groupNext = (s.groupNext + 1) % G;
             TraceResult::sumGroups(s.parts, G, s.trace);
@@ -377,6 +381,7 @@ private:
     std::vector<int> fdnRoomOf_;
     bool dirty_ = true;
     bool fdnStale_ = false;
+    TraceScene   traceScene_;   // レイが見る平らな場面（毎フレーム組み直す）
     int  buildCount_ = 0;
     // 段 8
     EnergyTrace tracer_;

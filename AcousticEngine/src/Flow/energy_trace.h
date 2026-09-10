@@ -51,6 +51,7 @@
 #include "Core/room_graph.h"      // kAirDbPerM（空気吸収の表はここ 1 か所）
 #include "Core/vec3.h"
 #include "Flow/surfaces.h"
+#include "Flow/trace_scene.h"
 #include "Flow/world_rules.h"
 
 namespace acoustic {
@@ -152,7 +153,7 @@ struct RayPartial {
 
 /// レイ 1 本を追う（純粋な関数）。i は**全体での本数の中の番号**で、種はここから作る。
 ///   受ける物は全部読み取り専用。書くのは out だけ。
-inline void traceRay(const Surfaces& surf, const MaterialTable& mats,
+inline void traceRay(const TraceScene& sc,
                      const Vec3& source, const Vec3& listener,
                      const TraceParams& prm, int i, float e0, RayPartial& out) {
     // ★レイごとに種を作る（音源 × レイ番号）。逐次の 1 本の流れにすると、組で間引いたとき
@@ -167,15 +168,16 @@ inline void traceRay(const Surfaces& surf, const MaterialTable& mats,
     int skip = -1;
     bool terminated = false;
     for (int bounce = 0; bounce < prm.maxBounces; ++bounce) {
-        const SurfaceHit h = surf.nearest(pos, dir, 1e4f, skip);
+        const SurfaceHit h = sceneNearest(sc, pos, dir, 1e4f, skip);
         if (!h.hit) { for (int b = 0; b < kNumBands; ++b) out.escaped6[b] += e[b]; terminated = true; break; }
         ++out.hits;
         pathLen += h.t;
-        const AcousticMaterial& m = mats.get(surf.at(h.index).material);
+        const int mi = sc.material[static_cast<std::size_t>(h.index)];
+        const SurfaceSplit* tbl = &sc.split[static_cast<std::size_t>(mi) * kNumBands];
         float rMean = 0.0f, tMean = 0.0f;
         SurfaceSplit sp[kNumBands];
         for (int b = 0; b < kNumBands; ++b) {
-            sp[b] = splitAt(m, b);
+            sp[b] = tbl[b];
             out.absorbed6[b] += e[b] * sp[b].absorb;
             rMean += sp[b].reflect; tMean += sp[b].transmit;
         }
@@ -192,7 +194,7 @@ inline void traceRay(const Surfaces& surf, const MaterialTable& mats,
                 const float cosT = std::fabs(cosF);
                 const Vec3 org = h.point + (front ? nFace : nFace * -1.0f) * kEps;
                 float tr[kNumBands]; int cr = 0;
-                surf.transmittance(org, listener, h.index, mats, tr, &cr);
+                sceneTransmittance(sc, org, listener, h.index, tr, &cr);
                 const float tSec = (pathLen + d) / kSpeedOfSound;
                 const float geo = cosT / (kPi * d * d);
                 bool any = false;
@@ -217,7 +219,7 @@ inline void traceRay(const Surfaces& surf, const MaterialTable& mats,
         float eMax = 0.0f; for (int b = 0; b < kNumBands; ++b) eMax = std::max(eMax, e[b]);
         if (eMax < e0 * 1e-4f) { for (int b = 0; b < kNumBands; ++b) out.remainder6[b] += e[b]; terminated = true; break; }
         if (goReflect) {
-            const float s = std::max(0.0f, std::min(1.0f, m.scattering[3]));   // 1 kHz の散乱率で向きを決める
+            const float s = sc.scatter1k[static_cast<std::size_t>(mi)];   // 1 kHz の散乱率で向きを決める
             dir = (rand01(rng) < s) ? cosineHemisphere(nFace, rng) : reflect(dir, nFace);
             if (dot(dir, nFace) <= 0.0f) dir = cosineHemisphere(nFace, rng);
             pos = h.point + nFace * kEps;
@@ -231,14 +233,23 @@ inline void traceRay(const Surfaces& surf, const MaterialTable& mats,
 
 class EnergyTrace {
 public:
+    /// 便利版: Surfaces から場面を組んで回す（検査や道具から呼ぶ）。毎回組むので実時間の道では使わない。
     TraceResult run(const Surfaces& surf, const MaterialTable& mats,
+                    const Vec3& source, const Vec3& listener, const TraceParams& prm) const {
+        TraceScene sc;
+        buildTraceScene(surf, mats, sc);
+        return run(sc, source, listener, prm);
+    }
+
+    /// 本体: 平らな場面だけを見る。★GPU 版もこれと同じ入力を受ける。
+    TraceResult run(const TraceScene& sc,
                     const Vec3& source, const Vec3& listener, const TraceParams& prm) const {
         TraceResult R;
         // ── 1) 自由音場の直接（決定的）──
         {
             const float d = std::max(length(listener - source), kEps);
             float tr[kNumBands]; int crossings = 0;
-            surf.transmittance(source, listener, -1, mats, tr, &crossings);   // 枚数だけ使う（τ は aperture の物）
+            sceneTransmittance(sc, source, listener, -1, tr, &crossings);   // 枚数だけ使う（τ は aperture の物）
             R.directCrossings = crossings;
             R.directDist = d;
             R.directSec = d / kSpeedOfSound;
@@ -255,7 +266,7 @@ public:
         const int g0 = ((prm.group % G) + G) % G;
         for (int i = g0; i < N; i += G) {
             RayPartial p;
-            traceRay(surf, mats, source, listener, prm, i, e0, p);
+            traceRay(sc, source, listener, prm, i, e0, p);
             ++R.raysTraced;
             R.hits += p.hits; R.neeVisible += p.neeVisible;
             for (int b = 0; b < kNumBands; ++b) {

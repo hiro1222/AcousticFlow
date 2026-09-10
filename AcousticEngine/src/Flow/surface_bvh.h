@@ -36,6 +36,7 @@
 #define ACOUSTICFLOW_FLOW_SURFACE_BVH_H
 
 #include <algorithm>
+#include <cstdint>
 #include <vector>
 
 #include "Core/aabb.h"
@@ -90,6 +91,15 @@ public:
         if (items_.empty()) return;
         nodes_.reserve(items_.size() * 2 + 1);
         buildRange(0, static_cast<int>(items_.size()));
+    }
+
+    /// 中身を平らな配列へ写す（GPU へ送る形。TraceScene が使う）。
+    ///   ★ここで写す物だけが GPU から見える。ノードは番号で子を指しているので、そのまま送れる。
+    void exportFlat(std::vector<Node>& nodesOut, std::vector<std::int32_t>& itemsOut) const {
+        nodesOut = nodes_;
+        itemsOut.clear();
+        itemsOut.reserve(items_.size());
+        for (const Item& it : items_) itemsOut.push_back(it.idx);
     }
 
     /// レイで歩く。葉の中の添字ごとに leaf(i) を呼ぶ。tMax は呼び出し側が縮めてよい。
