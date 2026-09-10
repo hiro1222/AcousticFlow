@@ -75,8 +75,9 @@ ACOUSTIC_API int  AF_WorldEmitterRays(AF_WorldHandle w, int emitter);
 ACOUSTIC_API void AF_WorldSetWeights(AF_WorldHandle w, const float* w5);          /* 直接・初期・後期・回折・透過。NULL で全部 1 */
 ACOUSTIC_API void AF_WorldSetResponse(AF_WorldHandle w, float levelSec, float colourSec, float statSec, float directionSec);
 ACOUSTIC_API void AF_WorldSetHeadCm(AF_WorldHandle w, float headCircumferenceCm);
-/* 閉じた扉から漏れる回折の扱い（試聴の A/B 用）。既定 0。
- *   0 今のまま / 1 案A 貫通を箱の薄さの割合で測る / 2 案B 回折の量に戸口の空き具合を掛ける / 3 両方
+/* 閉じた扉から漏れる回折の扱い。**既定 2（案B）**。
+ *   0 旧（作り物の漏れが出る）/ 1 案A（本物の隙間まで消えるので既定にしない）
+ *   2 案B（既定。作り物は消え、本物の隙間は残る）/ 3 両方
  *   ★どちらも角度に二値を置かない。1 は経路の幾何、2 は口の帳簿。2 は戸口が要る。 */
 ACOUSTIC_API void AF_WorldSetLeakModel(AF_WorldHandle w, int model);
 ACOUSTIC_API int  AF_WorldLeakModel(AF_WorldHandle w);
