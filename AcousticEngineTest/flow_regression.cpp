@@ -1183,7 +1183,10 @@ void testBudget() {
             }
             ImageSet im;
             timeIt("虚像（1・2 次）", [&] { buildImages(box, faces, lis, S, 0.2f, 0.06f, im); });
-            std::printf("        虚像: 検討 %d / 有効 %d\n", im.candidates, im.count);
+            ImageSet im3;
+            timeIt("虚像（1〜3 次）", [&] { buildImages(box, faces, lis, S, 0.2f, 0.06f, im3, 3); });
+            std::printf("        虚像: 2 次 検討 %d / 有効 %d ／ 3 次 検討 %d / 有効 %d\n",
+                        im.candidates, im.count, im3.candidates, im3.count);
         }
     }
 }
@@ -1262,6 +1265,7 @@ void testNearWall() {
         const float wallDist = d[k];
         World* w = makeWorldBox(half, h, 0.2f);
         w->raysPerEmitter = 512; w->rayGroups = 1; w->budget.cfg.totalRays = 0;
+        { const char* io2 = std::getenv("AF_IMG_ORDER"); if (io2) w->imageOrder = std::atoi(io2); }
         // AF_NEAR=src なら**音源**を壁へ寄せる（耳は固定）。既定は耳を寄せる。
         //   ★虚像は「音源」の鏡映なので、音源が壁に近いほど虚像が音源のそばに集まる。
         //     耳を寄せた場合に近づくのは「その壁の 1 本」だけで、群としては集まらない。

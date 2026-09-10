@@ -67,7 +67,8 @@ struct ImageSource {
     float weight6[kNumBands] = {};      // 正規化した重み（Σ_i = 1）
     float validity = 0.0f;              // 見える割合 0..1
     int   order = 0;
-    int   face[2] = {-1, -1};           // 経路の面（リスナー側から）
+    static constexpr int kMaxOrder = 3;
+    int   face[kMaxOrder] = {-1, -1, -1};   // 経路の面（**リスナー側から**）。使うのは order 本だけ
 };
 
 struct ImageSet {
@@ -126,26 +127,31 @@ inline bool legClear(const Surfaces& surf, const Vec3& a, const Vec3& b, int own
     return true;
 }
 /// リスナー L から点 P（虚像のまわりの点）への線が、経路（面 f2 → 面 f1 → 音源 S）として通るか。order 1 なら f1 だけ。
-inline bool pathOpen(const Surfaces& surf, const Vec3& L, const Vec3& P, const Vec3& S, const Face* f1, const Face* f2) {
-    if (f2) {
-        Vec3 q2;
-        if (!hitRect(L, P, *f2, q2)) return false;                    // 窓 2
-        const Vec3 Pm = mirror(P, *f2);                                 // 展開を戻す（P は S'' のまわり → S' のまわり）
-        Vec3 q1;
-        if (!hitRect(q2, Pm, *f1, q1)) return false;                   // 窓 1
-        return legClear(surf, L, q2, f2->box, -1) && legClear(surf, q2, q1, f2->box, f1->box) && legClear(surf, q1, S, f1->box, -1);
+/// 面の鎖（chain[0] がリスナー側、chain[n-1] が音源側）で 1..3 次をまとめて扱う。
+///   ★次数ごとに書き分けると、脚の除外（自分の箱と 1 つ前の箱）を間違える。
+///     旧実装の 2 次専用版はここを手で書いていて、3 次を足すときに同じ間違いを繰り返す形だった。
+///   毎段: リスナー側から見て窓（矩形）を通るか → その脚が他の箱に遮られていないか → 1 段展開を戻す。
+inline bool pathOpen(const Surfaces& surf, const Vec3& L, const Vec3& P, const Vec3& S,
+                     const Face* const* chain, int n) {
+    Vec3 cur = L, pt = P;
+    int prevBox = -1;
+    for (int k = 0; k < n; ++k) {
+        Vec3 q;
+        if (!hitRect(cur, pt, *chain[k], q)) return false;             // 窓
+        if (!legClear(surf, cur, q, chain[k]->box, prevBox)) return false;
+        pt = mirror(pt, *chain[k]);                                     // 展開を 1 段戻す
+        prevBox = chain[k]->box;
+        cur = q;
     }
-    Vec3 q1;
-    if (!hitRect(L, P, *f1, q1)) return false;
-    return legClear(surf, L, q1, f1->box, -1) && legClear(surf, q1, S, f1->box, -1);
+    return legClear(surf, cur, S, prevBox, -1);
 }
 /// 虚像 C のまわりの円盤（半径 r）のうち、経路として通る割合（走査線＋二分探索＋erf。aperture と同じ物差し）。
-inline float imageVisibility(const Surfaces& surf, const Vec3& L, const Vec3& C, float r, const Vec3& S, const Face* f1, const Face* f2,
-                             int lines = 5, int coarse = 8) {
+inline float imageVisibility(const Surfaces& surf, const Vec3& L, const Vec3& C, float r, const Vec3& S,
+                             const Face* const* chain, int nChain, int lines = 5, int coarse = 8) {
     const Vec3 toL = L - C;
     const float dist = length(toL);
     if (dist <= kEps) return 0.0f;
-    if (r <= 1e-4f) return pathOpen(surf, L, C, S, f1, f2) ? 1.0f : 0.0f;
+    if (r <= 1e-4f) return pathOpen(surf, L, C, S, chain, nChain) ? 1.0f : 0.0f;
     const Vec3 n = toL * (1.0f / dist);
     const Vec3 t = (std::fabs(n.y) < 0.9f) ? Vec3(0, 1, 0) : Vec3(1, 0, 0);
     const Vec3 U = normalized(cross(t, n)), V = cross(n, U);
@@ -158,7 +164,7 @@ inline float imageVisibility(const Surfaces& surf, const Vec3& L, const Vec3& C,
         const double wy = std::exp(-y * y / (2.0 * sigma * sigma));
         const Vec3 O = C + V * static_cast<float>(y);
         const double total = gaussCdf(halfW, sigma) - gaussCdf(-halfW, sigma);
-        auto open = [&](double x) { return pathOpen(surf, L, O + U * static_cast<float>(x), S, f1, f2); };
+        auto open = [&](double x) { return pathOpen(surf, L, O + U * static_cast<float>(x), S, chain, nChain); };
         const int np = coarse + 1;
         double xs[64]; bool ok[64];
         for (int j = 0; j < np; ++j) { xs[j] = -halfW + 2.0 * halfW * j / (np - 1); ok[j] = open(xs[j]); }
@@ -181,47 +187,73 @@ inline float imageVisibility(const Surfaces& surf, const Vec3& L, const Vec3& C,
 
 /// 虚像を作る。rDisc は音源の実効の幅（下限 15 cm はここで掛ける）。maxPathSec を超える経路は捨てる。
 inline void buildImages(const Surfaces& surf, const std::vector<Face>& faces, const Listener& listener, const Vec3& S,
-                        float rDisc, float maxPathSec, ImageSet& out) {
+                        float rDisc, float maxPathSec, ImageSet& out, int maxOrder = 2) {
     out.count = 0; out.firstSec = -1.0f; out.candidates = 0;
     const Vec3 L = listener.pos;
     const float r = std::max(rDisc, 0.15f);
     const float maxLen = maxPathSec * kSpeedOfSound;
+    const int mo = std::min(ImageSource::kMaxOrder, std::max(1, maxOrder));
     double sumW[kNumBands] = {}, sumFull[kNumBands] = {};
-    auto consider = [&](const Vec3& C, const Face* f1, const Face* f2, int order) {
+    // chain[0] がリスナー側、chain[order-1] が音源側。鏡映は音源側から順に掛けるので、
+    // 作る順（f1, f2, f3）と鎖の順は**逆**になる。ここを取り違えると窓の判定が別の空間で行われる。
+    auto consider = [&](const Vec3& C, const Face* const* mk, int order) {
         ++out.candidates;
         const float d = length(C - L);
         if (d <= kEps || d > maxLen) return;
+        const Face* chain[ImageSource::kMaxOrder];
+        for (int k = 0; k < order; ++k) chain[k] = mk[order - 1 - k];
         // 「通れば届くはずの量」は妥当性より先に数える（満室で切るときも数える）。
         //   ここを数えないと割合がいつも 1 になり、見えていない虚像が満額で鳴る。
         float pot[kNumBands];
         for (int b = 0; b < kNumBands; ++b) {
-            pot[b] = f1->reflect6[b] / (d * d);
-            if (f2) pot[b] *= f2->reflect6[b];
+            pot[b] = 1.0f / (d * d);
+            for (int k = 0; k < order; ++k) pot[b] *= mk[k]->reflect6[b];
             sumFull[b] += pot[b];
         }
         if (out.count >= ImageSet::kMaxImages) return;
-        const float v = detail::imageVisibility(surf, L, C, r, S, f1, f2);
+        const float v = detail::imageVisibility(surf, L, C, r, S, chain, order);
         if (v <= 1e-4f) return;
         ImageSource& im = out.img[out.count++];
         im.pos = C; im.dist = d; im.pathSec = d / kSpeedOfSound; im.validity = v; im.order = order;
-        im.face[0] = static_cast<int>(f2 ? (f2 - faces.data()) : (f1 - faces.data()));
-        im.face[1] = f2 ? static_cast<int>(f1 - faces.data()) : -1;
+        for (int k = 0; k < ImageSource::kMaxOrder; ++k)
+            im.face[k] = (k < order) ? static_cast<int>(chain[k] - faces.data()) : -1;
         for (int b = 0; b < kNumBands; ++b) { im.weight6[b] = pot[b] * v; sumW[b] += pot[b] * v; }
         if (out.firstSec < 0.0f || im.pathSec < out.firstSec) out.firstSec = im.pathSec;
     };
+    // 同じ箱の表裏（厚みを往復する虚像は無意味）を弾く決まり。次数が増えても同じ規則を使う。
+    auto sameBoxBackFace = [](const Face& a, const Face& b) {
+        return a.box == b.box && dot(a.normal, b.normal) < -0.99f;
+    };
+    const Face* mk[ImageSource::kMaxOrder];
     // 1 次: 音源とリスナーが同じ側の面
     for (const Face& f1 : faces) {
         if (detail::side(S, f1) <= 0.0f || detail::side(L, f1) <= 0.0f) continue;
         const Vec3 S1 = detail::mirror(S, f1);
-        consider(S1, &f1, nullptr, 1);
-        // 2 次: S1 とリスナーが同じ側の別の面（同じ箱の裏面は除く）
+        mk[0] = &f1;
+        consider(S1, mk, 1);
+        if (mo < 2) continue;
+        // 2 次: S1 とリスナーが同じ側の別の面
         for (const Face& f2 : faces) {
             if (&f2 == &f1) continue;
             if (detail::side(S1, f2) <= 0.0f || detail::side(L, f2) <= 0.0f) continue;
-            if (f2.box == f1.box && dot(f2.normal, f1.normal) < -0.99f) continue;   // 同じ箱の表裏（厚みを往復する虚像は無意味）
+            if (sameBoxBackFace(f1, f2)) continue;
             const Vec3 S2 = detail::mirror(S1, f2);
             if (length(S2 - L) > maxLen) continue;
-            consider(S2, &f1, &f2, 2);
+            mk[1] = &f2;
+            consider(S2, mk, 2);
+            if (mo < 3) continue;
+            // 3 次: 壁際で「詰まった連続反射」を作るのはここ（同じ壁を繰り返し使う経路）。
+            //   ★f3 == f1 を許す。禁じると「壁 → 別の面 → 同じ壁」が消え、
+            //     まさに壁際で欲しい繰り返しの経路が出ない。連続する 2 枚が同じ面でなければよい。
+            for (const Face& f3 : faces) {
+                if (&f3 == &f2) continue;
+                if (detail::side(S2, f3) <= 0.0f || detail::side(L, f3) <= 0.0f) continue;
+                if (sameBoxBackFace(f2, f3)) continue;
+                const Vec3 S3 = detail::mirror(S2, f3);
+                if (length(S3 - L) > maxLen) continue;
+                mk[2] = &f3;
+                consider(S3, mk, 3);
+            }
         }
     }
     // 方向の分かっている割合（正規化の前に取る。正規化すると消える量）

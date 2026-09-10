@@ -143,7 +143,12 @@ public:
                 MixTap* t = out.pushTap();
                 if (!t) break;
                 t->kind = TapKind::Early; t->delaySec = src.pathSec;
-                t->id = 16 + src.face[0] * 256 + (src.face[1] + 1);   // 面の組で決まる素性（並び順に依らない）
+                // 面の組で決まる素性（並び順に依らない）。3 次まで入る形。
+                //   面の番号が 126 を超える場面では衝突しうるので、そのときは素性を諦めて遅延で繋ぐ。
+                {
+                    const int f0 = src.face[0] + 1, f1 = src.face[1] + 1, f2 = src.face[2] + 1;
+                    t->id = (f0 < 128 && f1 < 128 && f2 < 128) ? (16 + f0 + f1 * 128 + f2 * 16384) : -1;
+                }
                 t->dirLocal = in.listener->toLocal(src.pos - in.listener->pos);
                 t->spread = 1.0f - src.validity;
                 for (int b = 0; b < kNumBands; ++b) t->e6[b] = sm[kEarly][b] * W.w[kEarly] * dirFrac[b] * src.weight6[b];

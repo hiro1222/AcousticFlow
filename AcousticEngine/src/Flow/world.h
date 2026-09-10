@@ -114,6 +114,12 @@ public:
     ///   ★2 は戸口（rooms::Aperture）が要る。部屋が割れていない場面では何も起きない。
     ///     そこは別途「密閉の旗」で埋める案がある（docs/CORE_DIFF.md）。
     int leakModel = 1;
+    /// 虚像の次数（1..3）。既定 2。
+    ///   ★3 にすると壁際で「詰まった連続反射」が出る。同じ壁を繰り返し使う経路が 3 次で初めて現れるため。
+    ///     2 次までだと、近づいた壁が絡む虚像だけが前へ寄り、群としては詰まらない
+    ///     （実測: 広がりが 1 m より近くで 4.8 ms から縮まず 5.1 ms へ戻る）。
+    ///   ★費用は候補の数で効く（箱 6 面なら 1 次 6・2 次 30・3 次 120）。厳密の段だけに掛ける。
+    int imageOrder = 2;
     bool fdnStale() const { return fdnStale_; }
     /// 部屋グラフのボクセル一辺(m)。**戸口の幅を数ボクセルで割れる大きさ**にすること。
     ///   粗いと戸口で部屋が割れず、2 部屋が 1 部屋に潰れる（＝扉を閉めても響きが変わらない）。
@@ -246,7 +252,7 @@ public:
             }
             // 虚像（段 7）: 初期の方向と正規化重み。簡易は作らない（方向なしの 1 本に落ちる）。
             if (light) s.images.count = 0;
-            else buildImages(surfaces, faces_, listener_, s.em.pos, rEff, mixingSec + 3.0f / kSpeedOfSound, s.images);
+            else buildImages(surfaces, faces_, listener_, s.em.pos, rEff, mixingSec + 3.0f / kSpeedOfSound, s.images, imageOrder);
             DistributeInput in;
             in.trace = &s.trace; in.visibility = &s.vis; in.diffraction = &s.diff; in.images = &s.images;
             in.sourcePos = s.em.pos; in.listener = &listener_;
