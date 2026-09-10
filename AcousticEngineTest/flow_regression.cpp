@@ -1262,12 +1262,15 @@ void testManySources() {
     const int leaf = w.addBox(doorLeaf(0.0f, -0.5f, 1.0f, 3.0f, 0.06f, 0.004f), lm, true);
     w.raysPerEmitter = 256;
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
+    { const char* tr = std::getenv("AF_TOTAL_RAYS"); if (tr) w.budget.cfg.totalRays = std::atoi(tr); }
     w.setListener(Vec3(0, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
     // 奥の部屋に音源を並べる（戸口の向こう。扉の効きが全部に乗る配置）。
+    const char* sr = std::getenv("AF_SRC_R");
+    const float srcR = sr ? static_cast<float>(std::atof(sr)) : 0.2f;
     std::vector<int> ids;
     for (int i = 0; i < N; ++i) {
         const float t = (N > 1) ? static_cast<float>(i) / (N - 1) : 0.5f;
-        ids.push_back(w.addEmitter(Vec3(-5.0f + 10.0f * t, 1.6f, 1.0f + 4.0f * ((i % 3) * 0.5f)), 0.2f));
+        ids.push_back(w.addEmitter(Vec3(-5.0f + 10.0f * t, 1.6f, 1.0f + 4.0f * ((i % 3) * 0.5f)), srcR));
     }
     w.build();
     const float dt = 1.0f / 60.0f;
@@ -1282,6 +1285,9 @@ void testManySources() {
     int visJump = 0, visJumpLight = 0, worstStepAt = -1, worstStepTier = -1; double worstStep = 0.0;
     std::vector<int> prevTier(static_cast<std::size_t>(N), -1);
     int tierChanges = 0; double stepOnChange = 0.0, stepOnSame = 0.0;
+    std::vector<double> prevComp(static_cast<std::size_t>(N) * kNumComponents, 0.0);
+    double worstComp[kNumComponents] = {}, worstCompPrev[kNumComponents] = {};
+    float worstVis = 0.0f, worstVisPrev = 0.0f; int worstRays = 0, worstImg = 0, worstWho = -1;
     int reTraceTotal = 0, reTraceMax = 0;
     std::printf("        %6s %6s | %5s %5s %5s | %8s %8s | %s\n",
                 "フレーム", "扉°", "厳密", "簡易", "保持", "最古(f)", "平均(f)", "使ったレイ");
@@ -1320,14 +1326,36 @@ void testManySources() {
                     const bool changed = (prevTier[static_cast<std::size_t>(i)] >= 0 && prevTier[static_cast<std::size_t>(i)] != t);
                     if (changed) { ++tierChanges; stepOnChange = std::max(stepOnChange, st); }
                     else stepOnSame = std::max(stepOnSame, st);
-                    if (st > worstStep) { worstStep = st; worstStepAt = k; worstStepTier = t; }
+                    if (st > worstStep) {
+                        worstStep = st; worstStepAt = k; worstStepTier = t;
+                        for (int c = 0; c < kNumComponents; ++c) {
+                            double ce = 0.0; for (int b = 0; b < kNumBands; ++b) ce += mx->component6[c][b];
+                            worstComp[c] = ce; worstCompPrev[c] = prevComp[static_cast<std::size_t>(i) * kNumComponents + c];
+                        }
+                        worstVis = v; worstVisPrev = pv; worstRays = r; worstImg = w.images(ids[static_cast<std::size_t>(i)])->count; worstWho = i;
+                    }
                 }
                 prevTier[static_cast<std::size_t>(i)] = t;
                 prevVis[static_cast<std::size_t>(i)] = v; prevTot[static_cast<std::size_t>(i)] = tot;
+                for (int c = 0; c < kNumComponents; ++c) {
+                    double ce = 0.0; for (int b = 0; b < kNumBands; ++b) ce += mx->component6[c][b];
+                    prevComp[static_cast<std::size_t>(i) * kNumComponents + c] = ce;
+                }
             }
             if (t == 0) ++full; else if (t == 1) ++light; else ++hold;
             const int stale = k - lastSolved[static_cast<std::size_t>(i)];
             if (k > 10 && stale > worstStale[static_cast<std::size_t>(i)]) worstStale[static_cast<std::size_t>(i)] = stale;
+        }
+        // AF_WATCH=<音源番号> でその音源の後期を毎フレーム出す（跳びが山か段かを見る）
+        if (const char* wv = std::getenv("AF_WATCH")) {
+            const int wi = std::atoi(wv);
+            if (wi >= 0 && wi < N && k >= 25 && k <= 55) {
+                const Mix* mx = w.mix(ids[static_cast<std::size_t>(wi)]);
+                double late = 0.0, early = 0.0;
+                for (int b = 0; b < kNumBands; ++b) { late += mx->component6[kLate][b]; early += mx->component6[kEarly][b]; }
+                std::printf("        f%3d 扉%5.1f° 後期 %10.3e 初期 %10.3e レイ %3d 段 %d\n",
+                            k, deg, late, early, w.raysOf(ids[static_cast<std::size_t>(wi)]), w.tierOf(ids[static_cast<std::size_t>(wi)]));
+            }
         }
         reTraceTotal += reTrace; reTraceMax = std::max(reTraceMax, reTrace);
         if (k % 20 == 0 && k > 0) {
@@ -1342,6 +1370,11 @@ void testManySources() {
     }
     int worst = 0; double meanWorst = 0.0;
     for (int i = 0; i < N; ++i) { worst = std::max(worst, worstStale[static_cast<std::size_t>(i)]); meanWorst += worstStale[static_cast<std::size_t>(i)]; }
+    std::printf("        → 最悪の瞬間: 見通し %.4f → %.4f、レイ %d、虚像 %d\n（音源 %d）", worstVisPrev, worstVis, worstRays, worstImg, worstWho);
+    { static const char* cn[5] = {"直接", "初期", "後期", "回折", "透過"};
+      for (int c = 0; c < kNumComponents; ++c)
+          std::printf("            %s %10.3e → %10.3e（%+.1f dB）\n", cn[c], worstCompPrev[c], worstComp[c],
+                      afti::dB(std::max(worstComp[c], 1e-30) / std::max(worstCompPrev[c], 1e-30))); }
     std::printf("        → 段が入れ替わった回数 %d、そのフレームの最大の段差 %.2f dB（入れ替わらない所は %.2f dB）\n",
                 tierChanges, stepOnChange, stepOnSame);
     std::printf("        → 見通しが 1 フレームで 0.5 以上跳んだ回数 %d（うち簡易の段 %d）\n", visJump, visJumpLight);

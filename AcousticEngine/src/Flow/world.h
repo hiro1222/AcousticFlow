@@ -221,8 +221,15 @@ public:
             }
             s.groupNext = (s.groupNext + 1) % G;
             TraceResult::sumGroups(s.parts, G, s.trace);
-            // 見通し（解析）。幅は見込み角で点へ寄せた物。簡易は手を掛けない（detail 0 で点）。
-            const float rEff = s.em.effectiveRadius(s.trace.directDist, light ? 0.0f : 1.0f);
+            // 見通し（解析）。幅は見込み角で点へ寄せた物。
+            //   ★段に関わらず**円盤のまま**解く（2026-09-10）。以前は簡易・保持を点に落としていたが、
+            //     点だと扉が横切る瞬間に見通しが 0↔1 で切り替わり、半影にならない。
+            //     音源 17 本で 1 フレーム 11.8 dB、24 本で 13.1 dB の跳びが出ていた（実測）。
+            //     厳密の枠が 6 なので、6 本までは起きず**枠を超えた分から跳ぶ**のが症状の形だった。
+            //   ★費用は遮りがある配置で 0.006 ms／音源。17 本で 0.1 ms、更新の中央 5.25 ms に対して 2%。
+            //     同じ場面のレイ 512 本が 5.4 ms なので、削るなら統計（レイ・虚像）の側を削る。
+            //     解析で出している物は削らない ── そこが段になると耳に付く。
+            const float rEff = s.em.effectiveRadius(s.trace.directDist, 1.0f);
             s.vis = discVisibility(surfaces, rules.materials, listener_.pos, s.em.pos, rEff);
             // 回折（段 6）: 遮られた分が最寄りの稜線を回る。見通しが 1 なら要らない。
             s.diff = edgeDiffraction(surfaces, listener_, s.em.pos, s.vis, leakModel);
