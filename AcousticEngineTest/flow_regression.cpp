@@ -1283,6 +1283,7 @@ void testDoorSweep() {
     for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
     const int leaf = w.addBox(doorLeaf(0.0f), lm, true);
     w.raysPerEmitter = 256;
+    if (const char* lk = std::getenv("AF_LEAK")) w.leakModel = std::atoi(lk);   // 漏れの模型 0/1/2/3
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 1;
       const char* bd = std::getenv("AF_BUDGET"); w.budget.cfg.totalRays = bd ? std::atoi(bd) : 0; }
     { const char* cv = std::getenv("AF_COMP");
@@ -1375,6 +1376,7 @@ void testClicks() {
         for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
         const int leaf = w.addBox(doorLeaf(0.0f), lm, true);
         w.raysPerEmitter = 256;
+    if (const char* lk = std::getenv("AF_LEAK")) w.leakModel = std::atoi(lk);   // 漏れの模型 0/1/2/3
         w.budget.cfg.totalRays = (which == 3) ? 0 : 1536;
         w.rayGroups = (which == 2 || which == 3) ? 1 : 4;
         if (which == 1) w.budget.cfg.fullSlots = 0;                    // 簡易に落として虚像を作らせない
