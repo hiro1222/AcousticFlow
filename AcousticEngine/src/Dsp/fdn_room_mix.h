@@ -112,8 +112,11 @@ public:
             r->wCur[b] = 0.0f; r->wTgt[b] = 0.0f; r->wPend[b] = 0.0f;
         }
         // レーン用（方向バスがあるとき）。行 × 帯域のバッファと、一様のレーンの重み。
-        r->rowBuf.assign(static_cast<std::size_t>(kMaxLanes) * kNumBands * N, 0.0f);
-        for (int k = 0; k < kMaxLanes; ++k)
+        // ★レーン 1 本につき**耳ごとに別の行**を持つ（2026-09-10）。同じ波形を左右へ複製すると
+        //   両耳が完全に相関し、尾の左右差が消える（実測: 尾だけの両耳相関 バスあり 0.860 / なし 0.154）。
+        //   反射タップなら 1 つの到来なので複製で正しいが、残響の尾は 1 つの到来ではない。
+        r->rowBuf.assign(static_cast<std::size_t>(kMaxLanes) * 2 * kNumBands * N, 0.0f);
+        for (int k = 0; k < kMaxLanes * 2; ++k)
             for (int b = 0; b < kNumBands; ++b)
                 r->prow[k * kNumBands + b] = r->rowBuf.data() + (static_cast<std::size_t>(k) * kNumBands + b) * N;
         r->laneSig.assign(N, 0.0f);
@@ -242,11 +245,16 @@ public:
                 else std::fill(row, row + kItdMax, 0.0f);
                 std::fill(row + kItdMax, row + n + kItdMax, 0.0f);
             }
-            int rows[kMaxLanes];
-            for (int l = 0; l < L; ++l) rows[l] = (l + 1) & (FdnTail::kLines - 1);   // 行 1..L（行 0 = M は使わない）
+            // 行はレーン×耳で別々に取る。行 0（M ＝ 全線の和）は使わないので 1..15 を順に回す。
+            //   8 レーン × 2 耳 = 16 に対して使える行が 15 本なので、最後の 1 つだけ先頭と重なる。
+            //   重なる 2 つは別のレーン（＝別のレーン重みと別の ITD）なので実害は小さい。
+            int rows[kMaxLanes * 2];
+            for (int l = 0; l < L; ++l)
+                for (int ear = 0; ear < 2; ++ear)
+                    rows[l * 2 + ear] = 1 + ((l * 2 + ear) % (FdnTail::kLines - 1));
             for (int k = 0; k < nr; ++k) {
                 Room& r = *rooms_[static_cast<std::size_t>(k)];
-                r.fdn->renderBandsRows(r.in.data(), n, rows, L, r.prow);
+                r.fdn->renderBandsRows(r.in.data(), n, rows, L * 2, r.prow);
                 std::fill(r.in.begin(), r.in.begin() + n, 0.0f);
                 float wStep[kNumBands];
                 for (int b = 0; b < kNumBands; ++b) wStep[b] = (r.wTgt[b] - r.wCur[b]) * inv;
@@ -260,17 +268,21 @@ public:
                     const float l0 = r.laneCur[l], dl = (lt - l0) * inv;
                     bool any = (l0 != 0.0f || lt != 0.0f);
                     if (!any) continue;
-                    float* sig = r.laneSig.data();
-                    for (int i = 0; i < n; ++i) {
-                        float acc = 0.0f;
-                        for (int b = 0; b < kNumBands; ++b) acc += r.prow[l * kNumBands + b][i] * (r.wCur[b] + wStep[b] * static_cast<float>(i + 1));
-                        const float y = acc * (l0 + dl * static_cast<float>(i + 1)) * laneNorm_;
-                        sig[i] = y;
-                        e += static_cast<double>(y) * y;
+                    // ★耳ごとに別の行から作る。ここが左右差の出所。
+                    for (int ear = 0; ear < 2; ++ear) {
+                        float* sig = r.laneSig.data();
+                        const int src = l * 2 + ear;
+                        for (int i = 0; i < n; ++i) {
+                            float acc = 0.0f;
+                            for (int b = 0; b < kNumBands; ++b) acc += r.prow[src * kNumBands + b][i] * (r.wCur[b] + wStep[b] * static_cast<float>(i + 1));
+                            const float y = acc * (l0 + dl * static_cast<float>(i + 1)) * laneNorm_;
+                            sig[i] = y;
+                            if (ear == 0) e += static_cast<double>(y) * y;   // 計器は片耳ぶん（今までと同じ意味）
+                        }
+                        float* row = laneRows_.data() + static_cast<std::size_t>(l * 2 + ear) * stride
+                                   + (ear == 0 ? itdL_[l] : itdR_[l]);
+                        for (int i = 0; i < n; ++i) row[i] += sig[i];
                     }
-                    float* rowL = laneRows_.data() + static_cast<std::size_t>(l * 2) * stride + itdL_[l];
-                    float* rowR = laneRows_.data() + static_cast<std::size_t>(l * 2 + 1) * stride + itdR_[l];
-                    for (int i = 0; i < n; ++i) { rowL[i] += sig[i]; rowR[i] += sig[i]; }
                 }
                 for (int b = 0; b < kNumBands; ++b) r.wCur[b] = r.wTgt[b];
                 for (int l = 0; l < kMaxLanes; ++l) r.laneCur[l] += (r.laneTgt[l] - r.laneCur[l]) * laneFollow;
@@ -320,7 +332,7 @@ private:
         float wCur[kNumBands], wTgt[kNumBands], wPend[kNumBands];
         // 方向バス用: 行（レーン）× 帯域の出力と、レーンの重み（Σ² = 1）。
         std::vector<float> rowBuf;
-        float* prow[kMaxLanes * kNumBands];
+            float* prow[kMaxLanes * 2 * kNumBands];   // [(レーン×2＋耳) × 帯域]
         std::vector<float> laneSig;
         float laneCur[kMaxLanes], laneTgt[kMaxLanes], lanePend[kMaxLanes];
     };
