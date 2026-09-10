@@ -30,6 +30,7 @@
 #include "../AcousticEngine/src/Flow/mix_to_voice.h"
 #include "../AcousticEngine/src/Flow/world.h"
 #include "../AcousticEngine/src/Gpu/compute_d3d11.h"
+#include "../AcousticEngine/src/Gpu/trace_gpu.h"
 
 using namespace acoustic;
 using namespace acoustic::flow;
@@ -1431,6 +1432,76 @@ void testGpuPipe() {
     }
     std::snprintf(buf, sizeof(buf), "(%d 要素、外れ %d 個、最大のずれ %.2e)", n, bad, worst);
     check("[GPU] 答えが CPU の期待と合う（in*3 + 番号）", bad == 0, buf);
+
+    // ── レイ本体を GPU で解いて CPU と突き合わせる ──
+    //   ★ビット一致はしない（丸めも sin/cos も違う）。見るのは 3 つ:
+    //     ①保存則が GPU 側でも立つか ②当たりの数が近いか ③初期・後期が dB で近いか
+    {
+        acoustic::gpu::GpuTracer gt;
+        if (!gt.init()) {
+            std::printf("      レイの GPU 版は積めませんでした（%s）\n", gt.error().c_str());
+            check("[GPU] シェーダが積めなくても CPU で進める", true, "(init 失敗。CPU のまま)");
+        } else {
+            AcousticMaterial wall = AcousticMaterial::defaultWall();
+            for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.scattering[b] = 0.5f; wall.transmission[b] = 0.01f; }
+            MaterialTable mats; const int matId = mats.add(wall);
+            Surfaces box = closedBox(3.5f, 3.0f, matId);
+            box.rebuildBvh();
+            TraceScene sc; buildTraceScene(box, mats, sc);
+            const Vec3 S(1.5f, 1.6f, -1.0f), L(-1.0f, 1.2f, 1.5f);
+            TraceParams prm{512, 20, 0.03f, 7u, 1, 0};
+
+            EnergyTrace cpu;
+            const TraceResult rc = cpu.run(sc, S, L, prm);
+            TraceResult rg;      // 反射だけ（直接は CPU が出す）
+            const bool okUp = gt.upload(sc);
+            const bool okRun = okUp && gt.run(sc, S, L, prm, rg);
+            check("[GPU] 場面を送って流せる", okRun, okRun ? "" : gt.error().c_str());
+            if (okRun) {
+                // ① 保存則（GPU の帳簿だけで）
+                double em = 0.0, ab = 0.0, rm = 0.0, es = 0.0;
+                for (int b = 0; b < kNumBands; ++b) { em += rg.emitted6[b]; ab += rg.absorbed6[b]; rm += rg.remainder6[b]; es += rg.escaped6[b]; }
+                const double consErr = std::fabs(em - (ab + rm + es)) / std::max(em, 1e-30);
+                std::snprintf(buf, sizeof(buf), "(放射 %.4f = 吸収 %.4f + 残り %.4f + 逃げ %.4f、ずれ %.2e)", em, ab, rm, es, consErr);
+                check("[GPU] 保存則が GPU 側でも立つ", consErr < 1e-3, buf);
+                // ② 当たりの数
+                const double hitRatio = static_cast<double>(rg.hits) / std::max(1, rc.hits);
+                std::snprintf(buf, sizeof(buf), "(CPU %d / GPU %d ＝ %.4f 倍、レイ CPU %d / GPU %d)",
+                              rc.hits, rg.hits, hitRatio, rc.raysTraced, rg.raysTraced);
+                check("[GPU] 当たりの数が CPU と 2% 以内", std::fabs(hitRatio - 1.0) < 0.02, buf);
+                // ③ 初期・後期
+                double ce = 0.0, ge = 0.0, cl = 0.0, gl = 0.0;
+                for (int b = 0; b < kNumBands; ++b) { ce += rc.early6[b]; ge += rg.early6[b]; cl += rc.late6[b]; gl += rg.late6[b]; }
+                const double dE = afti::dB(std::max(ge, 1e-30) / std::max(ce, 1e-30));
+                const double dL2 = afti::dB(std::max(gl, 1e-30) / std::max(cl, 1e-30));
+                std::snprintf(buf, sizeof(buf), "(初期 CPU %.3e / GPU %.3e ＝ %+.2f dB、後期 %.3e / %.3e ＝ %+.2f dB)",
+                              ce, ge, dE, cl, gl, dL2);
+                check("[GPU] 初期・後期が CPU と ±1 dB 以内", std::fabs(dE) < 1.0 && std::fabs(dL2) < 1.0, buf);
+                // ④ 何度流しても同じ（静止＝毎フレーム同じ、の GPU 側）
+                TraceResult rg2;
+                gt.run(sc, S, L, prm, rg2);
+                bool same = (rg2.hits == rg.hits);
+                for (int b = 0; b < kNumBands && same; ++b) same = (rg2.early6[b] == rg.early6[b] && rg2.late6[b] == rg.late6[b]);
+                std::snprintf(buf, sizeof(buf), "(2 回目の当たり %d)", rg2.hits);
+                check("[GPU] 同じ入力なら何度流しても同じ答え（静止していれば揺れない）", same, buf);
+                // ── 速さ（本題）。本数と跳ね返りを振って CPU と並べる ──
+                std::printf("      速さ（1 音源。GPU は転送と読み戻し込み）:\n");
+                std::printf("        %8s %6s | %10s %10s | %s\n", "レイ", "跳ね", "CPU", "GPU", "倍率");
+                for (int nr : {512, 2048, 8192, 32768}) {
+                    TraceParams pp{nr, 40, 0.03f, 7u, 1, 0};
+                    const auto c0 = std::chrono::steady_clock::now();
+                    for (int q = 0; q < 3; ++q) { volatile auto r = cpu.run(sc, S, L, pp); (void)r; }
+                    const double msC = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count() / 3.0;
+                    TraceResult tmp;
+                    gt.run(sc, S, L, pp, tmp);                       // 温める
+                    const auto g0 = std::chrono::steady_clock::now();
+                    for (int q = 0; q < 3; ++q) { TraceResult t2; gt.run(sc, S, L, pp, t2); }
+                    const double msG = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g0).count() / 3.0;
+                    std::printf("        %8d %6d | %8.3f ms %8.3f ms | %.1f 倍\n", nr, 40, msC, msG, msC / std::max(msG, 1e-6));
+                }
+            }
+        }
+    }
 }
 
 /// 【探り】壁に近づいたときの初期反射（AF_ONLY=nearwall）
