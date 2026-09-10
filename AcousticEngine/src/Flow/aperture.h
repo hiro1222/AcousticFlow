@@ -217,6 +217,82 @@ inline double polyArea(const std::vector<P2>& p) {
 }
 }  // namespace detail
 
+// ── 隙間の通り（フレネルゾーンのうち開いている割合。段 9）──
+//
+// ■ なぜ要るか
+//   幾何（レイと稜線）は**開口の広さという概念を持たない**。扉が 1° 開いた隙間も 90° 開いた戸口も、
+//   「経路が通るか通らないか」でしか区別できない。実際には隙間の幅と波長の比で通る量が決まる。
+//   これが無いと、扉の音は「経路が生まれた瞬間に段で立ち上がり、あとは開けてもほとんど変わらない」になる
+//   （段 8 の実測: 8→9° で +10.5 dB、9→50° は 2.6 dB）。試聴でも「急な変化が激しい」と出た。
+//
+// ■ 何を計算するか
+//   隙間の幅 a（回折点から、その稜線の持ち主以外の実体までの最短距離）と、波長ごとのフレネルゾーンの半径
+//     r_b = √(λ_b · d₁d₂/(d₁+d₂))   d₁ = |L−P|、d₂ = |P−S|
+//   の比で「どれだけ通るか」を出す。3 m + 3 m なら 125 Hz で r = 2.0 m、4 kHz で 0.36 m。
+//   同じ 6 cm の隙間でも、4 kHz はゾーンの 17% を占めるので少し通り、125 Hz は 3% しか占めないのでほとんど通らない。
+//   ＝**狭い隙間は高域だけ通す。開くほど低域が入ってくる**（Ⅸ「開度の残り区間を担うのは鮮明さ」）。
+//   旧実装で収録した現実の扉（開−閉の差が 125 Hz +2.6 dB / 1 kHz +10.3 dB）と同じ形。
+//
+// ■ なぜ連続か
+//   隙間の幅 a は扉の開き角に対して連続（自由端が動く距離）。通る割合は閉じた形
+//     f(x) = (2/π)(asin x + x√(1−x²))、x = a/r        （半円のうち幅 a の帯が覆う割合）
+//   なので標本化がなく、1 mm の隙間も取りこぼさない。レイを 1 本も撃たない。
+//
+// ■ 退けた書き方
+//   ・開き角に対するフェードの窓（何度前から混ぜ始めるか）: 幅の違う扉・厚みの違う壁で毎回調整が要る。
+//     設計文書が退けた 2 値クロスフェードの窓を広げただけになる。
+//   ・フレネルゾーンの円を平面に置いて塞がれた面積を引く（最初に書いた形）: 平面をどこに置くかで壊れる。
+//     板の面に置くと、扉が少し開いただけで平面が戸口から突き出て**枠が断面に入らない**（実測: 8→9° の段が
+//     +10.5 → +9.2 dB としか変わらなかった）。直線のまわりに置くと、横にずれた聞き手には戸口がゾーンに入らず
+//     「横から戸口越しに聞こえる」が消える。幅そのものを測れば置き場所の問題が無い。
+//   ・直接音にも掛ける: 戸口が全開で見通せているのに低域が落ちる。フレネルゾーンの部分遮蔽による直接音の減衰は
+//     面積比より弱い（60% 空いていればほぼ無損失）ので、隙間を通る成分（回折）にだけ掛ける。
+//
+// ■ 壊れる所
+//   ・a を「持ち主も含めた最短距離」にすると、押し出した 3 cm がそのまま a になって常にほぼ 0（何も通らない）。
+//   ・遮る物が 1 つしか無い（自立した衝立）ときは a = ∞ ＝ 1。半無限スクリーンには開口の制限が無いので正しい。
+//   ・キルヒホッフ近似は開口が波長より十分大きいときに精度が出る。125 Hz（λ 2.7 m）に対して 1 m の戸口は
+//     「大きい」とは言えないので低域は誤差が出る。目的は絶対精度でなく「開き具合が連続に音へ出ること」。
+struct GapOpen {
+    float open6[kNumBands] = {1, 1, 1, 1, 1, 1};
+    float width = 1e9f;                 // 隙間の幅（m）。診断用
+    float radius6[kNumBands] = {};      // フレネルゾーンの半径（m）。診断用
+};
+
+/// 点 P から、その稜線の持ち主 owner 以外の実体までの最短距離 ＝ 隙間の幅。
+inline float gapWidthAt(const Surfaces& surf, const Vec3& P, int owner) {
+    float best = 1e9f;
+    for (int i = 0; i < surf.count(); ++i) {
+        if (i == owner || !surf.at(i).active) continue;
+        const Obb& b = surf.at(i).obb;
+        const Vec3 d = P - b.center;
+        // 箱のローカルへ落として各軸で外にはみ出した分を測る（点と OBB の距離）
+        const float lx = dot(d, b.axisX), ly = dot(d, b.axisY), lz = dot(d, b.axisZ);
+        const float ox = std::max(0.0f, std::fabs(lx) - b.halfExtents.x);
+        const float oy = std::max(0.0f, std::fabs(ly) - b.halfExtents.y);
+        const float oz = std::max(0.0f, std::fabs(lz) - b.halfExtents.z);
+        best = std::min(best, std::sqrt(ox * ox + oy * oy + oz * oz));
+    }
+    return best;
+}
+
+/// 隙間の幅 a と波長から、帯域ごとに「どれだけ通るか」（0..1）。
+///   ゾーン半径 r_b = √(λ_b · d₁d₂/(d₁+d₂))。x = a/r_b として、半円のうち幅 a の帯が覆う割合
+///       f(x) = (2/π)(asin x + x√(1−x²))     x ≥ 1 で 1
+///   ★閉じた形なので標本化しない（1 mm の隙間も取りこぼさない）。a は連続（w·sinθ）なので f も連続。
+inline GapOpen gapOpen(float a, float d1, float d2) {
+    GapOpen out;
+    out.width = a;
+    const float dd = (d1 * d2) / std::max(1e-3f, d1 + d2);
+    for (int b = 0; b < kNumBands; ++b) {
+        const float r = std::sqrt((kSpeedOfSound / kBandHz[b]) * dd);
+        out.radius6[b] = r;
+        const float x = std::min(1.0f, std::max(0.0f, a / std::max(1e-6f, r)));
+        out.open6[b] = static_cast<float>((2.0 / 3.14159265358979) * (std::asin(x) + x * std::sqrt(std::max(0.0f, 1.0f - x * x))));
+    }
+    return out;
+}
+
 /// 戸口の矩形を板が覆う割合（0..1）。板のどこかが面から nearM 以内にある物だけ数える。
 inline float openingCoverage(const rooms::Aperture& ap, const Obb& leaf, float nearM = 0.1f) {
     using detail::P2;

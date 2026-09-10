@@ -686,6 +686,19 @@ void testAperture() {
         }
     }
 
+    // 4.5) 隙間の通り（段 9。回折の量を決める）: 幅 a と波長の比で決まる。0 で閉じ、a ≥ r で全部通り、高域が先に開く。
+    {
+        const float d1 = 3.0f, d2 = 3.0f;
+        const GapOpen g0 = gapOpen(0.0f, d1, d2), gTiny = gapOpen(0.06f, d1, d2), gMid = gapOpen(0.3f, d1, d2), gWide = gapOpen(3.0f, d1, d2);
+        std::snprintf(buf, sizeof(buf), "(3+3 m のゾーン半径 125Hz %.2f m / 4k %.2f m。隙間 6 cm: 125Hz %.3f / 4k %.3f、30 cm: %.3f / %.3f)",
+                      g0.radius6[0], g0.radius6[5], gTiny.open6[0], gTiny.open6[5], gMid.open6[0], gMid.open6[5]);
+        check("[開口] 隙間: 閉じていれば 0、十分広ければ 1（全帯域）", g0.open6[0] == 0.0f && g0.open6[5] == 0.0f && gWide.open6[0] > 0.999f && gWide.open6[5] > 0.999f, buf);
+        check("[開口] 隙間: 狭い隙間は高域が先に通る（同じ幅で 4kHz > 125Hz）", gTiny.open6[5] > 3.0f * gTiny.open6[0] && gMid.open6[5] > gMid.open6[0], buf);
+        bool mono = true; float prev = -1.0f;
+        for (float a = 0.0f; a <= 2.0f; a += 0.01f) { const float v = gapOpen(a, d1, d2).open6[2]; if (v < prev - 1e-6f) mono = false; prev = v; }
+        check("[開口] 隙間: 幅に対して単調（1 cm 刻みで戻らない）", mono);
+    }
+
     // 5) 世界を通す: 閉めると直接 ≈ 0 で透過が残り、開けると直接が戻る。閉めた部屋の RT60 が伸びる。
     {
         World w;
@@ -750,7 +763,7 @@ void testDiffraction() {
     {
         const Vec3 S(0, 1.6f, 3.0f);
         const int leaf = s.add(doorLeaf(0.0f), leafId, true);
-        int firstDiff = -1, rampEnd = -1, worstDeg = -1; double prevDb = -999.0, worstAfter = 0.0, stepAt = 0.0, closedDb = 0.0, at20Lo = 0, at20Hi = 0; bool monoAfter = true;
+        int firstDiff = -1, worstDeg = -1; double prevDb = -999.0, worstAfter = 0.0, closedDb = 0.0; bool monoAfter = true;
         std::printf("      角度→合計(dB):");
         for (int deg = 0; deg <= 90; ++deg) {
             s.at(leaf).obb = doorLeaf(static_cast<float>(deg));
@@ -764,12 +777,8 @@ void testDiffraction() {
             const double db = afti::dB(tot);
             if (deg % 5 == 0 || (deg >= 8 && deg <= 16) || (deg >= 50 && deg <= 70)) std::printf(" %d:%.1f", deg, db);
             if (deg == 0) closedDb = db;
-            if (deg == 20) { at20Lo = d.valid ? d.energy6[0] : 0; at20Hi = d.valid ? d.energy6[5] : 0; }
-            // 「最初の 1 段」= 回折が立ち始めてから閉より 6 dB 上がるまで（枠を抜ける約 2°）。物理なので跳んでよい。
-            //   その後は連続でなければならない。
-            if (d.valid && firstDiff < 0) { firstDiff = deg; stepAt = db - prevDb; }
-            if (firstDiff >= 0 && rampEnd < 0 && db > closedDb + 6.0) { rampEnd = deg; stepAt = db - closedDb; }
-            else if (rampEnd >= 0 && deg > rampEnd) {
+            if (d.valid && firstDiff < 0) firstDiff = deg;
+            if (deg > 0) {
                 if (db < prevDb - 0.3) { monoAfter = false; std::printf(" [%d°で %.2f dB 戻り]", deg, prevDb - db); }
                 if (std::fabs(db - prevDb) > worstAfter) { worstAfter = std::fabs(db - prevDb); worstDeg = deg; }
             }
@@ -778,7 +787,7 @@ void testDiffraction() {
         // ★回折が立つ角度は枠の厚みで決まる: 板の自由端が枠の奥行き（半厚み 0.1 m）＋板の半厚み 0.03 を抜ける
         //   sinθ > 0.13 → θ ≈ 7.5°。それまでの隙間は mm で、波長より小さく前川の範囲外（透過だけ）。余裕 +5° で 12°。
         //   0.2 m の壁ならこれが物理。10 cm の壁の家の扉なら 4° 前後で立つ。
-        const int expectFirst = static_cast<int>(std::asin(0.13f) * 180.0f / 3.14159265f) + 5;
+
         std::printf("\n");
         // 診断: 段差が出た角度で、候補の稜線ごとの経路を並べる（AF_DIFF_DEBUG があるとき）
         if (std::getenv("AF_DIFF_DEBUG") && worstDeg > 0) {
@@ -786,8 +795,11 @@ void testDiffraction() {
                 s.at(leaf).obb = doorLeaf(static_cast<float>(deg));
                 const Visibility v = discVisibility(s, mats, L, S, 0.2f);
                 const Diffraction d = edgeDiffraction(s, lis, S, v);
-                std::printf("      %d°: 見通し %.3f 遮る物 %d / 回折 %s 箱 %d 稜線 %d δ %.3f w %.2f 点 (%.3f, %.3f, %.3f)\n",
-                            deg, v.visible, v.shadowers, d.valid ? "有効" : "無効", d.box, d.edge, d.delta, d.weight, d.point.x, d.point.y, d.point.z);
+                double tot = 0.0;
+                for (int b = 0; b < kNumBands; ++b) tot += (v.visible + (1.0 - v.visible) * ((d.valid ? d.energy6[b] : 0.0f) + v.shadowTau6[b])) / kNumBands;
+                std::printf("      %d°: 合計 %.2f dB / 見通し %.3f 遮る物 %d τ(125) %.5f τ(1k) %.5f / 回折 %s 箱 %d 稜線 %d δ %.3f w %.2f 隙間 %.3f m 通り(125) %.3f (4k) %.3f 量(125) %.2f dB\n",
+                            deg, afti::dB(tot), v.visible, v.shadowers, v.shadowTau6[0], v.shadowTau6[3],
+                            d.valid ? "有効" : "無効", d.box, d.edge, d.delta, d.weight, d.gapWidth, d.gapOpen6[0], d.gapOpen6[5], afti::dB(d.energy6[0]));
                 const Obb& b = s.at(leaf).obb;
                 for (int e = 0; e < 12; ++e) {
                     Vec3 A, B, ow; detail::boxEdge(b, e, A, B, ow);
@@ -800,11 +812,25 @@ void testDiffraction() {
                 }
             }
         }
-        std::snprintf(buf, sizeof(buf), "(閉 %.1f dB、回折は %d° から立ち %d° で 1 段 %+.1f dB（幾何の見込み %d° 以内）、以後の 1° あたり最大 %.2f dB（%d°）、90° %.1f dB)", closedDb, firstDiff, rampEnd, stepAt, expectFirst, worstAfter, worstDeg, prevDb);
-        check("[回折] 扉: 閉は透過だけ（−20 dB 以下）、回折は板の自由端が枠を抜けた角度で 1 段立つ（その段は物理、4° 以内）", closedDb < -20.0 && firstDiff > 0 && rampEnd > 0 && rampEnd <= expectFirst && rampEnd - firstDiff <= 4, buf);
-        check("[回折] 扉: 立った後は単調に増え、1° で 3 dB も跳ばない（影の境 53〜68° でも）", monoAfter && worstAfter < 3.0, buf);
-        std::snprintf(buf, sizeof(buf), "(20°: 125Hz %.1f dB / 4k %.1f dB)", afti::dB(at20Lo), afti::dB(at20Hi));
-        check("[回折] 扉 20°: 回折は低域が通り高域が落ちる（鮮明さの「高域の通り」の材料）", at20Lo > 0 && at20Lo > 2.0 * at20Hi, buf);
+        // ★段 9: 隙間の通り（aperture.h の gapOpen）を掛けたので**段が無くなった**。
+        //   前は「経路が生まれた瞬間に +10.5 dB、その後 40° で 2.6 dB」（試聴で「急な変化が激しい」）。
+        //   いまは 0°→90° の全域で単調に、しかも 1° あたり 2 dB 未満で開く。
+        std::snprintf(buf, sizeof(buf), "(閉 %.1f dB → 90° %.1f dB、1° あたり最大 %.2f dB（%d°）。回折は %d° から)", closedDb, prevDb, worstAfter, worstDeg, firstDiff);
+        check("[回折] 扉: 閉は透過だけ（−20 dB 以下）、全開で 0 dB", closedDb < -20.0 && prevDb > -0.5, buf);
+        check("[回折] 扉: 0→90° の全域で単調に開き、どの 1° でも 2 dB より小さい（段が無い）", monoAfter && worstAfter < 2.0, buf);
+        // ★色の変化（Ⅸ「開度の残り区間を担うのは鮮明さ」）: 狭い隙間は高域だけ通し、開くと低域が入ってくる。
+        //   隙間の通り（gapOpen）は高域が先に開き、前川の減衰は高域を落とす。差し引きで、開くにつれて
+        //   **高域の取り分が増えてから低域が追いつく**。低域／高域の比が角度で動くことを見る。
+        double ratio[3] = {};   // 10°, 30°, 60° の 125Hz / 4kHz（回折のエネルギー比）
+        for (int k = 0; k < 3; ++k) {
+            const int deg = (k == 0) ? 10 : (k == 1) ? 30 : 60;
+            s.at(leaf).obb = doorLeaf(static_cast<float>(deg));
+            const Visibility v = discVisibility(s, mats, L, S, 0.2f);
+            const Diffraction d = edgeDiffraction(s, lis, S, v);
+            ratio[k] = (d.valid && d.energy6[5] > 0.0f) ? afti::dB(d.energy6[0] / d.energy6[5]) : 0.0;
+        }
+        std::snprintf(buf, sizeof(buf), "(125Hz − 4kHz: 10° %+.1f dB / 30° %+.1f dB / 60° %+.1f dB)", ratio[0], ratio[1], ratio[2]);
+        check("[回折] 扉: 開くにつれて色が動く（低域／高域の比が 3 dB 以上変わる。狭い隙間は高域が先）", std::fabs(ratio[2] - ratio[0]) > 3.0, buf);
     }
 
     // 3) 世界を通す: 扉 20° で回折のタップがあり、方向は右、帳簿は保存

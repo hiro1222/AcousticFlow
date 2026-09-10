@@ -58,7 +58,9 @@ namespace flow {
 
 struct Diffraction {
     bool  valid = false;
-    float energy6[kNumBands] = {};       // 帯域別のエネルギー比 g_b²（自由音場に対して）
+    float energy6[kNumBands] = {};       // 帯域別のエネルギー比（前川 × 隙間の通り）。自由音場に対して
+    float gapOpen6[kNumBands] = {};      // 隙間の通り（0..1、帯域別）。診断用
+    float gapWidth = 0.0f;               // 隙間の幅（m）。診断用
     float delta = 0.0f;                  // 迂回長 δ（m）
     float weight = 0.0f;                 // 脚の貫通による重み 0..1（1 = 脚が完全に通る）
     float pathSec = 0.0f;                // 到達（秒）
@@ -97,7 +99,8 @@ inline Diffraction edgeDiffraction(const Surfaces& surf, const Listener& listene
         for (int i = 0; i < surf.count(); ++i)
             if (surf.at(i).active && segmentIntersectsObb(L, S, surf.at(i).obb)) shadowers.push_back(i);
     if (shadowers.empty()) return out;
-    float best = 1e30f, bestLen = 0.0f, bestW = 0.0f;
+    float best = 0.0f, bestLen = 0.0f, bestW = 0.0f, bestA = 0.0f;
+    GapOpen bestGap;
     for (int i : shadowers) {
         const Obb& b = surf.at(i).obb;
         for (int e = 0; e < 12; ++e) {
@@ -113,7 +116,6 @@ inline Diffraction edgeDiffraction(const Surfaces& surf, const Listener& listene
             }
             const float t = 0.5f * (lo + hi);
             const float len = f(t);
-            if (len >= best) continue;
             // 回折点は稜線から**両隣の面の外側へ**押し出す（各面の法線の向きに 半厚み（上限 3 cm）＋1 mm）。
             //   ★薄い板の端を回る経路は、稜線ちょうどに点を置くと脚が板の厚みを幾何的に必ず貫く（旧 Core/aabb.h の注記の罠）。
             //     最初は「自分の箱の貫通は厚みまで許す」と書いたが、閉じた扉の**面**を貫く経路まで通って
@@ -130,32 +132,55 @@ inline Diffraction edgeDiffraction(const Surfaces& surf, const Listener& listene
             //     押し出した点から出る脚は、浅い角度で来ると自分の端を数 mm 掠める（12° の扉で 9 mm。5 mm の厳密判定だと
             //     正しい候補が落ちて 12 dB 跳んだ）。一方「板の面を通る」経路は厚みぶん（6 cm）貫くので半厚みで落ちる。
             //     閉じた扉で回折が立った件（−19.8 dB）はこれで防げる。
+            //     ★段 9 以降はこの判定が段を作らない ── 隙間の通り（fresnelOpenAt）が 0 に近いので、
+            //       境目で候補が出入りしても量はどちらもほぼ 0。判定は「どの稜線を選ぶか」だけの役になった。
+            //     ★段 9: これも 0/1 でなく**傾斜**にした。板の自由端は前後 2 本の稜線を持ち、開いていくと
+            //       奥の稜線は板の陰に入って見えなくなる。0/1 だと見えなくなった瞬間に手前の稜線へ乗り換え、
+            //       隙間が 0.18 → 0.08 m へ跳んで **2.6 dB 落ちた**（19°、実測）。半厚みから厚みまでで消せば連続。
+            //       厚みぶん貫く「板の面を通る」経路は 0 のままなので、閉扉で回折が立つ件は防げたまま。
             const float ownerTol = std::min(halfMin, 0.03f) + kEps;
-            float pen = 0.0f;
-            bool ownerCrossed = false;
+            float pen = 0.0f, ownerPen = 0.0f;
             for (int j = 0; j < surf.count(); ++j) {
                 if (!surf.at(j).active) continue;
                 const float pj = std::max(segmentObbPenetration(L, P, surf.at(j).obb), segmentObbPenetration(P, S, surf.at(j).obb));
-                if (j == i) { if (pj > ownerTol) { ownerCrossed = true; break; } continue; }
+                if (j == i) { ownerPen = pj; continue; }
                 pen = std::max(pen, pj);
                 if (pen >= 0.07f) break;
             }
-            if (ownerCrossed) continue;
-            const float w = std::min(1.0f, std::max(0.0f, (0.07f - pen) / 0.05f));
+            const float ownerW = std::min(1.0f, std::max(0.0f, (2.0f * ownerTol - ownerPen) / ownerTol));
+            if (ownerW <= 0.0f) continue;
+            const float w = std::min(1.0f, std::max(0.0f, (0.07f - pen) / 0.05f)) * ownerW;
             if (w <= 0.0f) continue;
-            // 重みは経路長に換算して比べる（w が小さい候補は「長い」扱い）: len_eff = len + (1−w)·0.5 m
-            const float lenEff = len + (1.0f - w) * 0.5f;
-            if (lenEff >= best) continue;
-            best = lenEff; bestLen = len; bestW = w;
+            // ★候補は**出てくる量そのもの**で選ぶ（経路の長さで選ばない）。
+            //   隙間の通り（段 9）を掛けると、経路の長さがほぼ同じで隙間の広さが違う稜線が並ぶ
+            //   （扉の自由端は前後 2 本の稜線を持ち、厚み 6 cm ぶん隙間が違う）。長さで選ぶと、
+            //   乗り換えた瞬間に隙間が 0.28 → 0.18 m へ跳んで **2.6 dB 落ちた**（19°、実測）。
+            //   量で選べば、乗り換えは「2 つが等しい所」で起きるので値は跳ばない（max は連続）。
+            //   ★隙間の通り: 回折点から他の実体までの最短距離 a と、波長ごとのフレネル半径 r_b の比。
+            //     これが無いと「経路が生まれた瞬間に段で立ち上がり、あとは開けてもほとんど変わらない」になる
+            //     （8→9° で +10.5 dB、9→50° は 2.6 dB。試聴で「急な変化が激しい」）。
+            const float a = gapWidthAt(surf, P, i);
+            const GapOpen gp = gapOpen(a, length(P - L), length(S - P));
+            const float dl = std::max(0.0f, len - direct);
+            float gn[kNumBands]; maekawa::gainBands(dl, gn, true);
+            float score = 0.0f;
+            for (int b = 0; b < kNumBands; ++b) score += gn[b] * gn[b] * gp.open6[b];
+            score = score / kNumBands * w;
+            if (score <= best) continue;
+            best = score; bestLen = len; bestW = w; bestGap = gp; bestA = a;
             out.valid = true; out.point = P; out.box = i; out.edge = e; out.pathSec = len / kSpeedOfSound;
         }
     }
     if (!out.valid) return out;
     out.delta = std::max(0.0f, bestLen - direct);
     out.weight = bestW;
+    out.gapWidth = bestA;
     float gain[kNumBands];
     maekawa::gainBands(out.delta, gain, true);
-    for (int b = 0; b < kNumBands; ++b) out.energy6[b] = gain[b] * gain[b] * bestW;
+    for (int b = 0; b < kNumBands; ++b) {
+        out.energy6[b] = gain[b] * gain[b] * bestW * bestGap.open6[b];
+        out.gapOpen6[b] = bestGap.open6[b];
+    }
     out.dirLocal = listener.toLocal(out.point - L);
     return out;
 }
