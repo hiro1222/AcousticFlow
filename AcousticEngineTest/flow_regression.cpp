@@ -1253,6 +1253,7 @@ void testLeakModels() {
 ///           最初の虚像の到達（ITDG）、虚像の数、1 次の虚像の最短到達。
 void testNearWall() {
     std::printf("\n[探り] 壁に近づく ── 初期反射の量と到達（奥行き感の材料）\n");
+    std::printf("        （%s を壁へ寄せる）\n", (std::getenv("AF_NEAR") != nullptr) ? "音源" : "耳");
     std::printf("        %7s | %9s %9s %9s | %8s | %8s %6s %8s\n",
                 "壁まで", "直接", "初期", "後期", "初期/直接", "ITDG", "虚像", "最短虚像");
     const float half = 3.5f, h = 3.0f;
@@ -1261,10 +1262,15 @@ void testNearWall() {
         const float wallDist = d[k];
         World* w = makeWorldBox(half, h, 0.2f);
         w->raysPerEmitter = 512; w->rayGroups = 1; w->budget.cfg.totalRays = 0;
-        // リスナーを −x の壁へ寄せる。音源は部屋の中央に固定（音源側は動かさない）。
-        const Vec3 L(-half + wallDist, 1.2f, 0.0f);
+        // AF_NEAR=src なら**音源**を壁へ寄せる（耳は固定）。既定は耳を寄せる。
+        //   ★虚像は「音源」の鏡映なので、音源が壁に近いほど虚像が音源のそばに集まる。
+        //     耳を寄せた場合に近づくのは「その壁の 1 本」だけで、群としては集まらない。
+        //     どちらの向きで狙いが出るかを分けて測る。
+        const bool nearSrc = (std::getenv("AF_NEAR") != nullptr);
+        const Vec3 L = nearSrc ? Vec3(1.5f, 1.2f, 0.0f) : Vec3(-half + wallDist, 1.2f, 0.0f);
+        const Vec3 S = nearSrc ? Vec3(-half + wallDist, 1.6f, -1.0f) : Vec3(1.5f, 1.6f, -1.0f);
         w->setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
-        const int e = w->addEmitter(Vec3(1.5f, 1.6f, -1.0f), 0.2f);
+        const int e = w->addEmitter(S, 0.2f);
         w->build();
         const float dt = 1.0f / 60.0f;
         for (int q = 0; q < 30; ++q) w->update(dt);      // 追従を落ち着かせる
@@ -1283,15 +1289,29 @@ void testNearWall() {
         // 直接の到達は Mix のタップから拾う
         float directSec = 0.0f;
         for (int i = 0; i < mx->tapCount; ++i) if (mx->taps[i].kind == TapKind::Direct) { directSec = mx->taps[i].delaySec; break; }
+        // ★集中度合い: 虚像の到達時刻を重み付きで見る。
+        //   重心 = Σw·t / Σw、広がり = その標準偏差、詰まり = 最初の 5 ms に入る取り分。
+        //   壁が近いほど「重心が前へ寄り、広がりが縮み、5 ms に入る取り分が増える」のが狙いの形。
+        double sw = 0.0, swt = 0.0, swt2 = 0.0, w5ms = 0.0;
+        for (int i = 0; i < im->count; ++i) {
+            double wi = 0.0; for (int b = 0; b < kNumBands; ++b) wi += im->img[i].weight6[b];
+            const double ti = (im->img[i].pathSec - directSec) * 1000.0;
+            sw += wi; swt += wi * ti; swt2 += wi * ti * ti;
+            if (ti <= 5.0) w5ms += wi;
+        }
+        const double cog = (sw > 0.0) ? swt / sw : 0.0;
+        const double var = (sw > 0.0) ? std::max(0.0, swt2 / sw - cog * cog) : 0.0;
+        const double spread = std::sqrt(var);
+        const double frac5 = (sw > 0.0) ? w5ms / sw : 0.0;
         // いちばん早い虚像の取り分（正規化重み、帯域幅平均でなく 500 Hz 帯）と、妥当性
         float wFirst = 0.0f, vFirst = 0.0f;
         for (int i = 0; i < im->count; ++i)
             if (im->img[i].order == 1 && std::fabs(im->img[i].pathSec - first1) < 1e-6f) { wFirst = im->img[i].weight6[2]; vFirst = im->img[i].validity; }
-        std::printf("        %7.2f | %9.2f %9.2f %9.2f | %8.2f | %6.1fms %6d %6.1fms  最早 %+6.2f dB（直接比）取り分 %.3f\n",
+        std::printf("        %7.2f | %9.2f %9.2f %9.2f | %8.2f | %6.1fms %6d %6.1fms  最早 %+6.2f dB 取り分 %.3f | 重心 %5.1fms 広がり %5.1fms 5ms内 %5.1f%%\n",
                     wallDist, afti::dB(dir), afti::dB(early), afti::dB(late), afti::dB(early / std::max(dir, 1e-30)),
                     (mx->onsetSec - directSec) * 1000.0f, im->count,
                     (first1 > 0.0f) ? (first1 - directSec) * 1000.0f : -1.0f,
-                    afti::dB(early * wFirst / std::max(dir, 1e-30)), wFirst);
+                    afti::dB(early * wFirst / std::max(dir, 1e-30)), wFirst, cog, spread, frac5 * 100.0);
         (void)vFirst;
         delete w;
     }
