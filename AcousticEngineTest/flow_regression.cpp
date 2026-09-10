@@ -1246,6 +1246,59 @@ void testLeakModels() {
     }
 }
 
+/// 【探り】壁に近づいたときの初期反射（AF_ONLY=nearwall）
+///   面音源化の狙いのうち **「壁が近いと虚像の密度が上がり、到達が近く早くなる ＝ 奥行き感」**
+///   が今の ISM で出ているかを測る。
+///   出す物: 壁までの距離ごとに、直接・初期・後期の量、初期/直接の比、
+///           最初の虚像の到達（ITDG）、虚像の数、1 次の虚像の最短到達。
+void testNearWall() {
+    std::printf("\n[探り] 壁に近づく ── 初期反射の量と到達（奥行き感の材料）\n");
+    std::printf("        %7s | %9s %9s %9s | %8s | %8s %6s %8s\n",
+                "壁まで", "直接", "初期", "後期", "初期/直接", "ITDG", "虚像", "最短虚像");
+    const float half = 3.5f, h = 3.0f;
+    for (int k = 0; k < 7; ++k) {
+        const float d[7] = {3.5f, 2.5f, 1.5f, 1.0f, 0.5f, 0.25f, 0.1f};
+        const float wallDist = d[k];
+        World* w = makeWorldBox(half, h, 0.2f);
+        w->raysPerEmitter = 512; w->rayGroups = 1; w->budget.cfg.totalRays = 0;
+        // リスナーを −x の壁へ寄せる。音源は部屋の中央に固定（音源側は動かさない）。
+        const Vec3 L(-half + wallDist, 1.2f, 0.0f);
+        w->setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w->addEmitter(Vec3(1.5f, 1.6f, -1.0f), 0.2f);
+        w->build();
+        const float dt = 1.0f / 60.0f;
+        for (int q = 0; q < 30; ++q) w->update(dt);      // 追従を落ち着かせる
+        const Mix* mx = w->mix(e);
+        const ImageSet* im = w->images(e);
+        double dir = 0.0, early = 0.0, late = 0.0;
+        for (int b = 0; b < kNumBands; ++b) {
+            dir += mx->component6[kDirect][b];
+            early += mx->component6[kEarly][b];
+            late += mx->component6[kLate][b];
+        }
+        // 1 次の虚像の最短到達（＝いちばん近い壁の反射が届く時刻）
+        float first1 = -1.0f;
+        for (int i = 0; i < im->count; ++i)
+            if (im->img[i].order == 1 && (first1 < 0.0f || im->img[i].pathSec < first1)) first1 = im->img[i].pathSec;
+        // 直接の到達は Mix のタップから拾う
+        float directSec = 0.0f;
+        for (int i = 0; i < mx->tapCount; ++i) if (mx->taps[i].kind == TapKind::Direct) { directSec = mx->taps[i].delaySec; break; }
+        // いちばん早い虚像の取り分（正規化重み、帯域幅平均でなく 500 Hz 帯）と、妥当性
+        float wFirst = 0.0f, vFirst = 0.0f;
+        for (int i = 0; i < im->count; ++i)
+            if (im->img[i].order == 1 && std::fabs(im->img[i].pathSec - first1) < 1e-6f) { wFirst = im->img[i].weight6[2]; vFirst = im->img[i].validity; }
+        std::printf("        %7.2f | %9.2f %9.2f %9.2f | %8.2f | %6.1fms %6d %6.1fms  最早 %+6.2f dB（直接比）取り分 %.3f\n",
+                    wallDist, afti::dB(dir), afti::dB(early), afti::dB(late), afti::dB(early / std::max(dir, 1e-30)),
+                    (mx->onsetSec - directSec) * 1000.0f, im->count,
+                    (first1 > 0.0f) ? (first1 - directSec) * 1000.0f : -1.0f,
+                    afti::dB(early * wFirst / std::max(dir, 1e-30)), wFirst);
+        (void)vFirst;
+        delete w;
+    }
+    std::printf("        ★「最早 dB（直接比）」＝ いちばん早い虚像 1 本が直接音に対してどれだけ鳴っているか。\n");
+    std::printf("          壁に近いほどこれが上がり、ITDG が短くなるのが狙いの形。\n");
+}
+
 /// 【探り】音源を増やして扉を動かす（AF_ONLY=manysrc）
 ///   試聴の「17 音源で扉を動かすと、開いてる途中や止めたときに音が遅くなってドロップアウトする」を数字にする。
 ///   出す物: 段の数、音源ごとの「最後に解いてから何フレーム経ったか」、レイの本数、
@@ -1718,7 +1771,7 @@ int main() {
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
         {"budget", testBudget}, {"clicks", testClicks}, {"leak", testLeakModels},
-        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
+        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {
         // AF_ONLY はコンマ区切りで複数指定できる（例 AF_ONLY=world,bridge）
