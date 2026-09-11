@@ -272,6 +272,13 @@ int main(int argc, char** argv) {
                               na, tot, ledger, 10.0 * std::log10(std::max(tot, 1e-30) / std::max(ledger, 1e-30)),
                               lateAll > 0.0 ? dirLate / lateAll * 100.0 : 0.0);
                 std::puts(line);
+                for (int q = 0, shown = 0; q < na && shown < 12; ++q) {           // 地図に置く出どころ（初期・回折・戸口）
+                    if (!arr[q].hasOrigin || (arr[q].kind != 1 && arr[q].kind != 3 && arr[q].kind != 6)) continue;
+                    std::snprintf(line, sizeof(line), "               出どころ %s (%.2f %.2f %.2f) 箱 %d 量 %.1f%%", kKind[arr[q].kind],
+                                  arr[q].origin[0], arr[q].origin[1], arr[q].origin[2], arr[q].box, tot > 0.0 ? arr[q].energy / tot * 100.0 : 0.0);
+                    std::puts(line);
+                    ++shown;
+                }
                 for (int k2 = 0; k2 < 9; ++k2) {
                     if (sumK[k2] <= 0.0) continue;
                     std::snprintf(line, sizeof(line), "               %s %.1f%%", kKind[k2], tot > 0.0 ? sumK[k2] / tot * 100.0 : 0.0);

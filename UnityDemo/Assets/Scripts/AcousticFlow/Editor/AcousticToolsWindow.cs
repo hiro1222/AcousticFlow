@@ -203,6 +203,20 @@ namespace AcousticFlow.EditorTools
             GUILayout.Space(4f);
             EditorGUILayout.HelpBox("円: 上が前（リスナーの向き）、右が右。中心からの距離は総量に対する割合（外周 0 dB、中心 −40 dB、薄い輪は −10/−20/−30 dB）。"
                 + "点は向きのある到来（大きさも割合）、色の輪は全方向から来る分、オレンジの弧は戸口の線音源の横幅。", MessageType.None);
+
+            // ── 地図（メートル。耳を中心に前が上）──
+            EditorGUILayout.Space(8f);
+            EditorGUILayout.LabelField("地図（上から。耳を中心に前が上）", EditorStyles.boldLabel);
+            _mapRadius = EditorGUILayout.Slider("見える半径 (m)", _mapRadius, 2f, 20f);
+            float msize = Mathf.Min(position.width - 20f, 420f);
+            Rect mr = GUILayoutUtility.GetRect(msize, msize);
+            mr.x = (position.width - msize) * 0.5f; mr.width = msize; mr.height = msize;
+            DrawMixMap(mr, world, total, sum);
+            GUILayout.Space(4f);
+            EditorGUILayout.HelpBox("地図: 灰の線は壁（耳の高さを通る箱）、オレンジの線は動く物（扉の板）、水色の線は戸口（数字は素通しの割合）。"
+                + "壁の黄色い塗りは、そこで返った初期反射の量（いちばん多い壁が濃い）。"
+                + "緑の線は直接音、紫は透過、水色は回折（耳 → 稜線の点 → 音源）、黄の点は壁の上の反射点、オレンジの点は戸口の線音源。"
+                + "全方向から来る後期は場所を持たないので、左上に割合で出す。", MessageType.None);
         }
 
         private void DrawMixPolar(Rect r, double total)
@@ -264,6 +278,143 @@ namespace AcousticFlow.EditorTools
                 Handles.DrawSolidDisc(p, Vector3.forward, 2.5f + 7f * Mathf.Sqrt((float)(a.energy / total)));
             }
             Handles.EndGUI();
+        }
+
+        private float _mapRadius = 8f;
+
+        // 地図: エンジンの箱と戸口（AF_WorldBoxInfo / AF_WorldApertureInfo）と、到来の出どころ（AF_Arrival.origin）を上から描く。
+        //   ★Handles.BeginGUI は使わず GUI.BeginClip の中で描く（地図の枠の外へ壁の線がはみ出さないように）。
+        private void DrawMixMap(Rect r, AcousticWorld world, double total, double[] sum)
+        {
+            EditorGUI.DrawRect(r, new Color(0.10f, 0.10f, 0.12f));
+            if (Event.current.type != EventType.Repaint || total <= 1e-12) return;
+            Transform lt = world.listener;
+            if (lt == null) { var al = Object.FindFirstObjectByType<AudioListener>(); if (al != null) lt = al.transform; }
+            if (lt == null) return;
+            Vector3 L = lt.position;
+            Vector3 fwd = lt.forward; fwd.y = 0f;
+            if (fwd.sqrMagnitude < 1e-6f) fwd = Vector3.forward;
+            fwd.Normalize();
+            Vector3 right = new Vector3(fwd.z, 0f, -fwd.x);                 // 上から見て前の右
+            Vector2 c = new Vector2(r.width * 0.5f, r.height * 0.5f);
+            float scale = (r.width * 0.5f - 6f) / Mathf.Max(0.5f, _mapRadius);
+            System.Func<Vector3, Vector3> toMap = p =>
+            {
+                Vector3 d = p - L;
+                return new Vector3(c.x + Vector3.Dot(d, right) * scale, c.y - Vector3.Dot(d, fwd) * scale, 0f);
+            };
+            Vector3 center = new Vector3(c.x, c.y, 0f);
+
+            // 壁ごとの初期反射（虚像の到来を、耳の側で返った箱で足す）
+            var wallE = new System.Collections.Generic.Dictionary<int, double>();
+            double wallMax = 0.0;
+            foreach (var a in _arr)
+            {
+                if (a.kind != 1 || a.box < 0) continue;
+                wallE.TryGetValue(a.box, out double v0);
+                wallE[a.box] = v0 + a.energy;
+                wallMax = System.Math.Max(wallMax, wallE[a.box]);
+            }
+
+            GUI.BeginClip(r);
+            // 目盛りの輪（1 m ごと、5 m は濃く）
+            for (int m = 1; m <= Mathf.CeilToInt(_mapRadius); m++)
+                DrawRing(c, m * scale, new Color(1f, 1f, 1f, (m % 5 == 0) ? 0.10f : 0.035f), 1f);
+
+            // 箱（耳の高さを通る物だけ。床と天井は描かない）
+            int nb = world.NativeBoxCount;
+            var quad = new Vector3[5];
+            for (int i = 0; i < nb; i++)
+            {
+                if (!world.TryGetBox(i, out AFBoxInfo b) || b.active == 0) continue;
+                Vector3 ax = new Vector3(b.xx, b.xy, b.xz) * b.hx, ay = new Vector3(b.yx, b.yy, b.yz) * b.hy, az = new Vector3(b.zx, b.zy, b.zz) * b.hz;
+                float yHalf = Mathf.Abs(ax.y) + Mathf.Abs(ay.y) + Mathf.Abs(az.y);
+                if (Mathf.Abs(L.y - b.cy) > yHalf) continue;
+                // 足跡の四角: いちばん上下を向いた軸を捨て、残りの 2 本で作る
+                float sx = Mathf.Abs(b.xy), sy = Mathf.Abs(b.yy), sz = Mathf.Abs(b.zy);
+                Vector3 u, v;
+                if (sy >= sx && sy >= sz) { u = ax; v = az; }
+                else if (sx >= sy && sx >= sz) { u = ay; v = az; }
+                else { u = ax; v = ay; }
+                Vector3 cc = new Vector3(b.cx, b.cy, b.cz);
+                quad[0] = toMap(cc + u + v); quad[1] = toMap(cc - u + v); quad[2] = toMap(cc - u - v); quad[3] = toMap(cc + u - v); quad[4] = quad[0];
+                if (wallE.TryGetValue(i, out double we) && wallMax > 0.0)
+                {
+                    Handles.color = new Color(1f, 0.85f, 0.3f, 0.12f + 0.6f * (float)(we / wallMax));
+                    Handles.DrawAAConvexPolygon(quad[0], quad[1], quad[2], quad[3]);
+                }
+                Handles.color = (b.dynamic != 0) ? new Color(1f, 0.6f, 0.2f, 0.95f) : new Color(0.72f, 0.72f, 0.78f, 0.85f);
+                Handles.DrawAAPolyLine((b.dynamic != 0) ? 3f : 2f, quad);
+            }
+
+            // 戸口
+            int nap = world.ApertureCount;
+            for (int i = 0; i < nap; i++)
+            {
+                if (!world.TryGetAperture(i, out AFApertureInfo ap)) continue;
+                Vector3 cc = new Vector3(ap.cx, ap.cy, ap.cz);
+                Vector3 u = new Vector3(ap.ux, ap.uy, ap.uz), v = new Vector3(ap.vx, ap.vy, ap.vz);
+                Vector3 wv = (Mathf.Abs(u.y) <= Mathf.Abs(v.y)) ? u * ap.halfU : v * ap.halfV;
+                Handles.color = new Color(0.35f, 0.9f, 1f, 0.9f);
+                Handles.DrawAAPolyLine(3f, toMap(cc - wv), toMap(cc + wv));
+                Vector3 lp = toMap(cc);
+                GUI.Label(new Rect(lp.x + 5f, lp.y + 2f, 120f, 14f), "戸口" + i + " 素通し " + ap.openFrac.ToString("F2"), EditorStyles.miniLabel);
+            }
+
+            // 到来の出どころ
+            foreach (var a in _arr)
+            {
+                if (a.hasOrigin == 0 || a.kind < 0 || a.kind >= kArrivalColors.Length) continue;
+                float share = (float)(a.energy / total);
+                Color col = kArrivalColors[a.kind];
+                Vector3 o = toMap(new Vector3(a.originX, a.originY, a.originZ));
+                if (a.kind == 0 || a.kind == 3 || a.kind == 4)
+                {
+                    // 直接・回折・透過: 耳から出どころへ線（太さは割合）
+                    Handles.color = new Color(col.r, col.g, col.b, 0.9f);
+                    Handles.DrawAAPolyLine(1.5f + 6f * Mathf.Sqrt(share), center, o);
+                    if (a.kind == 3)
+                    {
+                        foreach (var vv in world.Voices)
+                        {
+                            if (vv == null || vv.EmitterId != a.emitter) continue;
+                            Handles.color = new Color(col.r, col.g, col.b, 0.35f);
+                            Handles.DrawAAPolyLine(1.5f, o, toMap(vv.transform.position));
+                        }
+                        Handles.color = col;
+                        Handles.DrawSolidDisc(o, Vector3.forward, 3f);
+                    }
+                }
+                else
+                {
+                    // 壁の上の反射点・戸口の点: 点（大きさは割合）と、耳への細い線
+                    Handles.color = new Color(col.r, col.g, col.b, 0.22f);
+                    Handles.DrawAAPolyLine(1f, center, o);
+                    Handles.color = col;
+                    Handles.DrawSolidDisc(o, Vector3.forward, 2f + 6f * Mathf.Sqrt(share));
+                }
+            }
+
+            // 音源と耳
+            foreach (var vv in world.Voices)
+            {
+                if (vv == null) continue;
+                Vector3 sp = toMap(vv.transform.position);
+                Handles.color = Color.white;
+                Handles.DrawWireDisc(sp, Vector3.forward, 5f);
+                GUI.Label(new Rect(sp.x + 7f, sp.y - 7f, 140f, 14f), vv.name, EditorStyles.miniLabel);
+            }
+            Handles.color = Color.white;
+            Handles.DrawAAPolyLine(2.5f, new Vector3(c.x - 7f, c.y + 5f), new Vector3(c.x, c.y - 10f), new Vector3(c.x + 7f, c.y + 5f), new Vector3(c.x - 7f, c.y + 5f));
+
+            // 縮尺と、全方向の後期の割合
+            Handles.color = new Color(1f, 1f, 1f, 0.7f);
+            Handles.DrawAAPolyLine(2f, new Vector3(10f, r.height - 12f), new Vector3(10f + scale, r.height - 12f));
+            GUI.Label(new Rect(10f, r.height - 28f, 60f, 14f), "1 m", EditorStyles.miniLabel);
+            GUI.Label(new Rect(6f, 4f, r.width - 12f, 14f),
+                      "全方向の後期: 耳の部屋の響き " + (100.0 * sum[5] / total).ToString("F1") + "%  ／  戸口から流した響き " + (100.0 * sum[7] / total).ToString("F1") + "%",
+                      EditorStyles.miniLabel);
+            GUI.EndClip();
         }
 
         private void DrawRing(Vector2 c, float radius, Color col, float width)

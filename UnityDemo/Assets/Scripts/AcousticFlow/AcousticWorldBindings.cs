@@ -34,6 +34,27 @@ namespace AcousticFlow
         public float spread;             // 0 点 … 1 一様
         public float energy;             // 耳に届く量（帯域の平均エネルギー）
         public float delaySec;
+        public float originX, originY, originZ;   // 出どころ（world、地図用）
+        public int hasOrigin;                     // 出どころが意味を持つか（全方向の分は 0）
+        public int box;                           // 初期（虚像）が耳の側で返った箱（無ければ -1）
+    }
+
+    // 地図用の箱（AF ツールの配分タブ）。acoustic_world.h の AF_BoxInfo と並びを揃える（float×15、int×2）。
+    [StructLayout(LayoutKind.Sequential)]
+    public struct AFBoxInfo
+    {
+        public float cx, cy, cz, hx, hy, hz;
+        public float xx, xy, xz, yx, yy, yz, zx, zy, zz;   // 軸 X / Y / Z（world）
+        public int dynamic, active;
+    }
+
+    // 地図用の戸口。AF_ApertureInfo と並びを揃える（float×12、int×2）。
+    [StructLayout(LayoutKind.Sequential)]
+    public struct AFApertureInfo
+    {
+        public float cx, cy, cz, ux, uy, uz, vx, vy, vz;
+        public float halfU, halfV, openFrac;
+        public int roomA, roomB;
     }
 
     public static class NativeWorld
@@ -81,6 +102,9 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldApplyVoice(IntPtr w, int emitter, IntPtr voice, int sampleRate);
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldMixInfo(IntPtr w, int emitter, out AFMixInfo info);
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldArrivals(IntPtr w, int emitter, [Out] AFArrival[] buf, int maxOut);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldBoxCount(IntPtr w);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldBoxInfo(IntPtr w, int box, out AFBoxInfo info);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldApertureInfo(IntPtr w, int aperture, out AFApertureInfo info);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetBudget(IntPtr w, int totalRays, int fullSlots, int lightSlots, int probesPerFrame);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetRayGroups(IntPtr w, int rayGroups);
         // 1 音源の本数の上限（既定 512）。GPU で本数を増やすときはこれも上げる（raysPerEmitter だけでは頭打ち）。

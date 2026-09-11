@@ -193,6 +193,7 @@ public:
         float directGain = 0.0f, feedGain = 0.0f, visible = 0.0f;
         float pointGain[af::dsp::FdnRoomMix::kPortalPoints] = {};
         float pointAz[af::dsp::FdnRoomMix::kPortalPoints] = {};   // 点の方位（度、+ が右）
+        float pointPos[af::dsp::FdnRoomMix::kPortalPoints * 3] = {};   // 点の位置（world。配分タブの地図用）
     };
     const std::vector<PortalDiag>& portalDiag() const { return portalDiag_; }
 
@@ -227,6 +228,8 @@ public:
     const Visibility* visibility(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].vis : nullptr; }
     const Diffraction* diffraction(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].diff : nullptr; }
     const ImageSet* images(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].images : nullptr; }
+    /// ISM の面（虚像の face 番号が指す物）。配分タブの地図が壁の上の反射点を出すのに使う。
+    const std::vector<Face>& faces() const { return faces_; }
     int faceCount() const { return static_cast<int>(faces_.size()); }
 
     // ── FDN の器 ──
@@ -554,6 +557,7 @@ private:
                     vis[k] = v / kNumBands;
                     vsum += vis[k];
                     dg.pointAz[k] = std::atan2(dl.x, dl.z) * 180.0f / 3.14159265f;
+                    dg.pointPos[k * 3] = pt.x; dg.pointPos[k * 3 + 1] = pt.y; dg.pointPos[k * 3 + 2] = pt.z;
                 }
                 for (int k = 0; k < K; ++k)
                     gains[k] = (vsum > 1e-4) ? static_cast<float>(std::sqrt(vis[k] / vsum)) : static_cast<float>(std::sqrt(1.0 / K));

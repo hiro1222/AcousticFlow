@@ -159,8 +159,26 @@ typedef struct AF_Arrival {
     float spread;        /* 0 点 … 1 一様 */
     float energy;        /* 耳に届く量（帯域の平均エネルギー） */
     float delaySec;      /* 到達（絶対。後期は尾の開始） */
+    float origin[3];     /* 出どころ（world、地図用）: 直接・透過は音源、回折は稜線の点、初期（虚像）は耳の側の壁の反射点、
+                            戸口から直接は戸口の点、戸口の向きの点（案1）は戸口の中心 */
+    int   hasOrigin;     /* origin が意味を持つか（全方向の分は 0） */
+    int   box;           /* 初期（虚像）が耳の側で返った箱の番号（無ければ −1）。地図で壁を色付けする */
 } AF_Arrival;
 ACOUSTIC_API int AF_WorldArrivals(AF_WorldHandle w, int emitter, AF_Arrival* out, int maxOut);
+
+/* 地図用の形（AF ツールの配分タブ、2026-09-12）。エンジンが使っている箱と戸口をそのまま出す。 */
+typedef struct AF_BoxInfo {
+    float center[3], halfExtents[3], axisX[3], axisY[3], axisZ[3];
+    int   dynamic, active;
+} AF_BoxInfo;
+ACOUSTIC_API int AF_WorldBoxCount(AF_WorldHandle w);
+ACOUSTIC_API int AF_WorldBoxInfo(AF_WorldHandle w, int box, AF_BoxInfo* out);
+typedef struct AF_ApertureInfo {
+    float center[3], axisU[3], axisV[3];   /* 外接矩形の中心と 2 軸 */
+    float halfU, halfV, openFrac;           /* 半幅と素通しの割合 */
+    int   roomA, roomB;
+} AF_ApertureInfo;
+ACOUSTIC_API int AF_WorldApertureInfo(AF_WorldHandle w, int aperture, AF_ApertureInfo* out);
 
 /* 回折の中身（診断）。旧コアの AF_SceneDebugDiffractionPath にあたる。
  *   ★valid が 0 になる原因は 3 つあって、区別できないと追えない:

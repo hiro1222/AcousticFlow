@@ -289,6 +289,31 @@ namespace AcousticFlow
             if (_world == IntPtr.Zero || v == null || v.EmitterId < 0) return false;
             return NativeWorld.AF_WorldMixInfo(_world, v.EmitterId, out info) != 0;
         }
+        /// 地図用（AF ツールの配分タブ）: エンジンが使っている箱の数と形、戸口の形。DLL が古くて口が無ければ 0 / false。
+        public int NativeBoxCount
+        {
+            get
+            {
+                if (_world == IntPtr.Zero) return 0;
+                try { return NativeWorld.AF_WorldBoxCount(_world); }
+                catch (EntryPointNotFoundException) { return 0; }
+            }
+        }
+        public bool TryGetBox(int i, out AFBoxInfo info)
+        {
+            info = default;
+            if (_world == IntPtr.Zero) return false;
+            try { return NativeWorld.AF_WorldBoxInfo(_world, i, out info) != 0; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+        public bool TryGetAperture(int i, out AFApertureInfo info)
+        {
+            info = default;
+            if (_world == IntPtr.Zero) return false;
+            try { return NativeWorld.AF_WorldApertureInfo(_world, i, out info) != 0; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+
         /// 聞こえている音の到来（AF ツールの配分タブ用）。書いた数を返す。DLL が古くて口が無ければ 0。
         public int GetArrivals(WorldVoice v, AFArrival[] buf)
         {

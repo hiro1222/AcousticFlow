@@ -211,34 +211,77 @@ int AF_WorldMixInfo(AF_WorldHandle w, int e, AF_MixInfo* out) {
 }
 int AF_WorldArrivals(AF_WorldHandle w, int e, AF_Arrival* out, int maxOut) {
     // 聞こえている音の到来（配分タブ用）。配分の出口（Mix のタップと送り）を到来ごとに並べ直すだけで、計算は足さない。
+    //   出どころ（origin）は地図用: 直接・透過は音源、回折は稜線の点、初期（虚像）は耳の側の壁の反射点、戸口は戸口の点。
     acoustic::flow::World* W = asWorld(w); if (!W || !out || maxOut <= 0) return 0;
     const acoustic::flow::Mix* m = W->mix(e);
-    if (!m) return 0;
+    const acoustic::flow::Emitter* em = W->emitter(e);
+    if (!m || !em) return 0;
     int n = 0;
     auto mean6 = [](const float* v) { double s = 0.0; for (int b = 0; b < 6; ++b) s += v[b]; return static_cast<float>(s / 6.0); };
-    auto push = [&](int kind, float dx, float dy, float dz, float spread, float energy, float delaySec) {
+    const acoustic::Vec3 none(0.0f, 0.0f, 0.0f);
+    auto push = [&](int kind, float dx, float dy, float dz, float spread, float energy, float delaySec,
+                    bool hasOrigin, const acoustic::Vec3& origin, int box) {
         if (n >= maxOut || !(energy > 0.0f)) return;
         AF_Arrival& a = out[n++];
         a.kind = kind; a.emitter = e;
         a.dirLocal[0] = dx; a.dirLocal[1] = dy; a.dirLocal[2] = dz;
         a.spread = spread; a.energy = energy; a.delaySec = delaySec;
+        a.origin[0] = origin.x; a.origin[1] = origin.y; a.origin[2] = origin.z;
+        a.hasOrigin = hasOrigin ? 1 : 0; a.box = box;
     };
+    const acoustic::Vec3 L = W->listener().pos;
+    const acoustic::flow::ImageSet* im = W->images(e);
+    const std::vector<acoustic::flow::Face>& faces = W->faces();
+    const acoustic::flow::Diffraction* df = W->diffraction(e);
+    int imageIdx = 0;
     for (int i = 0; i < m->tapCount; ++i) {
         const acoustic::flow::MixTap& t = m->taps[i];
-        int kind = AF_ARRIVAL_EARLY;
-        if (t.kind == acoustic::flow::TapKind::Direct) kind = AF_ARRIVAL_DIRECT;
-        else if (t.kind == acoustic::flow::TapKind::Transmit) kind = AF_ARRIVAL_TRANSMIT;
-        else if (t.kind == acoustic::flow::TapKind::Diffract) kind = AF_ARRIVAL_DIFFRACT;
-        else if (t.id == 4) kind = AF_ARRIVAL_EARLY_DIFFUSE;              // 方向なしの初期（distribute の素性 4）
-        const float spread = (kind == AF_ARRIVAL_EARLY_DIFFUSE) ? 1.0f : t.spread;
-        push(kind, t.dirLocal.x, t.dirLocal.y, t.dirLocal.z, spread, mean6(t.e6), t.delaySec);
+        const float et = mean6(t.e6);
+        if (t.kind == acoustic::flow::TapKind::Direct) {
+            push(AF_ARRIVAL_DIRECT, t.dirLocal.x, t.dirLocal.y, t.dirLocal.z, t.spread, et, t.delaySec, true, em->pos, -1);
+            continue;
+        }
+        if (t.kind == acoustic::flow::TapKind::Transmit) {
+            push(AF_ARRIVAL_TRANSMIT, t.dirLocal.x, t.dirLocal.y, t.dirLocal.z, t.spread, et, t.delaySec, true, em->pos, -1);
+            continue;
+        }
+        if (t.kind == acoustic::flow::TapKind::Diffract) {
+            const bool ok = df && df->valid;
+            push(AF_ARRIVAL_DIFFRACT, t.dirLocal.x, t.dirLocal.y, t.dirLocal.z, t.spread, et, t.delaySec, ok, ok ? df->point : none, -1);
+            continue;
+        }
+        if (t.id == 4) {                                                    // 方向なしの初期（distribute の素性 4）
+            push(AF_ARRIVAL_EARLY_DIFFUSE, 0.0f, 0.0f, 0.0f, 1.0f, et, t.delaySec, false, none, -1);
+            continue;
+        }
+        // 初期（虚像）: distribute は虚像の順にタップを積むので、方向なし以外の初期の k 本目が k 番の虚像。
+        //   反射点 ＝ 耳から虚像への線が、耳の側で返った面（face[0]）の平面と交わる点。
+        acoustic::Vec3 origin = none;
+        bool has = false;
+        int box = -1;
+        if (im && imageIdx < im->count) {
+            const acoustic::flow::ImageSource& src = im->img[imageIdx];
+            const int f0 = src.face[0];
+            if (f0 >= 0 && f0 < static_cast<int>(faces.size())) {
+                const acoustic::flow::Face& fc = faces[static_cast<std::size_t>(f0)];
+                const acoustic::Vec3 d = src.pos - L;
+                const float denom = acoustic::dot(fc.normal, d);
+                if (std::fabs(denom) > 1e-6f) {
+                    const float tt = acoustic::dot(fc.normal, fc.center - L) / denom;
+                    if (tt > 0.0f && tt < 1.0f) { origin = L + d * tt; has = true; }
+                }
+                box = fc.box;
+            }
+        }
+        ++imageIdx;
+        push(AF_ARRIVAL_EARLY, t.dirLocal.x, t.dirLocal.y, t.dirLocal.z, t.spread, et, t.delaySec, has, origin, box);
     }
-    const int lroom = W->roomAt(W->listener().pos);
+    const int lroom = W->roomAt(L);
     const std::vector<acoustic::flow::World::PortalDiag>& diag = W->portalDiag();
     for (int k = 0; k < m->sendCount; ++k) {
         const acoustic::flow::FdnSend& sd = m->sends[k];
         const float eAll = mean6(sd.e6);
-        if (sd.room == lroom) { push(AF_ARRIVAL_LATE_ROOM, 0.0f, 0.0f, 0.0f, 1.0f, eAll, m->onsetSec); continue; }
+        if (sd.room == lroom) { push(AF_ARRIVAL_LATE_ROOM, 0.0f, 0.0f, 0.0f, 1.0f, eAll, m->onsetSec, false, none, -1); continue; }
         const acoustic::flow::World::PortalDiag* pd = nullptr;
         for (const acoustic::flow::World::PortalDiag& d : diag) if (d.room == sd.room) { pd = &d; break; }
         float eThru = mean6(sd.thru6);
@@ -247,15 +290,50 @@ int AF_WorldArrivals(AF_WorldHandle w, int e, AF_Arrival* out, int maxOut) {
             // 戸口の線音源: 戸口から直接の分を点の量（Σ² = 1）で配り、残りは耳の部屋へ流した響き
             for (int j = 0; j < af::dsp::FdnRoomMix::kPortalPoints; ++j) {
                 const float az = pd->pointAz[j] * 3.14159265f / 180.0f;
-                push(AF_ARRIVAL_LATE_DOOR, std::sin(az), 0.0f, std::cos(az), 0.0f, eThru * pd->pointGain[j] * pd->pointGain[j], m->onsetSec);
+                const acoustic::Vec3 pp(pd->pointPos[j * 3], pd->pointPos[j * 3 + 1], pd->pointPos[j * 3 + 2]);
+                push(AF_ARRIVAL_LATE_DOOR, std::sin(az), 0.0f, std::cos(az), 0.0f, eThru * pd->pointGain[j] * pd->pointGain[j], m->onsetSec, true, pp, -1);
             }
-            push(AF_ARRIVAL_LATE_DOOR_FEED, 0.0f, 0.0f, 0.0f, 1.0f, eAll - eThru, m->onsetSec);
+            push(AF_ARRIVAL_LATE_DOOR_FEED, 0.0f, 0.0f, 0.0f, 1.0f, eAll - eThru, m->onsetSec, false, none, -1);
         } else {
+            // 戸口の向きの点（案1）: 耳の部屋と音源の部屋を繋ぐ戸口の中心を出どころに
+            acoustic::Vec3 origin = none;
+            bool has = false;
+            for (int a = 0; a < W->apertureCount(); ++a) {
+                const acoustic::rooms::Aperture& ap = W->aperture(a);
+                if ((ap.roomA == sd.room && ap.roomB == lroom) || (ap.roomB == sd.room && ap.roomA == lroom)) { origin = ap.rectCenter; has = true; break; }
+            }
             const acoustic::Vec3 dl = W->listener().toLocal(acoustic::Vec3(sd.dir[0], sd.dir[1], sd.dir[2]));
-            push(AF_ARRIVAL_LATE_POINT, dl.x, dl.y, dl.z, 1.0f - sd.focus, eAll, m->onsetSec);
+            push(AF_ARRIVAL_LATE_POINT, dl.x, dl.y, dl.z, 1.0f - sd.focus, eAll, m->onsetSec, has, origin, -1);
         }
     }
     return n;
+}
+
+int AF_WorldBoxCount(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w);
+    return W ? W->surfaces.count() : 0;
+}
+int AF_WorldBoxInfo(AF_WorldHandle w, int i, AF_BoxInfo* out) {
+    acoustic::flow::World* W = asWorld(w);
+    if (!W || !out || i < 0 || i >= W->surfaces.count()) return 0;
+    const acoustic::flow::Surface& s = W->surfaces.at(i);
+    auto put = [](float* dst, const acoustic::Vec3& v) { dst[0] = v.x; dst[1] = v.y; dst[2] = v.z; };
+    put(out->center, s.obb.center); put(out->halfExtents, s.obb.halfExtents);
+    put(out->axisX, s.obb.axisX); put(out->axisY, s.obb.axisY); put(out->axisZ, s.obb.axisZ);
+    out->dynamic = s.dynamic ? 1 : 0;
+    out->active = s.active ? 1 : 0;
+    return 1;
+}
+int AF_WorldApertureInfo(AF_WorldHandle w, int a, AF_ApertureInfo* out) {
+    acoustic::flow::World* W = asWorld(w);
+    if (!W || !out || a < 0 || a >= W->apertureCount()) return 0;
+    const acoustic::rooms::Aperture& ap = W->aperture(a);
+    auto put = [](float* dst, const acoustic::Vec3& v) { dst[0] = v.x; dst[1] = v.y; dst[2] = v.z; };
+    put(out->center, ap.rectCenter); put(out->axisU, ap.axisU); put(out->axisV, ap.axisV);
+    out->halfU = ap.halfU; out->halfV = ap.halfV;
+    out->openFrac = W->apertureOpenFrac(a);
+    out->roomA = ap.roomA; out->roomB = ap.roomB;
+    return 1;
 }
 int AF_WorldDiffractionInfo(AF_WorldHandle w, int e, AF_DiffractionInfo* out) {
     acoustic::flow::World* W = asWorld(w); if (!W || !out) return 0;
