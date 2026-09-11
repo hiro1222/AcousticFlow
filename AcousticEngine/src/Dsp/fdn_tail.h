@@ -66,6 +66,18 @@
 //   状態は触らないので、いま溜まっているエネルギーが次のサンプルから新しい速さで減るだけ。
 //   ★遅延線の長さは実行時に変えない（変えると音程が動く）。部屋の違いは係数・量・開始時刻で出す。
 //
+// ■ 部屋ごとの種（variant、2026-09-11）
+//   同じ lineScale の器は遅延線の長さも符号も同じで、同じ入力に**同じ波形**を返していた（相関 1.000）。
+//   FdnRoomMix は部屋の出力を「無相関だからエネルギーで足す」前提で配線しているので、1 つの音源を
+//   2 部屋へ √(1−t)・√t で割って送ると振幅が揃って足され、量が (√(1−t)+√t)² 倍になった
+//   （段 2-f で戸口越しの後期を割ったときに表に出た。t=0.3 で +2.8 dB）。
+//   種が 0 でなければ、線と allpass の長さに種から決めた ±3% の揺らぎを掛ける。長さの比が変わると
+//   モードの並びが変わり、出力が無相関になる。種 0 は今までと 1 サンプルも同じ。
+//   ★±3% の根拠: 隣り合う線の長さの間隔は 5.6〜18%。これより大きく揺らすと 2 本がほぼ同じ長さに寄って
+//     モードが重なる（金属感）。小さすぎると低い帯域（周期 8 ms）で最初の数周の相関が抜けない。
+//   ★退けた書き方: 注ぎ込みの符号を部屋ごとに変える。線の長さが違う網では直交が保たれず、相関が残る。
+//     部屋ごとに Hadamard の別の行を読む: 16 行のうち 15 行を 8 レーン × 2 耳で使い切っていて、2 部屋目に回す行が無い。
+//
 // ■ スレッド規約
 //   setRt60 … 制御スレッド（目標を書いて版を上げる）
 //   render  … オーディオスレッド（確保・ロックなし。版が変わっていれば目標を取り込む）
@@ -75,6 +87,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace af {
@@ -91,9 +104,18 @@ public:
     ///             基準（1.0）は 15〜78 ms で、平均自由行程 12 ms（14 m 角・高 3 m の部屋）に当たる。
     ///             小さい乾いた部屋で長いままだと、混ざり切る（線の最長の約 3 周）前に減衰が終わる。
     ///             ★実行時には変えない（変えると音程が動く）。
-    explicit FdnTail(int sampleRate, float diffusion = 0.6f, float lineScale = 1.0f)
+    /// variant   : 部屋ごとの種（上の■）。0 で今までと同じ。FdnRoomMix が部屋の番号を渡す。
+    explicit FdnTail(int sampleRate, float diffusion = 0.6f, float lineScale = 1.0f, std::uint32_t variant = 0)
         : fs_(std::max(8000, sampleRate)), diffusion_(clampf(diffusion, 0.0f, 0.95f)),
           lineScale_(clampf(lineScale, 0.3f, 2.5f)) {
+        // 種 0 はちょうど 1.0 を返す（掛けても 1 ビットも変わらない）。
+        auto jitter = [variant](int i, std::uint32_t salt) -> float {
+            if (variant == 0u) return 1.0f;
+            std::uint32_t h = (variant * 2654435761u) ^ (static_cast<std::uint32_t>(i + 1) * 2246822519u) ^ (salt * 3266489917u);
+            h ^= h >> 15; h *= 2246822519u; h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
+            const float u = static_cast<float>(h) / 4294967295.0f * 2.0f - 1.0f;     // −1..1
+            return 1.0f + 0.03f * u;
+        };
         // 遅延線の長さ（ms）。C# 旧版（IrConvolver）で 4 ＝ 金属的／8／16 と詰めた値。互いに素っぽく広く分散。
         static const float kLineMs[kLines] = {
             15.3f, 18.1f, 21.7f, 25.3f, 29.1f, 33.7f, 37.9f, 42.3f,
@@ -103,7 +125,7 @@ public:
 
         std::size_t total = 0; double lenSum = 0.0;
         for (int i = 0; i < kLines; ++i) {
-            lineLen_[i] = std::max(1, static_cast<int>(std::lround(kLineMs[i] * lineScale_ * 0.001f * fs_)));
+            lineLen_[i] = std::max(1, static_cast<int>(std::lround(kLineMs[i] * lineScale_ * jitter(i, 0u) * 0.001f * fs_)));
             lineOff_[i] = total; total += static_cast<std::size_t>(lineLen_[i]);
             lenSum += static_cast<double>(lineLen_[i]);
         }
@@ -118,7 +140,7 @@ public:
 
         total = 0;
         for (int k = 0; k < kAllpass; ++k) {
-            apLen_[k] = std::max(1, static_cast<int>(std::lround(kApMs[k] * lineScale_ * 0.001f * fs_)));
+            apLen_[k] = std::max(1, static_cast<int>(std::lround(kApMs[k] * lineScale_ * jitter(k, 1u) * 0.001f * fs_)));
             apOff_[k] = total; total += static_cast<std::size_t>(apLen_[k]);
             apPos_[k] = 0;
         }

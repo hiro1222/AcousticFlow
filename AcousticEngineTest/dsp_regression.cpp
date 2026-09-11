@@ -3309,6 +3309,64 @@ void testFdnLanes() {
     }
 }
 
+// 【2026-09-11 に見つけた穴】同じ大きさの部屋の FDN どうしが無相関か
+//   FdnRoomMix は部屋の出力を「無相関だからエネルギーで足す」前提で配線している。
+//   同じ lineScale の FdnTail は遅延線の長さも符号も同じで、同じ入力に同じ波形を返していた（相関 1）。
+//   1 つの音源を 2 部屋へ √(1−t)・√t で割って送ると振幅が揃って足され、量が (√(1−t)+√t)² 倍になる。
+//   Flow の段 2-f（戸口越しの後期を音源の部屋へ割る）で表に出た。
+void testFdnRoomDecorrelation() {
+    std::puts("");
+    std::puts("[FDN 部屋どうしの相関] 同じ大きさの部屋でも無相関か");
+    const int fs = 48000, blk = 512, seconds = 3;
+    const int total = fs * seconds;
+    std::vector<float> noise(static_cast<std::size_t>(total));
+    std::uint32_t st = 12345u;
+    for (float& v : noise) { st = st * 1664525u + 1013904223u; v = static_cast<float>(st >> 8) / 16777216.0f * 2.0f - 1.0f; }
+    const float rt[6] = {0.8f, 0.8f, 0.8f, 0.8f, 0.8f, 0.8f};
+    auto renderTail = [&](std::uint32_t variant, std::vector<float>& out) {
+        af::dsp::FdnTail t(fs, 0.6f, 1.0f, variant);
+        t.setRt60(rt);
+        out.assign(static_cast<std::size_t>(total), 0.0f);
+        for (int p = 0; p < total; p += blk) {
+            const int n = std::min(blk, total - p);
+            t.render(noise.data() + p, n, out.data() + p);
+        }
+    };
+    std::vector<float> a, b, c;
+    renderTail(0u, a); renderTail(0u, b); renderTail(1u, c);
+    auto corr = [&](const std::vector<float>& x, const std::vector<float>& y) {
+        double sxy = 0.0, sxx = 0.0, syy = 0.0;
+        for (int i = fs; i < total; ++i) { sxy += x[i] * y[i]; sxx += x[i] * x[i]; syy += y[i] * y[i]; }
+        return sxy / std::sqrt(std::max(sxx * syy, 1e-30));
+    };
+    const double rSame = corr(a, b), rVar = corr(a, c);
+    char buf[240];
+    std::snprintf(buf, sizeof(buf), "(種が同じ 2 本 %.3f ／ 種 0 と 1 %.3f)", rSame, rVar);
+    check("[FDN 相関] 種を変えた同じ大きさの FDN は無相関（|相関| < 0.1）", std::fabs(rVar) < 0.1, buf);
+
+    // 1 つの音源を同じ大きさの 2 部屋へ 7:3 で割ったときの量（FdnRoomMix は部屋の番号を種に使う）
+    auto mixEnergy = [&](int rooms, float t) {
+        af::dsp::FdnRoomMix mix(fs, blk, 0.6f);
+        const float ones[6] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+        for (int r = 0; r < rooms; ++r) { mix.addRoom(1.0f, rt, false); mix.setListenerWeight(r, ones); }
+        std::vector<float> L(static_cast<std::size_t>(blk)), R(static_cast<std::size_t>(blk));
+        double e = 0.0;
+        for (int p = 0; p + blk <= total; p += blk) {
+            if (rooms == 1) mix.add(0, noise.data() + p, blk, 1.0f);
+            else { mix.add(0, noise.data() + p, blk, std::sqrt(1.0f - t)); mix.add(1, noise.data() + p, blk, std::sqrt(t)); }
+            std::fill(L.begin(), L.end(), 0.0f); std::fill(R.begin(), R.end(), 0.0f);
+            mix.render(blk, L.data(), R.data());
+            if (p >= fs) for (int i = 0; i < blk; ++i) e += static_cast<double>(L[i]) * L[i] + static_cast<double>(R[i]) * R[i];
+        }
+        return e;
+    };
+    const double e1 = mixEnergy(1, 0.0f), e2 = mixEnergy(2, 0.3f);
+    const double d = 10.0 * std::log10(std::max(e2, 1e-30) / std::max(e1, 1e-30));
+    const double coherent = 20.0 * std::log10(std::sqrt(0.7) + std::sqrt(0.3));
+    std::snprintf(buf, sizeof(buf), "(2 部屋に 7:3 で割る %+.2f dB ／ 揃って足されたら %+.2f dB)", d, coherent);
+    check("[FDN 相関] 1 つの音源を同じ大きさの 2 部屋へ割っても量は変わらない（±0.5 dB）", std::fabs(d) < 0.5, buf);
+}
+
 int main() {
     std::printf("=== DSP 数値回帰テスト（段4: C++ 移行）===\n");
     testFft();
@@ -3335,6 +3393,7 @@ int main() {
     testFdnRoomMix();
     testFdnColour();
     testFdnLanes();
+    testFdnRoomDecorrelation();
 
     std::printf("\n----\n");
     if (g_failures == 0) {

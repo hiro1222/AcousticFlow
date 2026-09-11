@@ -103,7 +103,10 @@ public:
         const int n = count_.load(std::memory_order_acquire);
         if (n >= kMaxRooms) return -1;
         auto r = std::make_unique<Room>();
-        r->fdn = std::make_unique<FdnTail>(fs_, diffusion_, lineScale);
+        // ★部屋の番号を種に渡す（2026-09-11）。同じ大きさの部屋が同じ遅延線になると出力が相関 1 になり、
+        //   下の render が前提にしている「部屋どうしは無相関なのでエネルギーで足す」が崩れる（FdnTail の■部屋ごとの種）。
+        //   0 番の部屋は今までと 1 サンプルも同じ。
+        r->fdn = std::make_unique<FdnTail>(fs_, diffusion_, lineScale, static_cast<std::uint32_t>(n));
         const std::size_t N = static_cast<std::size_t>(maxFrames_);
         r->in.assign(N, 0.0f);
         for (int b = 0; b < kNumBands; ++b) {
