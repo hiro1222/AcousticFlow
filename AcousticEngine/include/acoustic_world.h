@@ -92,6 +92,12 @@ ACOUSTIC_API void AF_WorldSetLeakModel(AF_WorldHandle w, int model);
  * 同じ部屋の音源はどれでも変わらない。2 でも戸口で繋がっていない部屋は 1 の形になる。 */
 ACOUSTIC_API void AF_WorldSetLateThrough(AF_WorldHandle w, int on);
 ACOUSTIC_API int  AF_WorldLateThrough(AF_WorldHandle w);
+/* 尾のレーンの作り（既定 1）。実行中に切り替えられる（試聴の A/B）。
+ *   0 耳ごとの行（点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる）
+ *   1 点と拡散を分ける（点は 1 本の波形＋点の向きの ITD。自室＝広がり 1 は 0 と 1 ビットも同じ）
+ * 効くのはレーン（方向バス）を通る尾だけ。戸口の線音源（AF_WorldSetLateThrough の 2）の部屋は通らない。 */
+ACOUSTIC_API void AF_WorldSetLaneModel(AF_WorldHandle w, int model);
+ACOUSTIC_API int  AF_WorldLaneModel(AF_WorldHandle w);
 /* レイを GPU で解くか（0 切／1 入。既定 0）。
  *   ★音は作らない。GPU が出すのは幾何と統計だけで、音にするのはエンジン（CPU）。
  *   ★ホストのデバイスは借りない。エンジンが自前で持つ。
