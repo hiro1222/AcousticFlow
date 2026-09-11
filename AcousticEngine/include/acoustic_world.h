@@ -136,6 +136,32 @@ ACOUSTIC_API int   AF_WorldApertureCount(AF_WorldHandle w);
 ACOUSTIC_API float AF_WorldApertureOpenFrac(AF_WorldHandle w, int aperture);
 ACOUSTIC_API int AF_WorldMixInfo(AF_WorldHandle w, int emitter, AF_MixInfo* out);
 
+/* 聞こえている音の到来（AF ツールの配分タブ用、2026-09-12）。
+ *   量は配分の出口（平滑 × 重み ＝ 耳に届く量）。帯域の平均エネルギーで、音源の出力 1 に対して 1/m²。
+ *   向きはリスナー座標（+x 右 / +y 上 / +z 前）。全方向から来る分は向き 0・広がり 1。
+ *   後期は FDN の送りを分けて出す: 耳の部屋の響き／戸口から直接（戸口の線音源の点）／戸口から流した響き／戸口の向きの点。
+ *   書いた数を返す（maxOut で打ち切る）。 */
+enum {
+    AF_ARRIVAL_DIRECT = 0,          /* 直接 */
+    AF_ARRIVAL_EARLY = 1,           /* 初期（虚像。向きあり） */
+    AF_ARRIVAL_EARLY_DIFFUSE = 2,   /* 初期（方向なしの残り） */
+    AF_ARRIVAL_DIFFRACT = 3,        /* 回折 */
+    AF_ARRIVAL_TRANSMIT = 4,        /* 透過 */
+    AF_ARRIVAL_LATE_ROOM = 5,       /* 後期・耳の部屋の響き（全方向） */
+    AF_ARRIVAL_LATE_DOOR = 6,       /* 後期・戸口から直接（戸口の線音源の点。段 2-g） */
+    AF_ARRIVAL_LATE_DOOR_FEED = 7,  /* 後期・戸口から流した響き（耳の部屋で全方向に鳴る。戸口の音から立ち上がる） */
+    AF_ARRIVAL_LATE_POINT = 8       /* 後期・戸口の向きの点（案1。段 2-f） */
+};
+typedef struct AF_Arrival {
+    int   kind;          /* 上の AF_ARRIVAL_* */
+    int   emitter;
+    float dirLocal[3];   /* リスナー座標。全方向なら 0 */
+    float spread;        /* 0 点 … 1 一様 */
+    float energy;        /* 耳に届く量（帯域の平均エネルギー） */
+    float delaySec;      /* 到達（絶対。後期は尾の開始） */
+} AF_Arrival;
+ACOUSTIC_API int AF_WorldArrivals(AF_WorldHandle w, int emitter, AF_Arrival* out, int maxOut);
+
 /* 回折の中身（診断）。旧コアの AF_SceneDebugDiffractionPath にあたる。
  *   ★valid が 0 になる原因は 3 つあって、区別できないと追えない:
  *     ① 見通しが 1（遮られていない ＝ 回折は不要）

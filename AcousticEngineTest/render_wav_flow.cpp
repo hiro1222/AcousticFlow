@@ -251,6 +251,33 @@ int main(int argc, char** argv) {
                         di.valid ? di.box : -1, di.valid ? di.edge : -1, di.delta, di.gapWidth, di.weight, mi.shadowers);
             if (di.valid) std::printf("             回折点 (%.3f %.3f %.3f) 経路 %.4fs\n",
                                       di.point[0], di.point[1], di.point[2], di.pathSec);
+            if (std::getenv("AF_ARRIVALS")) {
+                // 配分タブと同じ口（AF_WorldArrivals）を数字で確かめる: 種類ごとの割合と、到来の和と帳簿の総量
+                static const char* kKind[9] = {"直接", "初期・虚像", "初期・方向なし", "回折", "透過",
+                                               "後期・耳の部屋", "後期・戸口から直接", "後期・戸口から流した", "後期・戸口の点"};
+                AF_Arrival arr[128];
+                const int na = AF_WorldArrivals(w, emitter, arr, 128);
+                double sumK[9] = {}, tot = 0.0, dirLate = 0.0, lateAll = 0.0;
+                for (int q = 0; q < na; ++q) {
+                    if (arr[q].kind < 0 || arr[q].kind > 8) continue;
+                    sumK[arr[q].kind] += arr[q].energy; tot += arr[q].energy;
+                    const bool hasDir = arr[q].spread < 0.5f && (arr[q].dirLocal[0] != 0.0f || arr[q].dirLocal[1] != 0.0f || arr[q].dirLocal[2] != 0.0f);
+                    if (arr[q].kind >= 5) { lateAll += arr[q].energy; if (hasDir) dirLate += arr[q].energy; }
+                }
+                double ledger = 0.0;
+                for (int b = 0; b < 6; ++b) ledger += mi.energy6[b];
+                ledger /= 6.0;
+                char line[256];
+                std::snprintf(line, sizeof(line), "             到来 %d 個: 和 %.3e ／ 帳簿の総量 %.3e（%+.2f dB）、後期のうち向きのある分 %.1f%%",
+                              na, tot, ledger, 10.0 * std::log10(std::max(tot, 1e-30) / std::max(ledger, 1e-30)),
+                              lateAll > 0.0 ? dirLate / lateAll * 100.0 : 0.0);
+                std::puts(line);
+                for (int k2 = 0; k2 < 9; ++k2) {
+                    if (sumK[k2] <= 0.0) continue;
+                    std::snprintf(line, sizeof(line), "               %s %.1f%%", kKind[k2], tot > 0.0 ? sumK[k2] / tot * 100.0 : 0.0);
+                    std::puts(line);
+                }
+            }
             nextReport += total / 12;
         }
         pos += n;

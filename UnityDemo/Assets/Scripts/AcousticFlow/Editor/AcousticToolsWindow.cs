@@ -12,6 +12,7 @@
  *   履歴 … 道具2。毎フレームの状態を巻き戻して見る（記録は AcousticHistory）
  *   予算 … 道具10。audio thread の実費と音源数の余裕
  *   音源 … 道具A。ソロ／ミュートと寄与度順の一覧
+ *   配分 … 2026-09-12 追加。いまの耳に、どの向きから・どれだけ届いているか（AF_WorldArrivals を足して描くだけ）。
  *   情報 … 2026-09-09 追加。いま何で鳴っているか（模型の切り替え・尾・部屋・音の出どころ）。
  *          ★画面の HUD は箱が 480x300 で固定なので、下に足した行から順に**切れて見えなくなる**
  *            （尾の切り替えを足しても表示が変わらず「効いていない」と読めてしまった）。
@@ -25,8 +26,8 @@ namespace AcousticFlow.EditorTools
 {
     public class AcousticToolsWindow : EditorWindow
     {
-        private enum Tab { Info, History, Budget, Sources }
-        private static readonly string[] kTabNames = { "情報", "履歴", "予算", "音源" };
+        private enum Tab { Info, Mix, History, Budget, Sources }
+        private static readonly string[] kTabNames = { "情報", "配分", "履歴", "予算", "音源" };
 
         private Tab _tab = Tab.Info;
         private Vector2 _scroll;
@@ -68,6 +69,7 @@ namespace AcousticFlow.EditorTools
             EditorGUILayout.Space(4f);
 
             if (_tab == Tab.Info) DrawInfo();
+            else if (_tab == Tab.Mix) DrawMix();
             else if (_tab == Tab.History) DrawHistory();
             else if (_tab == Tab.Budget) DrawBudget();
             else DrawSources();
@@ -116,6 +118,163 @@ namespace AcousticFlow.EditorTools
                     + "   レイ " + mi.raysTraced + " 本 / ヒット " + mi.hits);
             }
             EditorGUILayout.Space(6f);
+        }
+
+        // =====================================================================
+        // 配分タブ ── いまの耳に、どの向きから・どれだけ届いているか（2026-09-12）
+        //   数値は DLL の AF_WorldArrivals（配分の出口 ＝ 耳に届く量）。C# は足して描くだけ。
+        //   ★試聴の問い「隣の部屋の残響が全体から聞こえる」を見て確かめるための物。
+        //     後期を「耳の部屋の響き／戸口から直接／戸口から流した響き」に分けて出す。
+        // =====================================================================
+        private static readonly string[] kArrivalNames = {
+            "直接", "初期（虚像）", "初期（方向なし）", "回折", "透過",
+            "後期・耳の部屋の響き", "後期・戸口から直接", "後期・戸口から流した響き", "後期・戸口の向きの点" };
+        private static readonly Color[] kArrivalColors = {
+            new Color(0.40f, 1.00f, 0.50f), new Color(1.00f, 0.85f, 0.30f), new Color(0.75f, 0.65f, 0.35f),
+            new Color(0.35f, 0.90f, 1.00f), new Color(0.75f, 0.50f, 1.00f), new Color(0.35f, 0.55f, 1.00f),
+            new Color(1.00f, 0.55f, 0.15f), new Color(1.00f, 0.78f, 0.55f), new Color(1.00f, 0.40f, 0.80f) };
+        private readonly AFArrival[] _arrBuf = new AFArrival[128];
+        private readonly System.Collections.Generic.List<AFArrival> _arr = new System.Collections.Generic.List<AFArrival>();
+        private int _mixVoice = -1;                       // -1 = 全音源
+        private readonly Vector3[] _ring = new Vector3[65];
+
+        private static bool HasDir(AFArrival a) { return a.spread < 0.5f && (a.dirX != 0f || a.dirY != 0f || a.dirZ != 0f); }
+
+        private void DrawMix()
+        {
+            var world = AcousticWorld.Instance;
+            if (world == null || !EditorApplication.isPlaying)
+            {
+                EditorGUILayout.HelpBox("再生中に、AcousticWorld がある場面（新コア）で出ます。", MessageType.Info);
+                return;
+            }
+            var names = new System.Collections.Generic.List<string> { "全音源" };
+            foreach (var v in world.Voices) names.Add(v != null ? v.name : "(なし)");
+            _mixVoice = Mathf.Clamp(EditorGUILayout.Popup("音源", _mixVoice + 1, names.ToArray()) - 1, -1, world.Voices.Count - 1);
+
+            _arr.Clear();
+            for (int i = 0; i < world.Voices.Count; i++)
+            {
+                if (_mixVoice >= 0 && i != _mixVoice) continue;
+                int n = world.GetArrivals(world.Voices[i], _arrBuf);
+                for (int k = 0; k < n; k++) _arr.Add(_arrBuf[k]);
+            }
+            if (_arr.Count == 0)
+            {
+                EditorGUILayout.HelpBox("到来がありません。DLL が古いと出ません（Unity を閉じて tools/dev.ps1 deploy）。", MessageType.Warning);
+                return;
+            }
+
+            var sum = new double[kArrivalNames.Length];
+            double total = 0.0, lateAll = 0.0, lateDir = 0.0, dirAll = 0.0, xw = 0.0;
+            foreach (var a in _arr)
+            {
+                if (a.kind < 0 || a.kind >= sum.Length) continue;
+                sum[a.kind] += a.energy; total += a.energy;
+                bool d = HasDir(a);
+                if (a.kind >= 5) { lateAll += a.energy; if (d) lateDir += a.energy; }
+                if (d) { dirAll += a.energy; xw += a.energy * a.dirX; }
+            }
+            EditorGUILayout.LabelField("耳に届く総量", Db2(total) + "（1/m²、音源の出力 1 に対して）");
+            EditorGUILayout.LabelField("後期のうち向きのある分", lateAll > 1e-12 ? (100.0 * lateDir / lateAll).ToString("F1") + "%" : "-");
+            EditorGUILayout.LabelField("向きのある音の左右の重心",
+                dirAll > 1e-12 ? ((xw / dirAll) >= 0.0 ? "右 " : "左 ") + System.Math.Abs(xw / dirAll).ToString("F2") + "（1 で真横）" : "-");
+            EditorGUILayout.Space(4f);
+
+            for (int k = 0; k < sum.Length; k++)
+            {
+                if (sum[k] <= 0.0) continue;
+                Rect row = EditorGUILayout.GetControlRect(false, 16f);
+                float share = total > 1e-12 ? (float)(sum[k] / total) : 0f;
+                const float labelW = 170f, valueW = 130f;
+                float barMax = Mathf.Max(10f, row.width - labelW - valueW);
+                EditorGUI.DrawRect(new Rect(row.x, row.y + 4f, 8f, 8f), kArrivalColors[k]);
+                GUI.Label(new Rect(row.x + 12f, row.y, labelW - 12f, row.height), kArrivalNames[k], EditorStyles.miniLabel);
+                EditorGUI.DrawRect(new Rect(row.x + labelW, row.y + 3f, barMax, row.height - 6f), new Color(1f, 1f, 1f, 0.05f));
+                EditorGUI.DrawRect(new Rect(row.x + labelW, row.y + 3f, Mathf.Max(1f, barMax * share), row.height - 6f), kArrivalColors[k]);
+                GUI.Label(new Rect(row.xMax - valueW + 4f, row.y, valueW - 4f, row.height), (share * 100f).ToString("F1") + "%   " + Db2(sum[k]), EditorStyles.miniLabel);
+            }
+            EditorGUILayout.Space(6f);
+
+            float size = Mathf.Min(position.width - 20f, 360f);
+            Rect r = GUILayoutUtility.GetRect(size, size);
+            r.x = (position.width - size) * 0.5f; r.width = size; r.height = size;
+            DrawMixPolar(r, total);
+            GUILayout.Space(4f);
+            EditorGUILayout.HelpBox("円: 上が前（リスナーの向き）、右が右。中心からの距離は総量に対する割合（外周 0 dB、中心 −40 dB、薄い輪は −10/−20/−30 dB）。"
+                + "点は向きのある到来（大きさも割合）、色の輪は全方向から来る分、オレンジの弧は戸口の線音源の横幅。", MessageType.None);
+        }
+
+        private void DrawMixPolar(Rect r, double total)
+        {
+            EditorGUI.DrawRect(r, new Color(0.11f, 0.11f, 0.13f));
+            if (Event.current.type != EventType.Repaint || total <= 1e-12) return;
+            Vector2 c = r.center;
+            float R = r.width * 0.5f - 8f;
+            System.Func<double, float> radius = e =>
+            {
+                double db = 10.0 * System.Math.Log10(System.Math.Max(e / total, 1e-12));
+                return R * Mathf.Clamp01((float)((db + 40.0) / 40.0));
+            };
+            Handles.BeginGUI();
+            for (int k = 1; k <= 3; k++) DrawRing(c, R * (1f - k * 0.25f), new Color(1f, 1f, 1f, 0.07f), 1f);
+            DrawRing(c, R, new Color(1f, 1f, 1f, 0.15f), 1f);
+            Handles.color = new Color(1f, 1f, 1f, 0.55f);
+            Handles.DrawAAPolyLine(2f, new Vector3(c.x - 6f, c.y + 4f), new Vector3(c.x, c.y - 9f), new Vector3(c.x + 6f, c.y + 4f));   // 前
+
+            // 全方向から来る分（種類ごとに足して 1 本の輪）
+            var ringSum = new double[kArrivalNames.Length];
+            foreach (var a in _arr) if (!HasDir(a) && a.kind >= 0 && a.kind < ringSum.Length) ringSum[a.kind] += a.energy;
+            for (int k = 0; k < ringSum.Length; k++)
+                if (ringSum[k] > 0.0) DrawRing(c, radius(ringSum[k]), kArrivalColors[k], 1.5f + 6f * Mathf.Sqrt((float)(ringSum[k] / total)));
+
+            // 戸口の線音源の弧（点の方位の端から端。±180° をまたいでも繋がるよう最初の点に寄せて開く）
+            double doorE = 0.0; float azRef = 0f, azMin = 0f, azMax = 0f; bool first = true;
+            foreach (var a in _arr)
+            {
+                if (a.kind != 6) continue;
+                doorE += a.energy;
+                float az = Mathf.Atan2(a.dirX, a.dirZ) * Mathf.Rad2Deg;
+                if (first) { azRef = az; azMin = az; azMax = az; first = false; continue; }
+                az = azRef + Mathf.DeltaAngle(azRef, az);
+                azMin = Mathf.Min(azMin, az); azMax = Mathf.Max(azMax, az);
+            }
+            if (doorE > 0.0)
+            {
+                float rr = radius(doorE);
+                const int segs = 24;
+                var arc = new Vector3[segs + 1];
+                for (int i = 0; i <= segs; i++)
+                {
+                    float az = Mathf.Lerp(azMin, azMax, (float)i / segs) * Mathf.Deg2Rad;
+                    arc[i] = new Vector3(c.x + rr * Mathf.Sin(az), c.y - rr * Mathf.Cos(az));
+                }
+                Handles.color = kArrivalColors[6];
+                Handles.DrawAAPolyLine(4f, arc);
+            }
+
+            // 向きのある到来（点）
+            foreach (var a in _arr)
+            {
+                if (!HasDir(a)) continue;
+                float az = Mathf.Atan2(a.dirX, a.dirZ);
+                float rr = radius(a.energy);
+                var p = new Vector3(c.x + rr * Mathf.Sin(az), c.y - rr * Mathf.Cos(az));
+                Handles.color = kArrivalColors[Mathf.Clamp(a.kind, 0, kArrivalColors.Length - 1)];
+                Handles.DrawSolidDisc(p, Vector3.forward, 2.5f + 7f * Mathf.Sqrt((float)(a.energy / total)));
+            }
+            Handles.EndGUI();
+        }
+
+        private void DrawRing(Vector2 c, float radius, Color col, float width)
+        {
+            for (int i = 0; i < _ring.Length; i++)
+            {
+                float t = (float)i / (_ring.Length - 1) * Mathf.PI * 2f;
+                _ring[i] = new Vector3(c.x + radius * Mathf.Cos(t), c.y + radius * Mathf.Sin(t));
+            }
+            Handles.color = col;
+            Handles.DrawAAPolyLine(width, _ring);
         }
 
         private void DrawInfo()

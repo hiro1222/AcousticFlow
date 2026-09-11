@@ -289,6 +289,13 @@ namespace AcousticFlow
             if (_world == IntPtr.Zero || v == null || v.EmitterId < 0) return false;
             return NativeWorld.AF_WorldMixInfo(_world, v.EmitterId, out info) != 0;
         }
+        /// 聞こえている音の到来（AF ツールの配分タブ用）。書いた数を返す。DLL が古くて口が無ければ 0。
+        public int GetArrivals(WorldVoice v, AFArrival[] buf)
+        {
+            if (_world == IntPtr.Zero || v == null || v.EmitterId < 0 || buf == null) return 0;
+            try { return NativeWorld.AF_WorldArrivals(_world, v.EmitterId, buf, buf.Length); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
         public int ListenerRoom => (_world != IntPtr.Zero && listener != null) ? NativeWorld.AF_WorldRoomAt(_world, new AFVector3(listener.position)) : -1;
     }
 }

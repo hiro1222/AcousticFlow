@@ -22,6 +22,20 @@ namespace AcousticFlow
         public int imageCandidates;
     }
 
+    // 聞こえている音の到来（AF ツールの配分タブ用）。acoustic_world.h の AF_Arrival と並びを揃える（int×2、float×6）。
+    [StructLayout(LayoutKind.Sequential)]
+    public struct AFArrival
+    {
+        // 0 直接 / 1 初期（虚像）/ 2 初期（方向なし）/ 3 回折 / 4 透過 /
+        // 5 後期・耳の部屋の響き / 6 後期・戸口から直接 / 7 後期・戸口から流した響き / 8 後期・戸口の向きの点（案1）
+        public int kind;
+        public int emitter;
+        public float dirX, dirY, dirZ;   // リスナー座標（+x 右 / +y 上 / +z 前）。全方向なら 0
+        public float spread;             // 0 点 … 1 一様
+        public float energy;             // 耳に届く量（帯域の平均エネルギー）
+        public float delaySec;
+    }
+
     public static class NativeWorld
     {
         private const string Dll = "AcousticEngine";
@@ -66,6 +80,7 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldFdnStale(IntPtr w);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldApplyVoice(IntPtr w, int emitter, IntPtr voice, int sampleRate);
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldMixInfo(IntPtr w, int emitter, out AFMixInfo info);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldArrivals(IntPtr w, int emitter, [Out] AFArrival[] buf, int maxOut);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetBudget(IntPtr w, int totalRays, int fullSlots, int lightSlots, int probesPerFrame);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetRayGroups(IntPtr w, int rayGroups);
         // 1 音源の本数の上限（既定 512）。GPU で本数を増やすときはこれも上げる（raysPerEmitter だけでは頭打ち）。
