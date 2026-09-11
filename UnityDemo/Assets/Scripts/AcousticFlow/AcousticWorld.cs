@@ -90,6 +90,11 @@ namespace AcousticFlow
         //   切ると壁を抜けるのは透過の直接音だけ。開いた戸口を通る分はどちらでも同じ。
         [Tooltip("壁越しの反射（既定 切）。入れると旧: 壁を横切った反射と残響も薄めて届ける。切ると壁を抜けるのは透過の直接音だけ。実行中に変えられる")]
         public bool wallReflections = false;
+        // 戸口の線音源の低域の相関（2026-09-12）。境より下は 5 点が同じ波形（振幅の和で 1）、上は点ごとに別の波形。0 で旧。
+        //   近づいて 5 点が広い角度に散ると、全部が無相関だと両耳の相関が落ちて「前の雲」になる。低域を揃えると戸口の方向が立つ。
+        //   IACC（戸口の正面 0.5〜3 m）: 0 で 0.34〜0.54（近いほど雲）、3000 で 0.59〜0.62（距離によらず）、6000 以上で 0.8〜0.9（点に寄って幅が消える）。
+        [Tooltip("戸口の線音源の低域の相関の境（Hz、既定 3000）。下は 5 点が同じ波形、上は別の波形。0 で旧（近いと雲）。6000 以上は点に寄る。実行中に動かせる")]
+        [Range(0f, 8000f)] public float doorCoherenceHz = 3000f;
 
         // 尾のレーンの作り（方向バスへ載せる尾）
         //   0 耳ごとの行（旧）: 点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる
@@ -385,6 +390,7 @@ namespace AcousticFlow
             NativeWorld.AF_WorldSetLateThrough(_world, lateThroughMode);   // 同上
             NativeWorld.AF_WorldSetDoorPull(_world, doorPull);             // 同上
             NativeWorld.AF_WorldSetWallReflect(_world, wallReflections ? 1 : 0);   // 同上
+            NativeWorld.AF_WorldSetDoorCoherence(_world, doorCoherenceHz);         // 同上
             NativeWorld.AF_WorldSetLaneModel(_world, laneModel);           // 同上
             NativeWorld.AF_WorldSetGpuTrace(_world, gpuTrace ? 1 : 0);
             GpuActive = NativeWorld.AF_WorldGpuActive(_world) != 0;

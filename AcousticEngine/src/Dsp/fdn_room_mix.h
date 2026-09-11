@@ -338,6 +338,17 @@ public:
         }
         version_.fetch_add(1, std::memory_order_release);
     }
+    /// 戸口の線音源の低域の相関（Hz、2026-09-12）。この境より下は 5 点が**同じ波形**（振幅の和で 1）、上は点ごとに別の波形（パワーの和で 1）。
+    ///   0 で全帯域を別の波形（旧）。
+    ///   ★試聴「ドアから遠いと定位が出るが、近いと方向がわからない」。5 点全部を無相関にすると、近づいて 5 点が広い角度に散ったとき
+    ///     両耳の相関が落ちて「前の雲」になる。向こうの部屋の拡散音場は戸口の幅の中で低域ほど相関が高い（波長 1 m の 340 Hz 以下は
+    ///     ほぼ同じ波面、点の間隔 0.2 m の 850 Hz 以上は無相関）ので、低域を揃えるのが物理にも合う。
+    ///   ★低域は振幅の和で 1 にする（同じ波形を N 点に配ると振幅で足されるため。パワーの和のままだと N 倍に膨らむ）。
+    void setPortalCoherence(float hz) {
+        portalCohHz_ = hz;
+        portalCohCoef_ = (hz > 0.0f) ? std::min(1.0f, 2.0f * 3.14159265f * hz / static_cast<float>(fs_)) : 0.0f;
+    }
+    float portalCoherence() const { return portalCohHz_; }
     /// 診断: 枠が今運んでいる部屋（オーディオスレッドの状態。読むだけ）。
     int portalSource(int slot) const { return (slot >= 0 && slot < kMaxPortals) ? portals_[slot].src : -1; }
     bool portalHrtfReady() const { return portalHrtfReady_.load(std::memory_order_acquire); }
@@ -749,6 +760,7 @@ private:
         bool  sentOnce[kPortalPoints] = {};
         float directPend = 0.0f, directTgt = 0.0f, directCur = 0.0f;
         float feedPend = 0.0f, feedTgt = 0.0f, feedCur = 0.0f;
+        float lpShared = 0.0f, lpOwn[kPortalPoints] = {};   // 低域の相関（setPortalCoherence）の一次 LP の状態
         std::unique_ptr<HrtfProcessor> hp[kPortalPoints];
         std::vector<float> sig;                         // [点][maxFrames] 点ごとのモノラル（行 × 帯域の重み）
         std::vector<float> tmp, scratchL, scratchR;
@@ -756,6 +768,7 @@ private:
     Portal portals_[kMaxPortals];
     std::atomic<bool> portalHrtfReady_{false};
     float portalNorm_ = 1.0f;
+    float portalCohHz_ = 0.0f, portalCohCoef_ = 0.0f;
     static constexpr float kSqrt2 = 1.41421356f;
 
     // 方向バスの HRTF を最初に見えたときに 1 回だけ全点へ差す（制御スレッド）。差し終えてから旗を立てる。
@@ -797,6 +810,26 @@ private:
                     }
                 }
             }
+            // 低域の相関（setPortalCoherence）: 境より下は真ん中の点の波形を全点で共有（振幅の和で 1）、上は点ごとの波形のまま。
+            //   点 k = LP(真ん中) × (1/Σg) + (点 k − LP(点 k))。真ん中の点は LP + HP ＝ 元のまま。
+            if (portalCohCoef_ > 0.0f) {
+                const float coef = portalCohCoef_;
+                float sumG = 0.0f;
+                for (int j = 0; j < kPortalPoints; ++j) sumG += p.gTgt[j];
+                const float f = (sumG > 1e-6f) ? 1.0f / sumG : 1.0f;
+                const float* center = p.sig.data() + static_cast<std::size_t>(kPortalPoints / 2) * static_cast<std::size_t>(maxFrames_);
+                float lpS = p.lpShared;
+                for (int i = 0; i < n; ++i) {
+                    lpS += coef * (center[i] - lpS);
+                    for (int j = 0; j < kPortalPoints; ++j) {
+                        float* sig = p.sig.data() + static_cast<std::size_t>(j) * static_cast<std::size_t>(maxFrames_);
+                        const float x = sig[i];
+                        p.lpOwn[j] += coef * (x - p.lpOwn[j]);
+                        sig[i] = lpS * f + (x - p.lpOwn[j]);
+                    }
+                }
+                p.lpShared = lpS;
+            }
         }
     }
 
@@ -812,6 +845,7 @@ private:
                 for (int j = 0; j < kPortalPoints; ++j)
                     p.hp[j]->processAdd(tmp, 0, n, p.scratchL.data(), p.scratchR.data(), 0, 0.0f);
             }
+            if (p.flush) { p.lpShared = 0.0f; for (int j = 0; j < kPortalPoints; ++j) p.lpOwn[j] = 0.0f; }
             p.flush = false;
             const bool live = !p.fadeOut;
             const float dT = live ? p.directTgt : 0.0f, fT = live ? p.feedTgt : 0.0f;

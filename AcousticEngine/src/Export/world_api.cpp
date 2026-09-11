@@ -111,6 +111,12 @@ void AF_WorldSetDoorPull(AF_WorldHandle w, float pull) {
 float AF_WorldDoorPull(AF_WorldHandle w) {
     acoustic::flow::World* W = asWorld(w); return W ? W->doorPull : 0.0f;
 }
+void AF_WorldSetDoorCoherence(AF_WorldHandle w, float hz) {
+    if (acoustic::flow::World* W = asWorld(w)) W->doorCoherenceHz = (hz < 0.0f) ? 0.0f : hz;
+}
+float AF_WorldDoorCoherence(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->doorCoherenceHz : 0.0f;
+}
 void AF_WorldSetWallReflect(AF_WorldHandle w, int on) {
     if (acoustic::flow::World* W = asWorld(w)) W->wallReflect = (on != 0) ? 1 : 0;
 }

@@ -101,6 +101,8 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetDoorPull(IntPtr w, float pull);
         // 壁越しの反射（既定 0 ＝ 通さない）。1 で旧: 壁を横切った反射と残響も透過率で薄めて届ける。実行中に切り替えてよい
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetWallReflect(IntPtr w, int on);
+        // 戸口の線音源の低域の相関の境（Hz、既定 3000）。下は 5 点が同じ波形、上は別の波形。0 で旧。実行中に動かせる
+        [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetDoorCoherence(IntPtr w, float hz);
         // 尾のレーンの作り（試聴の A/B 用）。0 耳ごとの行（旧）/ 1 点と拡散を分ける（既定）
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetLaneModel(IntPtr w, int model);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetWeights(IntPtr w, float[] w5);

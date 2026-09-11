@@ -2665,6 +2665,92 @@ void testDoorProbe() {
     std::printf("        （後期どうし = 探針から見積もった戸口の後期 ÷ 今の戸口越し。後期に占める = 探針の見積もり ÷ 今の後期全体）\n");
 }
 
+/// 【探り】戸口の線音源の両耳相関 ── 距離ごと（AF_ONLY=doorcoh）
+///   試聴「ドアから遠いと定位が出るが、近いと方向がわからない」。5 点に無相関な波形を入れているので、
+///   近づいて 5 点が広い角度に散ると両耳の相関が落ちて「前の雲」になる、という見立ての物差し。
+///   後期だけ・戸口寄せ 1（後期を全部戸口の線音源から）で、戸口の正面 0.5 / 1 / 2 / 3 m に立ち、
+///   最終出力の IACC（±1 ms の中の正規化相互相関の最大）と、点の見込み角を出す。AF_DOOR_COH=c で低域の相関の摘みを試す。
+void testDoorCoherence() {
+    std::printf("\n[探り] 戸口の線音源の両耳相関（後期だけ・戸口寄せ 1・白色雑音）\n");
+    const int fs = 48000, block = 512;
+    const float dt = static_cast<float>(block) / fs;
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    const Vec3 S(0.0f, 1.6f, 3.0f);
+    const char* ce = std::getenv("AF_DOOR_COH");
+    const float coh = ce ? static_cast<float>(std::atof(ce)) : -1.0f;
+    std::printf("        %6s | %8s | %6s %8s | %s\n", "距離", "横幅", "IACC", "L-R dB", "IACC(低域 <700) / (高域 >700)");
+    for (float dist : {0.5f, 1.0f, 2.0f, 3.0f}) {
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        w.addBox(doorLeaf(90.0f), lm, true);
+        w.lateThrough = 2; w.doorPull = 1.0f;
+        for (int c = 0; c < kNumComponents; ++c) w.rules.weights.w[c] = (c == kLate) ? 1.0f : 0.0f;
+        w.raysPerEmitter = 512; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+        const Vec3 L(0.0f, 1.6f, -dist);
+        w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w.addEmitter(S, 0.2f);
+        w.build();
+        af::dsp::FdnRoomMix fdn(fs, block, 0.6f);
+        if (coh >= 0.0f) w.doorCoherenceHz = coh;
+        w.bindFdn(&fdn);
+        af::dsp::VoiceRenderer::Config vc; vc.sampleRate = fs; vc.maxFrames = block; vc.tailSeconds = 1.0f;
+        af::dsp::VoiceRenderer v(vc);
+        v.setOutputGain(1.0f); v.setTailLevel(1.0f); v.setFdnMix(&fdn);
+        af::dsp::HrtfSet hrtf = af::dsp::HrtfSet::createSynthetic(fs);
+        af::dsp::DirectionBus bus(fs, 8, block);
+        v.setHrtfEnabled(true); v.setHrtfSet(&hrtf);
+        bus.setHrtfSet(&hrtf, 57.0f); v.setDirectionBus(&bus); fdn.setDirectionBus(&bus, 57.0f);
+        const int frames = 400;
+        std::vector<float> in(block), l(block), r(block), fl(block), fr(block), bl(block), br(block);
+        std::vector<float> outL, outR;
+        std::uint32_t st = 777u;
+        for (int k = 0; k < frames; ++k) {
+            w.update(dt);
+            if (w.fdnStale()) w.bindFdn(&fdn);
+            w.applyToVoice(e, v, fs);
+            for (int i = 0; i < block; ++i) { st = st * 1664525u + 1013904223u; in[static_cast<std::size_t>(i)] = static_cast<float>(st >> 8) / 16777216.0f * 0.2f - 0.1f; }
+            v.render(in.data(), block, l.data(), r.data(), nullptr);
+            std::fill(fl.begin(), fl.end(), 0.0f); std::fill(fr.begin(), fr.end(), 0.0f);
+            fdn.render(block, fl.data(), fr.data());
+            std::fill(bl.begin(), bl.end(), 0.0f); std::fill(br.begin(), br.end(), 0.0f);
+            bus.render(block, bl.data(), br.data());
+            if (k < 100) continue;
+            for (int i = 0; i < block; ++i) {
+                const std::size_t q = static_cast<std::size_t>(i);
+                outL.push_back(l[q] + fl[q] + bl[q]); outR.push_back(r[q] + fr[q] + br[q]);
+            }
+        }
+        // IACC: ±1 ms の中の正規化相互相関の最大。帯域は一次 LP/HP（700 Hz）で分けて別に出す
+        auto iacc = [&](const std::vector<float>& a, const std::vector<float>& b) {
+            const int n = static_cast<int>(a.size()), maxLag = fs / 1000;
+            double ea = 0.0, eb = 0.0;
+            for (int i = 0; i < n; ++i) { ea += static_cast<double>(a[i]) * a[i]; eb += static_cast<double>(b[i]) * b[i]; }
+            double best = 0.0;
+            for (int lag = -maxLag; lag <= maxLag; ++lag) {
+                double c = 0.0;
+                for (int i = std::max(0, -lag); i < std::min(n, n - lag); ++i) c += static_cast<double>(a[i]) * b[i + lag];
+                best = std::max(best, std::fabs(c));
+            }
+            return best / std::sqrt(std::max(ea * eb, 1e-30));
+        };
+        auto split = [&](const std::vector<float>& x, std::vector<float>& lo, std::vector<float>& hi) {
+            const float coef = 2.0f * 3.14159265f * 700.0f / fs;
+            float s2 = 0.0f;
+            lo.resize(x.size()); hi.resize(x.size());
+            for (std::size_t i = 0; i < x.size(); ++i) { s2 += coef * (x[i] - s2); lo[i] = s2; hi[i] = x[i] - s2; }
+        };
+        std::vector<float> lLo, lHi, rLo, rHi;
+        split(outL, lLo, lHi); split(outR, rLo, rHi);
+        double eL = 0.0, eR = 0.0;
+        for (std::size_t i = 0; i < outL.size(); ++i) { eL += static_cast<double>(outL[i]) * outL[i]; eR += static_cast<double>(outR[i]) * outR[i]; }
+        const float span = (w.portalDiag().empty()) ? 0.0f : w.portalDiag()[0].spanDeg;
+        std::printf("        %5.1f m | %7.1f° | %6.3f %+8.2f | %.3f / %.3f\n", dist, span, iacc(outL, outR),
+                    10.0 * std::log10(std::max(eL, 1e-30) / std::max(eR, 1e-30)), iacc(lLo, rLo), iacc(lHi, rHi));
+    }
+}
+
 /// 【探り】後期はどこから来るか（AF_ONLY=lateorigin）
 ///   ★「隣の部屋にいるときは扉からの指向性が強いはず」を**レイで**測る物差し。エンジンは変えない。
 ///   traceRay と同じ式で NEE を追い、後期の寄与ごとに「放射した面が耳と同じ部屋に面しているか」で分ける。
@@ -3132,7 +3218,7 @@ int main() {
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
         {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"wall", testWallReflect}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
-        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
+        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true}, {"doorcoh", testDoorCoherence, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {
         // AF_ONLY はコンマ区切りで複数指定できる（例 AF_ONLY=world,bridge）

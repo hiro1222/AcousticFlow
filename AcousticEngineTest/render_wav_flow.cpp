@@ -131,6 +131,7 @@ int main(int argc, char** argv) {
     if (const char* rc = std::getenv("AF_ROOM_CELL")) AF_WorldSetRoomCell(w, static_cast<float>(std::atof(rc)));
     if (const char* dp = std::getenv("AF_DOOR_PULL")) AF_WorldSetDoorPull(w, static_cast<float>(std::atof(dp)));   // 戸口寄せ 0..1
     if (const char* wr = std::getenv("AF_WALL_REFLECT")) AF_WorldSetWallReflect(w, std::atoi(wr));               // 壁越しの反射 0/1
+    if (const char* dc = std::getenv("AF_DOOR_COH")) AF_WorldSetDoorCoherence(w, static_cast<float>(std::atof(dc)));   // 戸口の低域の相関の境 Hz
     // 五成分の重み（直接・初期・後期・回折・透過）。AF_WEIGHTS="1,1,0,1,1" で後期を止める、など。
     //   ★色や広がりがどこから来ているかを切り分けるための摘み。既定は全部 1。
     if (const char* wv = std::getenv("AF_WEIGHTS")) {

@@ -104,6 +104,10 @@ ACOUSTIC_API int  AF_WorldLateThrough(AF_WorldHandle w);
  * 実行中に動かしてよい。 */
 ACOUSTIC_API void  AF_WorldSetDoorPull(AF_WorldHandle w, float pull);
 ACOUSTIC_API float AF_WorldDoorPull(AF_WorldHandle w);
+/* 戸口の線音源の低域の相関の境（Hz、既定 3000）。この境より下は 5 点が同じ波形、上は点ごとに別の波形。0 で旧（全帯域を別々に）。
+ * 近づいて 5 点が広い角度に散ったときの定位のため。実行中に動かしてよい。 */
+ACOUSTIC_API void  AF_WorldSetDoorCoherence(AF_WorldHandle w, float hz);
+ACOUSTIC_API float AF_WorldDoorCoherence(AF_WorldHandle w);
 /* 壁越しの反射（既定 0 ＝ 通さない）。1 で旧: 壁を横切った反射と残響も透過率で薄めて届ける。
  * 0 では壁を抜けるのは透過の直接音だけ。開いた戸口を通る分はどちらでも同じ。実行中に切り替えてよい。 */
 ACOUSTIC_API void AF_WorldSetWallReflect(AF_WorldHandle w, int on);
