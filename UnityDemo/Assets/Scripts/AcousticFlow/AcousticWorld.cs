@@ -62,10 +62,12 @@ namespace AcousticFlow
         [Tooltip("閉じた扉から漏れる回折。0 旧 / 1 厚みの割合（既定。10°以降は 0 と同じ）/ 2 口の空き具合（戸口の方向が薄まる）/ 3 両方。実行中に変えられる")]
         [Range(0, 3)] public int leakModel = 1;
 
-        // 戸口越しの後期に向きを付ける（段 2-f、既定 入）。隣の部屋にいるとき、向こうの部屋の響きのうち
-        // 戸口越しに届く分を戸口の向きから鳴らす。同じ部屋の音源は変わらない（LEV のまま）。実行中に変えられる。
-        [Tooltip("戸口越しの後期に向きを付ける（既定 入）。切ると旧（後期を全部、耳の部屋から一様に）。実行中に変えられる")]
-        public bool lateThroughDoor = true;
+        // 隣の部屋にいるときの、向こうの部屋の響きの鳴らし方（段 2-f / 2-g）。同じ部屋の音源はどれでも変わらない（LEV のまま）。
+        //   0 旧: 全部を耳の部屋から一様に
+        //   1 戸口越しに届く分を、戸口の向きの点から
+        //   2 戸口の線音源（既定）: 向こうの部屋の響きを戸口の横幅から HRTF で鳴らし、耳の部屋の響きも戸口の音から鳴り始める
+        [Tooltip("隣の部屋の響きの鳴らし方。0 旧（一様）/ 1 戸口の向きの点 / 2 戸口の線音源（既定）。実行中に変えられる")]
+        [Range(0, 2)] public int lateThroughMode = 2;
 
         // レイを GPU で解く（既定 切）。音は作らない ── GPU が出すのは幾何と統計だけで、
         // 音にするのは今までどおりエンジン。ホストのデバイスは借りず、エンジンが自前で持つ。
@@ -260,7 +262,7 @@ namespace AcousticFlow
             NativeWorld.AF_WorldSetResponse(_world, levelSec, colourSec, statSec, directionSec);
             NativeWorld.AF_WorldSetRays(_world, raysPerEmitter, maxBounces);
             NativeWorld.AF_WorldSetLeakModel(_world, leakModel);   // 実行中に切り替えられる（試聴の A/B）
-            NativeWorld.AF_WorldSetLateThrough(_world, lateThroughDoor ? 1 : 0);   // 同上
+            NativeWorld.AF_WorldSetLateThrough(_world, lateThroughMode);   // 同上
             NativeWorld.AF_WorldSetGpuTrace(_world, gpuTrace ? 1 : 0);
             GpuActive = NativeWorld.AF_WorldGpuActive(_world) != 0;
             NativeWorld.AF_WorldSetBudget(_world, totalRays, fullSlots, lightSlots, probesPerFrame);

@@ -84,9 +84,12 @@ ACOUSTIC_API void AF_WorldSetHeadCm(AF_WorldHandle w, float headCircumferenceCm)
  *   2 案B（半開きの回折まで下がり、戸口の方向が消える）/ 3 両方
  *   ★どちらも角度に二値を置かない。1 は経路の幾何、2 は口の帳簿。2 は戸口が要る。 */
 ACOUSTIC_API void AF_WorldSetLeakModel(AF_WorldHandle w, int model);
-/* 戸口越しの後期に向きを付ける（段 2-f、既定 1）。0 で旧（後期を丸ごと耳の部屋の FDN へ一様に）。
- * 音源が耳と別の部屋にいるとき、レイの後期のうち戸口越しの面から来た分を音源の部屋の FDN へ送り、
- * その FDN を戸口の向きで聞く。同じ部屋の音源は変わらない。実行中に切り替えられる（試聴の A/B）。 */
+/* 隣の部屋の後期の鳴らし方（段 2-f / 2-g、既定 2）。実行中に切り替えられる（試聴の A/B）。
+ *   0 旧（後期を丸ごと耳の部屋の FDN へ一様に）
+ *   1 戸口越しの面から来た分を音源の部屋の FDN へ送り、その FDN を戸口の向き（レーンの点）で聞く
+ *   2 戸口の線音源: 音源の部屋の尾を戸口の横幅に並べた 5 点から HRTF で鳴らし、耳の部屋の分のうち
+ *     戸口から入った分（× 戸口の開き具合）を戸口の線音源から耳の部屋の FDN へ流す
+ * 同じ部屋の音源はどれでも変わらない。2 でも戸口で繋がっていない部屋は 1 の形になる。 */
 ACOUSTIC_API void AF_WorldSetLateThrough(AF_WorldHandle w, int on);
 ACOUSTIC_API int  AF_WorldLateThrough(AF_WorldHandle w);
 /* レイを GPU で解くか（0 切／1 入。既定 0）。

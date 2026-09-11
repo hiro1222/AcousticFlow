@@ -59,6 +59,8 @@ public:
     int rows() const { return lanes_ * 2; }
     int maxFrames() const { return maxFrames_; }
     bool hasHrtf() const { return hasHrtf_; }
+    /// 差してある HRTF（無ければ nullptr）。戸口の線音源が点ごとの HRTF に使う（段 2-g）。生存は呼び手が保証する。
+    const HrtfSet* hrtfSet() const { return hasHrtf_ ? hrtfSet_ : nullptr; }
     /// 畳み込みの固有遅延（firstBlock）。タップはこのぶん早めて送ること（VoiceRenderer::setTaps）。
     int latency() const { return conv_.empty() ? 0 : conv_[0]->latency(); }
     void laneDirection(int k, float out[3]) const {
@@ -85,6 +87,7 @@ public:
 
     /// 方向 × 耳ごとに固定の HRIR（ITD を抜いて揃えた物）をモノラルで焼く。ITD はタップが持つ。
     void setHrtfSet(const HrtfSet* set, float /*headCircumferenceCm*/) {
+        hrtfSet_ = set;                                  // 戸口の線音源（FdnRoomMix、段 2-g）が同じ HRTF を借りる
         hasHrtf_ = false;
         conv_.clear();
         meanPowerGain_ = 1.0f;
@@ -185,6 +188,7 @@ private:
     float laneDir_[kMaxLanes][3] = {};
     std::vector<std::unique_ptr<NonUniformConvolver>> conv_;   // 行ごと（モノラル IR）
     bool hasHrtf_ = false;
+    const HrtfSet* hrtfSet_ = nullptr;
     std::vector<float> in_;                 // [行][maxFrames] 溜まった送り
     int pending_ = 0;                       // このブロックで触った長さ
     std::vector<float> scratchL_, scratchR_;

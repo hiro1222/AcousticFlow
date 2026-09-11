@@ -82,7 +82,7 @@ void AF_WorldSetLeakModel(AF_WorldHandle w, int model) {
     W->leakModel = model;
 }
 void AF_WorldSetLateThrough(AF_WorldHandle w, int on) {
-    if (acoustic::flow::World* W = asWorld(w)) W->lateThrough = (on != 0) ? 1 : 0;
+    if (acoustic::flow::World* W = asWorld(w)) W->lateThrough = (on < 0) ? 0 : (on > 2 ? 2 : on);   // 0 旧 / 1 案1 / 2 戸口の線音源
 }
 int AF_WorldLateThrough(AF_WorldHandle w) {
     acoustic::flow::World* W = asWorld(w); return W ? W->lateThrough : 0;

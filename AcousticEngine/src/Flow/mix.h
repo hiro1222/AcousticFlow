@@ -72,6 +72,9 @@ struct FdnSend {
     //   耳の部屋へ行く分は 0（一様）。戸口越しの分はレイが測った向きと R を持つ。World が部屋ごとに束ねて FDN に置く。
     float dir[3] = {0.0f, 0.0f, 0.0f};
     float focus = 0.0f;
+    // 段 2-g（戸口の線音源）: e6 のうち、戸口からリスナーへ直接出す分。残り（e6 − thru6）は戸口の線音源が
+    //   耳の部屋の FDN へ流す分。戸口の線音源が無い送りでは 0 のまま（使わない）。
+    float thru6[kNumBands] = {};
 };
 
 struct Mix {

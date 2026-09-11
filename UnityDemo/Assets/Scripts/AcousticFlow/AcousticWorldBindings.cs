@@ -55,7 +55,7 @@ namespace AcousticFlow
 
         // 閉じた扉から漏れる回折の扱い（試聴の A/B 用）。0 今のまま / 1 厚みの割合 / 2 口の空き具合 / 3 両方
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetLeakModel(IntPtr w, int model);
-        // 戸口越しの後期に向きを付ける（段 2-f、既定 1）。0 で旧（後期を丸ごと耳の部屋へ一様に）。試聴の A/B 用
+        // 隣の部屋の後期の鳴らし方（試聴の A/B 用）。0 旧（一様）/ 1 戸口の向きの点 / 2 戸口の線音源（既定）
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetLateThrough(IntPtr w, int on);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetWeights(IntPtr w, float[] w5);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetResponse(IntPtr w, float levelSec, float colourSec, float statSec, float directionSec);

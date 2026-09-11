@@ -62,6 +62,8 @@ struct DistributeInput {
     const Listener* listener = nullptr;
     int listenerRoom = -1;                 // −1 なら FDN の送りを作らない
     int sourceRoom = -1;                   // 段 2-f。耳と違う部屋なら、戸口越しの後期をこの部屋の FDN へ向き付きで送る
+    bool  doorSource = false;              // 段 2-g。音源の部屋と耳の部屋が戸口で繋がり、戸口の線音源で鳴らすか
+    float doorFeed = 0.0f;                 // 段 2-g。耳の部屋の分のうち戸口から入った割合（＝その戸口の開き具合 0..1）
     const WorldWeights* weights = nullptr; // nullptr なら全部 1
     const Response* response = nullptr;    // nullptr なら既定
     float dt = 1.0f / 60.0f;
@@ -172,19 +174,27 @@ public:
             for (int b = 0; b < kNumBands; ++b)
                 thru[b] = (apart && sm[kLate][b] > 0.0f) ? std::min(1.0f, std::max(0.0f, smOther[b] / sm[kLate][b])) : 0.0f;
         }
+        // 段 2-g: 戸口の線音源で鳴らすときは、耳の部屋の分のうち戸口から入った分（× 戸口の開き具合）も
+        //   音源の部屋の送りへ回す。そこから戸口の線音源が耳の部屋の FDN へ流す（戸口の音から鳴り始める）。
+        //   thru6 は戸口から耳へ直接出す分。★量の合計は変えない（耳の部屋へ直接 ＋ 戸口へ ＝ 後期）。
+        //   ★開き具合で割るのは、閉じた扉ごしの分（板と壁の透過）まで戸口から鳴らさないため。開ききれば 1。
+        const float feed = (apart && in.doorSource) ? std::min(1.0f, std::max(0.0f, in.doorFeed)) : 0.0f;
         if (in.listenerRoom >= 0) {
             FdnSend* s = out.pushSend();
             if (s) {
                 s->room = in.listenerRoom;
-                for (int b = 0; b < kNumBands; ++b) { out.component6[kLate][b] += raw[kLate][b]; s->e6[b] = sm[kLate][b] * W.w[kLate] * (1.0f - thru[b]); }
+                for (int b = 0; b < kNumBands; ++b) { out.component6[kLate][b] += raw[kLate][b]; s->e6[b] = sm[kLate][b] * W.w[kLate] * (1.0f - thru[b]) * (1.0f - feed); }
             }
             float eThru = 0.0f;
-            for (int b = 0; b < kNumBands; ++b) eThru += sm[kLate][b] * W.w[kLate] * thru[b];
+            for (int b = 0; b < kNumBands; ++b) eThru += sm[kLate][b] * W.w[kLate] * (thru[b] + (1.0f - thru[b]) * feed);
             if (apart && eThru > 0.0f) {
                 FdnSend* o = out.pushSend();
                 if (o) {
                     o->room = in.sourceRoom;
-                    for (int b = 0; b < kNumBands; ++b) o->e6[b] = sm[kLate][b] * W.w[kLate] * thru[b];
+                    for (int b = 0; b < kNumBands; ++b) {
+                        o->e6[b] = sm[kLate][b] * W.w[kLate] * (thru[b] + (1.0f - thru[b]) * feed);
+                        o->thru6[b] = sm[kLate][b] * W.w[kLate] * thru[b];
+                    }
                     float mass = 0.0f;
                     for (int b = 0; b < kNumBands; ++b) mass += T.lateOther6[b];
                     const float len = std::sqrt(T.otherDir[0] * T.otherDir[0] + T.otherDir[1] * T.otherDir[1] + T.otherDir[2] * T.otherDir[2]);

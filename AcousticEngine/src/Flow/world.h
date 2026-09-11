@@ -131,7 +131,12 @@ public:
     ///   向き付きで送る。向きと集まり具合はレイが測った物（戸口の中心から 1〜2°、R 0.97。docs/CORE_DIFF.md ④）。
     ///   ★同じ部屋の音源では何も変わらない（戸口越しの分は耳の部屋へ畳む）。部屋が割れない場面（CORE_DIFF ①）でも変わらない。
     ///   ★退けた書き方: 旧コアの式（戸口の立体角 × α²）。戸口が要るうえ、戸口から 3 m で戸口越しをレイの約 3 倍に見積もる。
-    int lateThrough = 1;
+    ///   ── 段 2-g（2026-09-12）で 3 段にした。**既定 2。** ──
+    ///   0 旧（後期を丸ごと耳の部屋の FDN へ一様に）／1 案1（戸口越しの分を音源の部屋の FDN へ、レーンの点で）
+    ///   2 戸口の線音源（音源の部屋の尾を戸口の横幅に並べた 5 点から HRTF で。耳の部屋の分のうち戸口から入った分は
+    ///     戸口の線音源から耳の部屋の FDN へ流す）。試聴の指摘「向こうの部屋の残響が全体から聞こえすぎ」から。
+    ///   ★2 でも、耳の部屋と戸口で繋がっていない部屋（部屋が割れない 1.2 m の戸口など）は 1 の形に落ちる。
+    int lateThrough = 2;
     /// 虚像の次数（1..3）。既定 2。
     ///   ★3 にすると壁際で「詰まった連続反射」が出る。同じ壁を繰り返し使う経路が 3 次で初めて現れるため。
     ///     2 次までだと、近づいた壁が絡む虚像だけが前へ寄り、群としては詰まらない
@@ -180,6 +185,16 @@ public:
                                     static_cast<int>((p.y - g.origin.y) / g.cell),
                                     static_cast<int>((p.z - g.origin.z) / g.cell));
     }
+
+    /// 段 2-g: 戸口の線音源の診断（update の後に読む。FDN が繋がっていないと空）。
+    struct PortalDiag {
+        int   room = -1, aperture = -1;
+        float spanDeg = 0.0f;                 // 戸口の縁どうしの見込み角（横幅）
+        float directGain = 0.0f, feedGain = 0.0f, visible = 0.0f;
+        float pointGain[af::dsp::FdnRoomMix::kPortalPoints] = {};
+        float pointAz[af::dsp::FdnRoomMix::kPortalPoints] = {};   // 点の方位（度、+ が右）
+    };
+    const std::vector<PortalDiag>& portalDiag() const { return portalDiag_; }
 
     /// レイが見る平らな場面（検査用。update の後に読む）。
     const TraceScene& traceScene() const { return traceScene_; }
@@ -243,6 +258,23 @@ public:
         now_ += dt;
         const int lroom = roomAt(listener_.pos);
         const float mixingSec = mixingSecFor(lroom);
+        lroom_ = lroom;
+        // 段 2-g: 耳の部屋と戸口で繋がる部屋ごとに、使う戸口を 1 つ選ぶ（面積 × 開き具合がいちばん大きい物）。
+        //   ★閉じた扉でも選ぶ（開き具合は下限 1e-3 で並べるだけ）。量のほうが開き具合で 0 へ寄るので段にならない。
+        doorOf_.assign(probes_.size(), -1);
+        if (lateThrough == 2 && lroom >= 0) {
+            std::vector<float> bestScore(probes_.size(), 0.0f);
+            for (std::size_t a = 0; a < apertures_.size(); ++a) {
+                const rooms::Aperture& ap = apertures_[a];
+                const int other = (ap.roomA == lroom) ? ap.roomB : ((ap.roomB == lroom) ? ap.roomA : -1);
+                if (other < 0 || other >= roomCount()) continue;
+                const float score = ap.area * std::max(openFrac_[a], 1e-3f);
+                if (score > bestScore[static_cast<std::size_t>(other)]) {
+                    bestScore[static_cast<std::size_t>(other)] = score;
+                    doorOf_[static_cast<std::size_t>(other)] = static_cast<int>(a);
+                }
+            }
+        }
 
         // 生きている音源を集め、予算で段と本数を決める（段 8）。
         live_.clear(); liveIdx_.clear();
@@ -337,6 +369,12 @@ public:
             in.sourcePos = s.em.pos; in.listener = &listener_;
             in.listenerRoom = lroom; in.weights = &rules.weights; in.response = &response; in.dt = dt;
             in.sourceRoom = (lateThrough != 0) ? s.em.room : -1;
+            {
+                const int er = s.em.room;
+                const int door = (lateThrough == 2 && er >= 0 && er < static_cast<int>(doorOf_.size())) ? doorOf_[static_cast<std::size_t>(er)] : -1;
+                in.doorSource = (door >= 0);
+                in.doorFeed = (door >= 0) ? openFrac_[static_cast<std::size_t>(door)] : 0.0f;
+            }
             s.mixer.run(in, s.mix);
         };
         // ★GPU が入っているときは並列にしない。計算の器が 1 つしかないので、
@@ -430,6 +468,7 @@ private:
         // 段 2-f: 部屋ごとの尾の向き。送りのエネルギー（帯域の平均）× 集まり具合 × 向き を足し、長さ ÷ 重さ がその部屋の集まり具合。
         //   ★耳の部屋へ行く分は集まり 0 なので重さだけ増える ＝ 同じ部屋に戸口越しと自室が混ざれば、その分だけ広がる。
         std::vector<double> dirSum(probes_.size() * 3, 0.0), dirMass(probes_.size(), 0.0);
+        std::vector<double> portalT(probes_.size(), 0.0), portalE(probes_.size(), 0.0);    // 段 2-g
         for (const Slot& s : slots_) {
             if (!s.used) continue;
             for (int k = 0; k < s.mix.sendCount; ++k) {
@@ -442,6 +481,17 @@ private:
                 const std::size_t ri = static_cast<std::size_t>(sd.room);
                 dirMass[ri] += mean;
                 for (int q = 0; q < 3; ++q) dirSum[ri * 3 + q] += mean * sd.focus * sd.dir[q];
+                // 段 2-g: 戸口の線音源の量。thru6 は戸口から耳へ直接出す分、残り（e6 − thru6）は耳の部屋の FDN へ流す分。
+                //   流す分は耳の部屋の帯域の形にも入れる（耳の部屋の FDN の出口の形は、入る物の合計で決める）。
+                if (lateThrough == 2 && ri < doorOf_.size() && doorOf_[ri] >= 0) {
+                    double t = 0.0;
+                    for (int b = 0; b < kNumBands; ++b) t += sd.thru6[b];
+                    portalT[ri] += t / kNumBands;
+                    portalE[ri] += mean;
+                    if (lroom_ >= 0 && lroom_ < roomCount())
+                        for (int b = 0; b < kNumBands; ++b)
+                            sum[static_cast<std::size_t>(lroom_) * kNumBands + b] += std::max(0.0f, sd.e6[b] - sd.thru6[b]);
+                }
             }
         }
         for (std::size_t r = 0; r < probes_.size(); ++r) {
@@ -465,6 +515,66 @@ private:
             fdnDir_[r * 4] = dirLocal[0]; fdnDir_[r * 4 + 1] = dirLocal[1]; fdnDir_[r * 4 + 2] = dirLocal[2]; fdnDir_[r * 4 + 3] = spread;
             if (lateThrough != 0) fdn_->setListenerDirection(fdnRoomOf_[r], dirLocal, spread);   // 0 のときは触らない（旧と 1 ビット同じ）
         }
+        // ── 段 2-g: 戸口の線音源 ──
+        //   戸口の横幅に 5 点（幅の −0.8, −0.4, 0, +0.4, +0.8）。点ごとに向き（リスナー座標）と見通しを出し、
+        //   見通しで量を配る（Σ² = 1）。見通しは戸口の面の点から 1 m 奥まで伸ばして測る ── 向こうへ開いた扉の板は
+        //   戸口の面より奥にあるので、面の点までだと隠れない。
+        //   ★幅は枠の外接矩形の半幅そのもの（1.0 m の戸口で 0.49 m）。端の点は幅の 0.8 に置くので枠の箱には沈まない。
+        //     最初は「外接矩形はセル 1 個ぶんの厚みを含む」の注記から半セルを引いたが、それは厚みの向きの話で、
+        //     横幅が 0.36 m に縮んで見込み角が 19° → 13.8° になった（検査 [戸口の線音源] ① で発覚）。
+        portalDiag_.clear();
+        const int K = af::dsp::FdnRoomMix::kPortalPoints;
+        int slot = 0;
+        const bool listenerHasFdn = lroom_ >= 0 && lroom_ < roomCount() && fdnRoomOf_[static_cast<std::size_t>(lroom_)] >= 0;
+        if (lateThrough == 2 && listenerHasFdn) {
+            for (std::size_t r = 0; r < probes_.size() && slot < af::dsp::FdnRoomMix::kMaxPortals; ++r) {
+                if (r >= doorOf_.size() || doorOf_[r] < 0 || fdnRoomOf_[r] < 0 || portalE[r] <= 1e-30) continue;
+                const rooms::Aperture& ap = apertures_[static_cast<std::size_t>(doorOf_[r])];
+                const bool uIsWidth = std::fabs(ap.axisU.y) <= std::fabs(ap.axisV.y);
+                const Vec3 wAxis = uIsWidth ? ap.axisU : ap.axisV;
+                const float halfW = std::max(0.05f, uIsWidth ? ap.halfU : ap.halfV);
+                // 戸口の中に立ったとき（点が耳に近すぎるとき）の向き: 耳の部屋から向こうの部屋へ向かう法線
+                const Vec3 toOther = (ap.roomB == static_cast<int>(r)) ? ap.normal : ap.normal * -1.0f;
+                float dirs[af::dsp::FdnRoomMix::kPortalPoints * 3], gains[af::dsp::FdnRoomMix::kPortalPoints], vis[af::dsp::FdnRoomMix::kPortalPoints];
+                PortalDiag dg;
+                dg.room = static_cast<int>(r); dg.aperture = doorOf_[r];
+                double vsum = 0.0;
+                for (int k = 0; k < K; ++k) {
+                    const float off = (K > 1) ? (-0.8f + 1.6f * static_cast<float>(k) / static_cast<float>(K - 1)) : 0.0f;
+                    const Vec3 pt = ap.rectCenter + wAxis * (off * halfW);
+                    Vec3 d = pt - listener_.pos;
+                    float len = length(d);
+                    const Vec3 u = (len > 0.05f) ? d * (1.0f / len) : toOther;
+                    const Vec3 dl = listener_.toLocal(u);
+                    dirs[k * 3] = dl.x; dirs[k * 3 + 1] = dl.y; dirs[k * 3 + 2] = dl.z;
+                    float tau[kNumBands];
+                    surfaces.transmittance(listener_.pos, pt + u * 1.0f, -1, rules.materials, tau);
+                    float v = 0.0f;
+                    for (int b = 0; b < kNumBands; ++b) v += tau[b];
+                    vis[k] = v / kNumBands;
+                    vsum += vis[k];
+                    dg.pointAz[k] = std::atan2(dl.x, dl.z) * 180.0f / 3.14159265f;
+                }
+                for (int k = 0; k < K; ++k)
+                    gains[k] = (vsum > 1e-4) ? static_cast<float>(std::sqrt(vis[k] / vsum)) : static_cast<float>(std::sqrt(1.0 / K));
+                const double E = portalE[r], T = std::min(portalT[r], E);
+                const float directG = static_cast<float>(std::sqrt(T / E));
+                const float feedG = static_cast<float>(std::sqrt(std::max(0.0, E - T) / E));
+                fdn_->setPortal(slot, fdnRoomOf_[r], fdnRoomOf_[static_cast<std::size_t>(lroom_)], dirs, gains, K, directG, feedG, headCm);
+                // 診断: 戸口の縁どうしの見込み角（横幅）
+                {
+                    Vec3 a0 = (ap.rectCenter - wAxis * halfW) - listener_.pos, a1 = (ap.rectCenter + wAxis * halfW) - listener_.pos;
+                    const float l0 = length(a0), l1 = length(a1);
+                    const float c = (l0 > 1e-4f && l1 > 1e-4f) ? dot(a0, a1) / (l0 * l1) : -1.0f;
+                    dg.spanDeg = std::acos(std::min(1.0f, std::max(-1.0f, c))) * 180.0f / 3.14159265f;
+                }
+                dg.directGain = directG; dg.feedGain = feedG; dg.visible = static_cast<float>(vsum / K);
+                for (int k = 0; k < K; ++k) dg.pointGain[k] = gains[k];
+                portalDiag_.push_back(dg);
+                ++slot;
+            }
+        }
+        for (; slot < af::dsp::FdnRoomMix::kMaxPortals; ++slot) fdn_->setPortal(slot, -1, -1, nullptr, nullptr, 0, 0.0f, 0.0f);
     }
 
     rooms::Builder builder_;
@@ -481,6 +591,9 @@ private:
     bool fdnStale_ = false;
     TraceScene   traceScene_;   // レイが見る平らな場面（毎フレーム組み直す）
     std::vector<float> fdnDir_; // 段 2-f。部屋ごとの尾の向き（リスナー座標 xyz ＋ 広がり）。診断用
+    int lroom_ = -1;                // 段 2-g。このフレームの耳の部屋（updateFdn が使う）
+    std::vector<int> doorOf_;       // 段 2-g。部屋 → 耳の部屋と繋ぐ戸口の番号（-1 なし）
+    std::vector<PortalDiag> portalDiag_;
     mutable gpu::GpuTracer gpuTracer_;
     bool gpuTried_ = false, gpuReady_ = false;
 

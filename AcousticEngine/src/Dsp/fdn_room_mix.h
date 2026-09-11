@@ -77,6 +77,7 @@
 
 #include "fdn_tail.h"
 #include "direction_bus.h"
+#include "hrtf_processor.h"
 
 namespace af {
 namespace dsp {
@@ -89,7 +90,17 @@ public:
     static constexpr int kItdMax = 64;                     // レーンの ITD の上限（サンプル。48 kHz で 1.3 ms）
 
     FdnRoomMix(int sampleRate, int maxFrames, float diffusion = 0.6f)
-        : fs_(std::max(8000, sampleRate)), maxFrames_(maxFrames > 0 ? maxFrames : 1024), diffusion_(diffusion) {}
+        : fs_(std::max(8000, sampleRate)), maxFrames_(maxFrames > 0 ? maxFrames : 1024), diffusion_(diffusion) {
+        // 戸口の線音源の器は作るときに全部確保する（オーディオスレッドでは確保しない）。
+        for (int s = 0; s < kMaxPortals; ++s) {
+            Portal& p = portals_[s];
+            for (int k = 0; k < kPortalPoints; ++k) p.hp[k] = std::make_unique<HrtfProcessor>(fs_);
+            p.sig.assign(static_cast<std::size_t>(kPortalPoints) * static_cast<std::size_t>(maxFrames_), 0.0f);
+            p.tmp.assign(static_cast<std::size_t>(maxFrames_), 0.0f);
+            p.scratchL.assign(static_cast<std::size_t>(maxFrames_), 0.0f);
+            p.scratchR.assign(static_cast<std::size_t>(maxFrames_), 0.0f);
+        }
+    }
 
     int sampleRate() const { return fs_; }
     int maxFrames() const { return maxFrames_; }
@@ -212,6 +223,58 @@ public:
         version_.fetch_add(1, std::memory_order_release);
     }
 
+    // ── 戸口の線音源（段 2-g、2026-09-12）──
+    //   隣の部屋の尾を、戸口の横幅に並べた kPortalPoints 個の点から HRTF で鳴らす。
+    //   試聴の指摘「向こうの部屋の残響が全体から聞こえすぎ。ドア側に寄せたい」から。
+    //   ★点ごとに FDN の**別の行**を入れる（行どうしは直交＝拡散状態で無相関）。同じ波形を全点に入れると
+    //     打ち消し合って真ん中に像が 1 つできるだけで、幅にならない。
+    //   ★srcRoom はリスナーへ直接は出さない（レーンにも L/R にも足さない）。聞こえるのは戸口からだけ。
+    //   ★feedGain で dstRoom（耳の部屋）の FDN へ流す。戸口から入った音で耳の部屋が鳴り始める形。
+    //     流す向きは src → dst の一方向だけで、dst が別の戸口の src になっている枠は流さない（信号の輪を作らない。
+    //     部屋の FDN を信号で結び返すと α=1 で発散した: 上の■退けた書き方）。流した分は次のブロックで入る。
+    //   ★乗り換え（src が変わる）は、今の量を 1 ブロックで 0 へ寄せ切ってから。HRTF の履歴は空にしてから使う。
+    //   HRTF は方向バスが持っている物を借りる。見えた最初の 1 回だけ全点に差し、差し終えてから使う旗を立てる
+    //   （オーディオスレッドは旗が立つまで HrtfProcessor に触らない＝競合しない）。無ければ左右の等パワーのパン。
+    static constexpr int kMaxPortals = 4;
+    static constexpr int kPortalPoints = 5;
+
+    /// 戸口の線音源を置く（制御スレッド。毎フレーム置いてよい。目標を置くだけ）。
+    ///   dirLocal … [点 × 3] リスナー座標の向き（+x 右 / +y 上 / +z 前）
+    ///   pointGain … [点] 量（振幅。Σ² = 1 に揃えて渡す）
+    ///   directGain … 戸口からリスナーへ出す量（振幅）／feedGain … dstRoom の FDN へ流す量（振幅）
+    ///   srcRoom < 0 でその枠を空ける（量を 0 へ寄せてから外す）。
+    void setPortal(int slot, int srcRoom, int dstRoom, const float* dirLocal, const float* pointGain, int nPoints,
+                   float directGain, float feedGain, float headCircumferenceCm = 57.0f) {
+        if (slot < 0 || slot >= kMaxPortals) return;
+        ensurePortalHrtf();
+        Portal& p = portals_[slot];
+        const bool on = valid(srcRoom);
+        const int np = std::min(std::max(nPoints, 0), kPortalPoints);
+        p.srcPend = on ? srcRoom : -1;
+        p.dstPend = (on && valid(dstRoom) && dstRoom != srcRoom) ? dstRoom : -1;
+        p.directPend = on ? std::max(0.0f, directGain) : 0.0f;
+        p.feedPend = on ? std::max(0.0f, feedGain) : 0.0f;
+        const bool hrtf = portalHrtfReady_.load(std::memory_order_acquire);
+        for (int k = 0; k < kPortalPoints; ++k) {
+            const bool has = on && k < np;
+            p.gPend[k] = (has && pointGain) ? std::max(0.0f, pointGain[k]) : 0.0f;
+            if (!has || !dirLocal) continue;
+            const float* d = dirLocal + k * 3;
+            for (int c = 0; c < 3; ++c) p.dirPend[k * 3 + c] = d[c];
+            // 向きがほとんど変わらないなら HRIR を置き直さない（毎フレーム置くとずっとクロスフェードで 2 倍重い）。
+            const float dd = d[0] * p.dirSent[k * 3] + d[1] * p.dirSent[k * 3 + 1] + d[2] * p.dirSent[k * 3 + 2];
+            if (hrtf && (!p.sentOnce[k] || dd < 0.99996f)) {       // 0.5 度より動いたら
+                p.hp[k]->setDirection(d, headCircumferenceCm);
+                for (int c = 0; c < 3; ++c) p.dirSent[k * 3 + c] = d[c];
+                p.sentOnce[k] = true;
+            }
+        }
+        version_.fetch_add(1, std::memory_order_release);
+    }
+    /// 診断: 枠が今運んでいる部屋（オーディオスレッドの状態。読むだけ）。
+    int portalSource(int slot) const { return (slot >= 0 && slot < kMaxPortals) ? portals_[slot].src : -1; }
+    bool portalHrtfReady() const { return portalHrtfReady_.load(std::memory_order_acquire); }
+
     // ── オーディオスレッド ──
 
     /// 音源の送り。TailBus と同じ契約（dstOffset はこのブロックの中の位置、gain は線形にランプ）。
@@ -242,7 +305,26 @@ public:
                 for (int b = 0; b < kNumBands; ++b) r.wTgt[b] = r.wPend[b];
                 for (int l = 0; l < kMaxLanes; ++l) r.laneTgt[l] = r.lanePend[l];
             }
+            for (int s = 0; s < kMaxPortals; ++s) {
+                Portal& p = portals_[s];
+                p.srcNext = p.srcPend; p.dstNext = p.dstPend;
+                for (int k = 0; k < kPortalPoints; ++k) p.gTgt[k] = p.gPend[k];
+                for (int c = 0; c < kPortalPoints * 3; ++c) p.dirTgt[c] = p.dirPend[c];
+                p.directTgt = p.directPend; p.feedTgt = p.feedPend;
+            }
             seen_ = v;
+        }
+        // 戸口の線音源: この枠が今どの部屋を運ぶか。変わるなら今の量を 0 へ寄せ切ってから乗り換える。
+        int portalSrcMask = 0;
+        for (int s = 0; s < kMaxPortals; ++s) {
+            Portal& p = portals_[s];
+            if (p.src != p.srcNext) {
+                if (p.src >= 0) p.fadeOut = true;
+                else { p.src = p.srcNext; p.dst = p.dstNext; p.flush = true; }
+            } else {
+                p.dst = p.dstNext;
+            }
+            if (p.src >= 0 && p.src < nr) portalSrcMask |= (1 << p.src);
         }
         const float inv = 1.0f / static_cast<float>(n);
         double e = 0.0;
@@ -272,12 +354,14 @@ public:
                 std::fill(r.in.begin(), r.in.begin() + n, 0.0f);
                 float wStep[kNumBands];
                 for (int b = 0; b < kNumBands; ++b) wStep[b] = (r.wTgt[b] - r.wCur[b]) * inv;
+                if (portalSrcMask & (1 << k)) capturePortal(r, k, n, wStep, L * 2, true);   // 段 2-g: 戸口からだけ鳴らす
                 // レーンの重みは 60 ms で追う（帯域の重み w は毎フレーム連続に来るのでブロック内で寄せ切る）。
                 //   ★1 ブロックで寄せ切ると、正弦（1 つの周波数）では行ごとのモードの応答が違うぶん
                 //     隣り合うブロックで 4.3 dB 跳んだ（実測。広帯域なら行のエネルギーは ±0.4 dB で揃う）。
                 //     60 ms に伸ばすと 1 ブロックあたり 1 dB 未満。扉の量（w）は別に毎フレーム追うので遅れは向きだけ。
                 const float laneFollow = std::min(1.0f, static_cast<float>(n) / (0.06f * static_cast<float>(fs_)));
-                for (int l = 0; l < L; ++l) {
+                const int lanesHere = (portalSrcMask & (1 << k)) ? 0 : L;       // 戸口の線音源の部屋はレーンへ出さない
+                for (int l = 0; l < lanesHere; ++l) {
                     const float lt = r.laneCur[l] + (r.laneTgt[l] - r.laneCur[l]) * laneFollow;
                     const float l0 = r.laneCur[l], dl = (lt - l0) * inv;
                     bool any = (l0 != 0.0f || lt != 0.0f);
@@ -301,6 +385,7 @@ public:
                 for (int b = 0; b < kNumBands; ++b) r.wCur[b] = r.wTgt[b];
                 for (int l = 0; l < kMaxLanes; ++l) r.laneCur[l] += (r.laneTgt[l] - r.laneCur[l]) * laneFollow;
             }
+            renderPortals(n, inv, nr, outL, outR, portalSrcMask, e);     // 段 2-g（L/R へ足す。バスは通さない）
             bus->add(laneRows_.data(), n, stride, 1.0f, 0);
             lanePrevN_ = n;
             rmsL_ = static_cast<float>(std::sqrt(e * inv * 0.5));   // レーンの和の片耳ぶん（計器）
@@ -312,6 +397,13 @@ public:
             r.fdn->renderBandsMLR(r.in.data(), n, nullptr, r.pl, r.pr);
             std::fill(r.in.begin(), r.in.begin() + n, 0.0f);
             for (int l = 0; l < kMaxLanes; ++l) r.laneCur[l] = r.laneTgt[l];
+            if (portalSrcMask & (1 << k)) {                        // 段 2-g: 戸口からだけ鳴らす
+                float wStep[kNumBands];
+                for (int b = 0; b < kNumBands; ++b) wStep[b] = (r.wTgt[b] - r.wCur[b]) * inv;
+                capturePortal(r, k, n, wStep, 2, false);
+                for (int b = 0; b < kNumBands; ++b) r.wCur[b] = r.wTgt[b];
+                continue;
+            }
             // 2) リスナーの重み（帯域別、ブロック内でランプ）を掛けて足す。
             for (int b = 0; b < kNumBands; ++b) {
                 const float w0 = r.wCur[b], dw = (r.wTgt[b] - r.wCur[b]) * inv;
@@ -328,6 +420,7 @@ public:
                 r.wCur[b] = r.wTgt[b];
             }
         }
+        renderPortals(n, inv, nr, outL, outR, portalSrcMask, e);     // 段 2-g
         rmsL_ = static_cast<float>(std::sqrt(e * inv));
     }
 
@@ -403,6 +496,123 @@ private:
     std::atomic<int> version_{0};
     int seen_ = 0;
     float rmsL_ = 0.0f;
+
+    // ── 戸口の線音源（段 2-g）──
+    struct Portal {
+        int srcPend = -1, dstPend = -1;                 // 制御スレッドが書く
+        int srcNext = -1, dstNext = -1;                 // 版で取り込んだ目標
+        int src = -1, dst = -1;                         // オーディオスレッドが今運んでいる部屋
+        bool fadeOut = false, flush = false;
+        float gPend[kPortalPoints] = {}, gTgt[kPortalPoints] = {}, gCur[kPortalPoints] = {};
+        float dirPend[kPortalPoints * 3] = {}, dirTgt[kPortalPoints * 3] = {};
+        float dirSent[kPortalPoints * 3] = {};
+        bool  sentOnce[kPortalPoints] = {};
+        float directPend = 0.0f, directTgt = 0.0f, directCur = 0.0f;
+        float feedPend = 0.0f, feedTgt = 0.0f, feedCur = 0.0f;
+        std::unique_ptr<HrtfProcessor> hp[kPortalPoints];
+        std::vector<float> sig;                         // [点][maxFrames] 点ごとのモノラル（行 × 帯域の重み）
+        std::vector<float> tmp, scratchL, scratchR;
+    };
+    Portal portals_[kMaxPortals];
+    std::atomic<bool> portalHrtfReady_{false};
+    float portalNorm_ = 1.0f;
+    static constexpr float kSqrt2 = 1.41421356f;
+
+    // 方向バスの HRTF を最初に見えたときに 1 回だけ全点へ差す（制御スレッド）。差し終えてから旗を立てる。
+    void ensurePortalHrtf() {
+        if (portalHrtfReady_.load(std::memory_order_acquire)) return;
+        const HrtfSet* hs = bus_ ? bus_->hrtfSet() : nullptr;
+        if (!hs || !hs->isValid()) return;
+        for (int s = 0; s < kMaxPortals; ++s)
+            for (int k = 0; k < kPortalPoints; ++k) portals_[s].hp[k]->setHrtfSet(hs);
+        // 量はレーンと同じ規約（HRIR の平均パワーで等パワーのパンに揃える）。
+        portalNorm_ = 1.0f / std::sqrt(std::max(1e-6f, hs->meanPowerGain()));
+        portalHrtfReady_.store(true, std::memory_order_release);
+    }
+
+    // 戸口の線音源の元になる部屋の行を、点ごとのモノラルに取る（オーディオスレッド）。
+    //   行 1 本は片耳ぶん（エネルギー 0.5）なので √2 倍してモノラルのエネルギー 1 にする。
+    void capturePortal(Room& r, int roomIdx, int n, const float* wStep, int nRowsAvail, bool lanesPath) {
+        for (int s = 0; s < kMaxPortals; ++s) {
+            Portal& p = portals_[s];
+            if (p.src != roomIdx) continue;
+            for (int j = 0; j < kPortalPoints; ++j) {
+                float* sig = p.sig.data() + static_cast<std::size_t>(j) * static_cast<std::size_t>(maxFrames_);
+                if (lanesPath) {
+                    const int src = (nRowsAvail > 0) ? (j * 3) % nRowsAvail : 0;   // 行 1, 4, 7, 10, 13
+                    for (int i = 0; i < n; ++i) {
+                        float acc = 0.0f;
+                        for (int b = 0; b < kNumBands; ++b)
+                            acc += r.prow[src * kNumBands + b][i] * (r.wCur[b] + wStep[b] * static_cast<float>(i + 1));
+                        sig[i] = acc * kSqrt2;
+                    }
+                } else {
+                    const bool left = (j % 2) == 0;                         // バスが無いときは L/R の 2 本を交互に
+                    for (int i = 0; i < n; ++i) {
+                        float acc = 0.0f;
+                        for (int b = 0; b < kNumBands; ++b)
+                            acc += (left ? r.l[b][static_cast<std::size_t>(i)] : r.rr[b][static_cast<std::size_t>(i)])
+                                 * (r.wCur[b] + wStep[b] * static_cast<float>(i + 1));
+                        sig[i] = acc * kSqrt2;
+                    }
+                }
+            }
+        }
+    }
+
+    // 戸口の線音源を鳴らし、耳の部屋へ流す（オーディオスレッド）。量は全部ブロックの中で線形に寄せる。
+    void renderPortals(int n, float inv, int nr, float* outL, float* outR, int srcMask, double& e) {
+        const bool useHrtf = portalHrtfReady_.load(std::memory_order_acquire);
+        for (int s = 0; s < kMaxPortals; ++s) {
+            Portal& p = portals_[s];
+            if (p.src < 0 || p.src >= nr) continue;
+            float* tmp = p.tmp.data();
+            if (p.flush && useHrtf) {                    // 乗り換え直後: 前に運んでいた音の履歴を空にする
+                std::fill(tmp, tmp + n, 0.0f);
+                for (int j = 0; j < kPortalPoints; ++j)
+                    p.hp[j]->processAdd(tmp, 0, n, p.scratchL.data(), p.scratchR.data(), 0, 0.0f);
+            }
+            p.flush = false;
+            const bool live = !p.fadeOut;
+            const float dT = live ? p.directTgt : 0.0f, fT = live ? p.feedTgt : 0.0f;
+            const float d0 = p.directCur, dd = (dT - d0) * inv;
+            const float f0 = p.feedCur, df = (fT - f0) * inv;
+            for (int j = 0; j < kPortalPoints; ++j) {
+                const float gT = live ? p.gTgt[j] : 0.0f;
+                const float g0 = p.gCur[j], dg = (gT - g0) * inv;
+                const float* sig = p.sig.data() + static_cast<std::size_t>(j) * static_cast<std::size_t>(maxFrames_);
+                for (int i = 0; i < n; ++i) {
+                    const float t = static_cast<float>(i + 1);
+                    tmp[i] = sig[i] * (g0 + dg * t) * (d0 + dd * t);
+                }
+                if (useHrtf && outL && outR) {
+                    p.hp[j]->processAdd(tmp, 0, n, outL, outR, 0, portalNorm_);
+                } else {
+                    const float x = std::min(1.0f, std::max(-1.0f, p.dirTgt[j * 3]));
+                    const float pl = std::sqrt(0.5f * (1.0f - x)), pr = std::sqrt(0.5f * (1.0f + x));
+                    for (int i = 0; i < n; ++i) {
+                        if (outL) outL[i] += tmp[i] * pl;
+                        if (outR) outR[i] += tmp[i] * pr;
+                    }
+                }
+                for (int i = 0; i < n; ++i) e += 0.5 * static_cast<double>(tmp[i]) * tmp[i];   // 計器（片耳ぶんの目安）
+                p.gCur[j] = gT;
+            }
+            // 耳の部屋へ流す（真ん中の点の行）。dst が別の戸口の元になっていたら流さない（輪を作らない）。
+            const bool feedOk = p.dst >= 0 && p.dst < nr && (srcMask & (1 << p.dst)) == 0;
+            if (feedOk && (f0 > 0.0f || fT > 0.0f)) {
+                const float* sig = p.sig.data() + static_cast<std::size_t>(kPortalPoints / 2) * static_cast<std::size_t>(maxFrames_);
+                Room& d = *rooms_[static_cast<std::size_t>(p.dst)];
+                for (int i = 0; i < n; ++i) d.in[static_cast<std::size_t>(i)] += sig[i] * (f0 + df * static_cast<float>(i + 1));
+            }
+            p.directCur = dT; p.feedCur = fT;
+            if (p.fadeOut) {                             // 0 へ寄せ切った。次のブロックから新しい部屋を運ぶ
+                p.src = p.srcNext; p.dst = p.dstNext; p.fadeOut = false; p.flush = true;
+                for (int j = 0; j < kPortalPoints; ++j) p.gCur[j] = 0.0f;
+                p.directCur = 0.0f; p.feedCur = 0.0f;
+            }
+        }
+    }
 };
 
 }  // namespace dsp

@@ -1840,6 +1840,7 @@ void testLateThrough() {
         for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
         w.addBox(doorLeaf(90.0f, -0.5f, 1.0f, 3.0f, 0.06f, 0.004f), lm, true);
         w.raysPerEmitter = rays; w.budget.cfg.maxPerEmitter = std::max(rays, w.budget.cfg.maxPerEmitter);
+        w.lateThrough = 1;   // この検査は案1（段 2-f）の見張り。段 2-g の戸口の線音源は [戸口の線音源] で見る
         w.rayGroups = 1; w.budget.cfg.totalRays = 0;
         w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
         const int e = w.addEmitter(S, 0.2f);
@@ -2155,6 +2156,12 @@ void testLateThrough() {
                     b0, z0, w0 / std::max(c0, 1e-6), s0, b1, z1, w1 / std::max(c1, 1e-6), s1);
         std::snprintf(buf, sizeof(buf), "(跳ね 旧 %d 回 → 新 %d 回、段差 旧 %.2f → 新 %.2f dB)", s0, s1, b0, b1);
         check("[後期の向き] 戸口をまたいで歩いても、跳ねを旧より増やさない", s1 <= s0, buf);
+        {
+            double c2 = 0.0, w2 = 0.0, b2 = 0.0; int s2 = 0; float z2 = 0.0f;
+            walk(2, &c2, &w2, &s2, &b2, &z2);
+            std::snprintf(buf, sizeof(buf), "(跳ね 案1 %d 回 → 戸口の線音源 %d 回、段差 案1 %.2f → %.2f dB（z=%+.2f）)", s1, s2, b1, b2, z2);
+            check("[戸口の線音源] 戸口をまたいで歩いても、跳ねを案1 より増やさない", s2 <= s1, buf);
+        }
         // ⑧ 2 本に割っても後期の量は変わらない（止まって、後期だけ・向きなしで旧と新を比べる）
         //   ★部屋の FDN どうしが相関していると、√(1−t) と √t の振幅が揃って足され、量が (√(1−t)+√t)² 倍になる。
         //     同じ大きさの部屋は同じ遅延線で作られていたので、2026-09-11 にここで見つかった。
@@ -2164,6 +2171,183 @@ void testLateThrough() {
         const double dLate = afti::dB(std::max(m1, 1e-30) / std::max(m0, 1e-30));
         std::snprintf(buf, sizeof(buf), "(耳 z=-3、後期だけ・向きなし・白色雑音: 旧 %.3e → 新 %.3e ＝ %+.2f dB)", m0, m1, dLate);
         check("[後期の向き] 2 本に割っても後期の量は変わらない（部屋の FDN どうしが無相関）", std::fabs(dLate) < 1.0, buf);
+    }
+}
+
+// ================================ [戸口の線音源] 隣の部屋の尾を戸口の横幅から鳴らす（段 2-g、AF_ONLY=doorline）
+//   ★試聴の指摘「向こうの部屋の残響が全体から聞こえすぎ。ドア側に寄せたい」の見張り。
+//   ① 幾何: 戸口の横幅の見込み角（正面 3 m で 19°、横 3 m・奥 3 m で 10°）、点の量は Σ² = 1
+//   ② 閉じかけると、蝶番の側の点が隠れて像が隙間の側へ寄る
+//   ③ 量: 案1（レーンの点）と戸口の線音源で、後期の量が同じ（白色雑音）
+//   ④ 向き: 戸口が左前にある所で、左右差が旧（一様）より戸口の側へ寄る
+//   ⑤ 立ち上がり: 耳の部屋の響きが戸口の音から鳴り始めるので、後期のエネルギーの重心が案1 より遅い
+//   ⑥ 輪ができない: 戸口を行き来し続けても量が増え続けない
+//   （戸口をまたいで歩く段差は [後期の向き] ⑦ に並べてある）
+void testDoorLineSource() {
+    std::printf("\n[戸口の線音源] 隣の部屋の尾を戸口の横幅から鳴らす（段 2-g）\n");
+    char buf[256];
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    const Vec3 S(0.0f, 1.6f, 3.0f);
+    const int fs = 48000, block = 512;
+    const float dt = static_cast<float>(block) / fs;
+
+    // ①② 幾何だけ（音は鳴らさない。FDN は繋ぐ ── 戸口の線音源の設定は updateFdn が出す）
+    auto geometry = [&](float deg, const Vec3& L, World::PortalDiag& out) {
+        af::dsp::FdnRoomMix fdn(fs, block, 0.6f);
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        w.addBox(doorLeaf(deg), lm, true);
+        w.lateThrough = 2;
+        w.raysPerEmitter = 256; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+        w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        w.addEmitter(S, 0.2f);
+        w.build();
+        w.bindFdn(&fdn);
+        for (int f = 0; f < 40; ++f) { w.update(dt); if (w.fdnStale()) w.bindFdn(&fdn); }
+        if (w.portalDiag().empty()) return false;
+        out = w.portalDiag()[0];
+        return true;
+    };
+    auto centroidAz = [](const World::PortalDiag& d) {
+        double num = 0.0, den = 0.0;
+        for (int k = 0; k < af::dsp::FdnRoomMix::kPortalPoints; ++k) {
+            const double g2 = static_cast<double>(d.pointGain[k]) * d.pointGain[k];
+            num += g2 * d.pointAz[k]; den += g2;
+        }
+        return (den > 0.0) ? num / den : 0.0;
+    };
+    {
+        World::PortalDiag a{}, b{};
+        const bool okA = geometry(90.0f, Vec3(0.0f, 1.6f, -3.0f), a);
+        const bool okB = geometry(90.0f, Vec3(3.0f, 1.6f, -3.0f), b);
+        double sa = 0.0;
+        for (int k = 0; k < af::dsp::FdnRoomMix::kPortalPoints; ++k) sa += static_cast<double>(a.pointGain[k]) * a.pointGain[k];
+        std::printf("        扉 90°: 正面 3 m 横幅 %.1f°・見通し %.2f・点の方位 %+.1f %+.1f %+.1f %+.1f %+.1f／横 3 m 横幅 %.1f°\n",
+                    a.spanDeg, a.visible, a.pointAz[0], a.pointAz[1], a.pointAz[2], a.pointAz[3], a.pointAz[4], b.spanDeg);
+        std::printf("        量: 戸口から耳へ直接 %.3f・耳の部屋へ流す %.3f（振幅）\n", a.directGain, a.feedGain);
+        std::snprintf(buf, sizeof(buf), "(正面 3 m %.1f°、横 3 m %.1f°、点の量の Σ² %.3f)", a.spanDeg, b.spanDeg, sa);
+        check("[戸口の線音源] 戸口の横幅を見込み角で持つ（正面 3 m で 19°±2、横 3 m・奥 3 m で 10°±2、Σ² = 1）",
+              okA && okB && std::fabs(a.spanDeg - 19.0f) < 2.0f && std::fabs(b.spanDeg - 10.0f) < 2.0f && std::fabs(sa - 1.0) < 1e-3, buf);
+    }
+    {
+        World::PortalDiag open{}, ajar{};
+        const bool ok1 = geometry(90.0f, Vec3(0.0f, 1.6f, -3.0f), open);
+        // ★45° で見る。20° では正面から戸口の全部が板の後ろに隠れ、5 点の見通しが揃って下がるので寄りが出ない
+        //   （揃って下がった分は量を配り直すと消える）。隙間が点にかかる角度で確かめる。
+        const bool ok2 = geometry(45.0f, Vec3(0.0f, 1.6f, -3.0f), ajar);
+        const double c1 = centroidAz(open), c2 = centroidAz(ajar);
+        std::printf("        扉 45°: 点の量 %.2f %.2f %.2f %.2f %.2f（左 → 右。蝶番は左）\n",
+                    ajar.pointGain[0], ajar.pointGain[1], ajar.pointGain[2], ajar.pointGain[3], ajar.pointGain[4]);
+        std::snprintf(buf, sizeof(buf), "(像の方位の重心 扉 90° %+.1f° → 45° %+.1f°)", c1, c2);
+        check("[戸口の線音源] 閉じかけると蝶番の側が隠れ、像が隙間の側（右）へ寄る", ok1 && ok2 && c2 > c1 + 1.0, buf);
+    }
+
+    // ③〜⑥ 鳴らして両耳を測る。mode = lateThrough、motion 0 止まる／1 戸口を ±1.5 m で行き来、
+    //   input 0 白色雑音／1 50 ms の雑音の塊（立ち上がりを見る）。後期だけを鳴らす。
+    struct Heard { double eL = 0.0, eR = 0.0, centroidSec = 0.0, earlyE = 0.0, lateE = 0.0; };
+    auto listen = [&](int mode, const Vec3& L0, int motion, int input, int frames) {
+        Heard h;
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        w.addBox(doorLeaf(90.0f), lm, true);
+        w.lateThrough = mode;
+        for (int c = 0; c < kNumComponents; ++c) w.rules.weights.w[c] = (c == kLate) ? 1.0f : 0.0f;
+        w.raysPerEmitter = 512; w.rayGroups = 4; w.budget.cfg.totalRays = 0;
+        Vec3 L = L0;
+        w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w.addEmitter(S, 0.2f);
+        w.build();
+        af::dsp::FdnRoomMix fdn(fs, block, 0.6f);
+        w.bindFdn(&fdn);
+        af::dsp::VoiceRenderer::Config vc; vc.sampleRate = fs; vc.maxFrames = block; vc.tailSeconds = 1.0f;
+        af::dsp::VoiceRenderer v(vc);
+        v.setOutputGain(1.0f); v.setTailLevel(1.0f);
+        v.setFdnMix(&fdn);
+        af::dsp::HrtfSet hrtf = af::dsp::HrtfSet::createSynthetic(fs);
+        af::dsp::DirectionBus bus(fs, 8, block);
+        v.setHrtfEnabled(true); v.setHrtfSet(&hrtf);
+        bus.setHrtfSet(&hrtf, 57.0f); v.setDirectionBus(&bus); fdn.setDirectionBus(&bus, 57.0f);
+        std::vector<float> in(block), l(block), r(block), fl(block), fr(block), bl(block), br(block);
+        std::uint32_t st = 777u;
+        double sumL = 0.0, sumR = 0.0, tw = 0.0, te = 0.0; int nSum = 0;
+        for (int k = 0; k < frames; ++k) {
+            const float t = k * dt;
+            if (motion == 1) {
+                const float ph = std::fmod(1.4f * t, 6.0f);
+                L.z = (ph < 3.0f) ? (-1.5f + ph) : (4.5f - ph);
+                w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+            }
+            w.update(dt);
+            if (w.fdnStale()) w.bindFdn(&fdn);
+            w.applyToVoice(e, v, fs);
+            for (int i = 0; i < block; ++i) {
+                float x = 0.0f;
+                if (input == 0 || (input == 1 && k >= 150 && k < 155)) {
+                    st = st * 1664525u + 1013904223u;
+                    x = static_cast<float>(st >> 8) / 16777216.0f * 0.2f - 0.1f;
+                }
+                in[static_cast<std::size_t>(i)] = x;
+            }
+            v.render(in.data(), block, l.data(), r.data(), nullptr);
+            std::fill(fl.begin(), fl.end(), 0.0f); std::fill(fr.begin(), fr.end(), 0.0f);
+            fdn.render(block, fl.data(), fr.data());
+            std::fill(bl.begin(), bl.end(), 0.0f); std::fill(br.begin(), br.end(), 0.0f);
+            bus.render(block, bl.data(), br.data());
+            double eL = 0.0, eR = 0.0;
+            for (int i = 0; i < block; ++i) {
+                const std::size_t q = static_cast<std::size_t>(i);
+                const double yl = static_cast<double>(l[q]) + fl[q] + bl[q], yr = static_cast<double>(r[q]) + fr[q] + br[q];
+                eL += yl * yl; eR += yr * yr;
+            }
+            eL /= block; eR /= block;
+            if (input == 0 && k >= 100) { sumL += eL; sumR += eR; ++nSum; }
+            if (input == 1 && k >= 150) { const double tt = (k - 150) * dt; tw += (eL + eR) * tt; te += eL + eR; }
+            if (motion == 1) {
+                if (k >= 200 && k < 400) h.earlyE += eL + eR;
+                if (k >= frames - 200) h.lateE += eL + eR;
+            }
+        }
+        h.eL = (nSum > 0) ? sumL / nSum : 0.0;
+        h.eR = (nSum > 0) ? sumR / nSum : 0.0;
+        h.centroidSec = (te > 0.0) ? tw / te : 0.0;
+        return h;
+    };
+    // ③ 量
+    {
+        const Heard h1 = listen(1, Vec3(0.0f, 1.6f, -3.0f), 0, 0, 400);
+        const Heard h2 = listen(2, Vec3(0.0f, 1.6f, -3.0f), 0, 0, 400);
+        const double d = afti::dB(std::max(h2.eL + h2.eR, 1e-30) / std::max(h1.eL + h1.eR, 1e-30));
+        std::snprintf(buf, sizeof(buf), "(耳 正面 3 m、後期だけ・白色雑音: 案1 %.3e → 戸口の線音源 %.3e ＝ %+.2f dB)", h1.eL + h1.eR, h2.eL + h2.eR, d);
+        check("[戸口の線音源] 後期の量は案1 と同じ（±1 dB）", std::fabs(d) < 1.0, buf);
+    }
+    // ④ 向き（戸口は左前 45°）
+    {
+        const Vec3 Lside(3.0f, 1.6f, -3.0f);
+        const Heard h0 = listen(0, Lside, 0, 0, 400), h1 = listen(1, Lside, 0, 0, 400), h2 = listen(2, Lside, 0, 0, 400);
+        const double i0 = afti::dB(std::max(h0.eL, 1e-30) / std::max(h0.eR, 1e-30));
+        const double i1 = afti::dB(std::max(h1.eL, 1e-30) / std::max(h1.eR, 1e-30));
+        const double i2 = afti::dB(std::max(h2.eL, 1e-30) / std::max(h2.eR, 1e-30));
+        std::snprintf(buf, sizeof(buf), "(耳 x=+3・z=-3、左 − 右: 旧 %+.2f dB ／ 案1 %+.2f dB ／ 戸口の線音源 %+.2f dB)", i0, i1, i2);
+        check("[戸口の線音源] 戸口が左前にある所で、左右差が旧より戸口の側（左）へ寄る", i2 > i0, buf);
+    }
+    // ⑤ 立ち上がり
+    {
+        const Heard h1 = listen(1, Vec3(0.0f, 1.6f, -3.0f), 0, 1, 400);
+        const Heard h2 = listen(2, Vec3(0.0f, 1.6f, -3.0f), 0, 1, 400);
+        std::snprintf(buf, sizeof(buf), "(50 ms の塊の後期のエネルギーの重心: 案1 %.1f ms → 戸口の線音源 %.1f ms)",
+                      h1.centroidSec * 1000.0, h2.centroidSec * 1000.0);
+        check("[戸口の線音源] 耳の部屋の響きが戸口の音から鳴り始める（後期の重心が案1 より遅い）", h2.centroidSec > h1.centroidSec, buf);
+    }
+    // ⑥ 輪ができない（戸口を ±1.5 m で 12 秒行き来）
+    {
+        const int frames = 1125;
+        const Heard h = listen(2, Vec3(0.0f, 1.6f, -1.5f), 1, 0, frames);
+        const double grow = afti::dB(std::max(h.lateE, 1e-30) / std::max(h.earlyE, 1e-30));
+        std::snprintf(buf, sizeof(buf), "(2〜4 秒 %.3e → 最後の 2 秒 %.3e ＝ %+.2f dB)", h.earlyE, h.lateE, grow);
+        check("[戸口の線音源] 戸口を行き来し続けても量が増え続けない（+6 dB 未満）", grow < 6.0, buf);
     }
 }
 
@@ -2628,7 +2812,7 @@ int main() {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
-        {"budget", testBudget}, {"raycap", testRayCap}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough},
+        {"budget", testBudget}, {"raycap", testRayCap}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
         {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {
