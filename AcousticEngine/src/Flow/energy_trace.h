@@ -40,6 +40,8 @@
  *   ・NEE の 1/π を忘れると反射が π 倍（+5 dB）。
  *   ・種を毎フレーム変えると静止で揺れる。
  *   ・帳簿は double。4096 本 × 40 回のヒットで float では 2e-4 ずれて保存則の検査が落ちた（段 2）。
+ *   ・後期の出どころ（段 2-f）: lateOther6 は late6 の**内訳**。distribute で late6 と足すと後期が二重になる。
+ *     押し出しが格子 1 個より短いと、面の点が壁のボクセルに残って全部「不明」（-1）になり、戸口越しが 0 に見える。
  */
 #ifndef ACOUSTICFLOW_FLOW_ENERGY_TRACE_H
 #define ACOUSTICFLOW_FLOW_ENERGY_TRACE_H
@@ -102,6 +104,11 @@ struct TraceParams {
     //   動いたときは group フレーム（既定 4 = 43 ms @ 60fps）で全部が入れ替わる。遅れの閾値 70 ms の下。
     int   groups = 1;               // 1 で分散なし（全部を毎フレーム）
     int   group = 0;                // 今フレームに飛ばす組（0..groups-1）
+    // ── 後期の出どころ（段 2-f、2026-09-11）──
+    //   耳のいる部屋。0 以上なら、後期の NEE を「放射した面が耳と同じ部屋に面しているか」で分け、
+    //   別の部屋（戸口越し）の分を lateOther6 と otherDir に**足す**。late6 は総量のまま変えない。
+    //   -1 なら分けない（今までと 1 ビットも同じ）。
+    int   listenerRoom = -1;
 };
 
 struct TraceResult {
@@ -115,6 +122,11 @@ struct TraceResult {
     // 帳簿（レイ側）。保存則: emitted = absorbed + remainder + escaped
     double emitted6[kNumBands] = {}, absorbed6[kNumBands] = {}, remainder6[kNumBands] = {}, escaped6[kNumBands] = {};
     int   raysTraced = 0, hits = 0, neeVisible = 0;
+    // 後期の出どころ（段 2-f）。lateOther6 は late6 の内訳（戸口越しの面から来た分）。
+    //   otherDir は その分の「耳 → 放射点」の単位ベクトルをエネルギー（帯域の和）で重み付けした和（ワールド、正規化しない）。
+    //   |otherDir| ÷ Σ lateOther6 が集まり具合 R（1 で一点から、0 で全方向から）。
+    float lateOther6[kNumBands] = {};
+    float otherDir[3] = {0.0f, 0.0f, 0.0f};
 
     float reflected6(int b) const { return early6[b] + late6[b]; }
 
@@ -128,7 +140,9 @@ struct TraceResult {
                 out.early6[b] += p.early6[b]; out.late6[b] += p.late6[b];
                 out.emitted6[b] += p.emitted6[b]; out.absorbed6[b] += p.absorbed6[b];
                 out.remainder6[b] += p.remainder6[b]; out.escaped6[b] += p.escaped6[b];
+                out.lateOther6[b] += p.lateOther6[b];
             }
+            for (int q = 0; q < 3; ++q) out.otherDir[q] += p.otherDir[q];
             out.raysTraced += p.raysTraced; out.hits += p.hits; out.neeVisible += p.neeVisible;
             if (p.firstReflectSec > 0.0f && (firstBest < 0.0f || p.firstReflectSec < firstBest)) firstBest = p.firstReflectSec;
             if (p.directDist > 0.0f) {   // 直接は決定的なので、どの組でも同じ（最後に書いた物を採る）
@@ -149,6 +163,8 @@ struct RayPartial {
     double emitted6[kNumBands] = {}, absorbed6[kNumBands] = {}, remainder6[kNumBands] = {}, escaped6[kNumBands] = {};
     float  firstReflectSec = -1.0f;
     int    hits = 0, neeVisible = 0;
+    float  lateOther6[kNumBands] = {};          // 段 2-f。late6 の内訳（戸口越しの面から）
+    float  otherDir[3] = {0.0f, 0.0f, 0.0f};    // 段 2-f。その分の向きの重み付き和（ワールド）
 };
 
 /// 自由音場の直接音（決定的）。★レイを飛ばさない。GPU の道でも**ここは CPU で出す**。
@@ -205,18 +221,34 @@ inline void traceRay(const TraceScene& sc,
                 const float cosF = dot(nFace, u);
                 const bool front = cosF > 0.0f;
                 const float cosT = std::fabs(cosF);
-                const Vec3 org = h.point + (front ? nFace : nFace * -1.0f) * kEps;
+                const Vec3 side = front ? nFace : nFace * -1.0f;      // リスナーの側（放射する面の向き）
+                const Vec3 org = h.point + side * kEps;
                 float tr[kNumBands]; int cr = 0;
                 sceneTransmittance(sc, org, listener, h.index, tr, &cr);
                 const float tSec = (pathLen + d) / kSpeedOfSound;
                 const float geo = cosT / (kPi * d * d);
                 bool any = false;
+                float c6[kNumBands] = {};
                 for (int b = 0; b < kNumBands; ++b) {
                     const float eSide = e[b] * (front ? sp[b].reflect : sp[b].transmit);
                     const float c = eSide * geo * tr[b] * airEnergy(b, pathLen + d);
                     if (c <= 0.0f) continue;
                     any = true;
+                    c6[b] = c;
                     if (tSec < prm.mixingSec) out.early6[b] += c; else out.late6[b] += c;
+                }
+                // ── 後期の出どころ（段 2-f）: 放射した面が耳と同じ部屋に面しているか ──
+                //   ★面の上の点は格子では壁の中（実体）に落ちるので、リスナーの側へ押し出した点で部屋を引く。
+                //     押す量は 0.3 m と格子 1.25 個ぶんの大きい方（格子が粗くなる場面でも壁のボクセルを抜けるように）。
+                //   ★足すだけで late6 は触らない。分けても分けなくても後期の総量は同じ（検査で 1 ビット一致を見る）。
+                if (any && prm.listenerRoom >= 0 && tSec >= prm.mixingSec) {
+                    const float push = std::max(0.3f, 1.25f * sc.roomCell);
+                    const int room = sceneRoomAt(sc, h.point + side * push);
+                    if (room >= 0 && room != prm.listenerRoom) {
+                        float cs = 0.0f;
+                        for (int b = 0; b < kNumBands; ++b) { out.lateOther6[b] += c6[b]; cs += c6[b]; }
+                        out.otherDir[0] -= cs * u.x; out.otherDir[1] -= cs * u.y; out.otherDir[2] -= cs * u.z;
+                    }
                 }
                 if (any) {
                     ++out.neeVisible;
@@ -276,7 +308,9 @@ public:
                 R.early6[b] += p.early6[b]; R.late6[b] += p.late6[b];
                 R.emitted6[b] += p.emitted6[b]; R.absorbed6[b] += p.absorbed6[b];
                 R.remainder6[b] += p.remainder6[b]; R.escaped6[b] += p.escaped6[b];
+                R.lateOther6[b] += p.lateOther6[b];
             }
+            for (int q = 0; q < 3; ++q) R.otherDir[q] += p.otherDir[q];
             if (p.firstReflectSec > 0.0f && (R.firstReflectSec < 0.0f || p.firstReflectSec < R.firstReflectSec))
                 R.firstReflectSec = p.firstReflectSec;
         }

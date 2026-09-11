@@ -27,6 +27,7 @@
  *   ・構造化バッファの並びが C++ 側の struct と 1 バイトでもずれると、全部が化ける。
  *     Obb は float3 が 4 つ + float3 で 15 float。HLSL 側も float の並びで受ける。
  *   ・スタックの深さが足りないと木の奥が見えない（CPU と同じ 64）。
+ *   ・部屋の引き方（roomAtP、段 2-f）は CPU の sceneRoomAt と同じ切り捨て。(int) は 0 へ向けて切るので floor にしないこと。
  */
 #ifndef ACOUSTICFLOW_GPU_TRACE_KERNEL_H
 #define ACOUSTICFLOW_GPU_TRACE_KERNEL_H
@@ -36,7 +37,7 @@ namespace gpu {
 
 /// レイの本体（cs_5_0）。入口は "main"。
 ///   t0 箱（float 15 個ずつ）／t1 木のノード（float 6 + int 4）／t2 葉の添字と材質と印
-///   t3 材質の表（反射・透過・吸収 × 6 帯域 + 散乱率）／t4 音源ごとの設定／t5 組 → 音源の表
+///   t3 材質の表（反射・透過・吸収 × 6 帯域 + 散乱率）／t4 音源ごとの設定／t5 組 → 音源の表／t6 部屋の格子
 ///   u0 レイごとの取り分（音源ごとに rayBase から rays 本ぶん）
 inline const char* kTraceKernelHlsl() {
     return R"HLSL(
@@ -52,7 +53,9 @@ struct GMat   { float3 reflLo; float3 reflHi; float3 tranLo; float3 tranHi;
 struct GOut   { float3 earlyLo; float3 earlyHi; float3 lateLo; float3 lateHi;
                 float3 emitLo;  float3 emitHi;  float3 absbLo; float3 absbHi;
                 float3 remLo;   float3 remHi;   float3 escLo;  float3 escHi;
-                float firstSec; int hits; int nee; int pad; };
+                float firstSec; int hits; int nee; int pad;
+                // 段 2-f: 後期のうち戸口越しの面から来た分（late の内訳）と、その向きの重み付き和（ワールド）
+                float3 lateOtherLo; float3 lateOtherHi; float3 otherDir; float pad2; };
 // ★音源ごとに違う物だけを集めた欄。定数（cbuffer）に置くと 1 音源しか入らないので、
 //   ここへ移して 1 回のディスパッチで全音源を流せるようにした（本数・跳ね返り・境・種は音源ごとに違う）。
 //   rays は「このフレームに**実際に走る本数**」（フレーム分散で 1/groups に減った後の数）。
@@ -66,11 +69,14 @@ StructuredBuffer<GItem> gItem : register(t2);
 StructuredBuffer<GMat>  gMat  : register(t3);
 StructuredBuffer<GEmit> gEmit : register(t4);
 StructuredBuffer<uint>  gBlock : register(t5);   // 組 → 音源の番号（組ごとに 1 個）
+StructuredBuffer<int>   gRoomVox : register(t6); // 部屋の格子（段 2-f）。(z*ny + y)*nx + x → 部屋番号
 RWStructuredBuffer<GOut> gOut : register(u0);
 
 cbuffer Cb : register(b0) {
     float3 gListener; float gPad0;
     uint   gBoxCount; uint gNodeCount; uint gItemCount; uint gBlockCount;
+    float3 gRoomOrigin; float gRoomCell;
+    int    gRoomNx; int gRoomNy; int gRoomNz; int gListenerRoom;   // gListenerRoom < 0 なら出どころを分けない
 };
 
 static const float kPi = 3.14159265358979f;
@@ -81,6 +87,16 @@ static const float3 kAirLo = float3(0.0003f, 0.0008f, 0.0017f);
 static const float3 kAirHi = float3(0.0030f, 0.0085f, 0.0250f);
 float3 airLo(float d) { return pow(10.0f, -kAirLo * d * 0.1f); }
 float3 airHi(float d) { return pow(10.0f, -kAirHi * d * 0.1f); }
+
+// ── 点がどの部屋か（段 2-f。CPU の sceneRoomAt と同じ切り捨て）──
+int roomAtP(float3 p) {
+    if (gRoomNx <= 0 || gRoomCell <= 0.0f) return -1;
+    int x = (int)((p.x - gRoomOrigin.x) / gRoomCell);
+    int y = (int)((p.y - gRoomOrigin.y) / gRoomCell);
+    int z = (int)((p.z - gRoomOrigin.z) / gRoomCell);
+    if (x < 0 || y < 0 || z < 0 || x >= gRoomNx || y >= gRoomNy || z >= gRoomNz) return -1;
+    return gRoomVox[(z * gRoomNy + y) * gRoomNx + x];
+}
 
 // ── 乱数（CPU と同じ式）──
 float rand01(inout uint s) {
@@ -254,7 +270,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             float cosF = dot(nFace, u);
             bool front = cosF > 0.0f;
             float cosT = abs(cosF);
-            float3 org = h.p + (front ? nFace : -nFace) * kEps;
+            float3 side = front ? nFace : -nFace;            // リスナーの側（放射する面の向き）
+            float3 org = h.p + side * kEps;
             float3 trLo, trHi; transmitTau(org, gListener, h.index, trLo, trHi);
             float tSec = (pathLen + dL) / kSpeed;
             float geo = cosT / (kPi * dL * dL);
@@ -265,6 +282,15 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             bool any = (cLo.x + cLo.y + cLo.z + cHi.x + cHi.y + cHi.z) > 0.0f;
             if (tSec < em.mixingSec) { o.earlyLo += cLo; o.earlyHi += cHi; }
             else                   { o.lateLo  += cLo; o.lateHi  += cHi; }
+            // ── 後期の出どころ（段 2-f。CPU の traceRay と同じ式）──
+            if (any && gListenerRoom >= 0 && tSec >= em.mixingSec) {
+                int room = roomAtP(h.p + side * max(0.3f, 1.25f * gRoomCell));
+                if (room >= 0 && room != gListenerRoom) {
+                    o.lateOtherLo += cLo; o.lateOtherHi += cHi;
+                    float cs = cLo.x + cLo.y + cLo.z + cHi.x + cHi.y + cHi.z;
+                    o.otherDir -= cs * u;
+                }
+            }
             if (any) {
                 o.nee += 1;
                 if (o.firstSec < 0.0f || tSec < o.firstSec) o.firstSec = tSec;

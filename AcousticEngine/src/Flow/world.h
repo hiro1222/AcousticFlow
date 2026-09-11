@@ -94,6 +94,15 @@ public:
         probes_.clear();
         for (const rooms::Room& rm : res.rooms) probes_.push_back(probeFromRoom(rm, res.grid.cell));
         apertures_ = res.apertures;
+        // 部屋の格子をレイの場面へ（段 2-f）。build のときだけ変わる（buildTraceScene は毎フレームだが、ここは触らない）。
+        {
+            const rooms::Grid& g = res.grid;
+            const std::vector<std::int16_t>& rv = builder_.roomOfVoxel();
+            traceScene_.roomOrigin = g.origin; traceScene_.roomCell = g.cell;
+            traceScene_.roomNx = g.nx; traceScene_.roomNy = g.ny; traceScene_.roomNz = g.nz;
+            traceScene_.roomVox.assign(rv.begin(), rv.end());
+            ++traceScene_.roomVersion;
+        }
         collectFaces(surfaces, rules.materials, faces_);          // ISM の面（静的な箱の 6 面）
         dirty_ = false;
         ++buildCount_;
@@ -116,6 +125,13 @@ public:
     ///   ★2 は戸口（rooms::Aperture）が要る。部屋が割れていない場面では何も起きない。
     ///     そこは別途「密閉の旗」で埋める案がある（docs/CORE_DIFF.md）。
     int leakModel = 1;
+    /// 戸口越しの後期に向きを付ける（段 2-f、2026-09-11）。**既定 1。**0 で旧（後期を丸ごと耳の部屋の FDN へ一様に）。
+    ///   試聴の指摘「同じ部屋は LEV でいいが、隣の部屋では扉からの指向性が強いはず」から。
+    ///   レイの後期を「放射した面が耳と同じ部屋に面しているか」で分け、戸口越しの分を**音源の部屋の FDN** へ
+    ///   向き付きで送る。向きと集まり具合はレイが測った物（戸口の中心から 1〜2°、R 0.97。docs/CORE_DIFF.md ④）。
+    ///   ★同じ部屋の音源では何も変わらない（戸口越しの分は耳の部屋へ畳む）。部屋が割れない場面（CORE_DIFF ①）でも変わらない。
+    ///   ★退けた書き方: 旧コアの式（戸口の立体角 × α²）。戸口が要るうえ、戸口から 3 m で戸口越しをレイの約 3 倍に見積もる。
+    int lateThrough = 1;
     /// 虚像の次数（1..3）。既定 2。
     ///   ★3 にすると壁際で「詰まった連続反射」が出る。同じ壁を繰り返し使う経路が 3 次で初めて現れるため。
     ///     2 次までだと、近づいた壁が絡む虚像だけが前へ寄り、群としては詰まらない
@@ -163,6 +179,17 @@ public:
         return builder_.roomAtVoxel(static_cast<int>((p.x - g.origin.x) / g.cell),
                                     static_cast<int>((p.y - g.origin.y) / g.cell),
                                     static_cast<int>((p.z - g.origin.z) / g.cell));
+    }
+
+    /// レイが見る平らな場面（検査用。update の後に読む）。
+    const TraceScene& traceScene() const { return traceScene_; }
+    /// 部屋 r の尾が来る向き（リスナー座標）と広がり（0 点〜1 一様）。updateFdn が置いた物（段 2-f）。無ければ false。
+    bool fdnDirection(int r, Vec3& dirLocal, float& spread) const {
+        if (r < 0 || static_cast<std::size_t>(r) * 4 + 3 >= fdnDir_.size()) return false;
+        const std::size_t i = static_cast<std::size_t>(r) * 4;
+        dirLocal = Vec3(fdnDir_[i], fdnDir_[i + 1], fdnDir_[i + 2]);
+        spread = fdnDir_[i + 3];
+        return true;
     }
 
     // ── リスナーと音源 ──
@@ -243,6 +270,7 @@ public:
             TraceParams prm;
             prm.rays = bs.rays; prm.maxBounces = light ? std::min(maxBounces, 12) : maxBounces; prm.mixingSec = mixingSec;
             prm.seed = static_cast<std::uint32_t>(s.em.id + 1) * 0x9E3779B1u;    // 音源ごとに固定
+            prm.listenerRoom = (lateThrough != 0) ? lroom : -1;                  // 段 2-f。-1 なら出どころを分けない（今までと 1 ビットも同じ）
             // フレーム分散（設計文書 Ⅶ）: 組を 1 つだけ飛ばし、残りは前回の結果を使う。
             //   本数が変わったら組を全部作り直す（重み 1/rays が変わるので混ぜられない）。
             const int G = std::max(1, std::min(rayGroups, TraceGroups::kMax));
@@ -308,6 +336,7 @@ public:
             in.trace = &s.trace; in.visibility = &s.vis; in.diffraction = &s.diff; in.images = &s.images;
             in.sourcePos = s.em.pos; in.listener = &listener_;
             in.listenerRoom = lroom; in.weights = &rules.weights; in.response = &response; in.dt = dt;
+            in.sourceRoom = (lateThrough != 0) ? s.em.room : -1;
             s.mixer.run(in, s.mix);
         };
         // ★GPU が入っているときは並列にしない。計算の器が 1 つしかないので、
@@ -398,12 +427,21 @@ private:
         for (std::size_t r = 0; r < probes_.size(); ++r)
             if (fdnRoomOf_[r] >= 0) fdn_->setRoomRt60(fdnRoomOf_[r], probes_[r].rt60, false);
         std::vector<float> sum(probes_.size() * kNumBands, 0.0f);
+        // 段 2-f: 部屋ごとの尾の向き。送りのエネルギー（帯域の平均）× 集まり具合 × 向き を足し、長さ ÷ 重さ がその部屋の集まり具合。
+        //   ★耳の部屋へ行く分は集まり 0 なので重さだけ増える ＝ 同じ部屋に戸口越しと自室が混ざれば、その分だけ広がる。
+        std::vector<double> dirSum(probes_.size() * 3, 0.0), dirMass(probes_.size(), 0.0);
         for (const Slot& s : slots_) {
             if (!s.used) continue;
             for (int k = 0; k < s.mix.sendCount; ++k) {
                 const FdnSend& sd = s.mix.sends[k];
                 if (sd.room < 0 || sd.room >= roomCount()) continue;
                 for (int b = 0; b < kNumBands; ++b) sum[static_cast<std::size_t>(sd.room) * kNumBands + b] += sd.e6[b];
+                double mean = 0.0;
+                for (int b = 0; b < kNumBands; ++b) mean += sd.e6[b];
+                mean /= kNumBands;
+                const std::size_t ri = static_cast<std::size_t>(sd.room);
+                dirMass[ri] += mean;
+                for (int q = 0; q < 3; ++q) dirSum[ri * 3 + q] += mean * sd.focus * sd.dir[q];
             }
         }
         for (std::size_t r = 0; r < probes_.size(); ++r) {
@@ -412,6 +450,20 @@ private:
             float w[kNumBands];
             for (int b = 0; b < kNumBands; ++b) w[b] = (mean > 1e-20f) ? std::sqrt(sum[r * kNumBands + b] / mean) : 0.0f;
             fdn_->setListenerWeight(fdnRoomOf_[r], w);
+            // 段 2-f: 向きと広がり。戸口越しの送りが無い部屋は一様（広がり 1）。
+            //   向きはワールドで束ねて、置く直前にリスナー座標へ写す（組を回している間に振り向いても古い向きにならない）。
+            float dirLocal[3] = {0.0f, 0.0f, 1.0f};
+            float spread = 1.0f;
+            const double dx = dirSum[r * 3], dy = dirSum[r * 3 + 1], dz = dirSum[r * 3 + 2];
+            const double len = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (dirMass[r] > 1e-20 && len > 1e-20) {
+                const Vec3 dl = listener_.toLocal(Vec3(static_cast<float>(dx / len), static_cast<float>(dy / len), static_cast<float>(dz / len)));
+                dirLocal[0] = dl.x; dirLocal[1] = dl.y; dirLocal[2] = dl.z;
+                spread = 1.0f - static_cast<float>(std::min(1.0, len / dirMass[r]));
+            }
+            if (fdnDir_.size() != probes_.size() * 4) fdnDir_.assign(probes_.size() * 4, 0.0f);
+            fdnDir_[r * 4] = dirLocal[0]; fdnDir_[r * 4 + 1] = dirLocal[1]; fdnDir_[r * 4 + 2] = dirLocal[2]; fdnDir_[r * 4 + 3] = spread;
+            if (lateThrough != 0) fdn_->setListenerDirection(fdnRoomOf_[r], dirLocal, spread);   // 0 のときは触らない（旧と 1 ビット同じ）
         }
     }
 
@@ -428,6 +480,7 @@ private:
     bool dirty_ = true;
     bool fdnStale_ = false;
     TraceScene   traceScene_;   // レイが見る平らな場面（毎フレーム組み直す）
+    std::vector<float> fdnDir_; // 段 2-f。部屋ごとの尾の向き（リスナー座標 xyz ＋ 広がり）。診断用
     mutable gpu::GpuTracer gpuTracer_;
     bool gpuTried_ = false, gpuReady_ = false;
 

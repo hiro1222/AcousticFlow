@@ -23,6 +23,7 @@
  *   ・HLSL の struct と下の Pack* の並びがずれる（いちばん多い事故）。
  *   ・numthreads(64) と組数の掛け算がレイの本数を下回ると、後ろの本が静かに欠ける。
  *   ・場面を作り直したのに転送し直さないと、古い幾何で解く。毎回 upload する。
+ *   ・部屋の格子は roomVersion で送り直しを決める。**別の場面を同じ器で解く**ときは版が同じだと古い格子のまま解く。
  *   ・音源ごとの出力の区切り（rayBase）と組の切り上げ（blockFirst）が食い違うと、
  *     隣の音源の枠へ書き込んで**別の音源の音が化ける**。ここは表を作る側と読む側を並べて書いてある。
  */
@@ -50,12 +51,15 @@ struct PackMat  { float reflLo[3]; float reflHi[3]; float tranLo[3]; float tranH
 struct PackOut  { float earlyLo[3]; float earlyHi[3]; float lateLo[3]; float lateHi[3];
                   float emitLo[3];  float emitHi[3];  float absbLo[3]; float absbHi[3];
                   float remLo[3];   float remHi[3];   float escLo[3];  float escHi[3];
-                  float firstSec; std::int32_t hits, nee, pad; };
+                  float firstSec; std::int32_t hits, nee, pad;
+                  float lateOtherLo[3]; float lateOtherHi[3]; float otherDir[3]; float pad2; };   // 段 2-f
 struct PackEmit { float source[3]; float e0;
                   std::uint32_t rayBase, rays, seed, groups;
                   std::uint32_t group, maxBounces, blockFirst; float mixingSec; };
 struct PackCb   { float listener[3]; float pad0;
-                  std::uint32_t boxCount, nodeCount, itemCount, blockCount; };
+                  std::uint32_t boxCount, nodeCount, itemCount, blockCount;
+                  float roomOrigin[3]; float roomCell;                                   // 段 2-f
+                  std::int32_t roomNx, roomNy, roomNz, listenerRoom; };
 
 /// 1 回のディスパッチに載せる 1 音源ぶんの注文。
 ///   out は**足し込み先**（直接音を入れた TraceResult をそのまま渡す。反射だけを足す）。
@@ -125,6 +129,15 @@ public:
         ok = ok && dev_.setInput(1, node_.data(), node_.size() * sizeof(PackNode), sizeof(PackNode));
         ok = ok && dev_.setInput(2, item_.data(), item_.size() * sizeof(PackItem), sizeof(PackItem));
         ok = ok && dev_.setInput(3, mat_.data(), mat_.size() * sizeof(PackMat), sizeof(PackMat));
+        // 部屋の格子（段 2-f）。build のときだけ変わるので、版が進んだときだけ送る（数十万ボクセルを毎フレーム送らない）。
+        //   ★部屋が無い場面でも 1 個は置く。大きさ 0 の構造化バッファは作れず、t6 が空だと翻訳済みのシェーダが読めない。
+        if (ok && (!roomSent_ || sc.roomVersion != roomVersionSent_)) {
+            static const std::int32_t kNone = -1;
+            const bool has = !sc.roomVox.empty();
+            ok = dev_.setInput(6, has ? sc.roomVox.data() : &kNone,
+                               (has ? sc.roomVox.size() : 1u) * sizeof(std::int32_t), sizeof(std::int32_t));
+            if (ok) { roomSent_ = true; roomVersionSent_ = sc.roomVersion; }
+        }
         if (!ok) err_ = dev_.error();
         return ok;
     }
@@ -172,6 +185,11 @@ public:
         cb.nodeCount = static_cast<std::uint32_t>(sc.node.size());
         cb.itemCount = static_cast<std::uint32_t>(sc.item.size());
         cb.blockCount = static_cast<std::uint32_t>(block_.size());
+        // 段 2-f。耳の部屋は全音源で同じ（リスナーは 1 人）なので最初の注文から採る。
+        cb.roomOrigin[0] = sc.roomOrigin.x; cb.roomOrigin[1] = sc.roomOrigin.y; cb.roomOrigin[2] = sc.roomOrigin.z;
+        cb.roomCell = sc.roomCell;
+        cb.roomNx = sc.roomVox.empty() ? 0 : sc.roomNx; cb.roomNy = sc.roomNy; cb.roomNz = sc.roomNz;
+        cb.listenerRoom = jobs[0].prm.listenerRoom;
         if (!dev_.setConstants(&cb, sizeof(cb))) { err_ = dev_.error(); return false; }
         // 3) 流して読み戻す
         if (block_.empty()) return true;                       // 走る本が 1 本も無いフレーム
@@ -205,6 +223,8 @@ private:
     std::vector<PackEmit> emit_;
     std::vector<std::uint32_t> block_;
     std::vector<PackOut>  out_;
+    bool          roomSent_ = false;       // 段 2-f。部屋の格子を送ったか
+    std::uint32_t roomVersionSent_ = 0;
 
     /// 1 音源ぶんの取り分を足す。
     void gather(const PackEmit& e, flow::TraceResult& R) const {
@@ -221,7 +241,9 @@ private:
                 R.absorbed6[b]  += (b < 3) ? p.absbLo[k] : p.absbHi[k];
                 R.remainder6[b] += (b < 3) ? p.remLo[k]  : p.remHi[k];
                 R.escaped6[b]   += (b < 3) ? p.escLo[k]  : p.escHi[k];
+                R.lateOther6[b] += (b < 3) ? p.lateOtherLo[k] : p.lateOtherHi[k];
             }
+            for (int q = 0; q < 3; ++q) R.otherDir[q] += p.otherDir[q];
             if (p.firstSec > 0.0f && (R.firstReflectSec < 0.0f || p.firstSec < R.firstReflectSec))
                 R.firstReflectSec = p.firstSec;
         }

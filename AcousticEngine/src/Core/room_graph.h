@@ -401,6 +401,9 @@ public:
     }
 
     const Result& result() const { return res_; }
+    /// ボクセル → 部屋番号の表をそのまま（-1 なし）。並びは Grid::index と同じ。
+    ///   ★レイの当たり点ごとに部屋を引くため、平らなまま GPU へ送る（段 2-f）。
+    const std::vector<std::int16_t>& roomOfVoxel() const { return room_; }
 
     // 格子座標がどの部屋か。-1 なら部屋の外／実体の中。
     int roomAtVoxel(int x, int y, int z) const {

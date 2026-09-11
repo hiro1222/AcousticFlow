@@ -68,6 +68,10 @@ struct MixTap {
 struct FdnSend {
     int   room = -1;
     float e6[kNumBands] = {};                // エネルギー（帯域別）
+    // 段 2-f: この送りの尾が来る向き（ワールドの単位ベクトル）と集まり具合（0 全方向〜1 一点）。
+    //   耳の部屋へ行く分は 0（一様）。戸口越しの分はレイが測った向きと R を持つ。World が部屋ごとに束ねて FDN に置く。
+    float dir[3] = {0.0f, 0.0f, 0.0f};
+    float focus = 0.0f;
 };
 
 struct Mix {

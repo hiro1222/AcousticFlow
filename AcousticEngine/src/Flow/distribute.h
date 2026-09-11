@@ -61,6 +61,7 @@ struct DistributeInput {
     Vec3 sourcePos{0, 0, 0};
     const Listener* listener = nullptr;
     int listenerRoom = -1;                 // −1 なら FDN の送りを作らない
+    int sourceRoom = -1;                   // 段 2-f。耳と違う部屋なら、戸口越しの後期をこの部屋の FDN へ向き付きで送る
     const WorldWeights* weights = nullptr; // nullptr なら全部 1
     const Response* response = nullptr;    // nullptr なら既定
     float dt = 1.0f / 60.0f;
@@ -69,7 +70,7 @@ struct DistributeInput {
 /// 音源 1 つぶんの配分の状態（成分ごとの追従）。世界が音源ごとに 1 つ持つ。
 class EmitterMixer {
 public:
-    void reset() { for (int c = 0; c < kNumComponents; ++c) f_[c].reset(); }
+    void reset() { for (int c = 0; c < kNumComponents; ++c) f_[c].reset(); fOther_.reset(); }
 
     void run(const DistributeInput& in, Mix& out) {
         out.clear();
@@ -155,11 +156,43 @@ public:
             }
         }
         for (int b = 0; b < kNumBands; ++b) out.component6[kEarly][b] += raw[kEarly][b];   // 帳簿は 1 回だけ
+        // ── 後期の送り（段 2-f で 2 本に割った）──
+        //   耳の部屋へ:   耳の部屋の面から来た分。一様に聞く ＝ 同じ部屋の LEV。
+        //   音源の部屋へ: 戸口越しの面から来た分。レイが測った向きと集まり具合を持たせ、World がその部屋の FDN を戸口の向きで聞く。
+        //   ★割合は**平滑した値どうしの比**で取る。生の比を平滑済みの総量に掛けると、組の入れ替わりで割合だけが跳ぶ。
+        //   ★音源が耳と同じ部屋なら割らない（戸口越しの分は耳の部屋へ畳む ＝ 今までと同じ）。
+        //   ★帳簿（component6）は総量を 1 回だけ。割るのは出口だけ。
+        const bool apart = (in.listenerRoom >= 0 && in.sourceRoom >= 0 && in.sourceRoom != in.listenerRoom);
+        float thru[kNumBands] = {};
+        {
+            float rawOther[kNumBands] = {};
+            if (apart) for (int b = 0; b < kNumBands; ++b) rawOther[b] = std::max(0.0f, std::min(T.lateOther6[b], T.late6[b]));
+            float smOther[kNumBands];
+            fOther_.update(rawOther, in.dt, statLevel, rs.colourSec, smOther);    // 割らないフレームも回す（戻るときに段にしない）
+            for (int b = 0; b < kNumBands; ++b)
+                thru[b] = (apart && sm[kLate][b] > 0.0f) ? std::min(1.0f, std::max(0.0f, smOther[b] / sm[kLate][b])) : 0.0f;
+        }
         if (in.listenerRoom >= 0) {
             FdnSend* s = out.pushSend();
             if (s) {
                 s->room = in.listenerRoom;
-                for (int b = 0; b < kNumBands; ++b) { out.component6[kLate][b] += raw[kLate][b]; s->e6[b] = sm[kLate][b] * W.w[kLate]; }
+                for (int b = 0; b < kNumBands; ++b) { out.component6[kLate][b] += raw[kLate][b]; s->e6[b] = sm[kLate][b] * W.w[kLate] * (1.0f - thru[b]); }
+            }
+            float eThru = 0.0f;
+            for (int b = 0; b < kNumBands; ++b) eThru += sm[kLate][b] * W.w[kLate] * thru[b];
+            if (apart && eThru > 0.0f) {
+                FdnSend* o = out.pushSend();
+                if (o) {
+                    o->room = in.sourceRoom;
+                    for (int b = 0; b < kNumBands; ++b) o->e6[b] = sm[kLate][b] * W.w[kLate] * thru[b];
+                    float mass = 0.0f;
+                    for (int b = 0; b < kNumBands; ++b) mass += T.lateOther6[b];
+                    const float len = std::sqrt(T.otherDir[0] * T.otherDir[0] + T.otherDir[1] * T.otherDir[1] + T.otherDir[2] * T.otherDir[2]);
+                    if (len > 0.0f && mass > 0.0f) {
+                        o->dir[0] = T.otherDir[0] / len; o->dir[1] = T.otherDir[1] / len; o->dir[2] = T.otherDir[2] / len;
+                        o->focus = std::min(1.0f, len / mass);
+                    }
+                }
             }
         } else {
             for (int b = 0; b < kNumBands; ++b) out.component6[kLate][b] += raw[kLate][b];
@@ -175,6 +208,7 @@ public:
 
 private:
     Follower6 f_[kNumComponents];
+    Follower6 fOther_;   // 段 2-f。後期のうち戸口越しの分。後期と同じ速さで追い、比を取る
 };
 
 }  // namespace flow

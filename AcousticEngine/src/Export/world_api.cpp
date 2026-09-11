@@ -81,6 +81,12 @@ void AF_WorldSetLeakModel(AF_WorldHandle w, int model) {
     acoustic::flow::World* W = asWorld(w); if (!W) return;
     W->leakModel = model;
 }
+void AF_WorldSetLateThrough(AF_WorldHandle w, int on) {
+    if (acoustic::flow::World* W = asWorld(w)) W->lateThrough = (on != 0) ? 1 : 0;
+}
+int AF_WorldLateThrough(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->lateThrough : 0;
+}
 int AF_WorldLeakModel(AF_WorldHandle w) {
     acoustic::flow::World* W = asWorld(w); return W ? W->leakModel : 0;
 }

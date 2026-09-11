@@ -55,6 +55,14 @@ struct TraceScene {
     // 木（SurfaceBvh の写し）
     std::vector<SurfaceBvh::Node> node;
     std::vector<std::int32_t>     item;       // 葉 → obb の添字
+    // 部屋の格子（段 2-f）。後期の寄与が「耳と同じ部屋の面」か「戸口越しの面」かを引くのに使う。
+    //   ★buildTraceScene は触らない。部屋は build のときだけ変わり、毎フレーム組み直す物と寿命が違う。
+    //     World が build の後に入れて roomVersion を進める。GPU はそれを見て送り直す。
+    Vec3 roomOrigin{0, 0, 0};
+    float roomCell = 0.0f;
+    int roomNx = 0, roomNy = 0, roomNz = 0;
+    std::vector<std::int32_t> roomVox;        // (z*ny + y)*nx + x → 部屋番号（-1 なし）
+    std::uint32_t roomVersion = 0;
 
     int boxCount() const { return static_cast<int>(obb.size()); }
     bool hasTree() const { return !node.empty(); }
@@ -85,6 +93,17 @@ inline void buildTraceScene(const Surfaces& surf, const MaterialTable& mats, Tra
     }
     // 木は Surfaces が持っている物をそのまま写す（World が rebuildBvh 済み）
     surf.bvh().exportFlat(out.node, out.item);
+}
+
+/// 点がどの部屋か（段 2-f）。World::roomAt と同じ引き方（格子座標は 0 へ向けて切り捨て）。
+///   ★GPU の roomAtP も同じ式。floor に変えると、原点の手前の点で CPU と GPU と World の答えが割れる。
+inline int sceneRoomAt(const TraceScene& sc, const Vec3& p) {
+    if (sc.roomVox.empty() || sc.roomCell <= 0.0f) return -1;
+    const int x = static_cast<int>((p.x - sc.roomOrigin.x) / sc.roomCell);
+    const int y = static_cast<int>((p.y - sc.roomOrigin.y) / sc.roomCell);
+    const int z = static_cast<int>((p.z - sc.roomOrigin.z) / sc.roomCell);
+    if (x < 0 || y < 0 || z < 0 || x >= sc.roomNx || y >= sc.roomNy || z >= sc.roomNz) return -1;
+    return sc.roomVox[static_cast<std::size_t>((z * sc.roomNy + y) * sc.roomNx + x)];
 }
 
 /// 最近ヒット。Surfaces::nearest と同じ答えを返す（当て方は同じ関数）。
