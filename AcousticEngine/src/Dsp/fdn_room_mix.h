@@ -55,6 +55,35 @@
 //     平滑する物なので、扉を開けた瞬間に尾の向きが追わない（扉の遅れの正体。DOOR_LAG.md）。
 //     戸口の向きは幾何そのものなので毎フレーム出せる。自室の分布（プローブ）は後で足せる（spread の中身）。
 //
+// ■ 点と拡散を分ける（laneModel 1、2026-09-12。既定）
+//   88d5f0b で「レーンの耳ごとに別の行」にした（自室の尾だけの両耳相関 0.860 → 0.354）。同じ扱いが「点」
+//   （戸口越しの尾）にも当たり、2 つ壊れていた（DspRegressionTest [FDN・方向] の 2 件。探りで切り分けた）:
+//     ・点でも左右が別の波形なので相関が無い（右 90° の点で IACC 0.023 ＝ 独立な 2 行を並べた床 0.026）。
+//       ITD を切っても変わらない ＝ 上の Woodworth の ITD が効いていない。向きの手がかりが ILD だけになる。
+//     ・向きが変わると聞こえる行が別の行に替わる ＝ 尾の波形が入れ替わる。持続音では行ごとに振幅も位相も違うので、
+//       正弦 48 点（ブロック同期）で隣り合うブロックの段差が最大 12.26 dB、くぼみ −24 dB。90°/s でなめらかに回しても 9.29 dB。
+//       （88d5f0b より前の「左右へ複製」でも 11/48 点で落ちる。220 Hz 1 点の検査で通っていたのは運）
+//   そこで 1 部屋の尾を 2 つに分ける:
+//     ・拡散（量の ed）  … 今までどおり枠（レーン×2＋耳）ごとに行 1 + (枠 % 15)。重みは一様 × √ed。
+//                          広がり 1（自室）は laneModel 0 と 1 ビットも同じ。
+//     ・点（量の 1−ed）  … 行 1 を **1 本の波形** にし、耳ごとに「点の向き」の ITD（小数）で遅らせてから、
+//                          隣り合う 2 レーンへ等パワーで振る。1 つの到来は 1 本の波形・ITD は到来ごと・HRIR はレーン、
+//                          という反射タップ（面の線音源）と同じ決まり。向きが変わっても波形は替わらず、重みと遅れが動くだけ。
+//     ・ed = sp² / (sp² + (1 − sp)²) … 今までの「振幅で混ぜて正規化」と同じ量の配分（一様と点を直交とみたとき）。
+//   ITD は 60 ms で追い、ブロック内で線形に動かす。小数の遅れは 8 点の Lanczos（a = 4、1/256 刻みの表）で読む。
+//   読みの窓の半分（4 サンプル ＝ 0.08 ms）だけ両耳に同じ遅れが乗る。点が鳴っていないときは遅れを目標へ跳ばす。
+//   ★退けた書き方:
+//     (1) 点の波形に行 0（M ＝ 全線の和）。行 1〜15 との量の比が部屋で −0.1〜+3.7 dB（帯域別で最大 +8.5 dB）動き、
+//         定数で揃えられない（注ぎ込みが全線に同じ符号で入るので、低域・短い線ほど行 0 だけ揃って足される）。
+//     (2) 点の ITD をレーンの整数のまま。レーンの間を渡るとき遅れの違う 2 本を混ぜるので、33 サンプル差なら
+//         727 Hz の奇数倍で打ち消し合う（最大 10.72 dB、12/48 点）。
+//     (3) 小数の遅れを線形補間で読む。遠い耳の高域が痩せて −2.5 dB（Lanczos で −0.6 dB）。
+//     (4) 拡散を 14 本で回して行 15 を点専用に。同じ耳に同じ波形が 2 回載り、自室の左耳が +1.16 dB。
+//     (5) 点を行 15（拡散の枠 1 つと共用）。広がり 0.5 の両耳相関が 0.313（行 1 は 0.204）、部屋ごとの量の揺れも大きい。
+//   残り: 行 1 は拡散の枠 0（レーン 0 の左耳）と枠 15（レーン 7 の右耳）と同じ波形なので、広がりの途中では
+//     点と拡散が少し相関する（広がり 0.5 で両耳相関 0.204、量は +0.55 dB 以内）。戸口をまたいで点から一様へ移るときは
+//     波形が点から拡散の行へ替わるので、持続音で段差が出る（どの作りでも残る。段 2-g の「残り」と同じ物）。
+//
 // ■ 尾の開始（手順 5）はここでなく VoiceRenderer 側（音源ごとの ITDG を送りの前の遅延に）。
 //
 // ■ 連続性
@@ -91,6 +120,8 @@ public:
 
     FdnRoomMix(int sampleRate, int maxFrames, float diffusion = 0.6f)
         : fs_(std::max(8000, sampleRate)), maxFrames_(maxFrames > 0 ? maxFrames : 1024), diffusion_(diffusion) {
+        // 点の ITD を小数で読む係数表（laneModel 1）。最初の 1 回だけ作る（制御スレッド。オーディオスレッドでは作らない）。
+        lanczos_ = lanczosTable();
         // 戸口の線音源の器は作るときに全部確保する（オーディオスレッドでは確保しない）。
         for (int s = 0; s < kMaxPortals; ++s) {
             Portal& p = portals_[s];
@@ -135,6 +166,16 @@ public:
                 r->prow[k * kNumBands + b] = r->rowBuf.data() + (static_cast<std::size_t>(k) * kNumBands + b) * N;
         r->laneSig.assign(N, 0.0f);
         uniformLanes(r->laneCur); uniformLanes(r->laneTgt); uniformLanes(r->lanePend);
+        // laneModel 1 用: 拡散は一様、点は無し。点の波形の履歴と耳ごとの読み出し。
+        uniformLanes(r->difCur); uniformLanes(r->difTgt); uniformLanes(r->difPend);
+        for (int k = 0; k < kMaxLanes; ++k) { r->ptCur[k] = 0.0f; r->ptTgt[k] = 0.0f; r->ptPend[k] = 0.0f; }
+        for (int ear = 0; ear < 2; ++ear) {
+            r->itdCur[ear] = 0.0f; r->itdTgt[ear] = 0.0f; r->itdPend[ear] = 0.0f;
+            r->ptEar[ear].assign(N, 0.0f);
+        }
+        r->ptHist.assign(kPtHist, 0.0f);
+        r->ptPos = 0;
+        r->dirX = 0.0f; r->dirZ = 1.0f; r->spread = 1.0f;
         if (rt60Sec6) setRt60Impl(*r, rt60Sec6, colour);
         rooms_[static_cast<std::size_t>(n)] = std::move(r);
         count_.store(n + 1, std::memory_order_release);
@@ -183,13 +224,31 @@ public:
         //   World も Unity も試聴の道具も「部屋を入れてからバスを差す」順なので、全部の尾に効いていた。
         //   setListenerDirection は置くたびにバスのレーン数で正規化するので、向きを置く道（段 2-f の戸口越し）だけ
         //   正しい量に戻り、切り替えの A/B が向きでなく量でずれていた（検査 [後期の向き] ⑧ で見つかった）。
+        headRadius_ = radius;
         const int nr = count_.load(std::memory_order_acquire);
         for (int k = 0; k < nr; ++k) {
             Room& r = *rooms_[static_cast<std::size_t>(k)];
             renormLanes(r.laneCur); renormLanes(r.laneTgt); renormLanes(r.lanePend);
+            // laneModel 1 の重みは、最後に置かれた向きからこのバスのレーン数で作り直す（器を作った直後なので今・目標・置いた値を揃える）。
+            //   点が無ければ拡散は laneModel 0 の重みをそのまま写す（今・目標もそれぞれ写す ＝ 広がり 1 で 1 ビットも同じ）。
+            const bool point = splitWeights(r.dirX, r.dirZ, r.spread, std::min(L, kMaxLanes), r.lanePend, r.difPend, r.ptPend, r.itdPend);
+            for (int l = 0; l < kMaxLanes; ++l) {
+                r.difTgt[l] = point ? r.difPend[l] : r.laneTgt[l];
+                r.difCur[l] = point ? r.difPend[l] : r.laneCur[l];
+                r.ptTgt[l] = r.ptPend[l];
+                r.ptCur[l] = r.ptPend[l];
+            }
+            for (int ear = 0; ear < 2; ++ear) r.itdTgt[ear] = r.itdCur[ear] = r.itdPend[ear];
         }
     }
     const DirectionBus* directionBus() const { return bus_; }
+
+    /// 尾のレーンの作り（2026-09-12、上の■点と拡散を分ける）。**既定 1。**実行中に変えてよい（試聴の A/B）。
+    ///   0 耳ごとの行（88d5f0b〜）: 点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる
+    ///   1 点と拡散を分ける: 拡散は 0 と同じ行（広がり 1 は 1 ビットも同じ）、点は行 1 を 1 本の波形＋点の向きの ITD
+    ///   ★切り替えた瞬間は波形が替わるので 1 回鳴る（重みと遅れはどちらの作りでも毎ブロック追っているので、そこは揃っている）。
+    void setLaneModel(int model) { laneModel_.store(model <= 0 ? 0 : 1, std::memory_order_release); }
+    int laneModel() const { return laneModel_.load(std::memory_order_acquire); }
 
     /// その部屋の尾が来る向き（リスナー座標: +x 右 / +z 前）と広がり（0 = 点、1 = 一様）。方向バスがあるときだけ効く。
     ///   隣室なら戸口の向きと口の立体角、自室なら spread = 1（scene の fdnRoomWeights が出す）。
@@ -220,6 +279,14 @@ public:
             for (int k = L; k < kMaxLanes; ++k) w[k] = 0.0f;
         }
         for (int k = 0; k < kMaxLanes; ++k) r.lanePend[k] = w[k];
+        // laneModel 1 の重み（上の■点と拡散を分ける）。バスを差し直したときに作り直せるよう、置かれた向きも持つ。
+        {
+            const float sp = std::min(1.0f, std::max(0.0f, spread));
+            r.dirX = dirLocal3 ? dirLocal3[0] : 0.0f;
+            r.dirZ = dirLocal3 ? dirLocal3[2] : 1.0f;
+            r.spread = sp;
+            splitWeights(r.dirX, r.dirZ, sp, L, r.lanePend, r.difPend, r.ptPend, r.itdPend);
+        }
         version_.fetch_add(1, std::memory_order_release);
     }
 
@@ -303,7 +370,8 @@ public:
             for (int k = 0; k < nr; ++k) {
                 Room& r = *rooms_[static_cast<std::size_t>(k)];
                 for (int b = 0; b < kNumBands; ++b) r.wTgt[b] = r.wPend[b];
-                for (int l = 0; l < kMaxLanes; ++l) r.laneTgt[l] = r.lanePend[l];
+                for (int l = 0; l < kMaxLanes; ++l) { r.laneTgt[l] = r.lanePend[l]; r.difTgt[l] = r.difPend[l]; r.ptTgt[l] = r.ptPend[l]; }
+                r.itdTgt[0] = r.itdPend[0]; r.itdTgt[1] = r.itdPend[1];
             }
             for (int s = 0; s < kMaxPortals; ++s) {
                 Portal& p = portals_[s];
@@ -341,16 +409,27 @@ public:
                 else std::fill(row, row + kItdMax, 0.0f);
                 std::fill(row + kItdMax, row + n + kItdMax, 0.0f);
             }
-            // 行はレーン×耳で別々に取る。行 0（M ＝ 全線の和）は使わないので 1..15 を順に回す。
+            // 行はレーン×耳（枠）で別々に取る。枠 s は行 1 + (s % 15)。行 0（M ＝ 全線の和）は使わない。
             //   8 レーン × 2 耳 = 16 に対して使える行が 15 本なので、最後の 1 つだけ先頭と重なる。
             //   重なる 2 つは別のレーン（＝別のレーン重みと別の ITD）なので実害は小さい。
+            //   laneModel 0 は枠の数だけ行を並べて読む（今までと 1 ビットも同じ）。
+            //   laneModel 1 は同じ行を 2 回読まないよう 15 本までにし、枠 s はバッファ s % 15 を読む（値は 0 と同じ）。
+            //   点の波形は行 1（バッファ 0）。行 0 は量が部屋で動くので使わない（上の■点と拡散を分ける）。
+            const int model = laneModel_.load(std::memory_order_acquire);
             int rows[kMaxLanes * 2];
-            for (int l = 0; l < L; ++l)
-                for (int ear = 0; ear < 2; ++ear)
-                    rows[l * 2 + ear] = 1 + ((l * 2 + ear) % (FdnTail::kLines - 1));
+            int nRowsRead = 0;
+            if (model == 0) {
+                for (int l = 0; l < L; ++l)
+                    for (int ear = 0; ear < 2; ++ear)
+                        rows[l * 2 + ear] = 1 + ((l * 2 + ear) % (FdnTail::kLines - 1));
+                nRowsRead = L * 2;
+            } else {
+                nRowsRead = std::min(L * 2, FdnTail::kLines - 1);
+                for (int u = 0; u < nRowsRead; ++u) rows[u] = 1 + u;
+            }
             for (int k = 0; k < nr; ++k) {
                 Room& r = *rooms_[static_cast<std::size_t>(k)];
-                r.fdn->renderBandsRows(r.in.data(), n, rows, L * 2, r.prow);
+                r.fdn->renderBandsRows(r.in.data(), n, rows, nRowsRead, r.prow);
                 std::fill(r.in.begin(), r.in.begin() + n, 0.0f);
                 float wStep[kNumBands];
                 for (int b = 0; b < kNumBands; ++b) wStep[b] = (r.wTgt[b] - r.wCur[b]) * inv;
@@ -361,29 +440,41 @@ public:
                 //     60 ms に伸ばすと 1 ブロックあたり 1 dB 未満。扉の量（w）は別に毎フレーム追うので遅れは向きだけ。
                 const float laneFollow = std::min(1.0f, static_cast<float>(n) / (0.06f * static_cast<float>(fs_)));
                 const int lanesHere = (portalSrcMask & (1 << k)) ? 0 : L;       // 戸口の線音源の部屋はレーンへ出さない
-                for (int l = 0; l < lanesHere; ++l) {
-                    const float lt = r.laneCur[l] + (r.laneTgt[l] - r.laneCur[l]) * laneFollow;
-                    const float l0 = r.laneCur[l], dl = (lt - l0) * inv;
-                    bool any = (l0 != 0.0f || lt != 0.0f);
-                    if (!any) continue;
-                    // ★耳ごとに別の行から作る。ここが左右差の出所。
-                    for (int ear = 0; ear < 2; ++ear) {
-                        float* sig = r.laneSig.data();
-                        const int src = l * 2 + ear;
-                        for (int i = 0; i < n; ++i) {
-                            float acc = 0.0f;
-                            for (int b = 0; b < kNumBands; ++b) acc += r.prow[src * kNumBands + b][i] * (r.wCur[b] + wStep[b] * static_cast<float>(i + 1));
-                            const float y = acc * (l0 + dl * static_cast<float>(i + 1)) * laneNorm_;
-                            sig[i] = y;
-                            if (ear == 0) e += static_cast<double>(y) * y;   // 計器は片耳ぶん（今までと同じ意味）
+                if (model == 0) {
+                    // ── laneModel 0: 耳ごとの行（88d5f0b〜）。点も拡散も区別せず、レーンの重みで振る ──
+                    for (int l = 0; l < lanesHere; ++l) {
+                        const float lt = r.laneCur[l] + (r.laneTgt[l] - r.laneCur[l]) * laneFollow;
+                        const float l0 = r.laneCur[l], dl = (lt - l0) * inv;
+                        bool any = (l0 != 0.0f || lt != 0.0f);
+                        if (!any) continue;
+                        // ★耳ごとに別の行から作る。ここが左右差の出所。
+                        for (int ear = 0; ear < 2; ++ear) {
+                            float* sig = r.laneSig.data();
+                            const int src = l * 2 + ear;
+                            for (int i = 0; i < n; ++i) {
+                                float acc = 0.0f;
+                                for (int b = 0; b < kNumBands; ++b) acc += r.prow[src * kNumBands + b][i] * (r.wCur[b] + wStep[b] * static_cast<float>(i + 1));
+                                const float y = acc * (l0 + dl * static_cast<float>(i + 1)) * laneNorm_;
+                                sig[i] = y;
+                                if (ear == 0) e += static_cast<double>(y) * y;   // 計器は片耳ぶん（今までと同じ意味）
+                            }
+                            float* row = laneRows_.data() + static_cast<std::size_t>(l * 2 + ear) * stride
+                                       + (ear == 0 ? itdL_[l] : itdR_[l]);
+                            for (int i = 0; i < n; ++i) row[i] += sig[i];
                         }
-                        float* row = laneRows_.data() + static_cast<std::size_t>(l * 2 + ear) * stride
-                                   + (ear == 0 ? itdL_[l] : itdR_[l]);
-                        for (int i = 0; i < n; ++i) row[i] += sig[i];
                     }
+                    for (int ear = 0; ear < 2; ++ear) r.itdCur[ear] += (r.itdTgt[ear] - r.itdCur[ear]) * laneFollow;
+                } else {
+                    // ── laneModel 1: 点と拡散を分ける（上の■）──
+                    renderSplit(r, n, inv, wStep, L, lanesHere, laneFollow, stride, e);
                 }
                 for (int b = 0; b < kNumBands; ++b) r.wCur[b] = r.wTgt[b];
-                for (int l = 0; l < kMaxLanes; ++l) r.laneCur[l] += (r.laneTgt[l] - r.laneCur[l]) * laneFollow;
+                // 重みはどちらの作りでも毎ブロック追う（実行中に作りを切り替えても、重みの状態は揃っている）。
+                for (int l = 0; l < kMaxLanes; ++l) {
+                    r.laneCur[l] += (r.laneTgt[l] - r.laneCur[l]) * laneFollow;
+                    r.difCur[l] += (r.difTgt[l] - r.difCur[l]) * laneFollow;
+                    r.ptCur[l] += (r.ptTgt[l] - r.ptCur[l]) * laneFollow;
+                }
             }
             renderPortals(n, inv, nr, outL, outR, portalSrcMask, e);     // 段 2-g（L/R へ足す。バスは通さない）
             bus->add(laneRows_.data(), n, stride, 1.0f, 0);
@@ -396,7 +487,8 @@ public:
             // 1) 送りを入れて回す（帯域ごとの L/R）。
             r.fdn->renderBandsMLR(r.in.data(), n, nullptr, r.pl, r.pr);
             std::fill(r.in.begin(), r.in.begin() + n, 0.0f);
-            for (int l = 0; l < kMaxLanes; ++l) r.laneCur[l] = r.laneTgt[l];
+            for (int l = 0; l < kMaxLanes; ++l) { r.laneCur[l] = r.laneTgt[l]; r.difCur[l] = r.difTgt[l]; r.ptCur[l] = r.ptTgt[l]; }
+            r.itdCur[0] = r.itdTgt[0]; r.itdCur[1] = r.itdTgt[1];
             if (portalSrcMask & (1 << k)) {                        // 段 2-g: 戸口からだけ鳴らす
                 float wStep[kNumBands];
                 for (int b = 0; b < kNumBands; ++b) wStep[b] = (r.wTgt[b] - r.wCur[b]) * inv;
@@ -442,6 +534,14 @@ private:
             float* prow[kMaxLanes * 2 * kNumBands];   // [(レーン×2＋耳) × 帯域]
         std::vector<float> laneSig;
         float laneCur[kMaxLanes], laneTgt[kMaxLanes], lanePend[kMaxLanes];
+        // laneModel 1（点と拡散を分ける）: 拡散の重み・点の重み（レーンごと。Σdif² + Σpt² = 1）、点の ITD（耳ごと、サンプル。小数）。
+        float difCur[kMaxLanes], difTgt[kMaxLanes], difPend[kMaxLanes];
+        float ptCur[kMaxLanes], ptTgt[kMaxLanes], ptPend[kMaxLanes];
+        float itdCur[2], itdTgt[2], itdPend[2];
+        float dirX = 0.0f, dirZ = 1.0f, spread = 1.0f;   // 最後に置かれた向きと広がり（バスを差し直したら重みを作り直す）
+        std::vector<float> ptHist;                       // [kPtHist] 点の波形の履歴（ptPos が最新）
+        int ptPos = 0;
+        std::vector<float> ptEar[2];                     // [maxFrames] 耳ごとに ITD ぶん遅らせた点の波形
     };
 
     bool valid(int room) const { return room >= 0 && room < count_.load(std::memory_order_acquire); }
@@ -496,6 +596,146 @@ private:
     std::atomic<int> version_{0};
     int seen_ = 0;
     float rmsL_ = 0.0f;
+
+    // ── 点と拡散を分ける（laneModel 1、上の■）──
+    static constexpr int kPtTaps = 8;        // 点の ITD を小数で読む窓（Lanczos a = 4）
+    static constexpr int kPtLead = 4;        // 窓の半分。両耳に同じだけ遅れが乗る（48 kHz で 0.08 ms）
+    static constexpr int kPtHist = 128;      // 点の波形の履歴。ITD の上限 64 ＋ 窓 8 より長い 2 の冪
+    static constexpr int kPtFrac = 256;      // 小数の刻み（1/256 サンプル ＝ 48 kHz で 4 µs）
+    std::atomic<int> laneModel_{1};
+    float headRadius_ = 57.0f * 0.01f / (2.0f * 3.14159265f);   // 点の ITD に使う頭の半径（setDirectionBus で頭囲から）
+    const float* lanczos_ = nullptr;         // [(kPtFrac + 1) × kPtTaps] 小数ごとの係数（行ごとに Σ = 1）
+
+    // 8 点の Lanczos（a = 4）の係数表。小数 f = k / kPtFrac の行 k に、位置 −3..+4 の重みを並べる。
+    //   ★行ごとに Σ = 1 に揃える（窓付き sinc の和は小数の位置で 1 から少しずれ、そのままだと遅れが動くたびに量が揺れる）。
+    //   ★退けた書き方: 線形補間。遠い耳の高域が痩せて −2.5 dB（上の■(3)）。
+    static const float* lanczosTable() {
+        static const std::vector<float> table = [] {
+            const double pi = 3.14159265358979323846;
+            auto sinc = [pi](double x) { return (std::fabs(x) < 1e-12) ? 1.0 : std::sin(pi * x) / (pi * x); };
+            std::vector<float> t(static_cast<std::size_t>(kPtFrac + 1) * kPtTaps, 0.0f);
+            for (int k = 0; k <= kPtFrac; ++k) {
+                const double fr = static_cast<double>(k) / kPtFrac;
+                double w[kPtTaps], sum = 0.0;
+                for (int j = 0; j < kPtTaps; ++j) {
+                    const double x = static_cast<double>(j - (kPtTaps / 2 - 1)) - fr;   // j = 0..7 → 位置 −3..+4
+                    w[j] = sinc(x) * sinc(x / (kPtTaps / 2));
+                    sum += w[j];
+                }
+                for (int j = 0; j < kPtTaps; ++j) t[static_cast<std::size_t>(k) * kPtTaps + j] = static_cast<float>(w[j] / sum);
+            }
+            return t;
+        }();
+        return table.data();
+    }
+
+    // 点と拡散の重み（制御スレッド）。戻り値は「点があるか」。
+    //   点がある: dif = 一様 × √ed、pt = 隣り合う 2 レーンへ等パワー × √(1−ed)、itd2 = 点の向きの ITD（耳ごと、サンプル）。
+    //     ed = sp² / (sp² + (1 − sp)²) … 今までの「振幅 sp と (1 − sp) で一様と点を混ぜて正規化」と同じ量の配分
+    //     （一様と点を直交とみなしたときのエネルギーの割合）。
+    //   点が無い（向きが無い・広がり 1・バスが無い）: dif に laneW（laneModel 0 の重み）をそのまま写し、pt = 0。
+    //     ★同じ数を使うので、広がり 1 は laneModel 0 と 1 ビットも同じになる（一様を作り直すと 1 ulp ずれうる）。
+    bool splitWeights(float x, float z, float sp, int L, const float* laneW, float* dif, float* pt, float* itd2) const {
+        for (int k = 0; k < kMaxLanes; ++k) pt[k] = 0.0f;
+        itd2[0] = 0.0f; itd2[1] = 0.0f;
+        if (L <= 0 || sp >= 1.0f || (x * x + z * z) <= 1e-8f) {
+            for (int k = 0; k < kMaxLanes; ++k) dif[k] = laneW[k];
+            return false;
+        }
+        uniformLanes(dif);
+        const float ed = (sp * sp) / (sp * sp + (1.0f - sp) * (1.0f - sp));
+        const float a = std::sqrt(ed), c = std::sqrt(1.0f - ed);
+        for (int k = 0; k < L; ++k) dif[k] *= a;
+        // 隣り合う 2 レーンへ等パワー（setListenerDirection と同じ式）。レーン k の方位 = 2πk/L、+x 右・+z 前。
+        float az = std::atan2(x, z); if (az < 0.0f) az += 2.0f * 3.14159265f;
+        const float u = az / (2.0f * 3.14159265f) * static_cast<float>(L);
+        const int k0 = static_cast<int>(u) % L, k1 = (k0 + 1) % L;
+        const float t = u - static_cast<float>(static_cast<int>(u));
+        pt[k0] += c * std::cos(t * 1.5707963f);
+        pt[k1] += c * std::sin(t * 1.5707963f);
+        // ITD は点の向きから Woodworth（(r/c)(θ + sinθ)、θ は正中面からの角）。レーンの整数ではなく小数のまま（上の■(2)）。
+        const float sx = std::min(1.0f, std::fabs(x) / std::sqrt(x * x + z * z));
+        const float th = std::asin(sx);
+        const float itd = std::min(static_cast<float>(kItdMax), headRadius_ / 343.0f * (th + std::sin(th)) * static_cast<float>(fs_));
+        itd2[0] = (x > 0.0f) ? itd : 0.0f;      // 右にあれば左耳が遅れる
+        itd2[1] = (x < 0.0f) ? itd : 0.0f;
+        return true;
+    }
+
+    // laneModel 1 の 1 部屋ぶん（オーディオスレッド）。
+    //   ① 点の波形（行 1 × 帯域の重み）を履歴へ書く。鳴らさないブロック（戸口の線音源の部屋も）でも書く ── 鳴り始めに古い音を読まない。
+    //   ② 耳ごとに、点の向きの ITD（60 ms で追い、ブロック内で線形）だけ遅らせて小数で読む。
+    //   ③ 拡散は耳ごとの行（laneModel 0 と同じ行・同じ整数 ITD・同じ式）× 拡散の重み、点は ② × 点の重みをレーンへ足す。
+    void renderSplit(Room& r, int n, float inv, const float* wStep, int L, int lanesHere, float follow, int stride, double& e) {
+        float* sig = r.laneSig.data();
+        for (int i = 0; i < n; ++i) {
+            float acc = 0.0f;
+            for (int b = 0; b < kNumBands; ++b) acc += r.prow[b][i] * (r.wCur[b] + wStep[b] * static_cast<float>(i + 1));   // バッファ 0 ＝ 行 1
+            sig[i] = acc * laneNorm_;
+        }
+        // 点が今聞こえていなければ、遅れは目標へ跳ばしてよい（聞こえる物が無いので継ぎ目が出ない）。
+        double ptE = 0.0;
+        bool ptOn = false;
+        for (int l = 0; l < L; ++l) {
+            ptE += static_cast<double>(r.ptCur[l]) * r.ptCur[l];
+            if (r.ptCur[l] != 0.0f || r.ptTgt[l] != 0.0f) ptOn = true;
+        }
+        if (ptE < 1e-8) { r.itdCur[0] = r.itdTgt[0]; r.itdCur[1] = r.itdTgt[1]; }
+        const float dNew[2] = { r.itdCur[0] + (r.itdTgt[0] - r.itdCur[0]) * follow,
+                                r.itdCur[1] + (r.itdTgt[1] - r.itdCur[1]) * follow };
+        const bool readPt = ptOn && lanesHere > 0;
+        const int mask = kPtHist - 1;
+        for (int i = 0; i < n; ++i) {
+            r.ptPos = (r.ptPos + 1) & mask;
+            r.ptHist[static_cast<std::size_t>(r.ptPos)] = sig[i];
+            if (!readPt) continue;
+            const float t = static_cast<float>(i + 1) * inv;
+            for (int ear = 0; ear < 2; ++ear) {
+                // 読む位置 = 最新 − (窓の半分 + ITD)。窓の右端（+4）が最新を越えない。
+                const float p = static_cast<float>(r.ptPos) - (static_cast<float>(kPtLead) + r.itdCur[ear] + (dNew[ear] - r.itdCur[ear]) * t);
+                const float fl = std::floor(p);
+                const int i0 = static_cast<int>(fl);
+                const int fk = static_cast<int>((p - fl) * static_cast<float>(kPtFrac) + 0.5f);
+                const float* w = lanczos_ + static_cast<std::size_t>(fk) * kPtTaps;
+                float y = 0.0f;
+                for (int j = 0; j < kPtTaps; ++j) y += r.ptHist[static_cast<std::size_t>((i0 - (kPtTaps / 2 - 1) + j) & mask)] * w[j];
+                r.ptEar[ear][static_cast<std::size_t>(i)] = y;
+            }
+        }
+        r.itdCur[0] = dNew[0]; r.itdCur[1] = dNew[1];
+        for (int l = 0; l < lanesHere; ++l) {
+            const float d0 = r.difCur[l], dt = d0 + (r.difTgt[l] - d0) * follow, dd = (dt - d0) * inv;
+            const float p0 = r.ptCur[l], pT = p0 + (r.ptTgt[l] - p0) * follow, dp = (pT - p0) * inv;
+            const bool difOn = (d0 != 0.0f || dt != 0.0f);
+            const bool ptHere = readPt && (p0 != 0.0f || pT != 0.0f);
+            if (!difOn && !ptHere) continue;
+            for (int ear = 0; ear < 2; ++ear) {
+                const int slot = l * 2 + ear;
+                float* row = laneRows_.data() + static_cast<std::size_t>(slot) * stride;
+                if (difOn) {
+                    // 拡散: laneModel 0 と同じ行（枠 % 15）・同じ整数 ITD・同じ式（広がり 1 で 1 ビットも同じになるように）。
+                    const int buf = slot % (FdnTail::kLines - 1);
+                    float* dst = row + (ear == 0 ? itdL_[l] : itdR_[l]);
+                    for (int i = 0; i < n; ++i) {
+                        float acc = 0.0f;
+                        for (int b = 0; b < kNumBands; ++b) acc += r.prow[buf * kNumBands + b][i] * (r.wCur[b] + wStep[b] * static_cast<float>(i + 1));
+                        const float y = acc * (d0 + dd * static_cast<float>(i + 1)) * laneNorm_;
+                        dst[i] += y;
+                        if (ear == 0) e += static_cast<double>(y) * y;   // 計器は片耳ぶん
+                    }
+                }
+                if (ptHere) {
+                    // 点: 1 本の波形を ITD ぶん遅らせた物を足す。レーンの整数 ITD は付けない（遅れは ② で付けてある）。
+                    const float* src = r.ptEar[ear].data();
+                    for (int i = 0; i < n; ++i) {
+                        const float y = src[i] * (p0 + dp * static_cast<float>(i + 1));
+                        row[i] += y;
+                        if (ear == 0) e += static_cast<double>(y) * y;
+                    }
+                }
+            }
+        }
+    }
 
     // ── 戸口の線音源（段 2-g）──
     struct Portal {

@@ -69,6 +69,13 @@ namespace AcousticFlow
         [Tooltip("隣の部屋の響きの鳴らし方。0 旧（一様）/ 1 戸口の向きの点 / 2 戸口の線音源（既定）。実行中に変えられる")]
         [Range(0, 2)] public int lateThroughMode = 2;
 
+        // 尾のレーンの作り（方向バスへ載せる尾）
+        //   0 耳ごとの行（旧）: 点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる
+        //   1 点と拡散を分ける（既定）: 点は 1 本の波形＋点の向きの ITD。自室（一様）は 0 と同じ音
+        //   戸口の線音源（lateThroughMode 2）の部屋はレーンを通らない。効くのは戸口で繋がっていない部屋と、lateThroughMode 1 のとき
+        [Tooltip("尾のレーンの作り。0 耳ごとの行（旧）/ 1 点と拡散を分ける（既定）。実行中に変えられる")]
+        [Range(0, 1)] public int laneModel = 1;
+
         // レイを GPU で解く（既定 切）。音は作らない ── GPU が出すのは幾何と統計だけで、
         // 音にするのは今までどおりエンジン。ホストのデバイスは借りず、エンジンが自前で持つ。
         // GPU が無い機械や積めない場合は黙って CPU のまま動く（GpuActive で実際の状態が読める）。
@@ -263,6 +270,7 @@ namespace AcousticFlow
             NativeWorld.AF_WorldSetRays(_world, raysPerEmitter, maxBounces);
             NativeWorld.AF_WorldSetLeakModel(_world, leakModel);   // 実行中に切り替えられる（試聴の A/B）
             NativeWorld.AF_WorldSetLateThrough(_world, lateThroughMode);   // 同上
+            NativeWorld.AF_WorldSetLaneModel(_world, laneModel);           // 同上
             NativeWorld.AF_WorldSetGpuTrace(_world, gpuTrace ? 1 : 0);
             GpuActive = NativeWorld.AF_WorldGpuActive(_world) != 0;
             NativeWorld.AF_WorldSetBudget(_world, totalRays, fullSlots, lightSlots, probesPerFrame);

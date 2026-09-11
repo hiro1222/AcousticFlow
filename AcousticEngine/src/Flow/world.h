@@ -137,6 +137,11 @@ public:
     ///     戸口の線音源から耳の部屋の FDN へ流す）。試聴の指摘「向こうの部屋の残響が全体から聞こえすぎ」から。
     ///   ★2 でも、耳の部屋と戸口で繋がっていない部屋（部屋が割れない 1.2 m の戸口など）は 1 の形に落ちる。
     int lateThrough = 2;
+    /// 尾のレーンの作り（FdnRoomMix::setLaneModel、2026-09-12）。**既定 1。**実行中に切り替えてよい（試聴の A/B）。
+    ///   0 耳ごとの行（88d5f0b〜）: 点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる
+    ///   1 点と拡散を分ける: 点は 1 本の波形＋点の向きの ITD。自室（広がり 1）は 0 と 1 ビットも同じ
+    ///   ★効くのはレーンを通る尾だけ。lateThrough=2 で戸口の線音源になった部屋はレーンを通らない。
+    int laneModel = 1;
     /// 虚像の次数（1..3）。既定 2。
     ///   ★3 にすると壁際で「詰まった連続反射」が出る。同じ壁を繰り返し使う経路が 3 次で初めて現れるため。
     ///     2 次までだと、近づいた壁が絡む虚像だけが前へ寄り、群としては詰まらない
@@ -462,6 +467,7 @@ private:
     }
     void updateFdn() {
         if (!fdn_ || probes_.empty()) return;
+        fdn_->setLaneModel(laneModel);                                     // 尾のレーンの作り（実行中に切り替えてよい）
         for (std::size_t r = 0; r < probes_.size(); ++r)
             if (fdnRoomOf_[r] >= 0) fdn_->setRoomRt60(fdnRoomOf_[r], probes_[r].rt60, false);
         std::vector<float> sum(probes_.size() * kNumBands, 0.0f);

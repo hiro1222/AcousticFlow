@@ -87,6 +87,12 @@ void AF_WorldSetLateThrough(AF_WorldHandle w, int on) {
 int AF_WorldLateThrough(AF_WorldHandle w) {
     acoustic::flow::World* W = asWorld(w); return W ? W->lateThrough : 0;
 }
+void AF_WorldSetLaneModel(AF_WorldHandle w, int model) {
+    if (acoustic::flow::World* W = asWorld(w)) W->laneModel = (model <= 0) ? 0 : 1;   // 0 耳ごとの行 / 1 点と拡散を分ける
+}
+int AF_WorldLaneModel(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->laneModel : 1;
+}
 int AF_WorldLeakModel(AF_WorldHandle w) {
     acoustic::flow::World* W = asWorld(w); return W ? W->leakModel : 0;
 }

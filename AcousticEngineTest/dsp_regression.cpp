@@ -3251,61 +3251,155 @@ void testFdnLanes() {
         check("[FDN・方向] 行どうしの相関が 0.2 未満（無相関＝方向ごとに別のノイズ）", cMax < 0.2, buf);
     }
     // ── 2. 方向バスへ（HRIR 無し＝そのまま耳へ）: 片耳のエネルギー 0.5、右 90° の点は右耳が ITD ぶん先 ──
-    auto run = [&](float dx, float dz, float spread, double* eL, double* eR, int* lagPeak, float switchAtSec, double* maxStepDb) {
+    //   model はレーンの作り（FdnRoomMix::setLaneModel）。1 が既定（点と拡散を分ける）、0 は 88d5f0b からの耳ごとの行。
+    struct Run {
+        int model = 1;
+        float dx = 0.0f, dz = 1.0f, spread = 0.0f;
+        int input = 0;                 // 0 インパルス / 1 正弦（倍精度の位相）/ 2 白色雑音
+        double freq = 0.0;
+        float switchAtSec = -1.0f;     // > 0: 正面から始め、その時刻を含むブロックで (dx, dz) へ切り替える
+        float rotDegPerSec = 0.0f;     // > 0: 正面から始め、1.0 s から (dx, dz) の向きまで回す
+        float seconds = 3.0f;
+        float rt60 = 0.6f, lineScale = 1.0f;
+    };
+    auto render = [&](const Run& c, std::vector<float>& L, std::vector<float>& R) {
+        const int n = static_cast<int>(c.seconds * fs);
+        L.assign(static_cast<std::size_t>(n), 0.0f);
+        R.assign(static_cast<std::size_t>(n), 0.0f);
         af::dsp::DirectionBus bus(fs, 8, blk);
         af::dsp::FdnRoomMix mix(fs, blk, 0.6f);
-        const int r = mix.addRoom(1.0f, rt, false);
+        const float rtc[6] = { c.rt60, c.rt60, c.rt60, c.rt60, c.rt60, c.rt60 };
+        const int r = mix.addRoom(c.lineScale, rtc, false);
         mix.setDirectionBus(&bus, 57.0f);
+        mix.setLaneModel(c.model);
         const float one[6] = { 1, 1, 1, 1, 1, 1 };
         mix.setListenerWeight(r, one);
-        const float d0[3] = { 0.0f, 0.0f, 1.0f };
-        const float d[3] = { dx, 0.0f, dz };
-        mix.setListenerDirection(r, (switchAtSec > 0.0f) ? d0 : d, spread);
-        const int n = fs * 3;
-        std::vector<float> in(static_cast<std::size_t>(blk), 0.0f), L(static_cast<std::size_t>(n), 0.0f), R(static_cast<std::size_t>(n), 0.0f);
-        double prev = -1.0; *maxStepDb = 0.0;
+        const float front[3] = { 0.0f, 0.0f, 1.0f };
+        const float d[3] = { c.dx, 0.0f, c.dz };
+        const bool moves = (c.switchAtSec > 0.0f || c.rotDegPerSec > 0.0f);
+        mix.setListenerDirection(r, moves ? front : d, c.spread);
+        const float azEnd = std::atan2(c.dx, c.dz);
+        std::vector<float> in(static_cast<std::size_t>(blk), 0.0f);
+        std::uint32_t seed = 20260912u;
+        const int swAt = static_cast<int>(c.switchAtSec * fs);
         for (int p = 0; p < n; p += blk) {
             const int m = std::min(blk, n - p);
-            if (switchAtSec > 0.0f) {
-                for (int i = 0; i < m; ++i) in[static_cast<std::size_t>(i)] = 0.1f * std::sin(2.0f * 3.14159265f * 220.0f * (p + i) / fs);
-                if (p >= static_cast<int>(switchAtSec * fs) && p < static_cast<int>(switchAtSec * fs) + blk) mix.setListenerDirection(r, d, spread);
-            } else {
-                std::fill(in.begin(), in.end(), 0.0f);
-                if (p == 0) in[0] = 1.0f;
+            for (int i = 0; i < m; ++i) {
+                float v = 0.0f;
+                if (c.input == 0) v = (p == 0 && i == 0) ? 1.0f : 0.0f;
+                else if (c.input == 1) v = static_cast<float>(0.1 * std::sin(2.0 * 3.14159265358979 * c.freq * (p + i) / fs));
+                else { seed = seed * 1664525u + 1013904223u; v = 0.1f * (static_cast<float>(seed >> 8) / 16777216.0f * 2.0f - 1.0f); }
+                in[static_cast<std::size_t>(i)] = v;
+            }
+            if (c.switchAtSec > 0.0f && p >= swAt && p < swAt + blk) mix.setListenerDirection(r, d, c.spread);
+            if (c.rotDegPerSec > 0.0f && p >= fs) {
+                const float t = static_cast<float>(p - fs) / fs;
+                const float az = std::copysign(std::min(std::fabs(azEnd), t * c.rotDegPerSec * 3.14159265f / 180.0f), azEnd);
+                const float dr[3] = { std::sin(az), 0.0f, std::cos(az) };
+                mix.setListenerDirection(r, dr, c.spread);
             }
             mix.add(r, in.data(), m, 1.0f);
             mix.render(m, nullptr, nullptr);
             bus.render(m, L.data() + p, R.data() + p);
-            if (switchAtSec > 0.0f && p >= fs / 2) {
-                double q = 0.0; for (int i = 0; i < m; ++i) q += static_cast<double>(L[static_cast<std::size_t>(p + i)]) * L[static_cast<std::size_t>(p + i)];
-                const double rms = std::sqrt(q / m);
-                if (prev > 0.0) *maxStepDb = std::max(*maxStepDb, std::fabs(20.0 * std::log10(std::max(rms, 1e-12) / prev)));
-                prev = rms;
-            }
-        }
-        *eL = 0.0; *eR = 0.0;
-        for (int i = 0; i < n; ++i) { *eL += static_cast<double>(L[static_cast<std::size_t>(i)]) * L[static_cast<std::size_t>(i)]; *eR += static_cast<double>(R[static_cast<std::size_t>(i)]) * R[static_cast<std::size_t>(i)]; }
-        // 右耳に対する左耳の遅れ: c(lag) = Σ L[i]·R[i − lag] が最大の lag（正なら左が遅い）。
-        double best = -1.0; *lagPeak = 0;
-        for (int lag = -60; lag <= 60; ++lag) {
-            double c = 0.0;
-            for (int i = 100; i < n - 100; ++i) c += static_cast<double>(L[static_cast<std::size_t>(i)]) * R[static_cast<std::size_t>(i - lag)];
-            if (c > best) { best = c; *lagPeak = lag; }
         }
     };
+    auto energy = [](const std::vector<float>& x) { double e = 0.0; for (float v : x) e += static_cast<double>(v) * v; return e; };
+    // 隣り合うブロックの RMS 比の最大（dB）。0.5 s 以降の、処理のブロックに揃えた 512 サンプルずつ。
+    auto maxBlockStep = [&](const std::vector<float>& x) {
+        double prev = -1.0, mx = 0.0;
+        for (std::size_t p = static_cast<std::size_t>((fs / 2 + blk - 1) / blk * blk); p + blk <= x.size(); p += blk) {
+            double q = 0.0;
+            for (int i = 0; i < blk; ++i) q += static_cast<double>(x[p + i]) * x[p + i];
+            const double rms = std::sqrt(q / blk);
+            if (prev > 0.0) mx = std::max(mx, std::fabs(20.0 * std::log10(std::max(rms, 1e-12) / prev)));
+            prev = rms;
+        }
+        return mx;
+    };
+    // 右耳に対する左耳の遅れ: c(lag) = Σ L[i]·R[i − lag] が最大の lag（正なら左が遅い）と、±1 ms の |相関| の最大（正規化）。
+    auto interaural = [&](const std::vector<float>& L, const std::vector<float>& R, int* lagPeak, double* iaccPeak) {
+        const long n = static_cast<long>(L.size());
+        const double el = energy(L), er = energy(R);
+        double best = -1e300; *lagPeak = 0; *iaccPeak = 0.0;
+        for (int lag = -60; lag <= 60; ++lag) {
+            double c = 0.0;
+            for (long i = 100; i < n - 100; ++i) c += static_cast<double>(L[static_cast<std::size_t>(i)]) * R[static_cast<std::size_t>(i - lag)];
+            if (c > best) { best = c; *lagPeak = lag; }
+            if (std::abs(lag) <= 48) *iaccPeak = std::max(*iaccPeak, std::fabs(c) / std::sqrt(std::max(el * er, 1e-30)));
+        }
+    };
+    auto db = [](double e) { return 10.0 * std::log10(std::max(e, 1e-30)); };
+    std::vector<float> L, R, L2, R2;
+    char buf2[240];
     {
-        double eL, eR, st; int lag;
-        run(0.0f, 1.0f, 1.0f, &eL, &eR, &lag, 0.0f, &st);
-        std::snprintf(buf, sizeof(buf), "(一様: 左 %.2f dB / 右 %.2f dB)", 10.0 * std::log10(eL), 10.0 * std::log10(eR));
-        check("[FDN・方向] 一様（自室）で片耳のエネルギーが 0.5（−3 dB ±2）", std::fabs(10.0 * std::log10(eL) + 3.0) <= 2.0 && std::fabs(10.0 * std::log10(eR) + 3.0) <= 2.0, buf);
-        run(1.0f, 0.0f, 0.0f, &eL, &eR, &lag, 0.0f, &st);
-        std::snprintf(buf, sizeof(buf), "(右 90° の点: 左 %.2f dB / 右 %.2f dB、左耳の遅れ %d サンプル ＝ %.2f ms。Woodworth 57 cm は 0.68 ms)",
-                      10.0 * std::log10(eL), 10.0 * std::log10(eR), lag, lag * 1000.0 / fs);
-        check("[FDN・方向] 右 90° の点でも片耳のエネルギーは 0.5（HRIR 無しなので量は変わらず ITD だけ）", std::fabs(10.0 * std::log10(eL) + 3.0) <= 2.0 && std::fabs(10.0 * std::log10(eR) + 3.0) <= 2.0, buf);
+        Run c; c.spread = 1.0f;
+        render(c, L, R);
+        std::snprintf(buf, sizeof(buf), "(一様: 左 %.2f dB / 右 %.2f dB)", db(energy(L)), db(energy(R)));
+        check("[FDN・方向] 一様（自室）で片耳のエネルギーが 0.5（−3 dB ±2）", std::fabs(db(energy(L)) + 3.0) <= 2.0 && std::fabs(db(energy(R)) + 3.0) <= 2.0, buf);
+    }
+    {
+        Run c; c.dx = 1.0f; c.dz = 0.0f; c.spread = 0.0f;
+        render(c, L, R);
+        int lag; double ia; interaural(L, R, &lag, &ia);
+        const double eL = db(energy(L)), eR = db(energy(R));
+        std::snprintf(buf, sizeof(buf), "(右 90° の点: 左 %.2f dB / 右 %.2f dB、左耳の遅れ %d サンプル ＝ %.2f ms、両耳相関 %.3f。Woodworth 57 cm は 0.68 ms)",
+                      eL, eR, lag, lag * 1000.0 / fs, ia);
+        check("[FDN・方向] 右 90° の点でも片耳のエネルギーは 0.5（HRIR 無しなので量は変わらず ITD だけ）", std::fabs(eL + 3.0) <= 2.0 && std::fabs(eR + 3.0) <= 2.0, buf);
         check("[FDN・方向] 右 90° の点は左耳が 0.45〜0.95 ms 遅れる（Woodworth）", lag >= 22 && lag <= 46, buf);
-        run(1.0f, 0.0f, 0.0f, &eL, &eR, &lag, 1.0f, &st);
-        std::snprintf(buf, sizeof(buf), "(鳴らしながら正面 → 右 90° へ切り替え: 隣り合うブロックの RMS 比の最大 %.2f dB)", st);
-        check("[FDN・方向] 向きを切り替えても隣り合うブロックの段差が 3 dB 以下", st <= 3.0, buf);
+        // ★点は 1 つの到来なので、左右は同じ波形（ITD ぶんずれるだけ）。耳ごとの行（laneModel 0）ではここが 0.023 ＝ 独立な 2 行と同じだった。
+        check("[FDN・方向] 右 90° の点は左右が同じ波形（±1 ms の両耳相関 0.6 以上）", ia >= 0.6, buf);
+        Run o = c; o.model = 0;
+        render(o, L2, R2);
+        int lag0; double ia0; interaural(L2, R2, &lag0, &ia0);
+        std::snprintf(buf2, sizeof(buf2), "(laneModel 0 の右 90° の点: 両耳相関 %.3f、遅れ %d サンプル)", ia0, lag0);
+        check("[FDN・方向] laneModel 0（耳ごとの行）へ戻すと、点でも左右が別の波形（両耳相関 0.1 未満）", ia0 < 0.1, buf2);
+    }
+    {
+        // 自室（広がり 1）は作りを変えても同じ音: 拡散は耳ごとの行のまま（88d5f0b の左右差を保つ）。
+        Run a; a.input = 2; a.spread = 1.0f; a.seconds = 1.0f; a.model = 0;
+        Run b = a; b.model = 1;
+        render(a, L, R);
+        render(b, L2, R2);
+        double dmax = 0.0;
+        for (std::size_t i = 0; i < L.size(); ++i)
+            dmax = std::max(dmax, static_cast<double>(std::max(std::fabs(L[i] - L2[i]), std::fabs(R[i] - R2[i]))));
+        std::snprintf(buf, sizeof(buf), "(白色雑音 1 s: 差の最大 %.3g)", dmax);
+        check("[FDN・方向] 広がり 1（自室）は laneModel 0 と 1 で 1 サンプルも違わない", dmax == 0.0, buf);
+    }
+    {
+        // 向きを変えたときの段差。★周波数 1 つでは決められない: 88d5f0b より前の「左右へ複製」は 220 Hz で 2.77 dB だったが、
+        //   48 点では 11/48 点で 3 dB を超えていた（最大 11.38 dB）。行ごとにモードの応答が違い、どの周波数が当たるかは運。
+        //   ★ブロック同期の周波数（93.75 Hz の整数倍）で測る。そうでないと静止でもブロックの RMS が揺れる（[歩行] の教訓）。
+        //   静止の床も一緒に採る（床が 0 に近くない物差しで比べない）。
+        double worstSw = 0.0, worstRot = 0.0, floorMax = 0.0, fSw = 0.0, fRot = 0.0;
+        for (int k = 1; k <= 47; k += 2) {
+            Run s; s.input = 1; s.freq = 93.75 * k; s.dx = 1.0f; s.dz = 0.0f; s.spread = 0.0f; s.seconds = 2.5f;
+            Run sw = s; sw.switchAtSec = 1.0f;
+            Run rot = s; rot.rotDegPerSec = 90.0f;
+            render(s, L, R);   floorMax = std::max(floorMax, maxBlockStep(L));
+            render(sw, L, R);  { const double st = maxBlockStep(L); if (st > worstSw) { worstSw = st; fSw = s.freq; } }
+            render(rot, L, R); { const double st = maxBlockStep(L); if (st > worstRot) { worstRot = st; fRot = s.freq; } }
+        }
+        std::snprintf(buf, sizeof(buf), "(正弦 24 点・正面 → 右 90° を 1 ブロックで: 最大 %.2f dB（%.0f Hz）、静止の床の最大 %.2f dB)", worstSw, fSw, floorMax);
+        check("[FDN・方向] 向きを切り替えても隣り合うブロックの段差が 3 dB 以下", worstSw <= 3.0, buf);
+        std::snprintf(buf2, sizeof(buf2), "(正弦 24 点・正面 → 右 90° を 90°/s で: 最大 %.2f dB（%.0f Hz）、静止の床の最大 %.2f dB)", worstRot, fRot, floorMax);
+        check("[FDN・方向] 向きをなめらかに回しても隣り合うブロックの段差が 3 dB 以下", worstRot <= 3.0, buf2);
+        check("[FDN・方向] 段差の物差しの床（静止）が 0.6 dB 以下", floorMax <= 0.6, buf);
+    }
+    {
+        // 点の波形（行 1）の量が拡散（行 1〜15）と揃うか。行 0 は部屋で −0.1〜+3.7 dB 動いたので使っていない。
+        double lo = 1e9, hi = -1e9;
+        for (float t60 : { 0.3f, 1.2f, 4.8f })
+            for (float ls : { 0.3f, 1.0f, 2.5f }) {
+                Run p; p.input = 2; p.dx = 1.0f; p.dz = 0.0f; p.spread = 0.0f; p.seconds = 4.0f; p.rt60 = t60; p.lineScale = ls;
+                Run u = p; u.spread = 1.0f;
+                render(p, L, R);
+                render(u, L2, R2);
+                const double dd = 0.5 * ((db(energy(L)) - db(energy(L2))) + (db(energy(R)) - db(energy(R2))));
+                lo = std::min(lo, dd); hi = std::max(hi, dd);
+            }
+        std::snprintf(buf, sizeof(buf), "(RT60 0.3/1.2/4.8 s × 線の倍率 0.3/1/2.5 の 9 通り、白色雑音: 点 − 一様 %+.2f 〜 %+.2f dB)", lo, hi);
+        check("[FDN・方向] 点（広がり 0）と一様（広がり 1）の量が ±1.5 dB で揃う", lo >= -1.5 && hi <= 1.5, buf);
     }
 }
 
