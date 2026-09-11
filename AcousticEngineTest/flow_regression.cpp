@@ -1822,6 +1822,133 @@ void testManySources() {
                 worst, worst * dt * 1000.0f, meanWorst / N);
 }
 
+/// 【探り】後期はどこから来るか（AF_ONLY=lateorigin）
+///   ★「隣の部屋にいるときは扉からの指向性が強いはず」を**レイで**測る物差し。エンジンは変えない。
+///   traceRay と同じ式で NEE を追い、後期の寄与ごとに「放射した面が耳と同じ部屋に面しているか」で分ける。
+///     同じ部屋 … 自室の拡散音場（LEV でよい分）
+///     別の部屋 … 戸口越しに見えている向こうの面（扉の向きから来るべき分）
+///   別の部屋の分は、耳から放射点への向きをエネルギーで重み付けして平均し、
+///   合成の長さ R（1 = 1 点に集中、0 = 全方向に散る）と、戸口の中心への角度を出す。
+///   ★面の上の点は格子では壁の中に落ちるので、**耳の側へ 0.3 m 押し出した点**で部屋を引く。
+void testLateOrigin() {
+    const char* rs = std::getenv("AF_RAYS");
+    const int rays = rs ? std::atoi(rs) : 8192;
+    std::printf("\n[探り] 後期はどこから来るか ── 耳と同じ部屋の面か、戸口越しの向こうの面か（レイ %d 本）\n", rays);
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    const Vec3 S(0.0f, 1.6f, 3.0f);
+    const Vec3 doorC(0.0f, 1.5f, 0.0f);
+    std::printf("        %5s %14s | %9s | %7s %7s %7s | %6s %7s | %6s\n",
+                "扉", "耳", "後期", "同部屋", "別部屋", "不明", "別のR", "戸口へ", "同のR");
+    struct Spot { float x, z; };
+    const Spot spots[] = {{-3.0f, -3.0f}, {-1.0f, -3.0f}, {0.0f, -3.0f}, {1.0f, -3.0f}, {3.0f, -3.0f}, {0.0f, -1.0f}, {0.0f, 1.5f}};
+    for (float deg : {90.0f, 0.0f}) {
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        w.addBox(doorLeaf(deg, -0.5f, 1.0f, 3.0f, 0.06f, 0.004f), lm, true);
+        w.raysPerEmitter = 64; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+        w.setListener(Vec3(0, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+        w.addEmitter(S, 0.2f);
+        w.build();
+        w.update(1.0f / 60.0f);                       // 部屋グラフと木を作る
+        TraceScene sc;
+        buildTraceScene(w.surfaces, w.rules.materials, sc);
+        for (const Spot& sp : spots) {
+            const Vec3 L(sp.x, 1.6f, sp.z);
+            const int lroom = w.roomAt(L);
+            float mixingSec = 0.03f;
+            if (lroom >= 0) mixingSec = std::max(0.01f, std::min(0.12f, 3.0f * w.probe(lroom).meanFreePath / kSpeedOfSound));
+            TraceParams prm; prm.rays = rays; prm.maxBounces = 40; prm.mixingSec = mixingSec; prm.seed = 7u;
+            const float e0 = 1.0f / static_cast<float>(rays);
+            double eOwn = 0.0, eOther = 0.0, eUnk = 0.0;
+            double oX = 0.0, oY = 0.0, oZ = 0.0, sX = 0.0, sY = 0.0, sZ = 0.0;
+            for (int i = 0; i < rays; ++i) {
+                // ── traceRay と同じ式（種・散乱・打ち切りまで）。後期の寄与だけを分類して数える ──
+                std::uint32_t rng = (prm.seed * 2654435761u + 0x9E3779B9u) ^ (static_cast<std::uint32_t>(i) * 2246822519u);
+                rng = rng * 747796405u + 2891336453u;
+                float e[kNumBands];
+                for (int b = 0; b < kNumBands; ++b) e[b] = e0;
+                Vec3 pos = S;
+                Vec3 dir = uniformSphere(rng);
+                float pathLen = 0.0f;
+                int skip = -1;
+                for (int bounce = 0; bounce < prm.maxBounces; ++bounce) {
+                    const SurfaceHit h = sceneNearest(sc, pos, dir, 1e4f, skip);
+                    if (!h.hit) break;
+                    pathLen += h.t;
+                    const int mi = sc.material[static_cast<std::size_t>(h.index)];
+                    const SurfaceSplit* tbl = &sc.split[static_cast<std::size_t>(mi) * kNumBands];
+                    float rMean = 0.0f, tMean = 0.0f;
+                    for (int b = 0; b < kNumBands; ++b) { rMean += tbl[b].reflect; tMean += tbl[b].transmit; }
+                    rMean /= kNumBands; tMean /= kNumBands;
+                    const Vec3 nFace = (dot(h.normal, dir) < 0.0f) ? h.normal : h.normal * -1.0f;
+                    {
+                        const Vec3 toL = L - h.point;
+                        const float d = length(toL);
+                        if (d > kEps) {
+                            const Vec3 u = toL * (1.0f / d);
+                            const float cosF = dot(nFace, u);
+                            const bool front = cosF > 0.0f;
+                            const float cosT = std::fabs(cosF);
+                            const Vec3 side = front ? nFace : nFace * -1.0f;
+                            const Vec3 org = h.point + side * kEps;
+                            float tr[kNumBands]; int cr = 0;
+                            sceneTransmittance(sc, org, L, h.index, tr, &cr);
+                            const float tSec = (pathLen + d) / kSpeedOfSound;
+                            const float geo = cosT / (kPi * d * d);
+                            double c = 0.0;
+                            for (int b = 0; b < kNumBands; ++b) {
+                                const float eSide = e[b] * (front ? tbl[b].reflect : tbl[b].transmit);
+                                c += std::max(0.0f, eSide * geo * tr[b] * airEnergy(b, pathLen + d));
+                            }
+                            if (c > 0.0 && tSec >= prm.mixingSec) {
+                                const int room = w.roomAt(h.point + side * 0.3f);
+                                const Vec3 toP = u * -1.0f;              // 耳から放射点への向き（ワールド）
+                                if (room < 0) eUnk += c;
+                                else if (room == lroom) { eOwn += c; sX += c * toP.x; sY += c * toP.y; sZ += c * toP.z; }
+                                else { eOther += c; oX += c * toP.x; oY += c * toP.y; oZ += c * toP.z; }
+                            }
+                        }
+                    }
+                    const float carry = rMean + tMean;
+                    if (carry <= 1e-6f) break;
+                    const bool goReflect = rand01(rng) < (rMean / carry);
+                    for (int b = 0; b < kNumBands; ++b) e[b] *= (tbl[b].reflect + tbl[b].transmit);
+                    float eMax = 0.0f; for (int b = 0; b < kNumBands; ++b) eMax = std::max(eMax, e[b]);
+                    if (eMax < e0 * 1e-4f) break;
+                    if (goReflect) {
+                        const float s = sc.scatter1k[static_cast<std::size_t>(mi)];
+                        dir = (rand01(rng) < s) ? cosineHemisphere(nFace, rng) : reflect(dir, nFace);
+                        if (dot(dir, nFace) <= 0.0f) dir = cosineHemisphere(nFace, rng);
+                        pos = h.point + nFace * kEps;
+                    } else {
+                        pos = h.point - nFace * kEps;
+                    }
+                    skip = h.index;
+                }
+            }
+            const double tot = eOwn + eOther + eUnk;
+            if (tot <= 0.0) continue;
+            const double rOther = (eOther > 0.0) ? std::sqrt(oX * oX + oY * oY + oZ * oZ) / eOther : 0.0;
+            const double rOwn = (eOwn > 0.0) ? std::sqrt(sX * sX + sY * sY + sZ * sZ) / eOwn : 0.0;
+            double angDoor = -1.0;
+            if (eOther > 0.0) {
+                Vec3 dd = doorC - L; const float dl = length(dd); dd = dd * (1.0f / std::max(dl, 1e-6f));
+                const double ol = std::sqrt(oX * oX + oY * oY + oZ * oZ);
+                const double cs = (ol > 0.0) ? (oX * dd.x + oY * dd.y + oZ * dd.z) / ol : 1.0;
+                angDoor = std::acos(std::min(1.0, std::max(-1.0, cs))) * 180.0 / 3.14159265;
+            }
+            char where[32];
+            std::snprintf(where, sizeof(where), "(%+.1f,%+.1f)%s", sp.x, sp.z, (lroom == w.roomAt(S)) ? "同" : "隣");
+            std::printf("        %4.0f° %14s | %9.2e | %6.1f%% %6.1f%% %6.1f%% | %6.3f %6.1f° | %6.3f\n",
+                        deg, where, tot, eOwn / tot * 100.0, eOther / tot * 100.0, eUnk / tot * 100.0,
+                        rOther, angDoor, rOwn);
+        }
+    }
+    std::printf("        （R: 1 = 一点から、0 = 全方向から。戸口へ = 別部屋の平均の向きと、耳から戸口の中心への向きの角度）\n");
+}
+
 /// 【探り】扉の脇へ歩いたときの定位と跳び（AF_ONLY=doorside）
 ///   扉を AF_DOOR_DEG（既定 20）度で止め、耳を戸口の前で左右に振る。
 ///   出す物: 方向を持つタップと方向なしのタップの取り分、回折の向き、1 歩ごとの変化。
@@ -2156,7 +2283,7 @@ int main() {
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
         {"budget", testBudget}, {"raycap", testRayCap}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels},
-        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
+        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {
         // AF_ONLY はコンマ区切りで複数指定できる（例 AF_ONLY=world,bridge）
