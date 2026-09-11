@@ -52,6 +52,7 @@ namespace AcousticFlow
         [Tooltip("レーンの本数（水平の環）。8 = 45° 刻みが出発点、12 = 30° が反射の上限。16 以上は聞き分けられない所に払う。")]
         [Range(4, 16)] public int directionLanes = 8;
         private System.IntPtr _dirBus = System.IntPtr.Zero;
+        private System.IntPtr _busHrtf = System.IntPtr.Zero;     // 方向バスの HRTF（バスと FDN の戸口の線音源が借りる）
         public System.IntPtr DirectionBusHandle => _dirBus;
         public float DirectionBusRms => (_dirBus != System.IntPtr.Zero) ? Native.AF_DirectionBusRms(_dirBus) : 0f;
 
@@ -61,6 +62,19 @@ namespace AcousticFlow
             if (_dirBus != System.IntPtr.Zero) return _dirBus;
             try { _dirBus = Native.AF_DirectionBusCreate(_sampleRate, directionLanes, Mathf.Max(maxFrames, 2048)); }
             catch (System.EntryPointNotFoundException) { _dirBus = System.IntPtr.Zero; }
+            // ★方向バスにも HRTF を差す（2026-09-12）。差さないとバスは「左の行を左耳へ、右の行を右耳へ」流すだけで、
+            //   反射と尾のレーンに左右の音量差と方向の音色が付かない（耳の時間差だけ）。検査と試聴の道具は差していたので、
+            //   実機だけが違っていた。戸口の線音源（段 2-g）も同じ HRTF を借りる。
+            //   FDN を繋ぐより前に差すこと（FDN はバスを差した時点の HRTF でレーンの量を揃える）。
+            if (_dirBus != System.IntPtr.Zero && _busHrtf == System.IntPtr.Zero)
+            {
+                try
+                {
+                    _busHrtf = Native.AF_HrtfCreateSynthetic(_sampleRate);
+                    if (_busHrtf != System.IntPtr.Zero) Native.AF_DirectionBusSetHrtf(_dirBus, _busHrtf, 57f);
+                }
+                catch (System.EntryPointNotFoundException) { _busHrtf = System.IntPtr.Zero; }
+            }
             AttachFdnToDirectionBus();
             return _dirBus;
         }
@@ -174,6 +188,8 @@ namespace AcousticFlow
             if (_fdn != System.IntPtr.Zero) { Native.AF_FdnMixDestroy(_fdn); _fdn = System.IntPtr.Zero; }
             foreach (var kv in _fdnRetired) Native.AF_FdnMixDestroy(kv.Value);
             _fdnRetired.Clear();
+            // バスの HRTF は、バスと FDN（戸口の線音源が借りている）を壊した後で。
+            if (_busHrtf != System.IntPtr.Zero) { Native.AF_HrtfDestroy(_busHrtf); _busHrtf = System.IntPtr.Zero; }
         }
 
         // ★全音源のミックス後に呼ばれる。ここで各バスを 1 回ずつ畳んで足す。
