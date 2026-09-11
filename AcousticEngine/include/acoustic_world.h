@@ -65,6 +65,10 @@ ACOUSTIC_API void AF_WorldSetBudget(AF_WorldHandle w, int totalRays, int fullSlo
 /* レイ更新のフレーム分散（設計文書 Ⅶ）。rayGroups 個の組に分け、毎フレーム 1 組だけ飛ばす（1 で分散なし、上限 8）。
  * 組ごとの結果は幾何が同じなら同じなので、静止していれば合計は一定＝揺れない。動けば rayGroups フレームで入れ替わる。 */
 ACOUSTIC_API void AF_WorldSetRayGroups(AF_WorldHandle w, int rayGroups);
+/* 1 音源の本数の上限（既定 512）。予算がいくら余っていても、これより多くは飛ばさない。
+ * ★GPU（AF_WorldSetGpuTrace）で本数を桁で増やすときに上げる。raysPerEmitter だけ上げても、ここで頭打ちになる。
+ * 下限は簡易の下限（32）、上限は 65536（1 回のディスパッチの出力が 4 GB を超えないため）。 */
+ACOUSTIC_API void AF_WorldSetMaxRaysPerEmitter(AF_WorldHandle w, int maxRays);
 /* 音源ごとのループを複数コアへ。workers <= 1 で直列（既定）。★Unity は既に全コアを使うので明示のときだけ。 */
 ACOUSTIC_API void AF_WorldSetWorkers(AF_WorldHandle w, int workers);
 /* 今フレームに実際に飛ばしたレイの総数（費用の目安）。 */

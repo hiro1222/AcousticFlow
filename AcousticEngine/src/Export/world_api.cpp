@@ -147,6 +147,13 @@ void AF_WorldSetRayGroups(AF_WorldHandle w, int g) {
     acoustic::flow::World* W = asWorld(w); if (!W) return;
     W->rayGroups = (g < 1) ? 1 : (g > acoustic::flow::TraceGroups::kMax ? acoustic::flow::TraceGroups::kMax : g);
 }
+void AF_WorldSetMaxRaysPerEmitter(AF_WorldHandle w, int maxRays) {
+    acoustic::flow::World* W = asWorld(w); if (!W || maxRays <= 0) return;
+    // ★上限 65536: 全音源を 1 回で流すので、出力は（音源 × 本数 × 160 B）。
+    //   D3D11 のバッファの大きさは 32 ビットなので、ここで抑えないと音源が多いときに確保が黙って失敗する。
+    const int lo = W->budget.cfg.minPerEmitter;
+    W->budget.cfg.maxPerEmitter = (maxRays < lo) ? lo : (maxRays > 65536 ? 65536 : maxRays);
+}
 void AF_WorldSetWorkers(AF_WorldHandle w, int workers) { if (acoustic::flow::World* W = asWorld(w)) W->setWorkers(workers); }
 int  AF_WorldSpentRays(AF_WorldHandle w) { acoustic::flow::World* W = asWorld(w); return W ? W->spentRays() : 0; }
 int  AF_WorldEmitterTier(AF_WorldHandle w, int e) { acoustic::flow::World* W = asWorld(w); return W ? W->tierOf(e) : 2; }

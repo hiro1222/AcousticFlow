@@ -1376,6 +1376,36 @@ void testLeakModels() {
     }
 }
 
+// ================================ [本数の上限] Unity から 8192 本に届くか（AF_ONLY=raycap）
+//   ★2026-09-11 に見つけた穴の見張り。raysPerEmitter を上げても、予算の上限 maxPerEmitter（既定 512）で
+//     頭打ちになり、Unity からは GPU の効きが聞こえなかった。検査の口（AF_RAYS）は上限も一緒に上げていたので気付かなかった。
+//     耳では「GPU を入れても何も変わらない」にしか聞こえないので、数で見張る。
+void testRayCap() {
+    std::puts("[本数の上限] raysPerEmitter と maxPerEmitter の関係");   // puts は改行を自分で足す
+    char buf[256];
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    auto raysAfter = [&](int perEmitter, int maxPer) {
+        World w;
+        const int m2 = w.rules.materials.add(wall);
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        w.raysPerEmitter = perEmitter; w.maxBounces = 1; w.rayGroups = 1;
+        w.budget.cfg.totalRays = 0;
+        if (maxPer > 0) w.budget.cfg.maxPerEmitter = maxPer;
+        w.setListener(Vec3(0, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int id = w.addEmitter(Vec3(0.0f, 1.6f, 2.0f), 0.2f);
+        w.build();
+        for (int f = 0; f < 70; ++f) w.update(1.0f / 60.0f);      // 昇格のヒステリシス（0.5 s）を越えるまで回す
+        return w.raysOf(id);
+    };
+    const int stuck = raysAfter(8192, 0);
+    std::snprintf(buf, sizeof(buf), "(raysPerEmitter 8192・上限は既定のまま → %d 本)", stuck);
+    check("[本数の上限] 上限を上げなければ既定の 512 で止まる（Unity で GPU が効かなかった原因）", stuck == 512, buf);
+    const int open = raysAfter(8192, 8192);
+    std::snprintf(buf, sizeof(buf), "(raysPerEmitter 8192・上限 8192 → %d 本)", open);
+    check("[本数の上限] 上限を上げれば 8192 本に届く（AF_WorldSetMaxRaysPerEmitter が効く道）", open == 8192, buf);
+}
+
 // ================================ [GPU] 計算デバイスの管が通るか（AF_ONLY=gpu）
 void testGpuPipe() {
     std::printf("\n[GPU] エンジン自前の計算デバイス ── 管が通るか\n");
@@ -2125,7 +2155,7 @@ int main() {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
-        {"budget", testBudget}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels},
+        {"budget", testBudget}, {"raycap", testRayCap}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels},
         {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {

@@ -50,6 +50,11 @@ namespace AcousticFlow
         [Header("レイと予算（段 8）")]
         [Tooltip("予算が無制限（totalRays = 0）のときの 1 音源の本数")]
         public int raysPerEmitter = 256;
+        // ★エンジン側の上限（既定 512）。予算が余っていても、これより多くは飛ばさない。
+        //   GPU で本数を桁で増やすときは raysPerEmitter と一緒にこれを上げる。上げないと 512 で頭打ちになり、
+        //   gpuTrace を入れても聞こえ方が変わらない。
+        [Tooltip("1 音源の本数の上限（既定 512）。GPU で本数を増やすときは raysPerEmitter と一緒に上げる")]
+        public int maxRaysPerEmitter = 512;
 
         // 閉じた扉から漏れる回折の扱い（試聴の A/B）。0 は厚さ 6 cm の板を通り抜ける経路が許容 7 cm に
         // 収まって残るので漏れる。1 は貫通を箱自身の薄さと比べる。2 は回折の量に戸口の空き具合を掛ける。
@@ -254,6 +259,7 @@ namespace AcousticFlow
             GpuActive = NativeWorld.AF_WorldGpuActive(_world) != 0;
             NativeWorld.AF_WorldSetBudget(_world, totalRays, fullSlots, lightSlots, probesPerFrame);
             NativeWorld.AF_WorldSetRayGroups(_world, rayGroups);
+            NativeWorld.AF_WorldSetMaxRaysPerEmitter(_world, maxRaysPerEmitter);
             if (workers != _appliedWorkers) { NativeWorld.AF_WorldSetWorkers(_world, workers); _appliedWorkers = workers; }
             foreach (var v in _voices)
                 if (v != null && v.EmitterId >= 0)

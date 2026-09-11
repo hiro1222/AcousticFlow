@@ -66,6 +66,8 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldMixInfo(IntPtr w, int emitter, out AFMixInfo info);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetBudget(IntPtr w, int totalRays, int fullSlots, int lightSlots, int probesPerFrame);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetRayGroups(IntPtr w, int rayGroups);
+        // 1 音源の本数の上限（既定 512）。GPU で本数を増やすときはこれも上げる（raysPerEmitter だけでは頭打ち）。
+        [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetMaxRaysPerEmitter(IntPtr w, int maxRays);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetWorkers(IntPtr w, int workers);
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldSpentRays(IntPtr w);
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldEmitterTier(IntPtr w, int emitter);
