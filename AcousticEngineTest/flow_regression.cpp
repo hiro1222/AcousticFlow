@@ -2351,6 +2351,164 @@ void testDoorLineSource() {
     }
 }
 
+/// 【探り】戸口に聞き手の探針を置いたら何が聞こえるか（AF_ONLY=doorprobe）
+///   ★試聴の問い「ドアの位置にリスナープローブを置き、そこで聞こえる残響・反射音を音源にする方針はできているか」の物差し。
+///   段 2-g の戸口の線音源は「向こうの部屋の FDN（部屋全体の統計）」を戸口から鳴らし、量は耳の位置のレイで決めている。
+///   戸口の位置で聞こえる音は測っていない。ここでは
+///     1) 戸口の向こう側 0.3 m に探針を置き、traceRay と同じ式の NEE で反射音（初期＋後期）を測る。
+///        耳の部屋へ向かって戸口の面を通る向きの流れ（片側の放射照度 E = Σ c·cosθ）も取る。
+///     2) 戸口を面の拡散音源（ランバート、放射輝度 E/π）にして、耳の位置へ届く量を面積分で見積もる（見通し込み）。
+///     3) 今の耳の位置のレイの「戸口越し」（段 2-f の分類）と「後期全体」と並べる。
+///   ★見積もりが今の戸口越しと同じくらいなら、探針にしても戸口から来る量は変わらない（物理が同じ）。
+///     大きく違うなら、戸口のそばの音の偏りを今の分け方が取りこぼしている。
+void testDoorProbe() {
+    std::printf("\n[探り] 戸口に聞き手の探針を置く ── そこで聞こえる反射音と、戸口から耳へ届く見積もり\n");
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    const Vec3 S(0.0f, 1.6f, 3.0f);
+    const char* rs_ = std::getenv("AF_RAYS");
+    const int rays = rs_ ? std::atoi(rs_) : 16384;
+    for (float deg : {90.0f, 45.0f}) {
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        w.addBox(doorLeaf(deg, -0.5f, 1.0f, 3.0f, 0.06f, 0.004f), lm, true);
+        w.raysPerEmitter = 64; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+        const Vec3 L0(0.0f, 1.6f, -3.0f);
+        w.setListener(L0, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        w.addEmitter(S, 0.2f);
+        w.build();
+        w.update(1.0f / 60.0f);
+        const TraceScene& sc = w.traceScene();
+        const int rsrc = w.roomAt(S), rlis = w.roomAt(L0);
+        int ai = -1;
+        for (int a = 0; a < w.apertureCount(); ++a) {
+            const rooms::Aperture& ap = w.aperture(a);
+            if ((ap.roomA == rsrc && ap.roomB == rlis) || (ap.roomA == rlis && ap.roomB == rsrc)) { ai = a; break; }
+        }
+        if (ai < 0) { std::printf("        扉 %.0f°: 戸口が見つからない（部屋 %d / %d）\n", deg, rsrc, rlis); continue; }
+        const rooms::Aperture& ap = w.aperture(ai);
+        const Vec3 toSrc = (ap.roomB == rsrc) ? ap.normal : ap.normal * -1.0f;   // 耳の部屋 → 音源の部屋
+        const Vec3 nOut = toSrc * -1.0f;                                           // 戸口から耳の部屋へ
+        const Vec3 P = ap.rectCenter + toSrc * 0.3f;
+        auto mixingOf = [&](const Vec3& q) {
+            const int r = w.roomAt(q);
+            return (r >= 0) ? std::max(0.01f, std::min(0.12f, 3.0f * w.probe(r).meanFreePath / kSpeedOfSound)) : 0.03f;
+        };
+
+        // 1) 探針: traceRay と同じ式の NEE。反射音の全方向の量 G と、耳の部屋へ向かう片側の流れ E。
+        const float mixP = mixingOf(P);
+        double gAll = 0.0, gLate = 0.0, eOne = 0.0, eOneLate = 0.0;
+        {
+            const float e0 = 1.0f / static_cast<float>(rays);
+            const std::uint32_t seed = 7u;
+            for (int i = 0; i < rays; ++i) {
+                std::uint32_t rng = (seed * 2654435761u + 0x9E3779B9u) ^ (static_cast<std::uint32_t>(i) * 2246822519u);
+                rng = rng * 747796405u + 2891336453u;
+                float e[kNumBands];
+                for (int b = 0; b < kNumBands; ++b) e[b] = e0;
+                Vec3 pos = S;
+                Vec3 dir = uniformSphere(rng);
+                float pathLen = 0.0f;
+                int skip = -1;
+                for (int bounce = 0; bounce < 40; ++bounce) {
+                    const SurfaceHit h = sceneNearest(sc, pos, dir, 1e4f, skip);
+                    if (!h.hit) break;
+                    pathLen += h.t;
+                    const int mi = sc.material[static_cast<std::size_t>(h.index)];
+                    const SurfaceSplit* tbl = &sc.split[static_cast<std::size_t>(mi) * kNumBands];
+                    float rMean = 0.0f, tMean = 0.0f;
+                    for (int b = 0; b < kNumBands; ++b) { rMean += tbl[b].reflect; tMean += tbl[b].transmit; }
+                    rMean /= kNumBands; tMean /= kNumBands;
+                    const Vec3 nFace = (dot(h.normal, dir) < 0.0f) ? h.normal : h.normal * -1.0f;
+                    {
+                        const Vec3 toP = P - h.point;
+                        const float d = length(toP);
+                        if (d > kEps) {
+                            const Vec3 u = toP * (1.0f / d);                 // 放射点 → 探針（音の進む向き）
+                            const float cosF = dot(nFace, u);
+                            const bool front = cosF > 0.0f;
+                            const float cosT = std::fabs(cosF);
+                            const Vec3 side = front ? nFace : nFace * -1.0f;
+                            float tr[kNumBands]; int cr = 0;
+                            sceneTransmittance(sc, h.point + side * kEps, P, h.index, tr, &cr);
+                            const float tSec = (pathLen + d) / kSpeedOfSound;
+                            const float geo = cosT / (kPi * d * d);
+                            double cs = 0.0;
+                            for (int b = 0; b < kNumBands; ++b) {
+                                const float eSide = e[b] * (front ? tbl[b].reflect : tbl[b].transmit);
+                                cs += std::max(0.0f, eSide * geo * tr[b] * airEnergy(b, pathLen + d));
+                            }
+                            if (cs > 0.0) {
+                                const double through = dot(u, nOut);         // 耳の部屋へ向かって戸口の面を通る向きの成分
+                                gAll += cs;
+                                if (tSec >= mixP) gLate += cs;
+                                if (through > 0.0) { eOne += cs * through; if (tSec >= mixP) eOneLate += cs * through; }
+                            }
+                        }
+                    }
+                    const float carry = rMean + tMean;
+                    if (carry <= 1e-6f) break;
+                    const bool goReflect = rand01(rng) < (rMean / carry);
+                    for (int b = 0; b < kNumBands; ++b) e[b] *= (tbl[b].reflect + tbl[b].transmit);
+                    float eMax = 0.0f; for (int b = 0; b < kNumBands; ++b) eMax = std::max(eMax, e[b]);
+                    if (eMax < e0 * 1e-4f) break;
+                    if (goReflect) {
+                        const float sct = sc.scatter1k[static_cast<std::size_t>(mi)];
+                        dir = (rand01(rng) < sct) ? cosineHemisphere(nFace, rng) : reflect(dir, nFace);
+                        if (dot(dir, nFace) <= 0.0f) dir = cosineHemisphere(nFace, rng);
+                        pos = h.point + nFace * kEps;
+                    } else {
+                        pos = h.point - nFace * kEps;
+                    }
+                    skip = h.index;
+                }
+            }
+        }
+        std::printf("        扉 %.0f°: 探針（戸口の向こう 0.3 m）反射音 %.3e（うち後期 %.3e）、耳の部屋へ向かう片側の流れ %.3e（後期 %.3e）\n",
+                    deg, gAll, gLate, eOne, eOneLate);
+
+        // 2) 戸口を面の拡散音源（放射輝度 E/π）にして耳へ。矩形を 10 × 30 に割り、見通しを掛ける。
+        const bool uW = std::fabs(ap.axisU.y) <= std::fabs(ap.axisV.y);
+        const Vec3 wAx = uW ? ap.axisU : ap.axisV, hAx = uW ? ap.axisV : ap.axisU;
+        const float hw = uW ? ap.halfU : ap.halfV, hh = uW ? ap.halfV : ap.halfU;
+        std::printf("        %13s | %11s %11s | %11s %11s | %8s %9s\n",
+                    "耳", "探針→戸口", "(後期だけ)", "今の戸口越し", "今の後期", "後期どうし", "後期に占める");
+        const float spots[4][2] = {{-3.0f, -3.0f}, {0.0f, -3.0f}, {3.0f, -3.0f}, {0.0f, -1.0f}};
+        for (int k = 0; k < 4; ++k) {
+            const Vec3 L(spots[k][0], 1.6f, spots[k][1]);
+            double gDoor = 0.0, gDoorLate = 0.0;
+            const int NU = 10, NV = 30;
+            const double dS = (2.0 * hw / NU) * (2.0 * hh / NV);
+            for (int iu = 0; iu < NU; ++iu)
+                for (int iv = 0; iv < NV; ++iv) {
+                    const Vec3 q = ap.rectCenter + wAx * (((static_cast<float>(iu) + 0.5f) / NU * 2.0f - 1.0f) * hw)
+                                                 + hAx * (((static_cast<float>(iv) + 0.5f) / NV * 2.0f - 1.0f) * hh);
+                    const Vec3 dv = L - q;
+                    const double r2 = static_cast<double>(dot(dv, dv));
+                    if (r2 < 1e-4) continue;
+                    const double cosS = static_cast<double>(dot(dv, nOut)) / std::sqrt(r2);
+                    if (cosS <= 0.0) continue;
+                    float tau[kNumBands];
+                    w.surfaces.transmittance(q + nOut * 0.02f, L, -1, w.rules.materials, tau);
+                    double vis = 0.0; for (int b = 0; b < kNumBands; ++b) vis += tau[b]; vis /= kNumBands;
+                    const double g = dS * cosS / r2 * vis / kPi;
+                    gDoor += eOne * g; gDoorLate += eOneLate * g;
+                }
+            // 3) 今の耳の位置のレイ（段 2-f の分類）
+            TraceParams p2; p2.rays = rays; p2.maxBounces = 40; p2.mixingSec = mixingOf(L); p2.seed = 7u; p2.listenerRoom = w.roomAt(L);
+            EnergyTrace cpu;
+            const TraceResult rr = cpu.run(sc, S, L, p2);
+            double thru = 0.0, late = 0.0;
+            for (int b = 0; b < kNumBands; ++b) { thru += rr.lateOther6[b]; late += rr.late6[b]; }
+            std::printf("        (%+.1f, %+.1f) | %11.3e %11.3e | %11.3e %11.3e | %+7.2f dB %8.1f%%\n",
+                        L.x, L.z, gDoor, gDoorLate, thru, late,
+                        afti::dB(std::max(gDoorLate, 1e-30) / std::max(thru, 1e-30)), (late > 0.0) ? gDoorLate / late * 100.0 : 0.0);
+        }
+    }
+    std::printf("        （後期どうし = 探針から見積もった戸口の後期 ÷ 今の戸口越し。後期に占める = 探針の見積もり ÷ 今の後期全体）\n");
+}
+
 /// 【探り】後期はどこから来るか（AF_ONLY=lateorigin）
 ///   ★「隣の部屋にいるときは扉からの指向性が強いはず」を**レイで**測る物差し。エンジンは変えない。
 ///   traceRay と同じ式で NEE を追い、後期の寄与ごとに「放射した面が耳と同じ部屋に面しているか」で分ける。
@@ -2813,7 +2971,7 @@ int main() {
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
         {"budget", testBudget}, {"raycap", testRayCap}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
-        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
+        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {
         // AF_ONLY はコンマ区切りで複数指定できる（例 AF_ONLY=world,bridge）
