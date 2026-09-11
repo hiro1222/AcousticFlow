@@ -218,6 +218,10 @@ void AF_DirectionBusSetHrtf(AF_DirectionBusHandle bus, AF_HrtfHandle hrtf, float
     if (af::dsp::DirectionBus* b = asDirBus(bus)) b->setHrtfSet(asHrtf(hrtf), orDefault(headCircumferenceCm, 57.0f));
 }
 
+void AF_DirectionBusSetCrossover(AF_DirectionBusHandle bus, float hz) {
+    if (af::dsp::DirectionBus* b = asDirBus(bus)) b->setCrossover(hz);
+}
+
 int AF_DirectionBusHasHrtf(AF_DirectionBusHandle bus) {
     af::dsp::DirectionBus* b = asDirBus(bus);
     return (b && b->hasHrtf()) ? 1 : 0;

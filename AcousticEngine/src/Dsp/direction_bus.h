@@ -16,6 +16,16 @@
 //   使い方は尾のバス（TailBus）と同じ: 音源が render の中で add() し、AudioListener のフィルタが render() を
 //   1 回呼んで左右へ足す。add() と render() は同じオーディオスレッドから順に呼ばれる前提。
 //   上下は畳む（水平の環）。本数の目安: 8（45°）が出発点、12（30°）が反射の弁別（10〜15°）と同じ桁で上限。
+//   ■ 低域と高域を分ける（2026-09-12。setCrossover、既定 700 Hz。0 で旧＝全帯域を畳む）
+//     直接音の HrtfProcessor は 700 Hz で分け、低域は HRIR を通さず ITD だけ、高域だけを畳む。バスは全帯域を畳んでいた。
+//     合成 HRTF（低域の利得 1）では差が出ないが、実測の kemar は測定の都合で低域が落ちている（50 Hz −11.6 dB、
+//     200〜1000 Hz −3〜−4.5 dB、2〜4 kHz +5〜+7 dB）。全帯域を畳むと反射と尾の低域がその分だけ薄くなり、
+//     試聴 WAV の低域寄りの信号で尾が 8 dB 落ちた（実測）。頭は波長より小さいので、低域は物理的にも素通しでよい。
+//     ★量の揃え方もここに移した。分けるときはバス自身が HRIR を「レーン × 耳の平均パワー 1」に揃える
+//       （低域は 1 のまま、高域は平均で 1）。送る側（FdnRoomMix の laneNorm_、VoiceRenderer のレーン）は割らない
+//       ＝ meanPowerGain() が 1 を返す。旧（全帯域）は FdnRoomMix が HrtfSet の全方向の平均パワー（kemar +3.2 dB、
+//       2〜4 kHz の山に引っ張られた値）で割っていて、低域寄りの音ではその分だけ損をしていた。
+//     低域の素通しは畳み込みの固有遅延（firstBlock）ぶん遅らせて高域と揃える（行ごとの短い環）。
 //   分割の最小ブロック（＝固有遅延）は 128（2.7 ms）。64 だと小さな FFT が増えて 2 倍重く、256 以上は
 //   遅延ぶんタップを早めきれない反射（壁ぎわの 5 ms 未満）が出る。実測: 8 方向で 64→4.6% / 128→2.0% / 256→2.1%。
 #pragma once
@@ -46,6 +56,8 @@ public:
         in_.assign(static_cast<std::size_t>(rows()) * maxFrames_, 0.0f);
         scratchL_.assign(static_cast<std::size_t>(maxFrames_), 0.0f);
         scratchR_.assign(static_cast<std::size_t>(maxFrames_), 0.0f);
+        hfBuf_.assign(static_cast<std::size_t>(maxFrames_), 0.0f);
+        setCrossover(700.0f);
         for (int k = 0; k < lanes_; ++k) {
             const float az = 2.0f * kPi * static_cast<float>(k) / static_cast<float>(lanes_);
             laneDir_[k][0] = std::sin(az);   // +x = 右
@@ -85,6 +97,13 @@ public:
         outW[1] = std::sin(f * 0.5f * kPi);
     }
 
+    /// 低域と高域の境（Hz）。0 で分けない（旧: 全帯域を HRIR で畳む）。★HRTF を差す前に決める（量の揃え方が変わる）。
+    void setCrossover(float hz) {
+        xoverHz_ = hz;
+        xoverCoef_ = (hz > 0.0f) ? std::min(1.0f, 2.0f * kPi * hz / static_cast<float>(sampleRate_)) : 0.0f;
+    }
+    float crossoverHz() const { return xoverHz_; }
+
     /// 方向 × 耳ごとに固定の HRIR（ITD を抜いて揃えた物）をモノラルで焼く。ITD はタップが持つ。
     void setHrtfSet(const HrtfSet* set, float /*headCircumferenceCm*/) {
         hrtfSet_ = set;                                  // 戸口の線音源（FdnRoomMix、段 2-g）が同じ HRTF を借りる
@@ -92,9 +111,29 @@ public:
         conv_.clear();
         meanPowerGain_ = 1.0f;
         if (!set || !set->isValid()) return;
-        meanPowerGain_ = std::max(1e-6f, set->meanPowerGain());   // 尾の FDN がレーンの量を等パワーのパンに揃えるのに使う
         const int irLen = std::min(set->irLength(), kLaneIrMax);
         const int fade = std::min(16, irLen / 4);
+        auto fadeAt = [&](int i) {
+            return (i >= irLen - fade) ? 0.5f * (1.0f + std::cos(kPi * static_cast<float>(i - (irLen - fade)) / static_cast<float>(fade))) : 1.0f;
+        };
+        // 量の揃え方（上の■）。分けるときはここで HRIR をレーン × 耳の平均パワー 1 に揃え、送る側は割らない。
+        float irNorm = 1.0f;
+        if (xoverCoef_ > 0.0f) {
+            double pw = 0.0; int cnt = 0;
+            for (int k = 0; k < lanes_; ++k) {
+                const int idx = set->nearestIndex(laneDir_[k]);
+                if (idx < 0) return;
+                for (int e = 0; e < 2; ++e) {
+                    const float* src = set->hrir(idx, e);
+                    for (int i = 0; i < irLen; ++i) { const double v = static_cast<double>(src[i]) * fadeAt(i); pw += v * v; }
+                    ++cnt;
+                }
+            }
+            const double mean = (cnt > 0) ? pw / cnt : 1.0;
+            irNorm = (mean > 1e-12) ? static_cast<float>(1.0 / std::sqrt(mean)) : 1.0f;
+        } else {
+            meanPowerGain_ = std::max(1e-6f, set->meanPowerGain());   // 旧: 尾の FDN が全方向の平均パワーで割る
+        }
         std::vector<float> cut(static_cast<std::size_t>(irLen));
         conv_.reserve(static_cast<std::size_t>(rows()));
         for (int k = 0; k < lanes_; ++k) {
@@ -103,17 +142,18 @@ public:
             for (int e = 0; e < 2; ++e) {
                 auto c = std::make_unique<NonUniformConvolver>(irLen, 1, firstBlock_, capBlock_, maxFrames_);
                 const float* src = set->hrir(idx, e);
-                for (int i = 0; i < irLen; ++i) {
-                    float wgt = 1.0f;
-                    if (i >= irLen - fade) wgt = 0.5f * (1.0f + std::cos(kPi * static_cast<float>(i - (irLen - fade)) / static_cast<float>(fade)));
-                    cut[static_cast<std::size_t>(i)] = src[i] * wgt;
-                }
+                for (int i = 0; i < irLen; ++i) cut[static_cast<std::size_t>(i)] = src[i] * fadeAt(i) * irNorm;
                 const float* ir[1] = { cut.data() };
                 const int    n1[1] = { irLen };
                 c->setIr(ir, n1);
                 conv_.push_back(std::move(c));
             }
         }
+        // 低域の素通しの環（畳み込みの固有遅延ぶん）と一次 LP の状態。行ごと。
+        lfLen_ = conv_.empty() ? 0 : conv_[0]->latency();
+        lpState_.assign(static_cast<std::size_t>(rows()), 0.0f);
+        lfDelay_.assign(static_cast<std::size_t>(rows()) * static_cast<std::size_t>(std::max(1, lfLen_)), 0.0f);
+        lfPos_ = 0;
         hasHrtf_ = true;
     }
 
@@ -157,13 +197,29 @@ public:
         for (int r = 0; r < R; ++r) {
             const float* row = in_.data() + static_cast<std::size_t>(r) * maxFrames_;
             float* ear = (r & 1) ? scratchR_.data() : scratchL_.data();
-            if (hasHrtf_) {
+            if (hasHrtf_ && xoverCoef_ > 0.0f) {
+                // 低域は素通し（固有遅延ぶん遅らせて高域と揃える）、高域だけ HRIR で畳む（上の■）
+                float lp = lpState_[static_cast<std::size_t>(r)];
+                float* hf = hfBuf_.data();
+                float* ring = lfDelay_.data() + static_cast<std::size_t>(r) * static_cast<std::size_t>(std::max(1, lfLen_));
+                int pos = lfPos_;
+                for (int i = 0; i < n; ++i) {
+                    lp += xoverCoef_ * (row[i] - lp);
+                    hf[i] = row[i] - lp;
+                    if (lfLen_ > 0) { const float d = ring[pos]; ring[pos] = lp; ear[i] += d; if (++pos >= lfLen_) pos = 0; }
+                    else ear[i] += lp;
+                }
+                lpState_[static_cast<std::size_t>(r)] = lp;
+                float* dst[1] = { ear };
+                conv_[static_cast<std::size_t>(r)]->processAdd(hf, 0, n, dst, 0, 1.0f);
+            } else if (hasHrtf_) {
                 float* dst[1] = { ear };
                 conv_[static_cast<std::size_t>(r)]->processAdd(row, 0, n, dst, 0, 1.0f);
             } else {
                 for (int i = 0; i < n; ++i) ear[i] += row[i];
             }
         }
+        if (hasHrtf_ && xoverCoef_ > 0.0f && lfLen_ > 0) lfPos_ = (lfPos_ + n) % lfLen_;
         float e = 0.0f;
         for (int i = 0; i < n; ++i) {
             outL[i] += scratchL_[static_cast<std::size_t>(i)];
@@ -194,6 +250,12 @@ private:
     std::vector<float> scratchL_, scratchR_;
     float rms_ = 0.0f;
     float meanPowerGain_ = 1.0f;
+    // 低域と高域を分ける（上の■）
+    float xoverHz_ = 0.0f, xoverCoef_ = 0.0f;
+    std::vector<float> hfBuf_;              // 高域（畳み込みへ）
+    std::vector<float> lpState_;            // [行] 一次 LP の状態
+    std::vector<float> lfDelay_;            // [行][固有遅延] 低域を遅らせる環
+    int lfLen_ = 0, lfPos_ = 0;
 };
 
 }  // namespace dsp

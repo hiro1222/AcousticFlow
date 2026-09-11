@@ -189,6 +189,8 @@ ACOUSTIC_API AF_DirectionBusHandle AF_DirectionBusCreateEx(int sampleRate, int l
 ACOUSTIC_API void AF_DirectionBusDestroy(AF_DirectionBusHandle bus);
 /* レーンごとの固定 HRIR を焼く。hrtf は呼び手が生存を保証する。 */
 ACOUSTIC_API void AF_DirectionBusSetHrtf(AF_DirectionBusHandle bus, AF_HrtfHandle hrtf, float headCircumferenceCm);
+/* 方向バスの低域と高域の境（Hz、既定 700）。0 で分けない（旧: 全帯域を HRIR で畳む）。★HRTF を差す前に。 */
+ACOUSTIC_API void AF_DirectionBusSetCrossover(AF_DirectionBusHandle bus, float hz);
 ACOUSTIC_API int  AF_DirectionBusHasHrtf(AF_DirectionBusHandle bus);
 ACOUSTIC_API int  AF_DirectionBusLanes(AF_DirectionBusHandle bus);
 /* 溜まった送りをレーンごとに畳んで outL/outR へ**足す**。音源が送っていないブロックでも呼ぶこと。 */

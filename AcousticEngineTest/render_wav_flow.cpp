@@ -163,7 +163,13 @@ int main(int argc, char** argv) {
     vc.tailSeconds = 1.2f;
     AF_VoiceHandle voice = AF_VoiceCreate(&vc);
     AF_VoiceSetOutputGain(voice, 0.6f);
-    AF_HrtfHandle hrtf = AF_HrtfCreateSynthetic(kSampleRate);
+    // AF_HRTF=<.afhr の道> で実測の HRTF（kemar など）。無ければ合成（Unity の既定と同じ）。
+    AF_HrtfHandle hrtf = nullptr;
+    if (const char* hp = std::getenv("AF_HRTF")) {
+        hrtf = AF_HrtfLoadFile(hp);
+        std::printf("  HRTF: %s%s\n", hp, hrtf ? "" : "（読めないので合成）");
+    }
+    if (!hrtf) hrtf = AF_HrtfCreateSynthetic(kSampleRate);
     AF_VoiceSetHrtf(voice, hrtf);
     AF_VoiceSetHrtfEnabled(voice, 1);
 
@@ -172,6 +178,7 @@ int main(int argc, char** argv) {
     AF_VoiceSetFdnMix(voice, fdn);
 
     AF_DirectionBusHandle bus = AF_DirectionBusCreate(kSampleRate, 8, kBlock);
+    if (const char* xo = std::getenv("AF_BUS_XOVER")) AF_DirectionBusSetCrossover(bus, static_cast<float>(std::atof(xo)));   // 0 で旧（全帯域）
     // AF_NO_BUS=1 で方向バスを外す（尾と初期が直に L/R へ出る）。尾の狭さの出所を切り分ける摘み。
     const bool useBus = std::getenv("AF_NO_BUS") == nullptr;
     if (useBus) {
@@ -193,6 +200,8 @@ int main(int argc, char** argv) {
                 "角度/耳x", "見通し", "直接", "初期", "後期", "回折", "透過", "段", "レイ", "虚像",
                 "回折: 箱/稜線 δ 隙間 重み 影の数");
 
+    double accDirect = 0.0, accEarly = 0.0, accTail = 0.0, accL = 0.0, accR = 0.0; int accBlocks = 0;
+    double repL = 0.0, repR = 0.0;   // 節目ごとの両耳の量（L-R を出す）
     float fixedDeg = -1.0f;
     if (const char* dd = std::getenv("AF_DOOR_DEG")) fixedDeg = static_cast<float>(std::atof(dd));
     const bool listenSweep = std::getenv("AF_LISTEN_SWEEP") != nullptr;
@@ -224,7 +233,8 @@ int main(int argc, char** argv) {
             pink += 0.03f * (wn - pink);
             dry[static_cast<std::size_t>(i)] = (pink * 3.0f + wn * 0.15f) * 0.5f;
         }
-        AF_VoiceRender(voice, dry.data(), n, bl.data(), br.data(), nullptr);
+        AF_VoiceMetering vm{}; AF_VoiceRender(voice, dry.data(), n, bl.data(), br.data(), &vm);
+        accDirect += vm.rmsDirect; accEarly += vm.rmsEarly; accTail += vm.rmsTail; ++accBlocks;
         std::fill(fl.begin(), fl.end(), 0.0f); std::fill(fr.begin(), fr.end(), 0.0f);
         AF_FdnMixRender(fdn, n, fl.data(), fr.data());
         for (int i = 0; i < n; ++i) {
@@ -237,6 +247,10 @@ int main(int argc, char** argv) {
             outL[static_cast<std::size_t>(pos + i)] += fl[static_cast<std::size_t>(i)];
             outR[static_cast<std::size_t>(pos + i)] += fr[static_cast<std::size_t>(i)];
         }
+        for (int i = 0; i < n; ++i) {
+            const double a = outL[static_cast<std::size_t>(pos + i)], b = outR[static_cast<std::size_t>(pos + i)];
+            accL += a * a; accR += b * b; repL += a * a; repR += b * b;
+        }
 
         if (pos >= nextReport) {
             AF_MixInfo mi{};
@@ -245,6 +259,7 @@ int main(int argc, char** argv) {
             for (int k = 0; k < 5; ++k) for (int b = 0; b < 6; ++b) cm[k] += mi.component6[k][b];
             AF_DiffractionInfo di{};
             AF_WorldDiffractionInfo(w, emitter, &di);
+            { char lr[96]; std::snprintf(lr, sizeof lr, "             両耳 L-R %+.2f dB（節目までの量）", 10.0 * std::log10(std::max(repL, 1e-30) / std::max(repR, 1e-30))); std::puts(lr); repL = repR = 0.0; }
             std::printf("    %6.1f %8.4f %9.2f %9.2f %9.2f %9.2f %9.2f %5d %6d %6d | %d/%d d=%.3f a=%.3f w=%.2f 影%d\n",
                         listenSweep ? (-3.0f + 6.0f * u) : deg, mi.visibleFraction, dB(cm[0]), dB(cm[1]), dB(cm[2]), dB(cm[3]), dB(cm[4]),
                         AF_WorldEmitterTier(w, emitter), AF_WorldEmitterRays(w, emitter), mi.imageCount,
@@ -290,6 +305,14 @@ int main(int argc, char** argv) {
         pos += n;
     }
 
+    {
+        char sm[200];
+        const double nb = std::max(1, accBlocks);
+        std::snprintf(sm, sizeof sm, "  量のまとめ: 左 %.2f dB / 右 %.2f dB（L-R %+.2f）、計器の平均 直接 %.3e 初期 %.3e 尾 %.3e",
+                      10.0 * std::log10(std::max(accL, 1e-30) / total), 10.0 * std::log10(std::max(accR, 1e-30) / total),
+                      10.0 * std::log10(std::max(accL, 1e-30) / std::max(accR, 1e-30)), accDirect / nb, accEarly / nb, accTail / nb);
+        std::puts(sm);
+    }
     if (!writeWav(outPath, outL, outR, kSampleRate)) {
         std::printf("  書き出しに失敗: %s\n", outPath);
         return 1;

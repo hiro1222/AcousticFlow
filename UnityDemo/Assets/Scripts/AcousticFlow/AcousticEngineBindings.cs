@@ -679,6 +679,9 @@ namespace AcousticFlow
         public static extern void AF_DirectionBusDestroy(IntPtr bus);
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_DirectionBusSetHrtf(IntPtr bus, IntPtr hrtf, float headCircumferenceCm);
+        // 方向バスの低域と高域の境（Hz、既定 700）。0 で分けない（旧）。HRTF を差す前に
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern void AF_DirectionBusSetCrossover(IntPtr bus, float hz);
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern int AF_DirectionBusHasHrtf(IntPtr bus);
         [DllImport(Dll, CallingConvention = Cc)]
