@@ -59,6 +59,27 @@ int AF_WorldAddMaterialPreset(AF_WorldHandle w, int preset) {
     acoustic::flow::World* W = asWorld(w); if (!W) return -1;
     return W->rules.materials.add(presetMaterial(preset));
 }
+void AF_WorldSetBoxMaterial(AF_WorldHandle w, int box, int material) {
+    if (acoustic::flow::World* W = asWorld(w)) W->setBoxMaterial(box, material);
+}
+int AF_WorldUpdateMaterial(AF_WorldHandle w, int material, const float* tr, const float* ab, const float* sc) {
+    acoustic::flow::World* W = asWorld(w); if (!W) return 0;
+    if (material < 0 || material >= W->rules.materials.count()) return 0;
+    acoustic::AcousticMaterial m = W->rules.materials.get(material);
+    for (int b = 0; b < acoustic::kNumBands; ++b) {
+        if (tr) m.transmission[b] = tr[b];
+        if (ab) m.absorption[b] = ab[b];
+        if (sc) m.scattering[b] = sc[b];
+    }
+    return W->updateMaterial(material, m) ? 1 : 0;
+}
+int AF_WorldUpdateMaterialPreset(AF_WorldHandle w, int material, int preset) {
+    acoustic::flow::World* W = asWorld(w); if (!W) return 0;
+    return W->updateMaterial(material, presetMaterial(preset)) ? 1 : 0;
+}
+int AF_WorldMaterialCount(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->rules.materials.count() : 0;
+}
 
 void AF_WorldSetGpuTrace(AF_WorldHandle w, int on) {
     acoustic::flow::World* W = asWorld(w); if (!W) return;

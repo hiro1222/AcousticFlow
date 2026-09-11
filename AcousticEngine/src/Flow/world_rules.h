@@ -83,6 +83,13 @@ public:
         return materials_[static_cast<std::size_t>(id)];
     }
     int count() const { return static_cast<int>(materials_.size()); }
+    /// 中身を書き換える（実行中の調整用、2026-09-12）。0 番（既定の壁）も書き換えてよい。範囲外なら false。
+    ///   ★毎フレーム add で増やすと表が伸び続けるので、調整は必ずこちらで。
+    bool set(int id, const AcousticMaterial& m) {
+        if (id < 0 || id >= static_cast<int>(materials_.size())) return false;
+        materials_[static_cast<std::size_t>(id)] = m;
+        return true;
+    }
 private:
     std::vector<AcousticMaterial> materials_;
 };

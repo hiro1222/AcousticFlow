@@ -67,6 +67,11 @@ namespace AcousticFlow
 
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldAddMaterial(IntPtr w, float[] transmission6, float[] absorption6, float[] scattering6);
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldAddMaterialPreset(IntPtr w, int preset);
+        // 実行中の材質の調整（2026-09-12）。静的な箱に効く変更は次の Update で部屋を組み直す（1 回）。動く箱だけなら組み直さない
+        [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetBoxMaterial(IntPtr w, int box, int material);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldUpdateMaterial(IntPtr w, int material, [In] float[] transmission6, [In] float[] absorption6, [In] float[] scattering6);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldUpdateMaterialPreset(IntPtr w, int material, int preset);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldMaterialCount(IntPtr w);
 
         [DllImport(Dll, CallingConvention = Cc)] public static extern int AF_WorldAddBox(IntPtr w, AFVector3 center, AFVector3 halfExtents, AFVector3 axisX, AFVector3 axisY, int material, int dynamic);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetBoxTransform(IntPtr w, int box, AFVector3 center, AFVector3 axisX, AFVector3 axisY);

@@ -142,7 +142,9 @@ namespace AcousticFlow
         public IReadOnlyList<WorldVoice> Voices => _voices;
         public TailBusRenderer TailHost => _tail;
 
-        private struct Box { public Collider col; public int id; public bool dynamic; }
+        private struct Box { public Collider col; public int id; public bool dynamic; public int matId; public AcousticSurface surf; public string key; }
+        private int _defaultMatId = -1;                       // defaultMaterial の材質（実行中に書き換える）
+        private AcousticMaterialPreset _appliedDefault;
         private IntPtr _world;
         private readonly List<Box> _boxes = new List<Box>();
         private readonly List<WorldVoice> _voices = new List<WorldVoice>();
@@ -212,6 +214,51 @@ namespace AcousticFlow
             if (Instance == this) Instance = null;
         }
 
+        // ── 実行中の材質の調整（2026-09-12）──
+        //   Inspector の defaultMaterial と各 AcousticSurface の変化を拾い、エンジンの材質を書き換える（足さない）。
+        //   静的な箱に効く変更はエンジンが次の更新で部屋（RT60・ISM の面）を組み直す（1 回、数百 ms の引っかかり）。
+        //   動く箱（扉の板）だけの変更は組み直さず、透過・吸音・散乱はそのフレームから効く。
+        //   ★AcousticSurface を実行中に付け外しするのは拾わない（箱の登録は再生の前）。
+        private void ApplyMaterialChanges()
+        {
+            if (_defaultMatId >= 0 && defaultMaterial != _appliedDefault)
+            {
+                try { NativeWorld.AF_WorldUpdateMaterialPreset(_world, _defaultMatId, (int)defaultMaterial); }
+                catch (EntryPointNotFoundException) { return; }
+                _appliedDefault = defaultMaterial;
+                Debug.Log("[AcousticWorld] 既定の材質 → " + defaultMaterial + "（次の更新で部屋を組み直す）");
+            }
+            for (int i = 0; i < _boxes.Count; i++)
+            {
+                var b = _boxes[i];
+                if (b.surf == null) continue;
+                string key = SurfaceKey(b.surf);
+                if (key == b.key) continue;
+                try
+                {
+                    if (b.surf.mode == AcousticSurfaceMode.Preset) NativeWorld.AF_WorldUpdateMaterialPreset(_world, b.matId, (int)b.surf.material);
+                    else { var m = b.surf.Resolve(); NativeWorld.AF_WorldUpdateMaterial(_world, b.matId, m.transmission, m.absorption, m.scattering); }
+                }
+                catch (EntryPointNotFoundException) { return; }
+                b.key = key; _boxes[i] = b;
+                Debug.Log("[AcousticWorld] 材質を書き換え: " + b.surf.name + (b.dynamic ? "（動く箱: 組み直しなし）" : "（次の更新で部屋を組み直す）"));
+            }
+        }
+        private static string SurfaceKey(AcousticSurface s)
+        {
+            var sb = new System.Text.StringBuilder(96);
+            sb.Append((int)s.mode).Append('|').Append((int)s.material).Append('|')
+              .Append(s.absorptionScale.ToString("F3")).Append('|').Append(s.transmissionLossOffsetDb.ToString("F2"));
+            AppendBands(sb, s.customAbsorption); AppendBands(sb, s.customTransmissionLossDb); AppendBands(sb, s.customScattering);
+            return sb.ToString();
+        }
+        private static void AppendBands(System.Text.StringBuilder sb, float[] v)
+        {
+            sb.Append('|');
+            if (v == null) return;
+            for (int i = 0; i < v.Length; i++) sb.Append(v[i].ToString("F3")).Append(',');
+        }
+
         private bool IsDynamic(Collider col)
         {
             if (dynamicColliders.Contains(col)) return true;
@@ -234,28 +281,28 @@ namespace AcousticFlow
         {
             _boxes.Clear(); DynamicCount = 0;
             if (!autoCollectBoxColliders) return;
-            var cache = new Dictionary<AcousticMaterialPreset, int>();
+            // ★材質は「既定に 1 つ」＋「AcousticSurface の付いた面ごとに 1 つ」で、面どうしで共有しない（2026-09-12）。
+            //   実行中に Inspector で 1 面を変えたとき、同じプリセットの他の面を巻き込まずに書き換えられるように。
+            _defaultMatId = NativeWorld.AF_WorldAddMaterialPreset(_world, (int)defaultMaterial);
+            _appliedDefault = defaultMaterial;
             foreach (var col in FindObjectsByType<BoxCollider>(FindObjectsSortMode.None))
             {
                 if (col == null || !col.enabled) continue;
                 if (listener != null && col.transform.IsChildOf(listener)) continue;
                 if (col.GetComponentInParent<WorldVoice>() != null) continue;      // 音源の見た目の箱は壁にしない
-                int mat;
+                int mat; string key = null;
                 var surf = col.GetComponent<AcousticSurface>();
-                if (surf != null && surf.mode != AcousticSurfaceMode.Preset)
+                if (surf != null)
                 {
-                    var m = surf.Resolve();
-                    mat = NativeWorld.AF_WorldAddMaterial(_world, m.transmission, m.absorption, m.scattering);
+                    if (surf.mode == AcousticSurfaceMode.Preset) mat = NativeWorld.AF_WorldAddMaterialPreset(_world, (int)surf.material);   // 値はエンジンの表が正
+                    else { var m = surf.Resolve(); mat = NativeWorld.AF_WorldAddMaterial(_world, m.transmission, m.absorption, m.scattering); }
+                    key = SurfaceKey(surf);
                 }
-                else
-                {
-                    var preset = surf != null ? surf.material : defaultMaterial;
-                    if (!cache.TryGetValue(preset, out mat)) { mat = NativeWorld.AF_WorldAddMaterialPreset(_world, (int)preset); cache[preset] = mat; }
-                }
+                else mat = _defaultMatId;
                 ObbOf(col, out var center, out var half, out var right, out var up);
                 bool dyn = IsDynamic(col);
                 int id = NativeWorld.AF_WorldAddBox(_world, new AFVector3(center), new AFVector3(half), new AFVector3(right), new AFVector3(up), mat, dyn ? 1 : 0);
-                _boxes.Add(new Box { col = col, id = id, dynamic = dyn });
+                _boxes.Add(new Box { col = col, id = id, dynamic = dyn, matId = mat, surf = surf, key = key });
                 if (dyn) DynamicCount++;
             }
         }
@@ -296,6 +343,7 @@ namespace AcousticFlow
                 ObbOf(b.col, out var center, out _, out var right, out var up);
                 NativeWorld.AF_WorldSetBoxTransform(_world, b.id, new AFVector3(center), new AFVector3(right), new AFVector3(up));
             }
+            if ((Time.frameCount % 15) == 0) ApplyMaterialChanges();   // 実行中の材質の調整（0.25 s ごとに拾う）
             if (listener != null)
                 NativeWorld.AF_WorldSetListener(_world, new AFVector3(listener.position), new AFVector3(listener.forward), new AFVector3(listener.up));
             _w5[0] = weightDirect; _w5[1] = weightEarly; _w5[2] = weightLate; _w5[3] = weightDiffract; _w5[4] = weightTransmit;

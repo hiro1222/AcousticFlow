@@ -26,6 +26,14 @@ ACOUSTIC_API void AF_WorldDestroy(AF_WorldHandle w);
 ACOUSTIC_API int AF_WorldAddMaterial(AF_WorldHandle w, const float* transmission6, const float* absorption6, const float* scattering6);
 /* プリセット番号で足す（AF_MaterialPresetBands と同じ番号: 1 コンクリート 2 ガラス 3 不透過 4 木の扉 5 板張り 6 石 7 洞窟 8 雪。0 既定） */
 ACOUSTIC_API int AF_WorldAddMaterialPreset(AF_WorldHandle w, int preset);
+/* 実行中の材質の調整（2026-09-12）。箱の材質を差し替える／材質の中身を書き換える（プリセット番号でも可）。
+ * 静的な箱に効く変更は次の Update で部屋グラフ（RT60）と ISM の面を組み直す（1 回、数百 ms）。
+ * 動く箱（扉の板）だけに効く変更は組み直さない（透過・吸音・散乱はそのフレームから効く）。
+ * 戻り値は 1 で書けた（範囲外なら 0）。★調整で毎フレーム AddMaterial を呼ぶと表が伸び続けるので、必ずこちらで。 */
+ACOUSTIC_API void AF_WorldSetBoxMaterial(AF_WorldHandle w, int box, int material);
+ACOUSTIC_API int  AF_WorldUpdateMaterial(AF_WorldHandle w, int material, const float* transmission6, const float* absorption6, const float* scattering6);
+ACOUSTIC_API int  AF_WorldUpdateMaterialPreset(AF_WorldHandle w, int material, int preset);
+ACOUSTIC_API int  AF_WorldMaterialCount(AF_WorldHandle w);
 
 /* ── 面（箱）。axisX/axisY は正規直交、axisZ は外積で出す。dynamic=1 は動く物（部屋グラフと焼きから外す） ── */
 ACOUSTIC_API int  AF_WorldAddBox(AF_WorldHandle w, AF_Vector3 center, AF_Vector3 halfExtents,

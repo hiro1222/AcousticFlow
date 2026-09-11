@@ -1406,6 +1406,57 @@ void testRayCap() {
     check("[本数の上限] 上限を上げれば 8192 本に届く（AF_WorldSetMaxRaysPerEmitter が効く道）", open == 8192, buf);
 }
 
+// ================================ [材質] 実行中に材質を変える（AF_ONLY=material）
+//   Unity の Inspector で defaultMaterial や AcousticSurface を動かしたときの道。
+//   ① 静的な箱が使う材質を書き換えると、次の update で部屋を組み直し、RT60 が追う
+//   ② 動く箱（扉の板）だけが使う材質を書き換えても組み直さない
+//   ③ 箱の材質を差し替えると組み直す。同じ材質を入れ直しても組み直さない
+void testMaterialChange() {
+    std::printf("\n[材質] 実行中に材質を変えると部屋の響きが追う\n");
+    char buf[256];
+    const float dt = 1.0f / 60.0f;
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.05f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    World w;
+    const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+    for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+    w.addBox(doorLeaf(90.0f), lm, true);
+    w.raysPerEmitter = 64; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+    const Vec3 L(0, 1.6f, -3.0f);
+    w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+    w.addEmitter(Vec3(0, 1.6f, 3.0f), 0.2f);
+    w.build();
+    w.update(dt);
+    const int room = w.roomAt(L);
+    const int builds0 = w.buildCount();
+    const float rt0 = (room >= 0) ? w.probe(room).rt60[3] : 0.0f;
+    // ① 壁の材質の中身を吸う側へ
+    AcousticMaterial absorb = wall;
+    for (int b = 0; b < kNumBands; ++b) absorb.absorption[b] = 0.4f;
+    const bool okSet = w.updateMaterial(m2, absorb);
+    w.update(dt);
+    const float rt1 = (room >= 0) ? w.probe(room).rt60[3] : 0.0f;
+    std::snprintf(buf, sizeof(buf), "(組み直し %d → %d 回、部屋 %d の 1 kHz の RT60 %.2f → %.2f s)", builds0, w.buildCount(), room, rt0, rt1);
+    check("[材質] 壁の吸音を上げると次の update で組み直し、RT60 が短くなる", okSet && room >= 0 && w.buildCount() == builds0 + 1 && rt1 < rt0 * 0.5f, buf);
+    // ② 動く箱だけが使う材質
+    const int builds1 = w.buildCount();
+    AcousticMaterial door2 = AcousticMaterial::woodDoor();
+    for (int b = 0; b < kNumBands; ++b) door2.absorption[b] = 0.5f;
+    w.updateMaterial(lm, door2);
+    w.update(dt);
+    std::snprintf(buf, sizeof(buf), "(組み直し %d → %d 回)", builds1, w.buildCount());
+    check("[材質] 動く箱だけが使う材質を変えても組み直さない（透過・吸音はそのフレームから効く）", w.buildCount() == builds1, buf);
+    // ③ 箱の材質の差し替え
+    const int m3 = w.rules.materials.add(wall);
+    w.setBoxMaterial(0, m3);
+    w.update(dt);
+    const int builds2 = w.buildCount();
+    w.setBoxMaterial(0, m3);
+    w.update(dt);
+    std::snprintf(buf, sizeof(buf), "(差し替えで %d → %d 回、同じ材質の入れ直しで %d 回)", builds1, builds2, w.buildCount());
+    check("[材質] 箱の材質を差し替えると組み直し、同じ材質の入れ直しでは組み直さない", builds2 == builds1 + 1 && w.buildCount() == builds2, buf);
+}
+
 // ================================ [GPU] 計算デバイスの管が通るか（AF_ONLY=gpu）
 void testGpuPipe() {
     std::printf("\n[GPU] エンジン自前の計算デバイス ── 管が通るか\n");
@@ -2995,7 +3046,7 @@ int main() {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
-        {"budget", testBudget}, {"raycap", testRayCap}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
+        {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
         {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {

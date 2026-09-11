@@ -77,6 +77,29 @@ public:
         s.obb = obb;
         if (!s.dynamic) dirty_ = true;          // 静的な物を動かしたら部屋グラフを作り直す
     }
+    // ── 実行中の材質の調整（2026-09-12）──
+    //   部屋の RT60 は build で材質から出し（Sabine）、ISM の面の反射率も build で写す。だから静的な箱に効く変更は
+    //   dirty にして次の update で組み直す（部屋グラフの作り直し込みで数百 ms。調整のときだけなので許容）。
+    //   レイの場面（透過・吸音・散乱）と扉の板の覆いは毎フレーム材質を読むので、そちらはそのフレームから効く。
+    //   ★退けた書き方: 部屋グラフを作り直さずに RT60 だけ出し直す。部屋ごとの面積の内訳を部屋グラフが持っていないので、
+    //     出し直しにもボクセルの走査が要る。作り直しと大差ないので分けなかった。
+    /// 箱の材質を差し替える。静的な箱なら次の update で部屋を組み直す。同じ材質なら何もしない。
+    void setBoxMaterial(int box, int material) {
+        if (box < 0 || box >= surfaces.count() || material < 0 || material >= rules.materials.count()) return;
+        Surface& s = surfaces.at(box);
+        if (s.material == material) return;
+        s.material = material;
+        if (!s.dynamic) dirty_ = true;
+    }
+    /// 材質の中身を書き換える。その材質を使う静的な箱があれば次の update で部屋を組み直す。範囲外なら false。
+    bool updateMaterial(int material, const AcousticMaterial& m) {
+        if (!rules.materials.set(material, m)) return false;
+        for (int i = 0; i < surfaces.count(); ++i) {
+            const Surface& s = surfaces.at(i);
+            if (s.material == material && !s.dynamic && s.active) { dirty_ = true; break; }
+        }
+        return true;
+    }
 
     // ── 部屋 ──
     void build() {
