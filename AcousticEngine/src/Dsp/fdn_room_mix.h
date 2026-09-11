@@ -166,6 +166,17 @@ public:
         laneStride_ = maxFrames_ + kItdMax;
         laneRows_.assign(static_cast<std::size_t>(bus->rows()) * laneStride_, 0.0f);
         lanePrevN_ = 0;
+        // ★差す前に作った部屋のレーンの重みを、このバスのレーン数で揃え直す（2026-09-11）。
+        //   addRoom はバスが無いと kMaxLanes 本で一様（1/√kMaxLanes）にする。あとから少ないレーンのバスを差すと
+        //   鳴るのはバスのレーンだけで Σw² が 1 に足りず、**尾がそのぶん小さかった**（8 レーンなら半分 ＝ −3 dB）。
+        //   World も Unity も試聴の道具も「部屋を入れてからバスを差す」順なので、全部の尾に効いていた。
+        //   setListenerDirection は置くたびにバスのレーン数で正規化するので、向きを置く道（段 2-f の戸口越し）だけ
+        //   正しい量に戻り、切り替えの A/B が向きでなく量でずれていた（検査 [後期の向き] ⑧ で見つかった）。
+        const int nr = count_.load(std::memory_order_acquire);
+        for (int k = 0; k < nr; ++k) {
+            Room& r = *rooms_[static_cast<std::size_t>(k)];
+            renormLanes(r.laneCur); renormLanes(r.laneTgt); renormLanes(r.lanePend);
+        }
     }
     const DirectionBus* directionBus() const { return bus_; }
 
@@ -341,6 +352,20 @@ private:
     };
 
     bool valid(int room) const { return room >= 0 && room < count_.load(std::memory_order_acquire); }
+
+    // レーンの重みを、今のバスのレーン数 L の中で Σ² = 1 に揃える（L から先は 0）。全部 0 なら一様にする。
+    //   向きを置いた後なら向きは保つ（形はそのまま、量だけ揃える）。
+    void renormLanes(float* w) const {
+        const int L = bus_ ? std::min(bus_->lanes(), kMaxLanes) : kMaxLanes;
+        double e = 0.0;
+        for (int k = 0; k < kMaxLanes; ++k) {
+            if (k >= L) w[k] = 0.0f;
+            else e += static_cast<double>(w[k]) * w[k];
+        }
+        if (e <= 1e-12) { uniformLanes(w); return; }
+        const float g = static_cast<float>(1.0 / std::sqrt(e));
+        for (int k = 0; k < L; ++k) w[k] *= g;
+    }
 
     // 一様のレーンの重み（バスのレーン数で 1/√L。バスが無ければ 1/√kMaxLanes。どちらも Σ² = 1）。
     void uniformLanes(float* w) const {
