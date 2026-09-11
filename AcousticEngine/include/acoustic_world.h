@@ -104,6 +104,10 @@ ACOUSTIC_API int  AF_WorldLateThrough(AF_WorldHandle w);
  * 実行中に動かしてよい。 */
 ACOUSTIC_API void  AF_WorldSetDoorPull(AF_WorldHandle w, float pull);
 ACOUSTIC_API float AF_WorldDoorPull(AF_WorldHandle w);
+/* 壁越しの反射（既定 0 ＝ 通さない）。1 で旧: 壁を横切った反射と残響も透過率で薄めて届ける。
+ * 0 では壁を抜けるのは透過の直接音だけ。開いた戸口を通る分はどちらでも同じ。実行中に切り替えてよい。 */
+ACOUSTIC_API void AF_WorldSetWallReflect(AF_WorldHandle w, int on);
+ACOUSTIC_API int  AF_WorldWallReflect(AF_WorldHandle w);
 /* 尾のレーンの作り（既定 1）。実行中に切り替えられる（試聴の A/B）。
  *   0 耳ごとの行（点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる）
  *   1 点と拡散を分ける（点は 1 本の波形＋点の向きの ITD。自室＝広がり 1 は 0 と 1 ビットも同じ）

@@ -1457,6 +1457,87 @@ void testMaterialChange() {
     check("[材質] 箱の材質を差し替えると組み直し、同じ材質の入れ直しでは組み直さない", builds2 == builds1 + 1 && w.buildCount() == builds2, buf);
 }
 
+// ================================ [壁越し] 反射と残響は壁を抜けない（AF_ONLY=wall）
+//   試聴「壁の向こうの透過音がダブる」。壁を横切る影の線を数えないと、閉じた扉の向こうでは
+//   初期・後期がほぼ 0 になり、透過の直接音（解析）は変わらない。開いた戸口では通る分が残る。GPU も同じ。
+void testWallReflect() {
+    std::printf("\n[壁越し] 反射と残響は壁を抜けない（透過は直接だけ）\n");
+    char buf[256];
+    const float dt = 1.0f / 60.0f;
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    const Vec3 S(0.0f, 1.6f, 3.0f), L(0.0f, 1.6f, -3.0f);
+    struct Got { double early = 0.0, late = 0.0, transmit = 0.0, direct = 0.0; };
+    auto run = [&](float deg, int wallReflect, float clearance) {
+        Got g;
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        w.addBox(doorLeaf(deg, -0.5f, 1.0f, 3.0f, 0.06f, clearance), lm, true);
+        w.wallReflect = wallReflect;
+        w.raysPerEmitter = 2048; w.budget.cfg.maxPerEmitter = 2048; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+        w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w.addEmitter(S, 0.2f);
+        w.build();
+        for (int f = 0; f < 40; ++f) w.update(dt);
+        const Mix* mx = w.mix(e);
+        for (int b = 0; b < kNumBands; ++b) {
+            g.early += mx->component6[kEarly][b]; g.late += mx->component6[kLate][b];
+            g.transmit += mx->component6[kTransmit][b]; g.direct += mx->component6[kDirect][b];
+        }
+        return g;
+    };
+    // 閉じた扉の向こう（隙間 0）: 旧は反射と残響が透過率で薄まって届く。新は透過の直接音だけ ＝ 初期・後期は厳密に 0
+    const Got c1 = run(0.0f, 1, 0.0f), c0 = run(0.0f, 0, 0.0f);
+    std::snprintf(buf, sizeof(buf), "(閉扉・隙間 0: 初期 %.2e → %.2e、後期 %.2e → %.2e、透過の直接 %.2e → %.2e)",
+                  c1.early, c0.early, c1.late, c0.late, c1.transmit, c0.transmit);
+    check("[壁越し] 閉じた扉（隙間 0）の向こうでは初期と後期が 0 になり、透過の直接音は変わらない",
+          c0.early == 0.0 && c0.late == 0.0 && c0.transmit == c1.transmit && c1.late > 0.0, buf);
+    // 閉じた扉（Unity と同じ 4 mm の隙間）: 隙間は本物の開口なので、そこを通る反射・残響は残る。
+    //   ★4 mm をレイが引き当てるのはまれで、種によって旧の 0.1% だったり 11% だったりする（実測）。ここでは「旧より減る」だけを見る。
+    const Got g1 = run(0.0f, 1, 0.004f), g0 = run(0.0f, 0, 0.004f);
+    std::snprintf(buf, sizeof(buf), "(閉扉・隙間 4 mm: 初期＋後期 %.2e → %.2e ＝ 旧の %.1f%%。残りは隙間を通る本物の分)",
+                  g1.early + g1.late, g0.early + g0.late, (g1.early + g1.late > 0.0) ? (g0.early + g0.late) / (g1.early + g1.late) * 100.0 : 0.0);
+    check("[壁越し] 閉じた扉（隙間 4 mm）でも旧より減り、隙間を通る分だけが残る", g0.early + g0.late < g1.early + g1.late, buf);
+    // 開いた扉: 戸口を通る分は残る（減るのは開いた板を横切る分だけ）
+    const Got o1 = run(90.0f, 1, 0.004f), o0 = run(90.0f, 0, 0.004f);
+    std::snprintf(buf, sizeof(buf), "(全開: 初期 %.2e → %.2e、後期 %.2e → %.2e ＝ %+.2f dB、直接 %.2e → %.2e)",
+                  o1.early, o0.early, o1.late, o0.late, afti::dB(std::max(o0.late, 1e-30) / std::max(o1.late, 1e-30)), o1.direct, o0.direct);
+    check("[壁越し] 全開の戸口を通る分は残る（後期が −1 dB 以内、直接は同じ）",
+          o0.late > o1.late * 0.79 && o0.direct == o1.direct, buf);
+    // GPU も同じ判定
+    {
+        acoustic::gpu::GpuTracer gt;
+        if (!gt.init()) { std::printf("        GPU が使えないので GPU の突き合わせは飛ばします\n"); }
+        else {
+            World w;
+            const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+            for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+            w.addBox(doorLeaf(0.0f, -0.5f, 1.0f, 3.0f, 0.06f, 0.0f), lm, true);   // 隙間 0（構造の確認。隙間があると本物の分がまれに通る）
+            w.raysPerEmitter = 64; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+            w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+            w.addEmitter(S, 0.2f);
+            w.build(); w.update(dt);
+            const TraceScene& sc = w.traceScene();
+            TraceParams p; p.rays = 4096; p.maxBounces = 40; p.mixingSec = 0.03f; p.seed = 7u; p.wallReflect = 0;
+            TraceParams p1 = p; p1.wallReflect = 1;
+            EnergyTrace cpu;
+            const TraceResult rc = cpu.run(sc, S, L, p), rc1 = cpu.run(sc, S, L, p1);
+            TraceResult rg;
+            const bool ok = gt.upload(sc) && gt.run(sc, S, L, p, rg);
+            double lc = 0.0, lg = 0.0, l1 = 0.0, em = 0.0, ab = 0.0, rm = 0.0, es = 0.0;
+            for (int b = 0; b < kNumBands; ++b) {
+                lc += rc.late6[b] + rc.early6[b]; lg += rg.late6[b] + rg.early6[b]; l1 += rc1.late6[b] + rc1.early6[b];
+                em += rg.emitted6[b]; ab += rg.absorbed6[b]; rm += rg.remainder6[b]; es += rg.escaped6[b];
+            }
+            const double cons = std::fabs(em - (ab + rm + es)) / std::max(em, 1e-30);
+            std::snprintf(buf, sizeof(buf), "(閉扉・隙間 0: 旧 %.3e → 壁越しなし CPU %.3e / GPU %.3e。GPU の保存則のずれ %.1e)", l1, lc, lg, cons);
+            check("[壁越し] GPU でも閉じた扉（隙間 0）の向こうの反射は 0 になり、保存則が立つ",
+                  ok && lc == 0.0 && lg == 0.0 && l1 > 0.0 && cons < 1e-3, buf);
+        }
+    }
+}
+
 // ================================ [GPU] 計算デバイスの管が通るか（AF_ONLY=gpu）
 void testGpuPipe() {
     std::printf("\n[GPU] エンジン自前の計算デバイス ── 管が通るか\n");
@@ -1740,6 +1821,7 @@ void testManySources() {
     //   AF_MAX_PER だけを上げても、予算の元になる raysPerEmitter が 256 のままなので増えない。
     { const char* r = std::getenv("AF_RAYS"); const int nr = r ? std::atoi(r) : 256;
       w.raysPerEmitter = nr; w.budget.cfg.maxPerEmitter = std::max(nr, w.budget.cfg.maxPerEmitter); }
+    if (const char* wr = std::getenv("AF_WALL_REFLECT")) w.wallReflect = std::atoi(wr);   // 壁越しの反射 0/1
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     { const char* tr = std::getenv("AF_TOTAL_RAYS"); if (tr) w.budget.cfg.totalRays = std::atoi(tr); }
     { const char* gp = std::getenv("AF_GPU"); if (gp) w.gpuTrace = std::atoi(gp); }
@@ -2842,6 +2924,7 @@ void testDoorSweep() {
     //   AF_MAX_PER だけを上げても、予算の元になる raysPerEmitter が 256 のままなので増えない。
     { const char* r = std::getenv("AF_RAYS"); const int nr = r ? std::atoi(r) : 256;
       w.raysPerEmitter = nr; w.budget.cfg.maxPerEmitter = std::max(nr, w.budget.cfg.maxPerEmitter); }
+    if (const char* wr = std::getenv("AF_WALL_REFLECT")) w.wallReflect = std::atoi(wr);   // 壁越しの反射 0/1
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     if (const char* lk = std::getenv("AF_LEAK")) w.leakModel = std::atoi(lk);   // 漏れの模型 0/1/2/3
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 1;
@@ -2934,13 +3017,15 @@ void testClicks() {
         World w;
         const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
         for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
-        const int leaf = w.addBox(doorLeaf(0.0f), lm, true);
+        const float clear = std::getenv("AF_CLEAR") ? static_cast<float>(std::atof(std::getenv("AF_CLEAR"))) : 0.0f;   // 枠との隙間（Unity は 4 mm）
+        const int leaf = w.addBox(doorLeaf(0.0f, -0.5f, 1.0f, 3.0f, 0.06f, clear), lm, true);
     // ★AF_RAYS は「1 音源の本数」を直に決める（上限も一緒に上げる）。
     //   AF_MAX_PER だけを上げても、予算の元になる raysPerEmitter が 256 のままなので増えない。
     { const char* r = std::getenv("AF_RAYS"); const int nr = r ? std::atoi(r) : 256;
       w.raysPerEmitter = nr; w.budget.cfg.maxPerEmitter = std::max(nr, w.budget.cfg.maxPerEmitter); }
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     if (const char* lk = std::getenv("AF_LEAK")) w.leakModel = std::atoi(lk);   // 漏れの模型 0/1/2/3
+    if (const char* wr = std::getenv("AF_WALL_REFLECT")) w.wallReflect = std::atoi(wr);   // 壁越しの反射 0/1
         if (const char* lt = std::getenv("AF_LATE_THROUGH")) w.lateThrough = std::atoi(lt);   // 戸口越しの後期 0/1（段 2-f）
         w.budget.cfg.totalRays = (which == 3) ? 0 : 1536;
         w.rayGroups = (which == 2 || which == 3) ? 1 : 4;
@@ -2973,7 +3058,7 @@ void testClicks() {
             if (k > 30) {                                     // 立ち上がりを流してから動かす
                 const float el = t - 30 * dt;
                 if (motion == 0 || motion == 1) { L.z = -4.0f + 1.4f * el; w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0)); }
-                if (motion == 0 || motion == 2) w.setBoxTransform(leaf, doorLeaf(std::min(90.0f, 30.0f * el)));
+                if (motion == 0 || motion == 2) w.setBoxTransform(leaf, doorLeaf(std::min(90.0f, 30.0f * el), -0.5f, 1.0f, 3.0f, 0.06f, clear));
             }
             w.update(dt);
             if (w.fdnStale()) { w.bindFdn(&fdn); }
@@ -3046,7 +3131,7 @@ int main() {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
-        {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
+        {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"wall", testWallReflect}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
         {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {

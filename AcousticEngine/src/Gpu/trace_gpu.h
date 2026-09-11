@@ -59,7 +59,8 @@ struct PackEmit { float source[3]; float e0;
 struct PackCb   { float listener[3]; float pad0;
                   std::uint32_t boxCount, nodeCount, itemCount, blockCount;
                   float roomOrigin[3]; float roomCell;                                   // 段 2-f
-                  std::int32_t roomNx, roomNy, roomNz, listenerRoom; };
+                  std::int32_t roomNx, roomNy, roomNz, listenerRoom;
+                  std::int32_t wallReflect, pad1, pad2, pad3; };
 
 /// 1 回のディスパッチに載せる 1 音源ぶんの注文。
 ///   out は**足し込み先**（直接音を入れた TraceResult をそのまま渡す。反射だけを足す）。
@@ -190,6 +191,7 @@ public:
         cb.roomCell = sc.roomCell;
         cb.roomNx = sc.roomVox.empty() ? 0 : sc.roomNx; cb.roomNy = sc.roomNy; cb.roomNz = sc.roomNz;
         cb.listenerRoom = jobs[0].prm.listenerRoom;
+        cb.wallReflect = jobs[0].prm.wallReflect;
         if (!dev_.setConstants(&cb, sizeof(cb))) { err_ = dev_.error(); return false; }
         // 3) 流して読み戻す
         if (block_.empty()) return true;                       // 走る本が 1 本も無いフレーム

@@ -85,6 +85,11 @@ namespace AcousticFlow
         //   総量は変えない。0 ＝ レイの割合のまま。壁の陰では戸口から直接が 1% 台で全方向に負けるので、耳で決める。配分タブの割合を見ながら動かす。
         [Tooltip("戸口寄せ（0..1、既定 0）。自分の部屋へ流す響きのうち、戸口から直接鳴らす側へ移す割合。総量は変えない。実行中に動かせる")]
         [Range(0f, 1f)] public float doorPull = 0f;
+        // 壁越しの反射（2026-09-12、既定 切）。入れると旧: 壁を横切った反射と残響も透過率で薄めて届ける
+        //   （向こうの部屋の反射÷直接の比がそのまま残り、透過の直接音の数 ms 後ろに写しが立って「ダブる」）。
+        //   切ると壁を抜けるのは透過の直接音だけ。開いた戸口を通る分はどちらでも同じ。
+        [Tooltip("壁越しの反射（既定 切）。入れると旧: 壁を横切った反射と残響も薄めて届ける。切ると壁を抜けるのは透過の直接音だけ。実行中に変えられる")]
+        public bool wallReflections = false;
 
         // 尾のレーンの作り（方向バスへ載せる尾）
         //   0 耳ごとの行（旧）: 点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる
@@ -379,6 +384,7 @@ namespace AcousticFlow
             NativeWorld.AF_WorldSetLeakModel(_world, leakModel);   // 実行中に切り替えられる（試聴の A/B）
             NativeWorld.AF_WorldSetLateThrough(_world, lateThroughMode);   // 同上
             NativeWorld.AF_WorldSetDoorPull(_world, doorPull);             // 同上
+            NativeWorld.AF_WorldSetWallReflect(_world, wallReflections ? 1 : 0);   // 同上
             NativeWorld.AF_WorldSetLaneModel(_world, laneModel);           // 同上
             NativeWorld.AF_WorldSetGpuTrace(_world, gpuTrace ? 1 : 0);
             GpuActive = NativeWorld.AF_WorldGpuActive(_world) != 0;

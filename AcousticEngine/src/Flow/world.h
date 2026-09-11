@@ -164,6 +164,10 @@ public:
     ///   0 ＝ レイの割合のまま（既定）。1 ＝ 戸口から入った分を全部戸口から鳴らす（自分の部屋の響きは戸口を通らなかった分だけ）。
     ///   総量は変えない。実行中に動かしてよい（distribute の平滑した値に掛かるので段にならない）。
     float doorPull = 0.0f;
+    /// 壁越しの反射（2026-09-12）。**既定 0 ＝ 通さない。**1 で旧（壁を横切った影の線も τ を掛けて初期・後期に数える）。
+    ///   試聴「壁の向こうの透過音がダブる。反射や残響は壁を抜けないから、透過は直接だけにしてほしい」。
+    ///   壁を抜けるのは解析で出す透過の直接音（distribute の kTransmit）だけになる。開いた戸口を通る分は変わらない。
+    int wallReflect = 0;
     /// 尾のレーンの作り（FdnRoomMix::setLaneModel、2026-09-12）。**既定 1。**実行中に切り替えてよい（試聴の A/B）。
     ///   0 耳ごとの行（88d5f0b〜）: 点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる
     ///   1 点と拡散を分ける: 点は 1 本の波形＋点の向きの ITD。自室（広がり 1）は 0 と 1 ビットも同じ
@@ -338,6 +342,7 @@ public:
             prm.rays = bs.rays; prm.maxBounces = light ? std::min(maxBounces, 12) : maxBounces; prm.mixingSec = mixingSec;
             prm.seed = static_cast<std::uint32_t>(s.em.id + 1) * 0x9E3779B1u;    // 音源ごとに固定
             prm.listenerRoom = (lateThrough != 0) ? lroom : -1;                  // 段 2-f。-1 なら出どころを分けない（今までと 1 ビットも同じ）
+            prm.wallReflect = wallReflect;
             // フレーム分散（設計文書 Ⅶ）: 組を 1 つだけ飛ばし、残りは前回の結果を使う。
             //   本数が変わったら組を全部作り直す（重み 1/rays が変わるので混ぜられない）。
             const int G = std::max(1, std::min(rayGroups, TraceGroups::kMax));

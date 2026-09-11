@@ -111,6 +111,12 @@ void AF_WorldSetDoorPull(AF_WorldHandle w, float pull) {
 float AF_WorldDoorPull(AF_WorldHandle w) {
     acoustic::flow::World* W = asWorld(w); return W ? W->doorPull : 0.0f;
 }
+void AF_WorldSetWallReflect(AF_WorldHandle w, int on) {
+    if (acoustic::flow::World* W = asWorld(w)) W->wallReflect = (on != 0) ? 1 : 0;
+}
+int AF_WorldWallReflect(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->wallReflect : 0;
+}
 int AF_WorldLateThrough(AF_WorldHandle w) {
     acoustic::flow::World* W = asWorld(w); return W ? W->lateThrough : 0;
 }

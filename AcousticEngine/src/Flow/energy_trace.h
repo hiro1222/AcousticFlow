@@ -109,6 +109,17 @@ struct TraceParams {
     //   別の部屋（戸口越し）の分を lateOther6 と otherDir に**足す**。late6 は総量のまま変えない。
     //   -1 なら分けない（今までと 1 ビットも同じ）。
     int   listenerRoom = -1;
+    // ── 壁越しの反射（2026-09-12）──
+    //   1 なら旧: 影の線が壁を横切っても τ を掛けて初期・後期に数える（向こうの部屋の反射と残響が壁越しに薄まって届く）。
+    //   0 なら壁を横切った分は数えない。壁を抜けるのは解析で出す透過の直接音だけになる（World の既定）。
+    //   ★試聴「壁の向こうの透過音がダブる」: 壁を通る分は直接も反射も同じ τ で縮むので、向こうの部屋の
+    //     反射÷直接の比がそのまま残り、透過の直接音の数 ms 後ろに「方向なしの初期」の写しが 1 本立っていた。
+    //   開いた戸口を通る影の線は横切りが無いので今までどおり通る。扉が開くにつれて通る本数が連続に増える。
+    //   ★影の線だけ止めても 12% しか減らなかった（実測）。大半は**レイそのものが壁を透過して**隣の部屋に入り、そこで
+    //     反射した分（ロシアンルーレットの「透過」）。閉じた扉の向こうでは透過の直接音の 8 倍あった。だから 0 では
+    //     レイの透過も止める（当たったら反射だけ。透過するはずだった分は帳簿の escaped6 へ ＝ 保存則は保つ）。
+    //     当たった面の裏側にいる耳へ、その面を通して届く分（NEE の !front）も止める。
+    int   wallReflect = 1;
 };
 
 struct TraceResult {
@@ -120,6 +131,7 @@ struct TraceResult {
     float directDist = 0.0f;            // 直接音の距離
     int   directCrossings = 0;          // 直線が横切った壁の枚数（情報）
     // 帳簿（レイ側）。保存則: emitted = absorbed + remainder + escaped
+    //   escaped は「場面の外へ逃げた分」＋ wallReflect=0 のとき「壁の向こうへ抜けたので数えない分」
     double emitted6[kNumBands] = {}, absorbed6[kNumBands] = {}, remainder6[kNumBands] = {}, escaped6[kNumBands] = {};
     int   raysTraced = 0, hits = 0, neeVisible = 0;
     // 後期の出どころ（段 2-f）。lateOther6 は late6 の内訳（戸口越しの面から来た分）。
@@ -229,7 +241,8 @@ inline void traceRay(const TraceScene& sc,
                 const float geo = cosT / (kPi * d * d);
                 bool any = false;
                 float c6[kNumBands] = {};
-                for (int b = 0; b < kNumBands; ++b) {
+                const bool passWall = (prm.wallReflect != 0 || (cr == 0 && front));   // 壁を横切る影の線と、面の裏側への分は数えない（上の■）
+                for (int b = 0; passWall && b < kNumBands; ++b) {
                     const float eSide = e[b] * (front ? sp[b].reflect : sp[b].transmit);
                     const float c = eSide * geo * tr[b] * airEnergy(b, pathLen + d);
                     if (c <= 0.0f) continue;
@@ -257,10 +270,13 @@ inline void traceRay(const TraceScene& sc,
             }
         }
         // ── 続きの経路: 反射か透過か（確率で片方、重みは r+t）──
-        const float carry = rMean + tMean;
+        //   wallReflect=0 では透過を引かない（反射だけ、重みは r）。透過するはずだった分は「壁の向こうへ抜けた」として escaped6 へ。
+        const bool passWallRay = (prm.wallReflect != 0);
+        if (!passWallRay) for (int b = 0; b < kNumBands; ++b) out.escaped6[b] += e[b] * sp[b].transmit;
+        const float carry = passWallRay ? (rMean + tMean) : rMean;
         if (carry <= 1e-6f) { terminated = true; break; }
-        const bool goReflect = rand01(rng) < (rMean / carry);
-        for (int b = 0; b < kNumBands; ++b) e[b] *= (sp[b].reflect + sp[b].transmit);
+        const bool goReflect = passWallRay ? (rand01(rng) < (rMean / carry)) : true;
+        for (int b = 0; b < kNumBands; ++b) e[b] *= passWallRay ? (sp[b].reflect + sp[b].transmit) : sp[b].reflect;
         float eMax = 0.0f; for (int b = 0; b < kNumBands; ++b) eMax = std::max(eMax, e[b]);
         if (eMax < e0 * 1e-4f) { for (int b = 0; b < kNumBands; ++b) out.remainder6[b] += e[b]; terminated = true; break; }
         if (goReflect) {

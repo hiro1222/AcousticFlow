@@ -77,6 +77,7 @@ cbuffer Cb : register(b0) {
     uint   gBoxCount; uint gNodeCount; uint gItemCount; uint gBlockCount;
     float3 gRoomOrigin; float gRoomCell;
     int    gRoomNx; int gRoomNy; int gRoomNz; int gListenerRoom;   // gListenerRoom < 0 なら出どころを分けない
+    int    gWallReflect; int gPad1; int gPad2; int gPad3;          // 0 なら壁を横切る影の線を数えない（CPU の wallReflect）
 };
 
 static const float kPi = 3.14159265358979f;
@@ -195,8 +196,8 @@ Hit nearestHit(float3 o, float3 d, float maxDist, int skip) {
 // τ の積。★CPU は添字の昇順に掛けるが、GPU は歩いた順にそのまま掛ける。
 //   掛け算は値として可換なので、違いは丸めの末尾だけ（相対 1e-7 くらい）。
 //   局所配列を動的に書かない形にするため、ここは順を揃えない。
-void transmitTau(float3 p0, float3 p1, int skip, out float3 tauLo, out float3 tauHi) {
-    tauLo = float3(1, 1, 1); tauHi = float3(1, 1, 1);
+void transmitTau(float3 p0, float3 p1, int skip, out float3 tauLo, out float3 tauHi, out int crossed) {
+    tauLo = float3(1, 1, 1); tauHi = float3(1, 1, 1); crossed = 0;
     float3 dv = p1 - p0;
     float len = length(dv);
     if (len <= kEps) return;
@@ -215,6 +216,7 @@ void transmitTau(float3 p0, float3 p1, int skip, out float3 tauLo, out float3 ta
                 if (t <= 0.0f || t >= len) continue;
                 int mi = gObb[i].material;
                 tauLo *= gMat[mi].tranLo; tauHi *= gMat[mi].tranHi;
+                crossed = 1;
             }
         } else if (sp + 2 <= 64) {
             stack[sp++] = nd.left; stack[sp++] = nd.right;
@@ -272,7 +274,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             float cosT = abs(cosF);
             float3 side = front ? nFace : -nFace;            // リスナーの側（放射する面の向き）
             float3 org = h.p + side * kEps;
-            float3 trLo, trHi; transmitTau(org, gListener, h.index, trLo, trHi);
+            float3 trLo, trHi; int crossed; transmitTau(org, gListener, h.index, trLo, trHi, crossed);
+            if (gWallReflect == 0 && (crossed != 0 || !front)) { trLo = float3(0, 0, 0); trHi = float3(0, 0, 0); }   // 壁越しと面の裏側は通さない
             float tSec = (pathLen + dL) / kSpeed;
             float geo = cosT / (kPi * dL * dL);
             float3 sideLo = eLo * (front ? rLo : tLo);
@@ -296,10 +299,12 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 if (o.firstSec < 0.0f || tSec < o.firstSec) o.firstSec = tSec;
             }
         }
-        float carry = rMean + tMean;
+        // wallReflect=0 では透過を引かない（CPU の traceRay と同じ。抜けるはずだった分は escaped へ）
+        float carry = (gWallReflect != 0) ? (rMean + tMean) : rMean;
+        if (gWallReflect == 0) { o.escLo += eLo * tLo; o.escHi += eHi * tHi; }
         if (carry <= 1e-6f) { terminated = true; break; }
-        bool goReflect = rand01(rng) < (rMean / carry);
-        eLo *= (rLo + tLo); eHi *= (rHi + tHi);
+        bool goReflect = (gWallReflect != 0) ? (rand01(rng) < (rMean / carry)) : true;
+        if (gWallReflect != 0) { eLo *= (rLo + tLo); eHi *= (rHi + tHi); } else { eLo *= rLo; eHi *= rHi; }
         float eMax = max(max(max(eLo.x, eLo.y), max(eLo.z, eHi.x)), max(eHi.y, eHi.z));
         if (eMax < em.e0 * 1e-4f) { o.remLo += eLo; o.remHi += eHi; terminated = true; break; }
         if (goReflect) {
