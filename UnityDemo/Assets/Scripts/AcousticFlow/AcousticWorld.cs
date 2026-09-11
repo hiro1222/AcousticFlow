@@ -81,6 +81,10 @@ namespace AcousticFlow
         //   2 戸口の線音源（既定）: 向こうの部屋の響きを戸口の横幅から HRTF で鳴らし、耳の部屋の響きも戸口の音から鳴り始める
         [Tooltip("隣の部屋の響きの鳴らし方。0 旧（一様）/ 1 戸口の向きの点 / 2 戸口の線音源（既定）。実行中に変えられる")]
         [Range(0, 2)] public int lateThroughMode = 2;
+        // 戸口寄せ（2026-09-12）。lateThroughMode 2 のとき、自分の部屋へ流す響きのうちこの割合を戸口の線音源から直接鳴らす。
+        //   総量は変えない。0 ＝ レイの割合のまま。壁の陰では戸口から直接が 1% 台で全方向に負けるので、耳で決める。配分タブの割合を見ながら動かす。
+        [Tooltip("戸口寄せ（0..1、既定 0）。自分の部屋へ流す響きのうち、戸口から直接鳴らす側へ移す割合。総量は変えない。実行中に動かせる")]
+        [Range(0f, 1f)] public float doorPull = 0f;
 
         // 尾のレーンの作り（方向バスへ載せる尾）
         //   0 耳ごとの行（旧）: 点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる
@@ -300,6 +304,7 @@ namespace AcousticFlow
             NativeWorld.AF_WorldSetRays(_world, raysPerEmitter, maxBounces);
             NativeWorld.AF_WorldSetLeakModel(_world, leakModel);   // 実行中に切り替えられる（試聴の A/B）
             NativeWorld.AF_WorldSetLateThrough(_world, lateThroughMode);   // 同上
+            NativeWorld.AF_WorldSetDoorPull(_world, doorPull);             // 同上
             NativeWorld.AF_WorldSetLaneModel(_world, laneModel);           // 同上
             NativeWorld.AF_WorldSetGpuTrace(_world, gpuTrace ? 1 : 0);
             GpuActive = NativeWorld.AF_WorldGpuActive(_world) != 0;

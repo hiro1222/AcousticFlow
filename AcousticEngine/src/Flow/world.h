@@ -137,6 +137,10 @@ public:
     ///     戸口の線音源から耳の部屋の FDN へ流す）。試聴の指摘「向こうの部屋の残響が全体から聞こえすぎ」から。
     ///   ★2 でも、耳の部屋と戸口で繋がっていない部屋（部屋が割れない 1.2 m の戸口など）は 1 の形に落ちる。
     int lateThrough = 2;
+    /// 戸口寄せ（2026-09-12）。lateThrough=2 のとき、耳の部屋へ流す分のうちこの割合を戸口の線音源から直接鳴らす。
+    ///   0 ＝ レイの割合のまま（既定）。1 ＝ 戸口から入った分を全部戸口から鳴らす（自分の部屋の響きは戸口を通らなかった分だけ）。
+    ///   総量は変えない。実行中に動かしてよい（distribute の平滑した値に掛かるので段にならない）。
+    float doorPull = 0.0f;
     /// 尾のレーンの作り（FdnRoomMix::setLaneModel、2026-09-12）。**既定 1。**実行中に切り替えてよい（試聴の A/B）。
     ///   0 耳ごとの行（88d5f0b〜）: 点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる
     ///   1 点と拡散を分ける: 点は 1 本の波形＋点の向きの ITD。自室（広がり 1）は 0 と 1 ビットも同じ
@@ -382,6 +386,7 @@ public:
                 const int door = (lateThrough == 2 && er >= 0 && er < static_cast<int>(doorOf_.size())) ? doorOf_[static_cast<std::size_t>(er)] : -1;
                 in.doorSource = (door >= 0);
                 in.doorFeed = (door >= 0) ? openFrac_[static_cast<std::size_t>(door)] : 0.0f;
+                in.doorPull = doorPull;
             }
             s.mixer.run(in, s.mix);
         };

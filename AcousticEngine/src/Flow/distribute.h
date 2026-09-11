@@ -64,6 +64,7 @@ struct DistributeInput {
     int sourceRoom = -1;                   // 段 2-f。耳と違う部屋なら、戸口越しの後期をこの部屋の FDN へ向き付きで送る
     bool  doorSource = false;              // 段 2-g。音源の部屋と耳の部屋が戸口で繋がり、戸口の線音源で鳴らすか
     float doorFeed = 0.0f;                 // 段 2-g。耳の部屋の分のうち戸口から入った割合（＝その戸口の開き具合 0..1）
+    float doorPull = 0.0f;                 // 戸口寄せ（2026-09-12）。耳の部屋へ流す分のうち、戸口の線音源から直接鳴らす側へ移す割合 0..1
     const WorldWeights* weights = nullptr; // nullptr なら全部 1
     const Response* response = nullptr;    // nullptr なら既定
     float dt = 1.0f / 60.0f;
@@ -191,9 +192,14 @@ public:
                 FdnSend* o = out.pushSend();
                 if (o) {
                     o->room = in.sourceRoom;
+                    // 戸口寄せ: 耳の部屋へ流す分（(1−thru)·feed）のうち pull を、戸口から直接鳴らす側（thru6）へ移す。
+                    //   ★総量（e6）は変えない。レイの割合から離れる調整なので、量は耳で決める（既定 0 ＝ 物理の割合のまま）。
+                    //     根拠: 耳は先に届いた音で定位を決める（先行音効果）。壁の陰では戸口から直接の分が総量の 1% 台になり、
+                    //     自分の部屋の響き（全方向）に −19 dB で負けていた（試聴 2026-09-12、配分タブ）。
+                    const float pull = std::min(1.0f, std::max(0.0f, in.doorPull));
                     for (int b = 0; b < kNumBands; ++b) {
                         o->e6[b] = sm[kLate][b] * W.w[kLate] * (thru[b] + (1.0f - thru[b]) * feed);
-                        o->thru6[b] = sm[kLate][b] * W.w[kLate] * thru[b];
+                        o->thru6[b] = sm[kLate][b] * W.w[kLate] * (thru[b] + (1.0f - thru[b]) * feed * pull);
                     }
                     float mass = 0.0f;
                     for (int b = 0; b < kNumBands; ++b) mass += T.lateOther6[b];

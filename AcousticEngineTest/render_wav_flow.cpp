@@ -129,6 +129,7 @@ int main(int argc, char** argv) {
     const int emitter = AF_WorldAddEmitter(w, S, srcR);
     // 部屋の粒度。戸口は 1.2 m なので、割るには一辺がその 1/4 以下ほしい。
     if (const char* rc = std::getenv("AF_ROOM_CELL")) AF_WorldSetRoomCell(w, static_cast<float>(std::atof(rc)));
+    if (const char* dp = std::getenv("AF_DOOR_PULL")) AF_WorldSetDoorPull(w, static_cast<float>(std::atof(dp)));   // 戸口寄せ 0..1
     // 五成分の重み（直接・初期・後期・回折・透過）。AF_WEIGHTS="1,1,0,1,1" で後期を止める、など。
     //   ★色や広がりがどこから来ているかを切り分けるための摘み。既定は全部 1。
     if (const char* wv = std::getenv("AF_WEIGHTS")) {

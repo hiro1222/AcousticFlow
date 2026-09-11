@@ -2349,6 +2349,29 @@ void testDoorLineSource() {
         std::snprintf(buf, sizeof(buf), "(2〜4 秒 %.3e → 最後の 2 秒 %.3e ＝ %+.2f dB)", h.earlyE, h.lateE, grow);
         check("[戸口の線音源] 戸口を行き来し続けても量が増え続けない（+6 dB 未満）", grow < 6.0, buf);
     }
+    // ⑦ 戸口寄せ: 耳の部屋へ流す分を戸口から直接へ移しても、送りの総量は 1 ビットも変わらない
+    {
+        double tot[3] = {}, thru[3] = {};
+        const float pulls[3] = {0.0f, 0.5f, 1.0f};
+        for (int k = 0; k < 3; ++k) {
+            World w; const Vec3 L(0.0f, 1.6f, -3.0f);
+            const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+            for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+            w.addBox(doorLeaf(90.0f), lm, true);
+            w.lateThrough = 2; w.doorPull = pulls[k];
+            w.raysPerEmitter = 512; w.budget.cfg.maxPerEmitter = 512; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+            w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+            const int e = w.addEmitter(S, 0.2f);
+            w.build();
+            for (int f = 0; f < 60; ++f) w.update(1.0f / 60.0f);
+            const Mix* mx = w.mix(e);
+            for (int i = 0; i < mx->sendCount; ++i)
+                for (int b = 0; b < kNumBands; ++b) { tot[k] += mx->sends[i].e6[b]; thru[k] += mx->sends[i].thru6[b]; }
+        }
+        std::snprintf(buf, sizeof(buf), "(戸口から直接の割合 寄せ 0: %.1f%% / 0.5: %.1f%% / 1: %.1f%%、総量 %.4e / %.4e / %.4e)",
+                      thru[0] / tot[0] * 100.0, thru[1] / tot[1] * 100.0, thru[2] / tot[2] * 100.0, tot[0], tot[1], tot[2]);
+        check("[戸口の線音源] 戸口寄せは戸口から直接の分を増やし、総量は変えない", tot[0] == tot[1] && tot[1] == tot[2] && thru[1] > thru[0] && thru[2] > thru[1], buf);
+    }
 }
 
 /// 【探り】戸口に聞き手の探針を置いたら何が聞こえるか（AF_ONLY=doorprobe）
@@ -2522,7 +2545,9 @@ void testLateOrigin() {
     const int rays = rs ? std::atoi(rs) : 8192;
     std::printf("\n[探り] 後期はどこから来るか ── 耳と同じ部屋の面か、戸口越しの向こうの面か（レイ %d 本）\n", rays);
     AcousticMaterial wall = AcousticMaterial::defaultWall();
-    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    // AF_WALL_ABSORB=<吸音率> で壁の吸音を変える（既定 0.2。Unity の Concrete は 0.02〜0.05 なので、戸口越しの割合が場面でどう動くかを見る）
+    { const char* ab = std::getenv("AF_WALL_ABSORB"); const float a = ab ? static_cast<float>(std::atof(ab)) : 0.2f;
+      for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = a; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; } }
     const Vec3 S(0.0f, 1.6f, 3.0f);
     const Vec3 doorC(0.0f, 1.5f, 0.0f);
     std::printf("        %5s %14s | %9s | %7s %7s %7s | %6s %7s | %6s\n",

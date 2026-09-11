@@ -92,6 +92,10 @@ ACOUSTIC_API void AF_WorldSetLeakModel(AF_WorldHandle w, int model);
  * 同じ部屋の音源はどれでも変わらない。2 でも戸口で繋がっていない部屋は 1 の形になる。 */
 ACOUSTIC_API void AF_WorldSetLateThrough(AF_WorldHandle w, int on);
 ACOUSTIC_API int  AF_WorldLateThrough(AF_WorldHandle w);
+/* 戸口寄せ（0..1、既定 0）。lateThrough=2 のとき、耳の部屋へ流す分のうちこの割合を戸口の線音源から直接鳴らす。総量は変えない。
+ * 実行中に動かしてよい。 */
+ACOUSTIC_API void  AF_WorldSetDoorPull(AF_WorldHandle w, float pull);
+ACOUSTIC_API float AF_WorldDoorPull(AF_WorldHandle w);
 /* 尾のレーンの作り（既定 1）。実行中に切り替えられる（試聴の A/B）。
  *   0 耳ごとの行（点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる）
  *   1 点と拡散を分ける（点は 1 本の波形＋点の向きの ITD。自室＝広がり 1 は 0 と 1 ビットも同じ）
