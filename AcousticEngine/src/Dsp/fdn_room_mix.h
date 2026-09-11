@@ -128,6 +128,7 @@ public:
             for (int k = 0; k < kPortalPoints; ++k) p.hp[k] = std::make_unique<HrtfProcessor>(fs_);
             p.sig.assign(static_cast<std::size_t>(kPortalPoints) * static_cast<std::size_t>(maxFrames_), 0.0f);
             p.tmp.assign(static_cast<std::size_t>(maxFrames_), 0.0f);
+            p.feed.assign(static_cast<std::size_t>(maxFrames_), 0.0f);
             p.scratchL.assign(static_cast<std::size_t>(maxFrames_), 0.0f);
             p.scratchR.assign(static_cast<std::size_t>(maxFrames_), 0.0f);
         }
@@ -763,6 +764,7 @@ private:
         float lpShared = 0.0f, lpOwn[kPortalPoints] = {};   // 低域の相関（setPortalCoherence）の一次 LP の状態
         std::unique_ptr<HrtfProcessor> hp[kPortalPoints];
         std::vector<float> sig;                         // [点][maxFrames] 点ごとのモノラル（行 × 帯域の重み）
+        std::vector<float> feed;                        // 耳の部屋へ流す分（真ん中の点の、低域の相関の処理より前の信号）
         std::vector<float> tmp, scratchL, scratchR;
     };
     Portal portals_[kMaxPortals];
@@ -809,6 +811,12 @@ private:
                         sig[i] = acc * kSqrt2;
                     }
                 }
+            }
+            // 耳の部屋へ流す分は、下の相関の処理より前の真ん中の信号を取っておく。
+            //   ★処理後の信号を流すと、共有する低域が 1/Σg（5 点で −7 dB）に縮んだまま部屋へ入り、後期が −2.2 dB 足りなくなった（実測）。
+            {
+                const float* center = p.sig.data() + static_cast<std::size_t>(kPortalPoints / 2) * static_cast<std::size_t>(maxFrames_);
+                std::copy(center, center + n, p.feed.data());
             }
             // 低域の相関（setPortalCoherence）: 境より下は真ん中の点の波形を全点で共有（振幅の和で 1）、上は点ごとの波形のまま。
             //   点 k = LP(真ん中) × (1/Σg) + (点 k − LP(点 k))。真ん中の点は LP + HP ＝ 元のまま。
@@ -875,7 +883,7 @@ private:
             // 耳の部屋へ流す（真ん中の点の行）。dst が別の戸口の元になっていたら流さない（輪を作らない）。
             const bool feedOk = p.dst >= 0 && p.dst < nr && (srcMask & (1 << p.dst)) == 0;
             if (feedOk && (f0 > 0.0f || fT > 0.0f)) {
-                const float* sig = p.sig.data() + static_cast<std::size_t>(kPortalPoints / 2) * static_cast<std::size_t>(maxFrames_);
+                const float* sig = p.feed.data();               // 相関の処理より前の真ん中の信号
                 Room& d = *rooms_[static_cast<std::size_t>(p.dst)];
                 for (int i = 0; i < n; ++i) d.in[static_cast<std::size_t>(i)] += sig[i] * (f0 + df * static_cast<float>(i + 1));
             }

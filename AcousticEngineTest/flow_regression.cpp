@@ -2746,8 +2746,9 @@ void testDoorCoherence() {
         double eL = 0.0, eR = 0.0;
         for (std::size_t i = 0; i < outL.size(); ++i) { eL += static_cast<double>(outL[i]) * outL[i]; eR += static_cast<double>(outR[i]) * outR[i]; }
         const float span = (w.portalDiag().empty()) ? 0.0f : w.portalDiag()[0].spanDeg;
-        std::printf("        %5.1f m | %7.1f° | %6.3f %+8.2f | %.3f / %.3f\n", dist, span, iacc(outL, outR),
-                    10.0 * std::log10(std::max(eL, 1e-30) / std::max(eR, 1e-30)), iacc(lLo, rLo), iacc(lHi, rHi));
+        std::printf("        %5.1f m | %7.1f° | %6.3f %+8.2f | %.3f / %.3f | 量 %.2f dB\n", dist, span, iacc(outL, outR),
+                    10.0 * std::log10(std::max(eL, 1e-30) / std::max(eR, 1e-30)), iacc(lLo, rLo), iacc(lHi, rHi),
+                    10.0 * std::log10(std::max(eL + eR, 1e-30) / static_cast<double>(outL.size())));
     }
 }
 
