@@ -47,6 +47,19 @@ namespace AcousticFlow
         [Tooltip("動く箱として扱う Collider（SwingDoor の下と非キネマティックの Rigidbody は自動で動く扱い）")]
         public List<Collider> dynamicColliders = new List<Collider>();
 
+        // HRTF（2026-09-12 に戻した欄）。空なら合成（球の頭: 耳の時間差と左右の音量差だけで、前後・上下の手がかりは無い）。
+        //   StreamingAssets の .afhr 名（kemar.afhr）を入れると実測を使う。声（直接音）と方向バス（反射・尾・戸口の線音源）の両方に効く。
+        //   ★旧コアの VoiceConvolver にあった欄が作り直しで落ちていた。実測を取り込んだのに使われていない状態が前にも一度あった（AudioMonitor.cs）。
+        [Tooltip("HRTF の .afhr（StreamingAssets 内の名前）。空なら合成（前後・上下の手がかり無し）。kemar.afhr で実測。再生の前に決める")]
+        public string hrtfFile = "";
+        // 方向バスの低域と高域の境（2026-09-12）。直接音の HRTF と同じ 700 Hz で分け、低域は素通し・高域だけ HRIR で畳む。
+        //   0 で旧（全帯域を畳む）。実測の HRTF は低域が落ちているので、分けないと反射と尾の低域が薄くなる。
+        [Tooltip("方向バスの低域と高域の境（Hz、既定 700）。0 で旧（全帯域を畳む）。再生の前に決める")]
+        public float busCrossoverHz = 700f;
+        /// 実際に読めた HRTF の名前（情報タブ用）。
+        public string HrtfName { get; private set; } = "合成（球の頭）";
+        private IntPtr _hrtfShared = IntPtr.Zero;   // 声が借りる。Detach で自前の合成へ戻してから壊す
+
         [Header("レイと予算（段 8）")]
         [Tooltip("予算が無制限（totalRays = 0）のときの 1 音源の本数")]
         public int raysPerEmitter = 256;
@@ -159,10 +172,24 @@ namespace AcousticFlow
             _appliedWorkers = workers;
             NativeWorld.AF_WorldBuild(_world);
 
+            // HRTF のファイル（空なら合成のまま）。声には Register で貸し、方向バスには TailBusRenderer が同じ名前で自分で読む。
+            if (!string.IsNullOrEmpty(hrtfFile))
+            {
+                string path = System.IO.Path.Combine(Application.streamingAssetsPath, hrtfFile);
+                if (System.IO.File.Exists(path))
+                {
+                    try { _hrtfShared = Native.AF_HrtfLoadFile(path); } catch (EntryPointNotFoundException) { _hrtfShared = IntPtr.Zero; }
+                    if (_hrtfShared != IntPtr.Zero) HrtfName = hrtfFile;
+                    else Debug.LogWarning("[AcousticWorld] HRTF を読めませんでした（合成のまま）: " + path);
+                }
+                else Debug.LogWarning("[AcousticWorld] HRTF が見つかりません（合成のまま）: " + path);
+            }
             if (listener != null)
             {
                 _tail = listener.GetComponent<TailBusRenderer>();
                 if (_tail == null) _tail = listener.gameObject.AddComponent<TailBusRenderer>();
+                _tail.hrtfFile = (_hrtfShared != IntPtr.Zero) ? hrtfFile : "";   // 方向バスも同じ HRTF（読めた時だけ）
+                _tail.busCrossoverHz = busCrossoverHz;
                 _tail.enableSharedTail = false;        // 畳み込みの尾は使わない
                 RebindFdn();
             }
@@ -172,10 +199,12 @@ namespace AcousticFlow
 
         private void OnDisable()
         {
-            foreach (var v in _voices) v.Detach();
+            foreach (var v in _voices) v.Detach();            // 貸した HRTF は Detach で自前の合成へ戻る
             _voices.Clear();
             _boxes.Clear();
             if (_world != IntPtr.Zero) { NativeWorld.AF_WorldDestroy(_world); _world = IntPtr.Zero; }
+            // ★声を全部外した後で壊す（オーディオスレッドが貸した HRTF を読んでいる最中に消さない）。
+            if (_hrtfShared != IntPtr.Zero) { Native.AF_HrtfDestroy(_hrtfShared); _hrtfShared = IntPtr.Zero; }
             if (Instance == this) Instance = null;
         }
 
@@ -235,6 +264,7 @@ namespace AcousticFlow
             if (id < 0) return;
             _voices.Add(v);
             v.Attach(id, _tail != null ? _tail.FdnMixHandle : IntPtr.Zero, _tail != null ? _tail.GetOrCreateDirectionBus(_maxFrames) : IntPtr.Zero);
+            v.SetSharedHrtf(_hrtfShared);                      // 空（Zero）なら声は自前の合成のまま
         }
         public void Unregister(WorldVoice v)
         {

@@ -53,6 +53,12 @@ namespace AcousticFlow
         [Range(4, 16)] public int directionLanes = 8;
         private System.IntPtr _dirBus = System.IntPtr.Zero;
         private System.IntPtr _busHrtf = System.IntPtr.Zero;     // 方向バスの HRTF（バスと FDN の戸口の線音源が借りる）
+        /// 方向バスの HRTF の .afhr 名（StreamingAssets 内）。空なら合成。AcousticWorld がバスを作る前に入れる。
+        [System.NonSerialized] public string hrtfFile = "";
+        /// 方向バスの低域と高域の境（Hz）。0 で旧（全帯域を畳む）。AcousticWorld がバスを作る前に入れる。
+        [System.NonSerialized] public float busCrossoverHz = 700f;
+        public string BusHrtfName { get; private set; } = "（無し）";
+        public bool BusHasHrtf => _dirBus != System.IntPtr.Zero && Native.AF_DirectionBusHasHrtf(_dirBus) != 0;
         public System.IntPtr DirectionBusHandle => _dirBus;
         public float DirectionBusRms => (_dirBus != System.IntPtr.Zero) ? Native.AF_DirectionBusRms(_dirBus) : 0f;
 
@@ -62,6 +68,7 @@ namespace AcousticFlow
             if (_dirBus != System.IntPtr.Zero) return _dirBus;
             try { _dirBus = Native.AF_DirectionBusCreate(_sampleRate, directionLanes, Mathf.Max(maxFrames, 2048)); }
             catch (System.EntryPointNotFoundException) { _dirBus = System.IntPtr.Zero; }
+            if (_dirBus != System.IntPtr.Zero) { try { Native.AF_DirectionBusSetCrossover(_dirBus, busCrossoverHz); } catch (System.EntryPointNotFoundException) { } }   // HRTF より先
             // ★方向バスにも HRTF を差す（2026-09-12）。差さないとバスは「左の行を左耳へ、右の行を右耳へ」流すだけで、
             //   反射と尾のレーンに左右の音量差と方向の音色が付かない（耳の時間差だけ）。検査と試聴の道具は差していたので、
             //   実機だけが違っていた。戸口の線音源（段 2-g）も同じ HRTF を借りる。
@@ -70,10 +77,17 @@ namespace AcousticFlow
             {
                 try
                 {
-                    _busHrtf = Native.AF_HrtfCreateSynthetic(_sampleRate);
+                    // 実測の .afhr が指定されていて読めればそれ、なければ合成。器はこのコンポーネントが持つ（バス・FDN と同じ寿命）。
+                    if (!string.IsNullOrEmpty(hrtfFile))
+                    {
+                        string path = System.IO.Path.Combine(Application.streamingAssetsPath, hrtfFile);
+                        if (System.IO.File.Exists(path)) _busHrtf = Native.AF_HrtfLoadFile(path);
+                    }
+                    BusHrtfName = (_busHrtf != System.IntPtr.Zero) ? hrtfFile : "合成（球の頭）";
+                    if (_busHrtf == System.IntPtr.Zero) _busHrtf = Native.AF_HrtfCreateSynthetic(_sampleRate);
                     if (_busHrtf != System.IntPtr.Zero) Native.AF_DirectionBusSetHrtf(_dirBus, _busHrtf, 57f);
                 }
-                catch (System.EntryPointNotFoundException) { _busHrtf = System.IntPtr.Zero; }
+                catch (System.EntryPointNotFoundException) { _busHrtf = System.IntPtr.Zero; BusHrtfName = "（無し）"; }
             }
             AttachFdnToDirectionBus();
             return _dirBus;

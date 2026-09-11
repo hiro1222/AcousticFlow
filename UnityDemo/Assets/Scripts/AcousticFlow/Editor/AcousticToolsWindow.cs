@@ -103,6 +103,14 @@ namespace AcousticFlow.EditorTools
             }
             if (world.TailHost != null)
                 EditorGUILayout.LabelField("  後期の器", world.TailHost.FdnRoomCount + " 部屋   出力 " + Db(world.TailHost.FdnRms) + "   方向バス " + (world.TailHost.DirectionBusHandle != System.IntPtr.Zero ? "ON" : "OFF"));
+            // HRTF: 声（直接音）と方向バス（反射・尾・戸口の線音源）。差さっていないと、反射と尾は耳の時間差だけになる。
+            {
+                int shared = 0;
+                foreach (var v in world.Voices) if (v != null && v.UsesSharedHrtf) shared++;
+                string voiceHrtf = (shared > 0) ? world.HrtfName + "（" + shared + "/" + world.Voices.Count + " 本）" : "合成（球の頭）";
+                string busHrtf = (world.TailHost != null) ? (world.TailHost.BusHasHrtf ? world.TailHost.BusHrtfName : "★差さっていない") : "-";
+                EditorGUILayout.LabelField("  HRTF", "声 " + voiceHrtf + "   方向バス " + busHrtf + "   （合成は前後・上下の手がかり無し）");
+            }
             foreach (var v in world.Voices)
             {
                 if (v == null || !world.TryGetMixInfo(v, out var mi)) continue;

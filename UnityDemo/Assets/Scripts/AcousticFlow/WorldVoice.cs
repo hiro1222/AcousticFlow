@@ -101,10 +101,23 @@ namespace AcousticFlow
             if (_voice != IntPtr.Zero) Native.AF_VoiceSetDirectionBus(_voice, directionBus);
         }
         public void SetFdn(IntPtr fdn) { if (_voice != IntPtr.Zero) Native.AF_VoiceSetFdnMix(_voice, fdn); }
+        /// AcousticWorld から借りる HRTF（実測）。Zero なら自前の合成へ戻す。器の寿命は貸す側（Detach で必ず戻す）。
+        public void SetSharedHrtf(IntPtr shared)
+        {
+            if (_voice == IntPtr.Zero) return;
+            _sharedHrtf = shared;
+            Native.AF_VoiceSetHrtf(_voice, shared != IntPtr.Zero ? shared : _hrtf);
+        }
+        public bool UsesSharedHrtf => _sharedHrtf != IntPtr.Zero;
+        private IntPtr _sharedHrtf = IntPtr.Zero;
         public void Detach()
         {
             EmitterId = -1;
-            if (_voice != IntPtr.Zero) { Native.AF_VoiceSetFdnMix(_voice, IntPtr.Zero); Native.AF_VoiceSetDirectionBus(_voice, IntPtr.Zero); }
+            if (_voice != IntPtr.Zero)
+            {
+                Native.AF_VoiceSetFdnMix(_voice, IntPtr.Zero); Native.AF_VoiceSetDirectionBus(_voice, IntPtr.Zero);
+                if (_sharedHrtf != IntPtr.Zero) { _sharedHrtf = IntPtr.Zero; Native.AF_VoiceSetHrtf(_voice, _hrtf); }   // 借り物を返す
+            }
         }
 
         private void OnAudioFilterRead(float[] data, int channels)
