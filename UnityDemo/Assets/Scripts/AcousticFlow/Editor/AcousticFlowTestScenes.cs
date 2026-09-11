@@ -1023,6 +1023,33 @@ namespace AcousticFlow.EditorTools
                  "新コア 段 5。戸口の手前に立ち、5/6 キーで扉を開閉。向こうの部屋の音源が扉の開きで連続に変わる。AF ツール ▸ 情報 に見通しの割合と戸口の素通し。");
         }
 
+        // 開いている場面の壁（BoxCollider）全部に AcousticSurface を付ける（2026-09-12）。
+        //   場面を作る MakeBox は Cube を置くだけで、AcousticSurface を持つのは扉だけだった。面ごとに材質を変える入口を作る。
+        //   材質は既定（AcousticWorld.defaultMaterial があればそれ）で、付けただけでは音は変わらない。
+        //   音源の見た目の箱と、耳（AudioListener）の下の箱は除く。既に付いている面は触らない。再生中でも効く（AcousticWorld が拾う）。
+        [MenuItem("AcousticFlow/Flow (新コア)/壁に AcousticSurface を付ける（開いている場面）")]
+        public static void AttachSurfacesToWalls()
+        {
+            var world = Object.FindFirstObjectByType<AcousticWorld>();
+            var preset = (world != null) ? world.defaultMaterial : AcousticMaterialPreset.Default;
+            var listener = Object.FindFirstObjectByType<AudioListener>();
+            int added = 0, skipped = 0;
+            foreach (var col in Object.FindObjectsByType<BoxCollider>(FindObjectsSortMode.None))
+            {
+                if (col == null) continue;
+                if (listener != null && col.transform.IsChildOf(listener.transform)) continue;
+                if (col.GetComponentInParent<WorldVoice>() != null) continue;
+                if (col.GetComponent<AcousticSurface>() != null) { skipped++; continue; }
+                var surf = Undo.AddComponent<AcousticSurface>(col.gameObject);
+                surf.mode = AcousticSurfaceMode.Preset;
+                surf.material = preset;
+                EditorUtility.SetDirty(surf);
+                added++;
+            }
+            if (!Application.isPlaying) EditorSceneManager.MarkSceneDirty(UnityEngine.SceneManagement.SceneManager.GetActiveScene());
+            Debug.Log("[AcousticFlow] AcousticSurface を " + added + " 面に付けました（既に付いていた " + skipped + " 面は触らず。材質は " + preset + "）");
+        }
+
         private static void Save(UnityEngine.SceneManagement.Scene scene, string fileName, string note)
         {
             const string dir = "Assets/Scenes";

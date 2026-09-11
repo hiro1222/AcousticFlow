@@ -218,7 +218,7 @@ namespace AcousticFlow
         //   Inspector の defaultMaterial と各 AcousticSurface の変化を拾い、エンジンの材質を書き換える（足さない）。
         //   静的な箱に効く変更はエンジンが次の更新で部屋（RT60・ISM の面）を組み直す（1 回、数百 ms の引っかかり）。
         //   動く箱（扉の板）だけの変更は組み直さず、透過・吸音・散乱はそのフレームから効く。
-        //   ★AcousticSurface を実行中に付け外しするのは拾わない（箱の登録は再生の前）。
+        //   AcousticSurface を実行中に付ければその面だけ別の材質になり、外せば既定に戻る（箱の登録そのものは再生の前）。
         private void ApplyMaterialChanges()
         {
             if (_defaultMatId >= 0 && defaultMaterial != _appliedDefault)
@@ -231,6 +231,32 @@ namespace AcousticFlow
             for (int i = 0; i < _boxes.Count; i++)
             {
                 var b = _boxes[i];
+                // 付け外し。付いたらその面に材質を 1 つ足して差し替え、外れたら既定へ戻す。
+                var surfNow = (b.col != null) ? b.col.GetComponent<AcousticSurface>() : null;
+                if (!ReferenceEquals(surfNow, b.surf))
+                {
+                    try
+                    {
+                        if (surfNow != null)
+                        {
+                            int mat;
+                            if (surfNow.mode == AcousticSurfaceMode.Preset) mat = NativeWorld.AF_WorldAddMaterialPreset(_world, (int)surfNow.material);
+                            else { var m = surfNow.Resolve(); mat = NativeWorld.AF_WorldAddMaterial(_world, m.transmission, m.absorption, m.scattering); }
+                            NativeWorld.AF_WorldSetBoxMaterial(_world, b.id, mat);
+                            b.matId = mat; b.surf = surfNow; b.key = SurfaceKey(surfNow);
+                            Debug.Log("[AcousticWorld] AcousticSurface が付いた: " + b.col.name + (b.dynamic ? "（動く箱: 組み直しなし）" : "（次の更新で部屋を組み直す）"));
+                        }
+                        else
+                        {
+                            NativeWorld.AF_WorldSetBoxMaterial(_world, b.id, _defaultMatId);
+                            b.matId = _defaultMatId; b.surf = null; b.key = null;
+                            Debug.Log("[AcousticWorld] AcousticSurface が外れた: " + b.col.name + "（既定の材質へ）");
+                        }
+                    }
+                    catch (EntryPointNotFoundException) { return; }
+                    _boxes[i] = b;
+                    continue;
+                }
                 if (b.surf == null) continue;
                 string key = SurfaceKey(b.surf);
                 if (key == b.key) continue;
