@@ -170,6 +170,12 @@ public:
     ///     3000: 0.59〜0.62（距離によらず、旧の 3 m と同じ）／ 6000: 0.79〜0.90 ／ 全帯域: 0.78〜0.95（点に寄りすぎて幅が消える）
     ///   物理の目安（点の間隔 0.2 m で 850 Hz 以上は無相関）より上だが、ここは耳で決める所。
     float doorCoherenceHz = 3000.0f;
+    /// 先着の重み（2026-09-12）。最初の到達（直接の到達時刻）から遅れる到来ほど出口の量を下げる（帳簿は物理のまま）。
+    ///   precedenceDb: 十分遅い到来の下げ幅（dB）。0 で今までと 1 ビットも同じ。precedenceSec: 窓（先行音効果の 40 ms が目安）。
+    ///   発注者の指示「ゲームだから完全物理でなく、聞こえ方がいい物を」。直接・透過は変わらず、部屋の響きが下がり、戸口の線音源は中間。
+    ///   ★エンジンの既定は 0（物理のまま。検査と AfFlowWav は「出口の和 ＝ 帳簿」を見張る）。演出の既定は載る側（Unity は 6 dB）が持つ。
+    float precedenceDb = 0.0f;
+    float precedenceSec = 0.04f;
     /// 壁越しの反射（2026-09-12）。**既定 0 ＝ 通さない。**1 で旧（壁を横切った影の線も τ を掛けて初期・後期に数える）。
     ///   試聴「壁の向こうの透過音がダブる。反射や残響は壁を抜けないから、透過は直接だけにしてほしい」。
     ///   壁を抜けるのは解析で出す透過の直接音（distribute の kTransmit）だけになる。開いた戸口を通る分は変わらない。
@@ -415,6 +421,7 @@ public:
             in.sourcePos = s.em.pos; in.listener = &listener_;
             in.listenerRoom = lroom; in.weights = &rules.weights; in.response = &response; in.dt = dt;
             in.sourceRoom = (lateThrough != 0) ? s.em.room : -1;
+            in.precedenceDb = precedenceDb; in.precedenceSec = precedenceSec;
             {
                 const int er = s.em.room;
                 const int door = (lateThrough == 2 && er >= 0 && er < static_cast<int>(doorOf_.size())) ? doorOf_[static_cast<std::size_t>(er)] : -1;

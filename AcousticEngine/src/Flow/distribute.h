@@ -65,6 +65,11 @@ struct DistributeInput {
     bool  doorSource = false;              // 段 2-g。音源の部屋と耳の部屋が戸口で繋がり、戸口の線音源で鳴らすか
     float doorFeed = 0.0f;                 // 段 2-g。耳の部屋の分のうち戸口から入った割合（＝その戸口の開き具合 0..1）
     float doorPull = 0.0f;                 // 戸口寄せ（2026-09-12）。耳の部屋へ流す分のうち、戸口の線音源から直接鳴らす側へ移す割合 0..1
+    // 先着の重み（2026-09-12）。到来が最初の到達（直接の到達時刻）から遅れるほど下げる。出口だけで、帳簿（component6）は物理のまま。
+    //   重み = 10^(−precedenceDb/10 · (1 − e^(−Δ/precedenceSec)))。直接・透過は Δ=0 で変わらず、部屋の響きは大きく下がる。0 dB で今までと同じ。
+    //   ★ゲームなので完全な物理でなく聞こえ方を優先する（発注者の指示）。先行音効果の窓 40 ms が τ の目安。
+    float precedenceDb = 0.0f;
+    float precedenceSec = 0.04f;
     const WorldWeights* weights = nullptr; // nullptr なら全部 1
     const Response* response = nullptr;    // nullptr なら既定
     float dt = 1.0f / 60.0f;
@@ -110,13 +115,21 @@ public:
         // ── 出す: 受け取った物を 1 回ずつ。帳簿の内訳は生、出口は 平滑 × 重み ──
         const Vec3 toSrc = in.sourcePos - in.listener->pos;
         const Vec3 dirLocal = (length(toSrc) > kEps) ? in.listener->toLocal(toSrc) : Vec3(0, 0, 0);
+        // 先着の重み（DistributeInput::precedenceDb）: 最初の到達（直接の到達時刻）からの遅れ Δ で出口の量を下げる。エネルギーの係数。
+        auto pre = [&](float delaySec) {
+            if (in.precedenceDb <= 0.0f) return 1.0f;
+            const float d = std::max(0.0f, delaySec - T.directSec);
+            const float k = 1.0f - std::exp(-d / std::max(1e-3f, in.precedenceSec));
+            return std::pow(10.0f, -in.precedenceDb * 0.1f * k);
+        };
         auto emitTap = [&](TapKind kind, int comp, float delaySec, const Vec3& dir, float spread, int id) {
             MixTap* t = out.pushTap();
             if (!t) return;
             t->kind = kind; t->id = id; t->delaySec = delaySec; t->dirLocal = dir; t->spread = spread;
+            const float pw = pre(delaySec);
             for (int b = 0; b < kNumBands; ++b) {
                 out.component6[comp][b] += raw[comp][b];
-                t->e6[b] = sm[comp][b] * W.w[comp];
+                t->e6[b] = sm[comp][b] * W.w[comp] * pw;
             }
         };
         emitTap(TapKind::Direct,   kDirect,   T.directSec, dirLocal, 0.0f, 1);
@@ -138,7 +151,8 @@ public:
                 t->kind = TapKind::Early; t->id = 4;
                 t->delaySec = (T.firstReflectSec > 0.0f) ? T.firstReflectSec : T.directSec;
                 t->dirLocal = Vec3(0, 0, 0); t->spread = 1.0f;
-                for (int b = 0; b < kNumBands; ++b) t->e6[b] = sm[kEarly][b] * W.w[kEarly] * (1.0f - dirFrac[b]);
+                const float pw = pre(t->delaySec);
+                for (int b = 0; b < kNumBands; ++b) t->e6[b] = sm[kEarly][b] * W.w[kEarly] * (1.0f - dirFrac[b]) * pw;
             }
         }
         if (im && im->count > 0) {
@@ -155,7 +169,8 @@ public:
                 }
                 t->dirLocal = in.listener->toLocal(src.pos - in.listener->pos);
                 t->spread = 1.0f - src.validity;
-                for (int b = 0; b < kNumBands; ++b) t->e6[b] = sm[kEarly][b] * W.w[kEarly] * dirFrac[b] * src.weight6[b];
+                const float pw = pre(src.pathSec);
+                for (int b = 0; b < kNumBands; ++b) t->e6[b] = sm[kEarly][b] * W.w[kEarly] * dirFrac[b] * src.weight6[b] * pw;
             }
         }
         for (int b = 0; b < kNumBands; ++b) out.component6[kEarly][b] += raw[kEarly][b];   // 帳簿は 1 回だけ
@@ -166,6 +181,13 @@ public:
         //   ★音源が耳と同じ部屋なら割らない（戸口越しの分は耳の部屋へ畳む ＝ 今までと同じ）。
         //   ★帳簿（component6）は総量を 1 回だけ。割るのは出口だけ。
         const bool apart = (in.listenerRoom >= 0 && in.sourceRoom >= 0 && in.sourceRoom != in.listenerRoom);
+        // 尾の開始 = 最初の虚像の到達（ITDG）。虚像が無ければレイの最初の反射、それも無ければ直接。（先着の重みの遅れにも使う）
+        const float onsetSec = (im && im->count > 0 && im->firstSec > 0.0f) ? im->firstSec
+                             : (T.firstReflectSec > 0.0f) ? T.firstReflectSec : T.directSec;
+        // 先着の重みで見る尾の遅れの目安: 戸口から直接の分 ＝ 尾の開始 ＋ 尾の器の最短の線（15 ms）、
+        //   部屋の響き（耳の部屋の尾、戸口から流した分）＝ さらに部屋を渡って戻る 30 ms。目安であって測った値ではない。
+        const float preDoor = pre(onsetSec + 0.015f);
+        const float preRoom = pre(onsetSec + 0.045f);
         float thru[kNumBands] = {};
         {
             float rawOther[kNumBands] = {};
@@ -184,7 +206,7 @@ public:
             FdnSend* s = out.pushSend();
             if (s) {
                 s->room = in.listenerRoom;
-                for (int b = 0; b < kNumBands; ++b) { out.component6[kLate][b] += raw[kLate][b]; s->e6[b] = sm[kLate][b] * W.w[kLate] * (1.0f - thru[b]) * (1.0f - feed); }
+                for (int b = 0; b < kNumBands; ++b) { out.component6[kLate][b] += raw[kLate][b]; s->e6[b] = sm[kLate][b] * W.w[kLate] * (1.0f - thru[b]) * (1.0f - feed) * preRoom; }
             }
             float eThru = 0.0f;
             for (int b = 0; b < kNumBands; ++b) eThru += sm[kLate][b] * W.w[kLate] * (thru[b] + (1.0f - thru[b]) * feed);
@@ -198,8 +220,9 @@ public:
                     //     自分の部屋の響き（全方向）に −19 dB で負けていた（試聴 2026-09-12、配分タブ）。
                     const float pull = std::min(1.0f, std::max(0.0f, in.doorPull));
                     for (int b = 0; b < kNumBands; ++b) {
-                        o->e6[b] = sm[kLate][b] * W.w[kLate] * (thru[b] + (1.0f - thru[b]) * feed);
-                        o->thru6[b] = sm[kLate][b] * W.w[kLate] * (thru[b] + (1.0f - thru[b]) * feed * pull);
+                        // 戸口から直接の分（thru6）は戸口の遅れ、耳の部屋へ流す分は部屋の遅れで重み付け
+                        o->thru6[b] = sm[kLate][b] * W.w[kLate] * (thru[b] + (1.0f - thru[b]) * feed * pull) * preDoor;
+                        o->e6[b] = o->thru6[b] + sm[kLate][b] * W.w[kLate] * (1.0f - thru[b]) * feed * (1.0f - pull) * preRoom;
                     }
                     float mass = 0.0f;
                     for (int b = 0; b < kNumBands; ++b) mass += T.lateOther6[b];
@@ -218,8 +241,7 @@ public:
         else
             for (int b = 0; b < kNumBands; ++b) out.component6[kDiffract][b] += raw[kDiffract][b];
         // 尾の開始 = 最初の虚像の到達（ITDG）。虚像が無ければレイの最初の反射、それも無ければ直接。
-        out.onsetSec = (im && im->count > 0 && im->firstSec > 0.0f) ? im->firstSec
-                     : (T.firstReflectSec > 0.0f) ? T.firstReflectSec : T.directSec;
+        out.onsetSec = onsetSec;
     }
 
 private:

@@ -117,6 +117,11 @@ void AF_WorldSetDoorCoherence(AF_WorldHandle w, float hz) {
 float AF_WorldDoorCoherence(AF_WorldHandle w) {
     acoustic::flow::World* W = asWorld(w); return W ? W->doorCoherenceHz : 0.0f;
 }
+void AF_WorldSetPrecedence(AF_WorldHandle w, float db, float sec) {
+    acoustic::flow::World* W = asWorld(w); if (!W) return;
+    W->precedenceDb = (db < 0.0f) ? 0.0f : db;
+    W->precedenceSec = (sec < 0.001f) ? 0.001f : sec;
+}
 void AF_WorldSetWallReflect(AF_WorldHandle w, int on) {
     if (acoustic::flow::World* W = asWorld(w)) W->wallReflect = (on != 0) ? 1 : 0;
 }

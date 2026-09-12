@@ -108,6 +108,9 @@ ACOUSTIC_API float AF_WorldDoorPull(AF_WorldHandle w);
  * 近づいて 5 点が広い角度に散ったときの定位のため。実行中に動かしてよい。 */
 ACOUSTIC_API void  AF_WorldSetDoorCoherence(AF_WorldHandle w, float hz);
 ACOUSTIC_API float AF_WorldDoorCoherence(AF_WorldHandle w);
+/* 先着の重み（既定 6 dB / 窓 0.04 s）。最初の到達（直接の到達時刻）から遅れる到来ほど出口の量を下げる。帳簿は物理のまま。
+ * 重み = 10^(−db/10 · (1 − e^(−Δ/sec)))。0 dB で今までと同じ。実行中に動かしてよい。 */
+ACOUSTIC_API void AF_WorldSetPrecedence(AF_WorldHandle w, float db, float sec);
 /* 壁越しの反射（既定 0 ＝ 通さない）。1 で旧: 壁を横切った反射と残響も透過率で薄めて届ける。
  * 0 では壁を抜けるのは透過の直接音だけ。開いた戸口を通る分はどちらでも同じ。実行中に切り替えてよい。 */
 ACOUSTIC_API void AF_WorldSetWallReflect(AF_WorldHandle w, int on);

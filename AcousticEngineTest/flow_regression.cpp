@@ -1538,6 +1538,66 @@ void testWallReflect() {
     }
 }
 
+// ================================ [先着] 最初に届く音を重く（AF_ONLY=precedence）
+//   発注者「一番最初に聞こえる音の重みを増やしたい。ゲームだから完全物理でなく聞こえ方がいい物を」。
+//   出口だけの重み付けで、帳簿（component6）は物理のまま。直接・透過は変わらず、遅い到来ほど下がる。0 dB は今までと 1 ビットも同じ。
+void testPrecedence() {
+    std::puts("");
+    std::puts("[先着] 最初に届く音を重く ── 遅い到来ほど出口で下げ、帳簿は物理のまま");
+    char buf[256];
+    const float dt = 1.0f / 60.0f;
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    const Vec3 S(0.0f, 1.6f, 3.0f);
+    struct Got { double direct = 0.0, early = 0.0, diffract = 0.0, late = 0.0, thru = 0.0, ledger = 0.0, ledgerLate = 0.0; };
+    auto run = [&](const Vec3& L, float db) {
+        Got g;
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        w.addBox(doorLeaf(90.0f), lm, true);
+        w.precedenceDb = db; w.precedenceSec = 0.04f;
+        w.raysPerEmitter = 512; w.budget.cfg.maxPerEmitter = 512; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+        w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w.addEmitter(S, 0.2f);
+        w.build();
+        for (int f = 0; f < 60; ++f) w.update(dt);
+        const Mix* mx = w.mix(e);
+        for (int i = 0; i < mx->tapCount; ++i) {
+            double te = 0.0; for (int b = 0; b < kNumBands; ++b) te += mx->taps[i].e6[b];
+            if (mx->taps[i].kind == TapKind::Direct) g.direct += te;
+            else if (mx->taps[i].kind == TapKind::Early) g.early += te;
+            else if (mx->taps[i].kind == TapKind::Diffract) g.diffract += te;
+        }
+        for (int i = 0; i < mx->sendCount; ++i)
+            for (int b = 0; b < kNumBands; ++b) { g.late += mx->sends[i].e6[b]; g.thru += mx->sends[i].thru6[b]; }
+        for (int c = 0; c < kNumComponents; ++c) for (int b = 0; b < kNumBands; ++b) g.ledger += mx->component6[c][b];
+        for (int b = 0; b < kNumBands; ++b) g.ledgerLate += mx->component6[kLate][b];
+        return g;
+    };
+    // 同じ部屋（見通しあり）: 直接は変わらず、初期は少し、後期は大きく下がる。帳簿は同じ
+    {
+        const Vec3 L(0.0f, 1.6f, 1.0f);
+        const Got a = run(L, 0.0f), b = run(L, 12.0f);
+        std::snprintf(buf, sizeof(buf), "(12 dB: 直接 %+.2f dB、初期 %+.2f dB、後期 %+.2f dB、帳簿 %.3e → %.3e)",
+                      afti::dB(std::max(b.direct, 1e-30) / std::max(a.direct, 1e-30)), afti::dB(std::max(b.early, 1e-30) / std::max(a.early, 1e-30)),
+                      afti::dB(std::max(b.late, 1e-30) / std::max(a.late, 1e-30)), a.ledger, b.ledger);
+        check("[先着] 同じ部屋: 直接は変わらず、初期は少し、後期は大きく下がり、帳簿は 1 ビットも変わらない",
+              b.direct == a.direct && b.early < a.early && b.early > a.early * 0.3 && b.late < a.late * 0.2 && b.ledger == a.ledger && b.ledgerLate == a.ledgerLate, buf);
+    }
+    // 隣の部屋（戸口の正面 3 m）: 戸口から直接の分（thru6）は部屋の響きより残る
+    {
+        const Vec3 L(0.0f, 1.6f, -3.0f);
+        const Got a = run(L, 0.0f), b = run(L, 12.0f);
+        const double roomA = a.late - a.thru, roomB = b.late - b.thru;
+        std::snprintf(buf, sizeof(buf), "(12 dB: 直接 %+.2f dB、戸口から直接 %+.2f dB、部屋の響き %+.2f dB)",
+                      afti::dB(std::max(b.direct, 1e-30) / std::max(a.direct, 1e-30)), afti::dB(std::max(b.thru, 1e-30) / std::max(a.thru, 1e-30)),
+                      afti::dB(std::max(roomB, 1e-30) / std::max(roomA, 1e-30)));
+        check("[先着] 隣の部屋: 戸口から直接の分は部屋の響きより残る（先に届く物が勝つ）",
+              b.direct == a.direct && b.thru / a.thru > roomB / roomA && roomB < roomA * 0.2, buf);
+    }
+}
+
 // ================================ [GPU] 計算デバイスの管が通るか（AF_ONLY=gpu）
 void testGpuPipe() {
     std::printf("\n[GPU] エンジン自前の計算デバイス ── 管が通るか\n");
@@ -3218,7 +3278,7 @@ int main() {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
-        {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"wall", testWallReflect}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
+        {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"wall", testWallReflect}, {"precedence", testPrecedence}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
         {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true}, {"doorcoh", testDoorCoherence, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {

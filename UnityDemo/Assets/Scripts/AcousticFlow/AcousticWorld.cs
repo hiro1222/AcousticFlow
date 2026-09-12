@@ -95,6 +95,13 @@ namespace AcousticFlow
         //   IACC（戸口の正面 0.5〜3 m）: 0 で 0.34〜0.54（近いほど雲）、3000 で 0.59〜0.62（距離によらず）、6000 以上で 0.8〜0.9（点に寄って幅が消える）。
         [Tooltip("戸口の線音源の低域の相関の境（Hz、既定 3000）。下は 5 点が同じ波形、上は別の波形。0 で旧（近いと雲）。6000 以上は点に寄る。実行中に動かせる")]
         [Range(0f, 8000f)] public float doorCoherenceHz = 3000f;
+        // 先着の重み（2026-09-12）。最初の到達（直接の到達時刻）から遅れる到来ほど耳に出す量を下げる。帳簿（配分タブの内訳）は物理のまま。
+        //   直接・透過は変わらず、回折・虚像は少し、部屋の響きは大きく下がる。戸口の線音源は中間。0 dB で今までと同じ。
+        //   ゲームなので完全な物理でなく聞こえ方を優先する（発注者の指示）。窓は先行音効果の 40 ms が目安。
+        [Tooltip("先着の重み: 十分遅い到来の下げ幅（dB、既定 6）。0 で物理のまま。直接は変わらず、部屋の響きが下がる。実行中に動かせる")]
+        [Range(0f, 24f)] public float precedenceDb = 6f;
+        [Tooltip("先着の重みの窓（ms、既定 40 ＝ 先行音効果）。この時間で下げ幅の 63% に達する")]
+        [Range(5f, 200f)] public float precedenceMs = 40f;
 
         // 尾のレーンの作り（方向バスへ載せる尾）
         //   0 耳ごとの行（旧）: 点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる
@@ -391,6 +398,7 @@ namespace AcousticFlow
             NativeWorld.AF_WorldSetDoorPull(_world, doorPull);             // 同上
             NativeWorld.AF_WorldSetWallReflect(_world, wallReflections ? 1 : 0);   // 同上
             NativeWorld.AF_WorldSetDoorCoherence(_world, doorCoherenceHz);         // 同上
+            NativeWorld.AF_WorldSetPrecedence(_world, precedenceDb, precedenceMs * 0.001f);   // 同上
             NativeWorld.AF_WorldSetLaneModel(_world, laneModel);           // 同上
             NativeWorld.AF_WorldSetGpuTrace(_world, gpuTrace ? 1 : 0);
             GpuActive = NativeWorld.AF_WorldGpuActive(_world) != 0;
