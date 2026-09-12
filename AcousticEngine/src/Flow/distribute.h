@@ -220,9 +220,13 @@ public:
                     //     自分の部屋の響き（全方向）に −19 dB で負けていた（試聴 2026-09-12、配分タブ）。
                     const float pull = std::min(1.0f, std::max(0.0f, in.doorPull));
                     for (int b = 0; b < kNumBands; ++b) {
-                        // 戸口から直接の分（thru6）は戸口の遅れ、耳の部屋へ流す分は部屋の遅れで重み付け
-                        o->thru6[b] = sm[kLate][b] * W.w[kLate] * (thru[b] + (1.0f - thru[b]) * feed * pull) * preDoor;
-                        o->e6[b] = o->thru6[b] + sm[kLate][b] * W.w[kLate] * (1.0f - thru[b]) * feed * (1.0f - pull) * preRoom;
+                        // 戸口から直接の分（thru6）は戸口の遅れ、耳の部屋へ流す分は部屋の遅れで重み付け。
+                        //   ★e6 は「thru·preDoor ＋ fp·(preRoom ＋ pull·(preDoor − preRoom))」の並びで書く。先着の重みが無いとき
+                        //     (preDoor = preRoom = 1) は pull によらず同じ式になり、寄せで総量が 1 ビットも変わらない（検査 ⑦）。
+                        const float base = sm[kLate][b] * W.w[kLate];
+                        const float fp = (1.0f - thru[b]) * feed;
+                        o->thru6[b] = base * (thru[b] + fp * pull) * preDoor;
+                        o->e6[b] = base * (thru[b] * preDoor + fp * (preRoom + pull * (preDoor - preRoom)));
                     }
                     float mass = 0.0f;
                     for (int b = 0; b < kNumBands; ++b) mass += T.lateOther6[b];
