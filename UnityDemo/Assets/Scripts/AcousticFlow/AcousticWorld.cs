@@ -90,6 +90,11 @@ namespace AcousticFlow
         //   切ると壁を抜けるのは透過の直接音だけ。開いた戸口を通る分はどちらでも同じ。
         [Tooltip("壁越しの反射（既定 切）。入れると旧: 壁を横切った反射と残響も薄めて届ける。切ると壁を抜けるのは透過の直接音だけ。実行中に変えられる")]
         public bool wallReflections = false;
+        // 初期反射の出し方（2026-09-13）。0 虚像（鏡に映した音源の点）／1 受取面（既定）。
+        //   受取面: 面をレイの受取面にして、面ごと・1 回目の当たりかどうかでタップを立てる。量は面が受けたレイ、耳へは見込みの大きさで配る。
+        //   壁に近いほど 1 回目の反射が早く・広く鳴る。実行中に切り替えて聞き比べられる。
+        [Tooltip("初期反射の出し方。0 虚像（点）／1 受取面（既定。面ごとのタップ、壁が近いと早く広く）。実行中に変えられる")]
+        [Range(0, 1)] public int earlyModel = 1;
         // 戸口の線音源の低域の相関（2026-09-12）。境より下は 5 点が同じ波形（振幅の和で 1）、上は点ごとに別の波形。0 で旧。
         //   近づいて 5 点が広い角度に散ると、全部が無相関だと両耳の相関が落ちて「前の雲」になる。低域を揃えると戸口の方向が立つ。
         //   IACC（戸口の正面 0.5〜3 m）: 0 で 0.34〜0.54（近いほど雲）、3000 で 0.59〜0.62（距離によらず）、6000 以上で 0.8〜0.9（点に寄って幅が消える）。
@@ -397,6 +402,7 @@ namespace AcousticFlow
             NativeWorld.AF_WorldSetLateThrough(_world, lateThroughMode);   // 同上
             NativeWorld.AF_WorldSetDoorPull(_world, doorPull);             // 同上
             NativeWorld.AF_WorldSetWallReflect(_world, wallReflections ? 1 : 0);   // 同上
+            NativeWorld.AF_WorldSetEarlyModel(_world, earlyModel);                  // 同上
             NativeWorld.AF_WorldSetDoorCoherence(_world, doorCoherenceHz);         // 同上
             NativeWorld.AF_WorldSetPrecedence(_world, precedenceDb, precedenceMs * 0.001f);   // 同上
             NativeWorld.AF_WorldSetLaneModel(_world, laneModel);           // 同上

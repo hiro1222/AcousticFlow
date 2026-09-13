@@ -1028,6 +1028,7 @@ void testImageSources() {
     {
         World* w = makeWorldBox(3.5f, 3.0f, 0.2f);
         w->raysPerEmitter = 128;
+        w->earlyModel = 0;   // この検査は虚像（ISM）の道の見張り。受取面は [受取面] で見る
         w->setListener(Vec3(-1.0f, 1.2f, 1.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
         const int e = w->addEmitter(Vec3(1.5f, 1.6f, -1.0f), 0.0f);
         w->build();
@@ -1598,6 +1599,123 @@ void testPrecedence() {
     }
 }
 
+// ================================ [受取面] 面をレイの受取面にして、面ごとのタップで鳴らす（AF_ONLY=recvworld、2026-09-13）
+//   World::earlyModel = 1。① 量が虚像の道（NEE の初期）と揃う ② タップの和が帳簿の初期と揃う（配分で解く）
+//   ③ 壁際: 1 回目の当たりのタップが虚像の遅れと壁の向きに寄り、近いほど広い ④ 止まっていれば揺れない ⑤ GPU でも初期が同じ
+void testReceiverWorld() {
+    std::puts("");
+    std::puts("[受取面] 面をレイの受取面にして、面ごとのタップで鳴らす（earlyModel = 1）");
+    char buf[300];
+    const float dt = 1.0f / 60.0f;
+    const Vec3 S(1.5f, 1.6f, -1.0f);
+    auto sumEarlyTaps = [](const Mix& m) {
+        double s = 0.0;
+        for (int i = 0; i < m.tapCount; ++i) if (m.taps[i].kind == TapKind::Early) for (int b = 0; b < kNumBands; ++b) s += m.taps[i].e6[b];
+        return s;
+    };
+    auto ledgerEarly = [](const Mix& m) { double s = 0.0; for (int b = 0; b < kNumBands; ++b) s += m.component6[kEarly][b]; return s; };
+    // ① ② ④
+    {
+        double early[2] = {0.0, 0.0};
+        double tapSum = 0.0, ledger = 0.0, stillStep = 0.0;
+        int faceTaps = 0; bool idsUnique = true, unitDirs = true;
+        for (int model = 0; model < 2; ++model) {
+            World* w = makeWorldBox(3.5f, 3.0f, 0.2f);
+            w->earlyModel = model;
+            w->raysPerEmitter = 2048; w->budget.cfg.maxPerEmitter = 2048; w->rayGroups = 1; w->budget.cfg.totalRays = 0;
+            w->setListener(Vec3(-1.0f, 1.2f, 1.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+            const int e = w->addEmitter(S, 0.2f);
+            w->build();
+            for (int k = 0; k < 60; ++k) w->update(dt);
+            const Mix m60 = *w->mix(e);
+            early[model] = ledgerEarly(m60);
+            if (model == 1) {
+                tapSum = sumEarlyTaps(m60); ledger = early[1];
+                std::vector<int> ids;
+                for (int i = 0; i < m60.tapCount; ++i) {
+                    const MixTap& t = m60.taps[i];
+                    if (t.kind != TapKind::Early) continue;
+                    ++faceTaps;
+                    for (int q : ids) if (q == t.id) idsUnique = false;
+                    ids.push_back(t.id);
+                    const float l = length(t.dirLocal);
+                    if (l > 0.0f && std::fabs(l - 1.0f) > 1e-3f) unitDirs = false;
+                }
+                w->update(dt);
+                const Mix& m61 = *w->mix(e);
+                for (int i = 0; i < std::min(m60.tapCount, m61.tapCount); ++i)
+                    for (int b = 0; b < kNumBands; ++b)
+                        if (m60.taps[i].e6[b] > 0.0f) stillStep = std::max(stillStep, std::fabs(afti::dB(static_cast<double>(m61.taps[i].e6[b]) / m60.taps[i].e6[b])));
+            }
+            delete w;
+        }
+        const double dq = afti::dB(early[1] / std::max(early[0], 1e-30));
+        std::snprintf(buf, sizeof buf, "(初期の帳簿: 虚像の道 %.4e → 受取面 %.4e ＝ %+.2f dB)", early[0], early[1], dq);
+        check("[受取面] 初期の量は虚像の道（レイの NEE）と ±0.3 dB で揃う", std::fabs(dq) < 0.3, buf);
+        std::snprintf(buf, sizeof buf, "(面のタップ %d 本、タップの和 %.4e 対 帳簿の初期 %.4e、素性の重なり %s、向き %s)",
+                      faceTaps, tapSum, ledger, idsUnique ? "なし" : "あり", unitDirs ? "単位" : "単位でない物あり");
+        check("[受取面] 初期のタップの和が帳簿の初期と 1% で揃い、素性は重ならず、向きは単位",
+              faceTaps >= 6 && std::fabs(tapSum / std::max(ledger, 1e-30) - 1.0) < 0.01 && idsUnique && unitDirs, buf);
+        std::snprintf(buf, sizeof buf, "(止まって 1 フレーム後のタップの量の最大の差 %.6f dB)", stillStep);
+        check("[受取面] 止まっていれば次のフレームもタップの量が同じ（0.001 dB 未満）", stillStep < 0.001, buf);
+    }
+    // ③ 壁際: −x の壁（makeWorldBox の 3 番目の箱）の +x 面、1 回目の当たりのタップ
+    {
+        const int wantId = FaceTapSet::kIdBase + ((2 * 6 + 0) * 2 + 0);
+        struct Got { bool found = false; float delay = 0.0f, spread = 0.0f, share = 0.0f; Vec3 dir{0, 0, 0}; };
+        auto at = [&](float dw) {
+            Got g;
+            World* w = makeWorldBox(3.5f, 3.0f, 0.2f);
+            w->earlyModel = 1;
+            w->raysPerEmitter = 4096; w->budget.cfg.maxPerEmitter = 4096; w->rayGroups = 1; w->budget.cfg.totalRays = 0;
+            const Vec3 L(-3.5f + dw, 1.2f, 0.0f);
+            w->setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+            const int e = w->addEmitter(S, 0.2f);
+            w->build();
+            for (int k = 0; k < 30; ++k) w->update(dt);
+            const Mix& m = *w->mix(e);
+            double tot = 0.0;
+            for (int i = 0; i < m.tapCount; ++i) if (m.taps[i].kind == TapKind::Early) for (int b = 0; b < kNumBands; ++b) tot += m.taps[i].e6[b];
+            for (int i = 0; i < m.tapCount; ++i)
+                if (m.taps[i].id == wantId) {
+                    g.found = true; g.delay = m.taps[i].delaySec; g.spread = m.taps[i].spread; g.dir = m.taps[i].dirLocal;
+                    double te = 0.0; for (int b = 0; b < kNumBands; ++b) te += m.taps[i].e6[b];
+                    g.share = static_cast<float>(te / std::max(tot, 1e-30));
+                }
+            delete w;
+            return g;
+        };
+        const Got nearG = at(0.1f), farG = at(1.0f);
+        const Vec3 L(-3.4f, 1.2f, 0.0f), Simg(-7.0f - S.x, S.y, S.z);
+        const float imgSec = length(Simg - L) / kSpeedOfSound;
+        std::snprintf(buf, sizeof buf, "(0.1 m: 遅れ %.2f ms 対 虚像 %.2f ms、向き x %+.2f、広がり %.2f、取り分 %.1f%% ／ 1.0 m: 広がり %.2f、取り分 %.1f%%)",
+                      nearG.delay * 1000.0f, imgSec * 1000.0f, nearG.dir.x, nearG.spread, nearG.share * 100.0f, farG.spread, farG.share * 100.0f);
+        check("[受取面] 壁際: 1 回目の当たりのタップは虚像の遅れ（±1.5 ms）と壁の向き（左）に寄り、1 m より広い",
+              nearG.found && farG.found && std::fabs(nearG.delay - imgSec) < 0.0015f && nearG.dir.x < -0.5f && nearG.spread > farG.spread, buf);
+    }
+    // ⑤ GPU
+    {
+        acoustic::gpu::GpuTracer probeGpu;
+        if (!probeGpu.init()) { std::puts("        GPU が使えないので GPU の突き合わせは飛ばします"); return; }
+        double early[2] = {0.0, 0.0};
+        bool gpuOn = false;
+        for (int g = 0; g < 2; ++g) {
+            World* w = makeWorldBox(3.5f, 3.0f, 0.2f);
+            w->earlyModel = 1; w->gpuTrace = g;
+            w->raysPerEmitter = 2048; w->budget.cfg.maxPerEmitter = 2048; w->rayGroups = 1; w->budget.cfg.totalRays = 0;
+            w->setListener(Vec3(-1.0f, 1.2f, 1.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+            const int e = w->addEmitter(S, 0.2f);
+            w->build();
+            for (int k = 0; k < 5; ++k) w->update(dt);
+            if (g == 1) gpuOn = w->gpuActive();
+            early[g] = ledgerEarly(*w->mix(e));
+            delete w;
+        }
+        std::snprintf(buf, sizeof buf, "(初期の帳簿: CPU %.6e ／ GPU %.6e、GPU %s)", early[0], early[1], gpuOn ? "入" : "切");
+        check("[受取面] GPU の道でも初期の帳簿が CPU と同じ（受け取りは CPU で取る）", gpuOn && early[0] == early[1], buf);
+    }
+}
+
 // ================================ [GPU] 計算デバイスの管が通るか（AF_ONLY=gpu）
 void testGpuPipe() {
     std::printf("\n[GPU] エンジン自前の計算デバイス ── 管が通るか\n");
@@ -1805,6 +1923,7 @@ void testNearWall() {
         const float wallDist = d[k];
         World* w = makeWorldBox(half, h, 0.2f);
         w->raysPerEmitter = 512; w->rayGroups = 1; w->budget.cfg.totalRays = 0;
+        if (const char* em = std::getenv("AF_EARLY_MODEL")) w->earlyModel = std::atoi(em);   // 初期反射 0 虚像 / 1 受取面
         { const char* io2 = std::getenv("AF_IMG_ORDER"); if (io2) w->imageOrder = std::atoi(io2); }
         // AF_NEAR=src なら**音源**を壁へ寄せる（耳は固定）。既定は耳を寄せる。
         //   ★虚像は「音源」の鏡映なので、音源が壁に近いほど虚像が音源のそばに集まる。
@@ -1882,6 +2001,7 @@ void testManySources() {
     { const char* r = std::getenv("AF_RAYS"); const int nr = r ? std::atoi(r) : 256;
       w.raysPerEmitter = nr; w.budget.cfg.maxPerEmitter = std::max(nr, w.budget.cfg.maxPerEmitter); }
     if (const char* wr = std::getenv("AF_WALL_REFLECT")) w.wallReflect = std::atoi(wr);   // 壁越しの反射 0/1
+    if (const char* em = std::getenv("AF_EARLY_MODEL")) w.earlyModel = std::atoi(em);   // 初期反射 0 虚像 / 1 受取面
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     { const char* tr = std::getenv("AF_TOTAL_RAYS"); if (tr) w.budget.cfg.totalRays = std::atoi(tr); }
     { const char* gp = std::getenv("AF_GPU"); if (gp) w.gpuTrace = std::atoi(gp); }
@@ -3178,6 +3298,168 @@ void testReceiverFaces() {
     delete w;
 }
 
+/// 【探り】受取面のタップの中身（AF_ONLY=recvtaps）── どの面から何が届いているか
+///   AF_DOOR_DEG（既定 0 ＝ 閉）、耳は隣の部屋の戸口の正面 3 m。箱の番号: 0 床 1 天井 2 −x 3 +x 4 −z 5 +z 6 仕切り左 7 仕切り右 8 扉の板。
+void testReceiverTaps() {
+    std::puts("");
+    std::puts("[探り] 受取面のタップの中身（二部屋・扉、耳は隣の部屋）");
+    char line[300];
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    const float deg = std::getenv("AF_DOOR_DEG") ? static_cast<float>(std::atof(std::getenv("AF_DOOR_DEG"))) : 0.0f;
+    const float clear = std::getenv("AF_CLEAR") ? static_cast<float>(std::atof(std::getenv("AF_CLEAR"))) : 0.0f;
+    World w;
+    const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+    for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+    w.addBox(doorLeaf(deg, -0.5f, 1.0f, 3.0f, 0.06f, clear), lm, true);
+    w.raysPerEmitter = 2048; w.budget.cfg.maxPerEmitter = 2048; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+    const Vec3 S(0.0f, 1.6f, 3.0f), L(0.0f, 1.6f, -3.0f);
+    w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+    const int e = w.addEmitter(S, 0.2f);
+    w.build();
+    for (int f = 0; f < 10; ++f) w.update(1.0f / 60.0f);
+    const FaceTapSet* ft = w.faceTaps(e);
+    double tot = 0.0; for (int b = 0; b < kNumBands; ++b) tot += ft->total6[b];
+    std::snprintf(line, sizeof line, "        扉 %.0f°・隙間 %.3f m: タップ %d 本、初期の総量 %.3e、受け取り %d 件、小片 %d、見通しの線 %d",
+                  deg, clear, ft->count, tot, ft->deposits, w.receiverPatches(), w.receiverVisTests());
+    std::puts(line);
+    for (int i = 0; i < ft->count; ++i) {
+        const FaceTap& t = ft->tap[i];
+        double te = 0.0; for (int b = 0; b < kNumBands; ++b) te += t.e6[b];
+        std::snprintf(line, sizeof line, "          箱 %d 面 %d 次 %d | 量 %.3e (%.1f%%) | 遅れ %.1f ms | 点 (%+.2f %+.2f %+.2f) | 向き (%+.2f %+.2f %+.2f) 広がり %.2f",
+                      t.box, t.face, t.order, te, tot > 0 ? te / tot * 100.0 : 0.0, t.delaySec * 1000.0f,
+                      t.point.x, t.point.y, t.point.z, t.dirWorld.x, t.dirWorld.y, t.dirWorld.z, t.spread);
+        std::puts(line);
+    }
+}
+
+/// 【探り】壁に寄ると最初の反射がどう変わるか ── 虚像の道と受取面を並べる（AF_ONLY=recvnear）
+///   場面 makeWorldBox（7×3×7 m・α 0.2）、音源 (1.5, 1.6, -1)、耳を −x の壁へ寄せる（前は +z）。
+///   量が総初期の 2% 以上ある初期のタップのうち、いちばん早い物: 直接の後の遅れ・取り分・広がり・左右（x）。
+void testReceiverNear() {
+    std::puts("");
+    std::puts("[探り] 壁に寄ると最初の反射がどう変わるか（虚像の道 / 受取面、4096 本）");
+    std::puts("        壁まで | 虚像: 遅れ ms  取り分  広がり  左右 | 受取面: 遅れ ms  取り分  広がり  左右 | 受取面の壁の 1 回目: 遅れ  取り分  広がり");
+    char line[320];
+    const Vec3 S(1.5f, 1.6f, -1.0f);
+    for (float dw : {2.0f, 1.0f, 0.5f, 0.25f, 0.1f}) {
+        double r[2][4] = {};
+        double wallTap[3] = {-1.0, 0.0, 0.0};
+        for (int model = 0; model < 2; ++model) {
+            World* w = makeWorldBox(3.5f, 3.0f, 0.2f);
+            w->earlyModel = model;
+            w->raysPerEmitter = 4096; w->budget.cfg.maxPerEmitter = 4096; w->rayGroups = 1; w->budget.cfg.totalRays = 0;
+            const Vec3 L(-3.5f + dw, 1.2f, 0.0f);
+            w->setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+            const int e = w->addEmitter(S, 0.2f);
+            w->build();
+            for (int k = 0; k < 30; ++k) w->update(1.0f / 60.0f);
+            const Mix& m = *w->mix(e);
+            float directSec = 0.0f;
+            for (int i = 0; i < m.tapCount; ++i) if (m.taps[i].kind == TapKind::Direct) { directSec = m.taps[i].delaySec; break; }
+            double tot = 0.0;
+            for (int i = 0; i < m.tapCount; ++i) if (m.taps[i].kind == TapKind::Early) for (int b = 0; b < kNumBands; ++b) tot += m.taps[i].e6[b];
+            int best = -1;
+            for (int i = 0; i < m.tapCount; ++i) {
+                if (m.taps[i].kind != TapKind::Early) continue;
+                double te = 0.0; for (int b = 0; b < kNumBands; ++b) te += m.taps[i].e6[b];
+                if (te < 0.02 * tot) continue;
+                if (best < 0 || m.taps[i].delaySec < m.taps[best].delaySec) best = i;
+            }
+            if (best >= 0) {
+                const MixTap& t = m.taps[best];
+                double te = 0.0; for (int b = 0; b < kNumBands; ++b) te += t.e6[b];
+                r[model][0] = (t.delaySec - directSec) * 1000.0; r[model][1] = te / tot * 100.0; r[model][2] = t.spread; r[model][3] = t.dirLocal.x;
+            }
+            if (model == 1) {
+                const int wantId = FaceTapSet::kIdBase + ((2 * 6 + 0) * 2 + 0);
+                for (int i = 0; i < m.tapCount; ++i)
+                    if (m.taps[i].id == wantId) {
+                        double te = 0.0; for (int b = 0; b < kNumBands; ++b) te += m.taps[i].e6[b];
+                        wallTap[0] = (m.taps[i].delaySec - directSec) * 1000.0; wallTap[1] = te / tot * 100.0; wallTap[2] = m.taps[i].spread;
+                    }
+            }
+            delete w;
+        }
+        std::snprintf(line, sizeof line, "        %5.2f  | %8.2f  %5.1f%%   %4.2f  %+5.2f | %10.2f  %5.1f%%   %4.2f  %+5.2f | %8.2f  %5.1f%%   %4.2f",
+                      dw, r[0][0], r[0][1], r[0][2], r[0][3], r[1][0], r[1][1], r[1][2], r[1][3], wallTap[0], wallTap[1], wallTap[2]);
+        std::puts(line);
+    }
+}
+
+/// 【探り】扉を動かしたときの初期のフレームごとの中身（AF_ONLY=recvdoor）── 段差の出どころ
+///   clicks の「扉だけ」と同じ場面（耳 z=−4、音源 z=+3、扉 30°/s、組 4・総予算 1536）。AF_FROM / AF_TO（度、既定 24〜36）。
+void testReceiverDoor() {
+    std::puts("");
+    std::puts("[探り] 扉を動かしたときの初期（虚像の道 / 受取面）");
+    const int fs = 48000, block = 512;
+    const float dt = static_cast<float>(block) / fs;
+    const float from = std::getenv("AF_FROM") ? static_cast<float>(std::atof(std::getenv("AF_FROM"))) : 24.0f;
+    const float to = std::getenv("AF_TO") ? static_cast<float>(std::atof(std::getenv("AF_TO"))) : 36.0f;
+    char line[700];
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    for (int model = 0; model < 2; ++model) {
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        const int leaf = w.addBox(doorLeaf(0.0f), lm, true);
+        w.earlyModel = model;
+        w.raysPerEmitter = 256; w.rayGroups = 4; w.budget.cfg.totalRays = 1536;
+        Vec3 L(0, 1.6f, -4.0f);
+        const bool walkToo = std::getenv("AF_WALK") != nullptr;   // 耳も 1.4 m/s で戸口へ歩く（clicks の歩き＋扉）
+        w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w.addEmitter(Vec3(0, 1.6f, 3.0f), 0.2f);
+        w.build();
+        std::snprintf(line, sizeof line, "      ── %s ──", model == 0 ? "虚像の道" : "受取面");
+        std::puts(line);
+        std::puts("        扉°   | 初期(生) dB  差    | 後期(生) dB | 尾の開始 ms | 初期のタップ 本  和 dB   差   | 主なタップ（素性の面・次、取り分、遅れ ms）");
+        double prevE = -1.0, prevT = -1.0;
+        for (int k = 0; k < 240; ++k) {
+            const float t = k * dt;
+            float deg = 0.0f;
+            if (k > 30) {
+                deg = std::min(90.0f, 30.0f * (t - 30 * dt)); w.setBoxTransform(leaf, doorLeaf(deg));
+                if (walkToo) { L.z = -4.0f + 1.4f * (t - 30 * dt); w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0)); }
+            }
+            w.update(dt);
+            const Mix& m = *w.mix(e);
+            double er = 0.0, lr = 0.0; for (int b = 0; b < kNumBands; ++b) { er += m.component6[kEarly][b]; lr += m.component6[kLate][b]; }
+            double ts = 0.0; int nt = 0;
+            float directSec = 0.0f;
+            for (int i = 0; i < m.tapCount; ++i) if (m.taps[i].kind == TapKind::Direct) directSec = m.taps[i].delaySec;
+            int top[3] = {-1, -1, -1}; double topE[3] = {0, 0, 0};
+            for (int i = 0; i < m.tapCount; ++i) {
+                if (m.taps[i].kind != TapKind::Early) continue;
+                ++nt;
+                double te = 0.0; for (int b = 0; b < kNumBands; ++b) te += m.taps[i].e6[b];
+                ts += te;
+                for (int q = 0; q < 3; ++q) if (te > topE[q]) { for (int z = 2; z > q; --z) { topE[z] = topE[z - 1]; top[z] = top[z - 1]; } topE[q] = te; top[q] = i; break; }
+            }
+            if (deg < from || deg > to) { prevE = er; prevT = ts; continue; }
+            char tops[400] = {0};
+            int off = 0;
+            for (int q = 0; q < 3; ++q) {
+                if (top[q] < 0) continue;
+                const MixTap& tp = m.taps[top[q]];
+                int key = tp.id - FaceTapSet::kIdBase;
+                if (model == 1 && key >= 0) off += std::snprintf(tops + off, sizeof(tops) - off, " 箱%d面%d次%d %.0f%% %.1f (%+.2f %+.2f %+.2f) 広%.2f 方位%.0f", key / 12, (key / 2) % 6, key % 2, topE[q] / ts * 100.0, (tp.delaySec - directSec) * 1000.0, tp.dirLocal.x, tp.dirLocal.y, tp.dirLocal.z, tp.spread, std::atan2(tp.dirLocal.x, tp.dirLocal.z) * 57.2958);
+                else off += std::snprintf(tops + off, sizeof(tops) - off, " id%d %.0f%% %.1f", tp.id, topE[q] / ts * 100.0, (tp.delaySec - directSec) * 1000.0);
+            }
+            double dirT = 0.0, difT = 0.0, trT = 0.0;
+            for (int i = 0; i < m.tapCount; ++i) {
+                double te = 0.0; for (int b = 0; b < kNumBands; ++b) te += m.taps[i].e6[b];
+                if (m.taps[i].kind == TapKind::Direct) dirT += te; else if (m.taps[i].kind == TapKind::Diffract) difT += te; else if (m.taps[i].kind == TapKind::Transmit) trT += te;
+            }
+            std::snprintf(line, sizeof line, "        %5.1f z%+.2f | %+9.2f  %+5.2f | %+9.2f  | %8.2f    | %4d  %+7.2f  %+5.2f | 直 %+6.1f 回 %+6.1f 透 %+6.1f |%s",
+                          deg, L.z, afti::dB(er), prevE > 0 ? afti::dB(er / prevE) : 0.0, afti::dB(lr), (m.onsetSec - directSec) * 1000.0f,
+                          nt, afti::dB(ts), prevT > 0 ? afti::dB(ts / prevT) : 0.0, afti::dB(dirT), afti::dB(difT), afti::dB(trT), tops);
+            std::puts(line);
+            prevE = er; prevT = ts;
+        }
+    }
+}
+
 /// 【探り】後期はどこから来るか（AF_ONLY=lateorigin）
 ///   ★「隣の部屋にいるときは扉からの指向性が強いはず」を**レイで**測る物差し。エンジンは変えない。
 ///   traceRay と同じ式で NEE を追い、後期の寄与ごとに「放射した面が耳と同じ部屋に面しているか」で分ける。
@@ -3438,6 +3720,7 @@ void testDoorSweep() {
     { const char* r = std::getenv("AF_RAYS"); const int nr = r ? std::atoi(r) : 256;
       w.raysPerEmitter = nr; w.budget.cfg.maxPerEmitter = std::max(nr, w.budget.cfg.maxPerEmitter); }
     if (const char* wr = std::getenv("AF_WALL_REFLECT")) w.wallReflect = std::atoi(wr);   // 壁越しの反射 0/1
+    if (const char* em = std::getenv("AF_EARLY_MODEL")) w.earlyModel = std::atoi(em);   // 初期反射 0 虚像 / 1 受取面
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     if (const char* lk = std::getenv("AF_LEAK")) w.leakModel = std::atoi(lk);   // 漏れの模型 0/1/2/3
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 1;
@@ -3682,6 +3965,7 @@ void testClicks() {
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     if (const char* lk = std::getenv("AF_LEAK")) w.leakModel = std::atoi(lk);   // 漏れの模型 0/1/2/3
     if (const char* wr = std::getenv("AF_WALL_REFLECT")) w.wallReflect = std::atoi(wr);   // 壁越しの反射 0/1
+    if (const char* em = std::getenv("AF_EARLY_MODEL")) w.earlyModel = std::atoi(em);   // 初期反射 0 虚像 / 1 受取面
         if (const char* lt = std::getenv("AF_LATE_THROUGH")) w.lateThrough = std::atoi(lt);   // 戸口越しの後期 0/1（段 2-f）
         w.budget.cfg.totalRays = (which == 3) ? 0 : 1536;
         w.rayGroups = (which == 2 || which == 3) ? 1 : 4;
@@ -3739,6 +4023,9 @@ void testClicks() {
                 if (prevE > 0.0 && e2 > 0.0) {
                     const double st = std::fabs(afti::dB(e2 / prevE));
                     if (st > worstBlock) { worstBlock = st; worstAtDeg = std::min(90.0f, 30.0f * (t - 30 * dt)); worstAtZ = L.z; }
+                    // AF_STEP_LOG=<dB>: その段より大きいブロックを角度つきで出す（全部の成分・扉だけのとき）
+                    if (which == (std::getenv("AF_STEP_WHICH") ? std::atoi(std::getenv("AF_STEP_WHICH")) : 0) && motion == (std::getenv("AF_STEP_MOTION") ? std::atoi(std::getenv("AF_STEP_MOTION")) : 2) && std::getenv("AF_STEP_LOG") && st > std::atof(std::getenv("AF_STEP_LOG")))
+                        std::printf("        段 %+.2f dB 扉 %.1f° 耳 z %.2f（ブロック %d）\n", afti::dB(e2 / prevE), std::min(90.0f, 30.0f * (t - 30 * dt)), L.z, nb);
                 }
             }
             prevE = e2;
@@ -3787,8 +4074,8 @@ int main() {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
-        {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"wall", testWallReflect}, {"precedence", testPrecedence}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
-        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true}, {"doorcoh", testDoorCoherence, true}, {"receiver", testReceiverFaces, true}, {"doormap", testDoorMap, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
+        {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"wall", testWallReflect}, {"precedence", testPrecedence}, {"recvworld", testReceiverWorld}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
+        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true}, {"doorcoh", testDoorCoherence, true}, {"receiver", testReceiverFaces, true}, {"recvtaps", testReceiverTaps, true}, {"recvnear", testReceiverNear, true}, {"recvdoor", testReceiverDoor, true}, {"doormap", testDoorMap, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {
         // AF_ONLY はコンマ区切りで複数指定できる（例 AF_ONLY=world,bridge）

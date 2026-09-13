@@ -122,6 +122,12 @@ void AF_WorldSetPrecedence(AF_WorldHandle w, float db, float sec) {
     W->precedenceDb = (db < 0.0f) ? 0.0f : db;
     W->precedenceSec = (sec < 0.001f) ? 0.001f : sec;
 }
+void AF_WorldSetEarlyModel(AF_WorldHandle w, int model) {
+    if (acoustic::flow::World* W = asWorld(w)) W->earlyModel = (model <= 0) ? 0 : 1;
+}
+int AF_WorldEarlyModel(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->earlyModel : 1;
+}
 void AF_WorldSetWallReflect(AF_WorldHandle w, int on) {
     if (acoustic::flow::World* W = asWorld(w)) W->wallReflect = (on != 0) ? 1 : 0;
 }
@@ -281,6 +287,7 @@ int AF_WorldArrivals(AF_WorldHandle w, int e, AF_Arrival* out, int maxOut) {
     };
     const acoustic::Vec3 L = W->listener().pos;
     const acoustic::flow::ImageSet* im = W->images(e);
+    const acoustic::flow::FaceTapSet* ftaps = W->faceTaps(e);
     const std::vector<acoustic::flow::Face>& faces = W->faces();
     const acoustic::flow::Diffraction* df = W->diffraction(e);
     int imageIdx = 0;
@@ -298,6 +305,15 @@ int AF_WorldArrivals(AF_WorldHandle w, int e, AF_Arrival* out, int maxOut) {
         if (t.kind == acoustic::flow::TapKind::Diffract) {
             const bool ok = df && df->valid;
             push(AF_ARRIVAL_DIFFRACT, t.dirLocal.x, t.dirLocal.y, t.dirLocal.z, t.spread, et, t.delaySec, ok, ok ? df->point : none, -1);
+            continue;
+        }
+        if (ftaps && ftaps->count > 0 && (t.id >= acoustic::flow::FaceTapSet::kIdBase || t.id == acoustic::flow::FaceTapSet::kIdRest)) {
+            // 受取面のタップ: 出どころは量で重みを付けた小片の中心、箱は面の持ち主
+            const acoustic::flow::FaceTap* hit = nullptr;
+            for (int q = 0; q < ftaps->count; ++q) if (ftaps->tap[q].id == t.id) { hit = &ftaps->tap[q]; break; }
+            const bool dirOk = acoustic::length(t.dirLocal) > 0.5f;
+            push(dirOk ? AF_ARRIVAL_EARLY : AF_ARRIVAL_EARLY_DIFFUSE, t.dirLocal.x, t.dirLocal.y, t.dirLocal.z, dirOk ? t.spread : 1.0f, et, t.delaySec,
+                 hit != nullptr && t.id != acoustic::flow::FaceTapSet::kIdRest, hit ? hit->point : none, hit ? hit->box : -1);
             continue;
         }
         if (t.id == 4) {                                                    // 方向なしの初期（distribute の素性 4）

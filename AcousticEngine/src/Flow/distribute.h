@@ -46,6 +46,7 @@
 #include "Flow/emitter.h"
 #include "Flow/energy_trace.h"
 #include "Flow/image_sources.h"
+#include "Flow/receiver.h"
 #include "Flow/mix.h"
 #include "Flow/response.h"
 #include "Flow/world_rules.h"
@@ -53,11 +54,17 @@
 namespace acoustic {
 namespace flow {
 
+/// 受取面の「それ以降の当たり」のタップの遅れを均す時間（秒）。1 回目のタップは Response::statSec。
+constexpr float kFaceLaterDelaySec = 0.3f;
+
 struct DistributeInput {
     const TraceResult* trace = nullptr;
     const Visibility* visibility = nullptr;   // nullptr なら見通し 1（検査用）
     const Diffraction* diffraction = nullptr; // nullptr か valid=false なら回折 0
     const ImageSet* images = nullptr;         // nullptr か count=0 なら初期は方向なしの 1 本
+    // 受取面（2026-09-13、World::earlyModel = 1）。あれば初期は虚像でなくこの面ごとのタップで鳴らす。
+    //   ★量の総量は trace->early6（World が受取面の合計に書き戻した物）。ここは取り分・遅れ・向き・広がりだけを使う。
+    const FaceTapSet* faceTaps = nullptr;
     Vec3 sourcePos{0, 0, 0};
     const Listener* listener = nullptr;
     int listenerRoom = -1;                 // −1 なら FDN の送りを作らない
@@ -78,7 +85,7 @@ struct DistributeInput {
 /// 音源 1 つぶんの配分の状態（成分ごとの追従）。世界が音源ごとに 1 つ持つ。
 class EmitterMixer {
 public:
-    void reset() { for (int c = 0; c < kNumComponents; ++c) f_[c].reset(); fOther_.reset(); }
+    void reset() { for (int c = 0; c < kNumComponents; ++c) f_[c].reset(); fOther_.reset(); faceSm_.clear(); onsetSm_ = -1.0f; }
 
     void run(const DistributeInput& in, Mix& out) {
         out.clear();
@@ -140,12 +147,82 @@ public:
         //   虚像が 0→4 本に生えた瞬間に初期反射が丸ごと方向つきに切り替わっていた（実測 2.0 dB／55°）。
         //   広がりは 1 − 可視率（面の縁で半分隠れた虚像は半分ぼやける）。帳簿の初期は総量を 1 回だけ。
         const ImageSet* im = in.images;
+        const FaceTapSet* ft = (in.faceTaps && in.faceTaps->count > 0) ? in.faceTaps : nullptr;
+        if (ft) {
+            // 受取面: 面ごとのタップへ、面が受けた量の取り分で配る（帯域ごとに Σ = 1）。
+            //   ★取り分・遅れ・向き・広がりは**追従で均してから**使う（2026-09-13）。レイの組が入れ替わると、面のタップの
+            //     取り分と遅れがそのフレームで跳ぶ（扉 29.8° で天井のタップが 1 回目 18%・2.1 ms とそれ以降 17%・5.8 ms に割れ、
+            //     扉の板のタップの遅れが 3.1 → 3.8 ms）。総量は statSec で均しているのに形だけ生だったので、鳴らすと段になった
+            //     （clicks の扉だけ 虚像 0.75 → 受取面 1.81 dB）。取り分と遅れは statSec、向きと広がりは directionSec。
+            //   ★新しく出たタップは取り分 0 から、消えたタップは 0 へ落としてから外す。取り分は帯域ごとに和を 1 に揃え直す（帳簿は変えない）。
+            const float aStat = (rs.statSec > 1e-4f) ? 1.0f - std::exp(-in.dt / rs.statSec) : 1.0f;
+            const float aDir = (rs.directionSec > 1e-4f) ? 1.0f - std::exp(-in.dt / rs.directionSec) : 1.0f;
+            for (FaceSmooth& z : faceSm_) z.seen = false;
+            for (int i = 0; i < ft->count; ++i) {
+                const FaceTap& f = ft->tap[i];
+                FaceSmooth* z = nullptr;
+                for (FaceSmooth& q : faceSm_) if (q.id == f.id) { z = &q; break; }
+                const bool hasDir = length(f.dirWorld) > 0.5f;
+                if (!z) {
+                    faceSm_.push_back(FaceSmooth{});
+                    z = &faceSm_.back();
+                    z->id = f.id; z->delay = f.delaySec; z->dir = hasDir ? f.dirWorld : Vec3(0, 0, 0); z->spread = hasDir ? f.spread : 1.0f;
+                }
+                z->seen = true;
+                for (int b = 0; b < kNumBands; ++b) {
+                    const float target = (ft->total6[b] > 0.0f) ? f.e6[b] / ft->total6[b] : 0.0f;
+                    z->share6[b] += aStat * (target - z->share6[b]);
+                }
+                {
+                    // それ以降の当たりのタップは遅れを長く均す（kFaceLaterDelaySec）。1 回目は statSec のまま（壁際の近さの手がかり）。
+                    //   ★それ以降のタップは多くの経路をまとめた物で、扉が開くと量の重心が一気に移り、目標の遅れが数 ms 跳ぶ。
+                    //     50 ms で追うと強いタップの遅れが 1 フレームに 1 ms ずつ掃かれ（扉の板のタップ 11.7 → 7.5 ms）、
+                    //     鳴らすと段になった（clicks の歩き＋扉 虚像 1.20 → 受取面 1.66 dB。0.3 s で 1.41 dB、1 s でも 1.41 dB）。
+                    const bool later = (f.id == FaceTapSet::kIdRest) || (f.id >= FaceTapSet::kIdBase && ((f.id - FaceTapSet::kIdBase) % 2) == 1);
+                    const float aD = later ? (1.0f - std::exp(-in.dt / kFaceLaterDelaySec)) : aStat;
+                    z->delay += aD * (f.delaySec - z->delay);
+                }
+                if (hasDir) {
+                    Vec3 d = (length(z->dir) > 0.5f) ? z->dir + (f.dirWorld - z->dir) * aDir : f.dirWorld;
+                    const float ld = length(d);
+                    z->dir = (ld > 1e-6f) ? d * (1.0f / ld) : f.dirWorld;
+                    z->spread += aDir * (f.spread - z->spread);
+                } else {
+                    z->spread += aDir * (1.0f - z->spread);
+                }
+            }
+            // 見えなくなったタップは 0 へ落とし、十分小さくなったら外す
+            for (FaceSmooth& z : faceSm_) if (!z.seen) for (int b = 0; b < kNumBands; ++b) z.share6[b] *= (1.0f - aStat);
+            faceSm_.erase(std::remove_if(faceSm_.begin(), faceSm_.end(), [](const FaceSmooth& z) {
+                if (z.seen) return false;
+                for (int b = 0; b < kNumBands; ++b) if (z.share6[b] > 1e-5f) return false;
+                return true;
+            }), faceSm_.end());
+            float sumShare[kNumBands] = {};
+            for (const FaceSmooth& z : faceSm_) for (int b = 0; b < kNumBands; ++b) sumShare[b] += z.share6[b];
+            for (const FaceSmooth& z : faceSm_) {
+                MixTap* t = out.pushTap();
+                if (!t) break;
+                t->kind = TapKind::Early; t->id = z.id; t->delaySec = z.delay;
+                const bool hasDir = length(z.dir) > 0.5f;
+                t->dirLocal = hasDir ? in.listener->toLocal(z.dir) : Vec3(0, 0, 0);
+                t->spread = hasDir ? std::min(1.0f, std::max(0.0f, z.spread)) : 1.0f;
+                const float pw = pre(z.delay);
+                for (int b = 0; b < kNumBands; ++b) {
+                    const float share = (sumShare[b] > 0.0f) ? z.share6[b] / sumShare[b] : 0.0f;
+                    t->e6[b] = sm[kEarly][b] * W.w[kEarly] * share * pw;
+                }
+            }
+            if (ft->firstSec > 0.0f) onsetSm_ = (onsetSm_ < 0.0f) ? ft->firstSec : onsetSm_ + aStat * (ft->firstSec - onsetSm_);
+        } else {
+            faceSm_.clear(); onsetSm_ = -1.0f;
+        }
         float dirFrac[kNumBands] = {};
-        if (im && im->count > 0)
+        if (!ft && im && im->count > 0)
             for (int b = 0; b < kNumBands; ++b) dirFrac[b] = std::min(1.0f, std::max(0.0f, im->directional6[b]));
         // 方向なしの残り。虚像が無ければ丸ごとここ（＝従来の 1 本と同じ）。到達はレイの最初の反射で固定
-        //   ── 虚像の出入りで到達が動くと、素性で繋いだこのタップの遅延が掃引される。
-        {
+        //   ── 虚像の出入りで到達が動くと、素性で繋いだこのタップの遅延が掃引される。受取面のときは出さない。
+        if (!ft) {
             MixTap* t = out.pushTap();
             if (t) {
                 t->kind = TapKind::Early; t->id = 4;
@@ -155,7 +232,7 @@ public:
                 for (int b = 0; b < kNumBands; ++b) t->e6[b] = sm[kEarly][b] * W.w[kEarly] * (1.0f - dirFrac[b]) * pw;
             }
         }
-        if (im && im->count > 0) {
+        if (!ft && im && im->count > 0) {
             for (int i = 0; i < im->count; ++i) {
                 const ImageSource& src = im->img[i];
                 MixTap* t = out.pushTap();
@@ -182,7 +259,8 @@ public:
         //   ★帳簿（component6）は総量を 1 回だけ。割るのは出口だけ。
         const bool apart = (in.listenerRoom >= 0 && in.sourceRoom >= 0 && in.sourceRoom != in.listenerRoom);
         // 尾の開始 = 最初の虚像の到達（ITDG）。虚像が無ければレイの最初の反射、それも無ければ直接。（先着の重みの遅れにも使う）
-        const float onsetSec = (im && im->count > 0 && im->firstSec > 0.0f) ? im->firstSec
+        const float onsetSec = (ft && onsetSm_ > 0.0f) ? onsetSm_
+                             : (im && im->count > 0 && im->firstSec > 0.0f) ? im->firstSec
                              : (T.firstReflectSec > 0.0f) ? T.firstReflectSec : T.directSec;
         // 先着の重みで見る尾の遅れの目安: 戸口から直接の分 ＝ 尾の開始 ＋ 尾の器の最短の線（15 ms）、
         //   部屋の響き（耳の部屋の尾、戸口から流した分）＝ さらに部屋を渡って戻る 30 ms。目安であって測った値ではない。
@@ -249,6 +327,17 @@ public:
     }
 
 private:
+    // 受取面のタップの追従（素性ごと）。取り分・遅れは statSec、向き・広がりは directionSec。
+    struct FaceSmooth {
+        int   id = -1;
+        float share6[kNumBands] = {};
+        float delay = 0.0f;
+        Vec3  dir{0, 0, 0};
+        float spread = 1.0f;
+        bool  seen = false;
+    };
+    std::vector<FaceSmooth> faceSm_;
+    float onsetSm_ = -1.0f;
     Follower6 f_[kNumComponents];
     Follower6 fOther_;   // 段 2-f。後期のうち戸口越しの分。後期と同じ速さで追い、比を取る
 };

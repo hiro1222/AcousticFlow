@@ -49,6 +49,8 @@
 #include "Flow/mix.h"
 #include "Flow/mix_to_voice.h"
 #include "Flow/probe.h"
+#include "Flow/receiver.h"
+#include "Flow/receiver_layout.h"
 #include "Flow/response.h"
 #include "Flow/surfaces.h"
 #include "Flow/trace_scene.h"
@@ -191,6 +193,12 @@ public:
     ///     （実測: 広がりが 1 m より近くで 4.8 ms から縮まず 5.1 ms へ戻る）。
     ///   ★費用は候補の数で効く（箱 6 面なら 1 次 6・2 次 30・3 次 120）。厳密の段だけに掛ける。
     int imageOrder = 2;
+    /// 初期反射の出し方（2026-09-13）。0 虚像（ISM、段 7）／1 受取面（receiver.h）。実行中に切り替えてよい。
+    ///   受取面: レイは音源から面までを運び、面の小片が受けた量を耳へ立体角で解析的に配る。面ごと・1 回目の当たりかどうかでタップを立て、
+    ///   向きと遅れは鏡面の折り返しで重みを付ける。発注者の案「面をレイの受取面にする」（探り AF_ONLY=receiver）。
+    int earlyModel = 1;
+    /// 受取面の小片の一辺（m）。変えると次の更新で割り付けを作り直す。
+    float patchCell = 0.5f;
     /// レイを GPU で解くか（0 切／1 入。**既定 0**）。2026-09-10。
     ///   ★音は作らない。GPU が出すのは幾何と統計（レイの当たりと帳簿）だけで、
     ///     音にするのは今までどおりエンジン（CPU）。決めごと（音の計算はエンジンだけ）と当たらない。
@@ -276,6 +284,11 @@ public:
     const Visibility* visibility(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].vis : nullptr; }
     const Diffraction* diffraction(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].diff : nullptr; }
     const ImageSet* images(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].images : nullptr; }
+    /// 受取面の面ごとのタップ（earlyModel = 1 のとき。そうでなければ count 0）。
+    const FaceTapSet* faceTaps(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].faceTaps : nullptr; }
+    const PatchLayout& patchLayout() const { return patchLayout_; }
+    int receiverVisTests() const { return recvView_.visTests(); }
+    int receiverPatches() const { return recvView_.solvedCount(); }
     /// ISM の面（虚像の face 番号が指す物）。配分タブの地図が壁の上の反射点を出すのに使う。
     const std::vector<Face>& faces() const { return faces_; }
     int faceCount() const { return static_cast<int>(faces_.size()); }
@@ -301,6 +314,9 @@ public:
         // ★レイが見る場面を平らな配列にして 1 フレームに 1 回だけ組む。
         //   音源ごとに組み直すと箱の数 × 音源の数だけ無駄が出る。GPU へ送るのもこの 1 つ。
         buildTraceScene(surfaces, rules.materials, traceScene_);
+        if (earlyModel == 1 && (patchLayout_.boxCount != traceScene_.boxCount() || patchLayout_.cell != std::max(0.05f, patchCell)))
+            buildPatchLayout(traceScene_, patchCell, patchLayout_);
+        const bool receiver = (earlyModel == 1);
         // GPU の道（既定は切）。1 回だけ積んで、以後は毎フレーム場面を送るだけ。
         if (gpuTrace != 0 && !gpuTried_) { gpuTried_ = true; gpuReady_ = gpuTracer_.init(); }
         if (gpuActive() && !gpuTracer_.upload(traceScene_)) gpuReady_ = false;   // 送れなくなったら CPU へ戻る
@@ -365,19 +381,35 @@ public:
             if (s.groupRays != bs.rays || s.groupCount != G) {
                 for (int g = 0; g < G; ++g) {
                     TraceParams pg = prm; pg.group = g;
-                    jobs_.push_back(TraceJob{s.em.pos, pg, &s.parts[g]});
+                    jobs_.push_back(TraceJob{s.em.pos, pg, &s.parts[g], receiver ? &s.depParts[g] : nullptr});
+                    if (!receiver) s.depParts[g].clear();
                 }
                 s.groupRays = bs.rays; s.groupCount = G;
             } else {
-                jobs_.push_back(TraceJob{s.em.pos, prm, &s.parts[prm.group]});
+                jobs_.push_back(TraceJob{s.em.pos, prm, &s.parts[prm.group], receiver ? &s.depParts[prm.group] : nullptr});
             }
             jr.count = static_cast<int>(jobs_.size()) - jr.first;
             s.groupNext = (s.groupNext + 1) % G;
         }
         // ── GPU なら 1 回で全部流す。CPU なら音源ごとの解きの中で（並列のまま）解く。──
         const bool batched = gpuActive() && runTracesBatched();
+        // 受取面: GPU が NEE を引いたフレームは、受け取りだけを CPU で取る（同じ種・同じ組なので同じレイ）。
+        if (batched && receiver) {
+            auto dep = [&](int j) {
+                TraceJob& jb = jobs_[static_cast<std::size_t>(j)];
+                if (!jb.dep) return;
+                jb.dep->clear();
+                DepositSink sink; sink.layout = &patchLayout_; sink.out = jb.dep; sink.maxSec = jb.prm.mixingSec;
+                tracer_.runDeposit(traceScene_, jb.src, jb.prm, sink);
+            };
+            const int nj = static_cast<int>(jobs_.size());
+            if (pool_ && pool_->size() > 1 && nj > 1) pool_->parallelFor(nj, dep);
+            else for (int j = 0; j < nj; ++j) dep(j);
+        }
 
         // 音源ごとの解き（互いに独立で、自分の枠にしか書かない → 並列化できる。既定は直列）。
+        //   ★受取面のために 2 段に割った（2026-09-13）: ① レイと解析 → 全音源ぶんの小片を 1 回だけ耳へ解く → ② 配分。
+        //     小片の見え方は音源に依らないので、音源ごとに解くと同じ影の線を音源の数だけ引くことになる。
         auto solve = [&](int k) {
             Slot& s = slots_[static_cast<std::size_t>(liveIdx_[static_cast<std::size_t>(k)])];
             const BudgetSlot& bs = budgetSlots_[static_cast<std::size_t>(k)];
@@ -387,7 +419,7 @@ public:
             if (!batched)
                 for (int j = jr.first; j < jr.first + jr.count; ++j)
                     *jobs_[static_cast<std::size_t>(j)].out =
-                        runTrace(jobs_[static_cast<std::size_t>(j)].src, jobs_[static_cast<std::size_t>(j)].prm);
+                        runTrace(jobs_[static_cast<std::size_t>(j)].src, jobs_[static_cast<std::size_t>(j)].prm, jobs_[static_cast<std::size_t>(j)].dep);
             const int G = std::max(1, s.groupCount);
             TraceResult::sumGroups(s.parts, G, s.trace);
             // 見通し（解析）。幅は見込み角で点へ寄せた物。
@@ -414,10 +446,26 @@ public:
                 for (int b = 0; b < kNumBands; ++b) s.diff.energy6[b] *= openF;
             }
             // 虚像（段 7）: 初期の方向と正規化重み。簡易は作らない（方向なしの 1 本に落ちる）。
-            if (light) s.images.count = 0;
+            if (light || receiver) s.images.count = 0;          // 受取面のときは虚像を作らない（向きも量も面が持つ）
             else buildImages(surfaces, faces_, listener_, s.em.pos, rEff, mixingSec + 3.0f / kSpeedOfSound, s.images, imageOrder);
+        };
+        auto solveMix = [&](int k) {
+            Slot& s = slots_[static_cast<std::size_t>(liveIdx_[static_cast<std::size_t>(k)])];
+            const BudgetSlot& bs = budgetSlots_[static_cast<std::size_t>(k)];
+            if (bs.rays <= 0) return;                     // 保持: 最後の答えを保つ（Mix を触らない）
+            // 受取面: 面ごとのタップにまとめ、初期の総量をレイの NEE から受取面の合計に置き換える（帳簿の初期）。
+            if (receiver) {
+                const std::vector<Deposit>* groups[TraceGroups::kMax];
+                const int G = std::max(1, s.groupCount);
+                for (int g = 0; g < G; ++g) groups[g] = &s.depParts[g];
+                buildFaceTaps(traceScene_, patchLayout_, recvView_, listener_.pos, groups, G, mixingSec, s.faceScratch, s.faceTaps);
+                for (int b = 0; b < kNumBands; ++b) s.trace.early6[b] = s.faceTaps.total6[b];
+            } else {
+                s.faceTaps = FaceTapSet{};
+            }
             DistributeInput in;
             in.trace = &s.trace; in.visibility = &s.vis; in.diffraction = &s.diff; in.images = &s.images;
+            in.faceTaps = receiver ? &s.faceTaps : nullptr;
             in.sourcePos = s.em.pos; in.listener = &listener_;
             in.listenerRoom = lroom; in.weights = &rules.weights; in.response = &response; in.dt = dt;
             in.sourceRoom = (lateThrough != 0) ? s.em.room : -1;
@@ -436,6 +484,20 @@ public:
         //   そもそも GPU 側が桁で速いので、主スレッドから順に流しても足りる。
         if (pool_ && pool_->size() > 1 && n > 1 && !gpuActive()) pool_->parallelFor(n, solve);
         else for (int k = 0; k < n; ++k) solve(k);
+        // 受取面: このフレームに受け取りのある小片を集め、耳へ 1 回だけ解く（直列）。
+        if (receiver) {
+            recvView_.begin(patchLayout_.patchCount);
+            for (int k = 0; k < n; ++k) {
+                if (budgetSlots_[static_cast<std::size_t>(k)].rays <= 0) continue;
+                const Slot& s = slots_[static_cast<std::size_t>(liveIdx_[static_cast<std::size_t>(k)])];
+                const int G = std::max(1, s.groupCount);
+                for (int g = 0; g < G; ++g) for (const Deposit& d : s.depParts[g]) recvView_.touch(d.patch);
+            }
+            recvView_.solve(traceScene_, patchLayout_, listener_.pos);
+        }
+        // 配分の段は GPU を触らない（受取面の影の線も CPU）ので、GPU のときも並列にしてよい。
+        if (pool_ && pool_->size() > 1 && n > 1) pool_->parallelFor(n, solveMix);
+        else for (int k = 0; k < n; ++k) solveMix(k);
         spentRays_ = Budget::spentRays(budgetSlots_, n);
         updateFdn();
     }
@@ -465,6 +527,9 @@ private:
         Visibility   vis;
         Diffraction  diff;
         ImageSet     images;
+        FaceTapSet   faceTaps;                           // 受取面（earlyModel = 1）
+        FaceScratch  faceScratch;
+        std::vector<Deposit> depParts[TraceGroups::kMax]; // 組ごとの受け取り
         int          tier = 2, rays = 0;
         // フレーム分散（段 8）: 組ごとの結果を持ち、毎フレーム 1 組だけ更新して足し合わせる
         TraceResult  parts[TraceGroups::kMax];
@@ -655,7 +720,7 @@ private:
     bool gpuTried_ = false, gpuReady_ = false;
 
     /// レイの注文（どの音源の、どの組を、何本）。
-    struct TraceJob { Vec3 src; TraceParams prm; TraceResult* out; };
+    struct TraceJob { Vec3 src; TraceParams prm; TraceResult* out; std::vector<Deposit>* dep; };
     struct JobRange { int first = 0, count = 0; };
     mutable std::vector<TraceJob>  jobs_;
     std::vector<JobRange>  jobRange_;
@@ -675,16 +740,22 @@ private:
         return gpuTracer_.runBatch(traceScene_, listener_.pos, gpuJobs_.data(), static_cast<int>(gpuJobs_.size()));
     }
 
-    /// レイを 1 音源ぶん解く。GPU が入っていれば GPU、そうでなければ CPU。
-    TraceResult runTrace(const Vec3& src, const TraceParams& prm) const {
-        if (!gpuActive()) return tracer_.run(traceScene_, src, listener_.pos, prm);
+    /// レイを 1 音源ぶん解く。GPU が入っていれば GPU、そうでなければ CPU。dep があれば受取面の受け取りも取る。
+    TraceResult runTrace(const Vec3& src, const TraceParams& prm, std::vector<Deposit>* dep = nullptr) const {
+        DepositSink sink; sink.layout = &patchLayout_; sink.out = dep; sink.maxSec = prm.mixingSec;
+        if (dep) dep->clear();
+        if (!gpuActive()) return tracer_.run(traceScene_, src, listener_.pos, prm, dep ? &sink : nullptr);
         TraceResult R;
         fillDirect(traceScene_, src, listener_.pos, R);
         if (!gpuTracer_.run(traceScene_, src, listener_.pos, prm, R))
-            return tracer_.run(traceScene_, src, listener_.pos, prm);   // 流せなければ CPU で出し直す
+            return tracer_.run(traceScene_, src, listener_.pos, prm, dep ? &sink : nullptr);   // 流せなければ CPU で出し直す
+        if (dep) tracer_.runDeposit(traceScene_, src, prm, sink);
         return R;
     }
     int  buildCount_ = 0;
+    // 受取面（2026-09-13）
+    PatchLayout  patchLayout_;
+    ReceiverView recvView_;
     // 段 8
     EnergyTrace tracer_;
     std::vector<const Emitter*> live_;

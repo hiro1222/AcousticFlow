@@ -54,6 +54,7 @@
 #include "Core/vec3.h"
 #include "Flow/surfaces.h"
 #include "Flow/trace_scene.h"
+#include "Flow/receiver_layout.h"
 #include "Flow/world_rules.h"
 
 namespace acoustic {
@@ -194,9 +195,12 @@ inline void fillDirect(const TraceScene& sc, const Vec3& source, const Vec3& lis
 
 /// レイ 1 本を追う（純粋な関数）。i は**全体での本数の中の番号**で、種はここから作る。
 ///   受ける物は全部読み取り専用。書くのは out だけ。
+///   sink を渡すと、mixing time より前の当たりごとに受け取り（受取面、receiver_layout.h）を置く。doNee=false で耳への影の線を引かない
+///   （受け取りだけを取るとき。GPU が NEE を引く道で使う）。どちらも既定のままなら今までと 1 ビットも同じ。
 inline void traceRay(const TraceScene& sc,
                      const Vec3& source, const Vec3& listener,
-                     const TraceParams& prm, int i, float e0, RayPartial& out) {
+                     const TraceParams& prm, int i, float e0, RayPartial& out,
+                     DepositSink* sink = nullptr, bool doNee = true) {
     // ★レイごとに種を作る（音源 × レイ番号）。逐次の 1 本の流れにすると、組で間引いたとき
     //   同じレイ番号が別の道を通ってしまい、静止していても合計が組ごとに変わる（＝揺れる）。
     std::uint32_t rng = (prm.seed * 2654435761u + 0x9E3779B9u) ^ (static_cast<std::uint32_t>(i) * 2246822519u);
@@ -224,8 +228,24 @@ inline void traceRay(const TraceScene& sc,
         }
         rMean /= kNumBands; tMean /= kNumBands;
         const Vec3 nFace = (dot(h.normal, dir) < 0.0f) ? h.normal : h.normal * -1.0f;
+        // ── 受取面（2026-09-13）: この当たりを小片に置く。法線の側（箱の外）から当たったときだけ ──
+        if (sink && sink->out && sink->layout) {
+            const float ts = pathLen / kSpeedOfSound;
+            if (ts < sink->maxSec && dot(h.normal, nFace) > 0.0f) {
+                float lu = 0.5f, lv = 0.5f;
+                const int pch = patchOfHit(sc, *sink->layout, h.index, h.point, h.normal, &lu, &lv);
+                if (pch >= 0) {
+                    Deposit d;
+                    d.patch = pch; d.order = static_cast<std::uint8_t>(std::min(bounce, 255)); d.tSec = ts;
+                    d.u8 = static_cast<std::uint8_t>(std::min(255.0f, lu * 256.0f)); d.v8 = static_cast<std::uint8_t>(std::min(255.0f, lv * 256.0f));
+                    for (int b = 0; b < kNumBands; ++b) d.e6[b] = e[b] * sp[b].reflect * airEnergy(b, pathLen);
+                    d.inDir[0] = dir.x; d.inDir[1] = dir.y; d.inDir[2] = dir.z;
+                    sink->out->push_back(d);
+                }
+            }
+        }
         // ── NEE: この当たり点からリスナーへ ──
-        {
+        if (doNee) {
             const Vec3 toL = listener - h.point;
             const float d = length(toL);
             if (d > kEps) {
@@ -294,6 +314,18 @@ inline void traceRay(const TraceScene& sc,
 
 class EnergyTrace {
 public:
+    /// 受け取りだけを取る（耳への影の線を引かない）。GPU が NEE を引くフレームの受取面の道。組の間引きは run と同じ。
+    void runDeposit(const TraceScene& sc, const Vec3& source, const TraceParams& prm, DepositSink& sink) const {
+        const int N = std::max(1, prm.rays);
+        const float e0 = 1.0f / static_cast<float>(N);
+        const int G = std::max(1, prm.groups);
+        const int g0 = ((prm.group % G) + G) % G;
+        for (int i = g0; i < N; i += G) {
+            RayPartial p;
+            traceRay(sc, source, source, prm, i, e0, p, &sink, false);
+        }
+    }
+
     /// 便利版: Surfaces から場面を組んで回す（検査や道具から呼ぶ）。毎回組むので実時間の道では使わない。
     TraceResult run(const Surfaces& surf, const MaterialTable& mats,
                     const Vec3& source, const Vec3& listener, const TraceParams& prm) const {
@@ -304,7 +336,7 @@ public:
 
     /// 本体: 平らな場面だけを見る。★GPU 版もこれと同じ入力を受ける。
     TraceResult run(const TraceScene& sc,
-                    const Vec3& source, const Vec3& listener, const TraceParams& prm) const {
+                    const Vec3& source, const Vec3& listener, const TraceParams& prm, DepositSink* sink = nullptr) const {
         TraceResult R;
         fillDirect(sc, source, listener, R);
         // ── 2) 反射（レイ + NEE）──
@@ -317,7 +349,7 @@ public:
         const int g0 = ((prm.group % G) + G) % G;
         for (int i = g0; i < N; i += G) {
             RayPartial p;
-            traceRay(sc, source, listener, prm, i, e0, p);
+            traceRay(sc, source, listener, prm, i, e0, p, sink);
             ++R.raysTraced;
             R.hits += p.hits; R.neeVisible += p.neeVisible;
             for (int b = 0; b < kNumBands; ++b) {

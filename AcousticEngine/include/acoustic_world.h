@@ -114,6 +114,9 @@ ACOUSTIC_API void AF_WorldSetPrecedence(AF_WorldHandle w, float db, float sec);
 /* 壁越しの反射（既定 0 ＝ 通さない）。1 で旧: 壁を横切った反射と残響も透過率で薄めて届ける。
  * 0 では壁を抜けるのは透過の直接音だけ。開いた戸口を通る分はどちらでも同じ。実行中に切り替えてよい。 */
 ACOUSTIC_API void AF_WorldSetWallReflect(AF_WorldHandle w, int on);
+/* 初期反射の出し方（既定 1）。0 虚像（ISM）／1 受取面（面をレイの受取面にして、面ごとのタップで鳴らす）。実行中に切り替えてよい。 */
+ACOUSTIC_API void AF_WorldSetEarlyModel(AF_WorldHandle w, int model);
+ACOUSTIC_API int  AF_WorldEarlyModel(AF_WorldHandle w);
 ACOUSTIC_API int  AF_WorldWallReflect(AF_WorldHandle w);
 /* 尾のレーンの作り（既定 1）。実行中に切り替えられる（試聴の A/B）。
  *   0 耳ごとの行（点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる）
