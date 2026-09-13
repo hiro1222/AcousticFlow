@@ -2812,6 +2812,372 @@ void testDoorCoherence() {
     }
 }
 
+// ================================ 【探り】受取面（AF_ONLY=receiver、2026-09-13）
+//   発注者の案「虚像を音源にするのでなく、面をレイの受取面にする」を、今の NEE と**同じレイ**で並べる。
+//   レイは音源から面までだけを運び、面の小片に「反射して出ていく量」を到達時刻ごとに貯める（音源→面の空気込み）。
+//   耳へ届く量は、小片の四角を耳から見た立体角 Ω で解析的に出す:
+//     寄与 = 貯めた量 × Ω / (π·小片の面積) × 見える割合 × 空気(面→耳)
+//   ★NEE（当たりごとに cosθ/(π d²)）と同じランバートの模型なので、期待値は一致するはず。違うのは
+//     「耳がレイの計算の外にいる」こと（耳が動いてもレイの統計が変わらない）と、耳のそばで上限の無い 1/d² の跳ねが無いこと。
+//   測る物: ① 量が一致するか ② 歩いたときの揺れ ③ 壁に寄ったときの近さ ④ 費用。場面は makeWorldBox（7×3×7 m、α 0.2）。
+//   鏡面の向きはまだ持たない（今の NEE と同じ全部ランバート）。壁越しは wallReflect=0 と同じ（面の表側・横切り無しだけ）。
+namespace recvprobe {
+
+struct Patch { int box = -1; Vec3 c, n, U, V; float hu = 0.0f, hv = 0.0f, area = 0.0f; };
+
+struct Field {
+    float cell = 0.5f, binSec = 0.00025f, mix = 0.03f;
+    int bins = 0;
+    std::vector<Patch> patches;
+    std::vector<int> faceFirst, faceNu, faceNv;          // [箱 * 6 + 面]
+    std::vector<float> E;                                 // [小片][時刻][帯域]
+    std::vector<std::uint8_t> used;                       // 小片に何か入ったか
+    float& at(int p, int k, int b) { return E[(static_cast<std::size_t>(p) * static_cast<std::size_t>(bins) + static_cast<std::size_t>(k)) * kNumBands + static_cast<std::size_t>(b)]; }
+    void clear() { std::fill(E.begin(), E.end(), 0.0f); std::fill(used.begin(), used.end(), 0u); }
+};
+
+inline Vec3 axisOf(const Obb& o, int a) { return a == 0 ? o.axisX : (a == 1 ? o.axisY : o.axisZ); }
+inline float halfOf(const Obb& o, int a) { return a == 0 ? o.halfExtents.x : (a == 1 ? o.halfExtents.y : o.halfExtents.z); }
+
+inline void build(const TraceScene& sc, float cell, float mix, Field& F) {
+    F.cell = cell; F.mix = mix;
+    F.bins = static_cast<int>(std::ceil(mix / F.binSec)) + 1;
+    const int nb = sc.boxCount();
+    F.faceFirst.assign(static_cast<std::size_t>(nb) * 6, -1);
+    F.faceNu.assign(static_cast<std::size_t>(nb) * 6, 0); F.faceNv.assign(static_cast<std::size_t>(nb) * 6, 0);
+    F.patches.clear();
+    for (int i = 0; i < nb; ++i) {
+        if (!sc.active[static_cast<std::size_t>(i)]) continue;
+        const Obb& o = sc.obb[static_cast<std::size_t>(i)];
+        for (int f = 0; f < 6; ++f) {
+            const int a = f / 2; const float sgn = (f % 2 == 0) ? 1.0f : -1.0f;
+            const int au = (a + 1) % 3, av = (a + 2) % 3;
+            const Vec3 n = axisOf(o, a) * sgn, U = axisOf(o, au), V = axisOf(o, av);
+            const float hu = halfOf(o, au), hv = halfOf(o, av);
+            const int nu = std::max(1, static_cast<int>(std::ceil(2.0f * hu / cell - 1e-4f)));
+            const int nv = std::max(1, static_cast<int>(std::ceil(2.0f * hv / cell - 1e-4f)));
+            const Vec3 fc = o.center + n * halfOf(o, a);
+            const std::size_t key = static_cast<std::size_t>(i) * 6 + static_cast<std::size_t>(f);
+            F.faceFirst[key] = static_cast<int>(F.patches.size()); F.faceNu[key] = nu; F.faceNv[key] = nv;
+            const float su = 2.0f * hu / nu, sv = 2.0f * hv / nv;
+            for (int iv = 0; iv < nv; ++iv)
+                for (int iu = 0; iu < nu; ++iu) {
+                    Patch p; p.box = i; p.n = n; p.U = U; p.V = V; p.hu = su * 0.5f; p.hv = sv * 0.5f; p.area = su * sv;
+                    p.c = fc + U * (-hu + su * (static_cast<float>(iu) + 0.5f)) + V * (-hv + sv * (static_cast<float>(iv) + 0.5f));
+                    F.patches.push_back(p);
+                }
+        }
+    }
+    F.E.assign(F.patches.size() * static_cast<std::size_t>(F.bins) * kNumBands, 0.0f);
+    F.used.assign(F.patches.size(), 0u);
+}
+
+inline int patchOf(const TraceScene& sc, const Field& F, const SurfaceHit& h) {
+    const Obb& o = sc.obb[static_cast<std::size_t>(h.index)];
+    int a = 0; float best = -1.0f;
+    for (int q = 0; q < 3; ++q) { const float d = std::fabs(dot(h.normal, axisOf(o, q))); if (d > best) { best = d; a = q; } }
+    const int f = a * 2 + (dot(h.normal, axisOf(o, a)) > 0.0f ? 0 : 1);
+    const std::size_t key = static_cast<std::size_t>(h.index) * 6 + static_cast<std::size_t>(f);
+    const int first = F.faceFirst[key];
+    if (first < 0) return -1;
+    const int au = (a + 1) % 3, av = (a + 2) % 3;
+    const float hu = halfOf(o, au), hv = halfOf(o, av);
+    const Vec3 rel = h.point - o.center;
+    const float u = dot(rel, axisOf(o, au)), v = dot(rel, axisOf(o, av));
+    const int nu = F.faceNu[key], nv = F.faceNv[key];
+    const int iu = std::min(nu - 1, std::max(0, static_cast<int>(std::floor((u + hu) / (2.0f * hu) * static_cast<float>(nu)))));
+    const int iv = std::min(nv - 1, std::max(0, static_cast<int>(std::floor((v + hv) / (2.0f * hv) * static_cast<float>(nv)))));
+    return first + iu + iv * nu;
+}
+
+// 耳に届いた初期の量。hist は到達時刻（0.25 ms）ごと、dir は届いた量で重みを付けた「来る向き」の和。
+struct Heard {
+    double early[kNumBands] = {};
+    double dir[3] = {0.0, 0.0, 0.0};
+    double sum = 0.0, maxOne = 0.0;
+    std::vector<double> hist;
+    int visTests = 0;
+    double total() const { double s = 0.0; for (int b = 0; b < kNumBands; ++b) s += early[b]; return s; }
+    double focus() const { return (sum > 0.0) ? std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]) / sum : 0.0; }
+};
+
+// traceRay（wallReflect=0）と 1 行ずつ同じ輸送。F があれば小片に貯め、nee と L があれば今の NEE を足す。
+inline void trace(const TraceScene& sc, const Vec3& S, const Vec3* L, const TraceParams& prm, int i, float e0,
+                  float mix, Field* F, Heard* nee) {
+    std::uint32_t rng = (prm.seed * 2654435761u + 0x9E3779B9u) ^ (static_cast<std::uint32_t>(i) * 2246822519u);
+    rng = rng * 747796405u + 2891336453u;
+    float e[kNumBands];
+    for (int b = 0; b < kNumBands; ++b) e[b] = e0;
+    Vec3 pos = S, dir = uniformSphere(rng);
+    float pathLen = 0.0f;
+    int skip = -1;
+    for (int bounce = 0; bounce < prm.maxBounces; ++bounce) {
+        const SurfaceHit h = sceneNearest(sc, pos, dir, 1e4f, skip);
+        if (!h.hit) break;
+        pathLen += h.t;
+        const int mi = sc.material[static_cast<std::size_t>(h.index)];
+        const SurfaceSplit* tbl = &sc.split[static_cast<std::size_t>(mi) * kNumBands];
+        float rMean = 0.0f;
+        for (int b = 0; b < kNumBands; ++b) rMean += tbl[b].reflect;
+        rMean /= kNumBands;
+        const Vec3 nFace = (dot(h.normal, dir) < 0.0f) ? h.normal : h.normal * -1.0f;
+        if (F) {
+            const float ts = pathLen / kSpeedOfSound;
+            const int k = static_cast<int>(ts / F->binSec);
+            const int p = patchOf(sc, *F, h);
+            if (p >= 0 && k < F->bins && dot(h.normal, nFace) > 0.0f) {
+                for (int b = 0; b < kNumBands; ++b) F->at(p, k, b) += e[b] * tbl[b].reflect * airEnergy(b, pathLen);
+                F->used[static_cast<std::size_t>(p)] = 1u;
+            }
+        }
+        if (nee && L) {
+            const Vec3 toL = *L - h.point;
+            const float d = length(toL);
+            if (d > kEps) {
+                const Vec3 u = toL * (1.0f / d);
+                const float cosF = dot(nFace, u);
+                const bool front = cosF > 0.0f;
+                const Vec3 org = h.point + (front ? nFace : nFace * -1.0f) * kEps;
+                float tr[kNumBands]; int cr = 0;
+                sceneTransmittance(sc, org, *L, h.index, tr, &cr);
+                const float tSec = (pathLen + d) / kSpeedOfSound;
+                if (cr == 0 && front && tSec < mix) {
+                    const float geo = std::fabs(cosF) / (kPi * d * d);
+                    double cs = 0.0;
+                    for (int b = 0; b < kNumBands; ++b) {
+                        const float c = e[b] * tbl[b].reflect * geo * tr[b] * airEnergy(b, pathLen + d);
+                        nee->early[b] += c; cs += c;
+                    }
+                    nee->dir[0] -= cs * u.x; nee->dir[1] -= cs * u.y; nee->dir[2] -= cs * u.z;
+                    nee->sum += cs; nee->maxOne = std::max(nee->maxOne, cs);
+                    const int kk = static_cast<int>(tSec / 0.00025f);
+                    if (kk >= 0 && kk < static_cast<int>(nee->hist.size())) nee->hist[static_cast<std::size_t>(kk)] += cs;
+                }
+            }
+        }
+        if (rMean <= 1e-6f) break;
+        for (int b = 0; b < kNumBands; ++b) e[b] *= tbl[b].reflect;
+        float eMax = 0.0f; for (int b = 0; b < kNumBands; ++b) eMax = std::max(eMax, e[b]);
+        if (eMax < e0 * 1e-4f) break;
+        const float s = sc.scatter1k[static_cast<std::size_t>(mi)];
+        dir = (rand01(rng) < s) ? cosineHemisphere(nFace, rng) : reflect(dir, nFace);
+        if (dot(dir, nFace) <= 0.0f) dir = cosineHemisphere(nFace, rng);
+        pos = h.point + nFace * kEps;
+        skip = h.index;
+    }
+}
+
+// 四角 [x0,x1]×[y0,y1]（面の上、耳の足元が原点）を高さ h から見た立体角。角ごとの符号付きの和。
+inline double rectSolidAngle(double h, double x0, double x1, double y0, double y1) {
+    auto S = [&](double x, double y) { return std::atan2(x * y, h * std::sqrt(x * x + y * y + h * h)); };
+    return S(x1, y1) - S(x0, y1) - S(x1, y0) + S(x0, y0);
+}
+
+// 小片から耳へ（解析）。見える割合と来る向きは小片の上の m×m 点で、cosθ/r² の重みで取る。
+inline void gather(const TraceScene& sc, Field& F, const Vec3& L, Heard& g) {
+    g = Heard{};
+    g.hist.assign(static_cast<std::size_t>(F.bins) * 2, 0.0);
+    for (std::size_t pi = 0; pi < F.patches.size(); ++pi) {
+        if (!F.used[pi]) continue;
+        const Patch& P = F.patches[pi];
+        const Vec3 rel = L - P.c;
+        const double h = dot(rel, P.n);
+        if (h <= 1e-4) continue;
+        const double px = dot(rel, P.U), py = dot(rel, P.V);
+        const double omega = rectSolidAngle(h, -P.hu - px, P.hu - px, -P.hv - py, P.hv - py);
+        if (omega <= 0.0) continue;
+        const int m = std::min(8, std::max(2, static_cast<int>(std::ceil(4.0 * std::max(P.hu, P.hv) / h))));
+        double wsum = 0.0, wvis = 0.0, vd[3] = {0.0, 0.0, 0.0};
+        for (int sv = 0; sv < m; ++sv)
+            for (int su = 0; su < m; ++su) {
+                const Vec3 q = P.c + P.U * (P.hu * ((2.0f * su + 1.0f) / m - 1.0f)) + P.V * (P.hv * ((2.0f * sv + 1.0f) / m - 1.0f));
+                const Vec3 d = L - q;
+                const float r = length(d);
+                if (r < 1e-5f) continue;
+                const double w = std::max(0.0, static_cast<double>(dot(P.n, d)) / r) / (static_cast<double>(r) * r);
+                float tr[kNumBands]; int cr = 0;
+                sceneTransmittance(sc, q + P.n * kEps, L, P.box, tr, &cr);
+                ++g.visTests;
+                wsum += w;
+                if (cr != 0) continue;
+                wvis += w;
+                vd[0] -= w * d.x / r; vd[1] -= w * d.y / r; vd[2] -= w * d.z / r;
+            }
+        if (wsum <= 0.0 || wvis <= 0.0) continue;
+        const double vis = wvis / wsum;
+        const double geo = omega / (kPi * P.area) * vis;
+        const float dc = length(rel);
+        double csP = 0.0;
+        for (int k = 0; k < F.bins; ++k) {
+            const double t = (k + 0.5) * F.binSec + dc / kSpeedOfSound;
+            if (t >= F.mix) break;
+            double ck = 0.0;
+            for (int b = 0; b < kNumBands; ++b) {
+                const double c = F.at(static_cast<int>(pi), k, b) * geo * airEnergy(b, dc);
+                g.early[b] += c; ck += c;
+            }
+            const int kk = static_cast<int>(t / F.binSec);
+            if (kk >= 0 && kk < static_cast<int>(g.hist.size())) g.hist[static_cast<std::size_t>(kk)] += ck;
+            csP += ck;
+        }
+        for (int q = 0; q < 3; ++q) g.dir[q] += csP * vd[q] / wvis;
+        g.sum += csP;
+        g.maxOne = std::max(g.maxOne, csP);
+    }
+}
+
+inline double firstMs(const std::vector<double>& hist, double total, double directSec, float binSec) {
+    double acc = 0.0;
+    for (std::size_t k = 0; k < hist.size(); ++k) {
+        acc += hist[k];
+        if (acc >= 0.01 * total) return ((static_cast<double>(k) + 0.5) * binSec - directSec) * 1000.0;
+    }
+    return -1.0;
+}
+
+}  // namespace recvprobe
+
+void testReceiverFaces() {
+    using namespace recvprobe;
+    using clk = std::chrono::steady_clock;
+    std::puts("");
+    std::puts("[探り] 受取面 ── 面をレイの受取面にして、耳へは立体角で解析的に配る（今の NEE と同じレイで並べる）");
+    char line[320];
+    const float half = 3.5f, hgt = 3.0f;
+    World* w = makeWorldBox(half, hgt, 0.2f);
+    w->raysPerEmitter = 64; w->rayGroups = 1; w->budget.cfg.totalRays = 0;
+    const Vec3 S(1.5f, 1.6f, -1.0f);
+    w->setListener(Vec3(0.0f, 1.2f, 0.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+    w->addEmitter(S, 0.2f);
+    w->build();
+    w->update(1.0f / 60.0f);
+    const TraceScene& sc = w->traceScene();
+    const int room = w->roomAt(Vec3(0.0f, 1.2f, 0.0f));
+    const float mfp = (room >= 0) ? w->probe(room).meanFreePath : 3.0f;
+    const float mix = std::max(0.01f, std::min(0.12f, 3.0f * mfp / kSpeedOfSound));
+    const float cellEnv = std::getenv("AF_PATCH") ? static_cast<float>(std::atof(std::getenv("AF_PATCH"))) : 0.5f;
+    std::snprintf(line, sizeof line, "        場面 7×3×7 m・α 0.2、音源 (1.5, 1.6, -1)、mixing %.1f ms、小片 %.2f m", mix * 1000.0, cellEnv);
+    std::puts(line);
+
+    TraceParams prm; prm.maxBounces = 24; prm.mixingSec = mix; prm.wallReflect = 0;
+    auto neeAt = [&](const Vec3& L, int rays, std::uint32_t seed) {
+        Heard h; h.hist.assign(static_cast<std::size_t>(std::ceil(mix / 0.00025f)) + 2, 0.0);
+        TraceParams p = prm; p.rays = rays; p.seed = seed;
+        const float e0 = 1.0f / static_cast<float>(rays);
+        for (int i = 0; i < rays; ++i) trace(sc, S, &L, p, i, e0, mix, nullptr, &h);
+        return h;
+    };
+    auto deposit = [&](Field& Fd, int rays, std::uint32_t seed) {
+        Fd.clear();
+        TraceParams p = prm; p.rays = rays; p.seed = seed;
+        const float e0 = 1.0f / static_cast<float>(rays);
+        for (int i = 0; i < rays; ++i) trace(sc, S, nullptr, p, i, e0, mix, &Fd, nullptr);
+    };
+    auto dB = [](double a, double b) { return 10.0 * std::log10(std::max(a, 1e-30) / std::max(b, 1e-30)); };
+
+    Field F; build(sc, cellEnv, mix, F);
+    std::snprintf(line, sizeof line, "        小片 %zu 個・時刻の箱 %d（0.25 ms）", F.patches.size(), F.bins);
+    std::puts(line);
+
+    // ── ① 量が一致するか（初期の総量、4096 本。参照は NEE 32768 本）──
+    std::puts("        ① 量: 初期の総量（参照 NEE 32768 本との差 dB）");
+    std::puts("           耳                 | NEE 4096 | 受取面 4096 | 受取面 32768 | 本体の NEE と写しの差");
+    {
+        const Vec3 Ls[4] = {Vec3(-1.0f, 1.2f, 1.5f), Vec3(0.0f, 1.2f, 0.0f), Vec3(-2.5f, 1.2f, 2.5f), Vec3(2.5f, 1.2f, -2.5f)};
+        Field Fbig; build(sc, cellEnv, mix, Fbig);
+        deposit(F, 4096, 7u); deposit(Fbig, 32768, 7u);
+        for (const Vec3& L : Ls) {
+            const Heard ref = neeAt(L, 32768, 7u), n4 = neeAt(L, 4096, 7u);
+            Heard g4, g32; gather(sc, F, L, g4); gather(sc, Fbig, L, g32);
+            TraceParams p = prm; p.rays = 4096; p.seed = 7u;
+            EnergyTrace et; const TraceResult tr = et.run(sc, S, L, p);
+            double eng = 0.0; for (int b = 0; b < kNumBands; ++b) eng += tr.early6[b];
+            std::snprintf(line, sizeof line, "           (%+.1f, %+.1f, %+.1f) | %+7.2f  | %+10.2f  | %+11.2f  | %+.4f dB",
+                          L.x, L.y, L.z, dB(n4.total(), ref.total()), dB(g4.total(), ref.total()), dB(g32.total(), ref.total()), dB(eng, n4.total()));
+            std::puts(line);
+        }
+    }
+
+    // ── ② 歩いたときの揺れ（1.4 m/s・60 fps で 2 m、耳 (-2, 1.2, 1.5) → (0, 1.2, 1.5)）──
+    std::puts("        ② 歩き: 隣り合うフレームの初期の総量の段差（最大 dB）と、参照（NEE 16384 本）からのずれ（RMS / 最大 dB）");
+    {
+        const int frames = 86;
+        std::vector<double> ref(frames);
+        for (int k = 0; k < frames; ++k) {
+            const Vec3 L(-2.0f + 2.0f * static_cast<float>(k) / (frames - 1), 1.2f, 1.5f);
+            ref[static_cast<std::size_t>(k)] = neeAt(L, 16384, 7u).total();
+        }
+        for (int rays : {512, 4096}) {
+            for (int mode = 0; mode < 2; ++mode) {
+                if (mode == 1) deposit(F, rays, 7u);
+                double prev = -1.0, maxStep = 0.0, rms = 0.0, maxDev = 0.0;
+                for (int k = 0; k < frames; ++k) {
+                    const Vec3 L(-2.0f + 2.0f * static_cast<float>(k) / (frames - 1), 1.2f, 1.5f);
+                    double v;
+                    if (mode == 0) v = neeAt(L, rays, 7u).total();
+                    else { Heard g; gather(sc, F, L, g); v = g.total(); }
+                    if (prev > 0.0) maxStep = std::max(maxStep, std::fabs(dB(v, prev)));
+                    const double dev = dB(v, ref[static_cast<std::size_t>(k)]);
+                    rms += dev * dev; maxDev = std::max(maxDev, std::fabs(dev));
+                    prev = v;
+                }
+                std::snprintf(line, sizeof line, "           %-9s %5d 本: 段差 最大 %.3f dB ／ ずれ RMS %.2f・最大 %.2f dB",
+                              mode == 0 ? "NEE" : "受取面", rays, maxStep, std::sqrt(rms / frames), maxDev);
+                std::puts(line);
+            }
+        }
+    }
+
+    // ── ③ 壁に寄る（耳を x=-3.5 の壁へ。4096 本・種 4 つ）──
+    std::puts("        ③ 壁に寄る: 初期の総量（種 4 つの平均と揺れ）、向きのまとまり（1 点 … 0 一様）、最初の 1% が届く時刻（直接の後 ms）");
+    std::puts("           壁まで | NEE 量 dB  揺れ   まとまり  最初  | 受取面 量 dB  揺れ   まとまり  最初");
+    {
+        bool haveBase = false; double base = 0.0;
+        for (float dw : {1.0f, 0.5f, 0.25f, 0.1f, 0.05f}) {
+            const Vec3 L(-half + dw, 1.2f, 0.0f);
+            const double directSec = length(S - L) / kSpeedOfSound;
+            double nSum = 0.0, nSq = 0.0, gSum = 0.0, gSq = 0.0, nFocus = 0.0, gFocus = 0.0, nFirst = 0.0, gFirst = 0.0;
+            for (std::uint32_t seed = 1u; seed <= 4u; ++seed) {
+                const Heard n = neeAt(L, 4096, seed);
+                deposit(F, 4096, seed);
+                Heard g; gather(sc, F, L, g);
+                const double nv = 10.0 * std::log10(std::max(n.total(), 1e-30)), gv = 10.0 * std::log10(std::max(g.total(), 1e-30));
+                nSum += nv; nSq += nv * nv; gSum += gv; gSq += gv * gv;
+                nFocus += n.focus(); gFocus += g.focus();
+                nFirst += firstMs(n.hist, n.total(), directSec, 0.00025f); gFirst += firstMs(g.hist, g.total(), directSec, F.binSec);
+            }
+            const double nMean = nSum / 4.0, gMean = gSum / 4.0;
+            if (!haveBase) { base = nMean; haveBase = true; }
+            std::snprintf(line, sizeof line, "           %5.2f  | %+7.2f  %5.2f   %5.3f  %5.1f | %+9.2f  %5.2f   %5.3f  %5.1f",
+                          dw, nMean - base, std::sqrt(std::max(0.0, nSq / 4.0 - nMean * nMean)), nFocus / 4.0, nFirst / 4.0,
+                          gMean - base, std::sqrt(std::max(0.0, gSq / 4.0 - gMean * gMean)), gFocus / 4.0, gFirst / 4.0);
+            std::puts(line);
+        }
+        std::puts("           （量は NEE の 1.0 m を 0 dB とした差）");
+    }
+
+    // ── ④ 費用（1 音源・1 フレーム）──
+    std::puts("        ④ 費用: 1 フレーム（NEE はレイを飛ばし直す。受取面は音源と壁が動いたときだけ貯め直し、耳の移動は配るだけ）");
+    {
+        const Vec3 L(-1.0f, 1.2f, 1.5f);
+        for (int rays : {512, 4096}) {
+            auto t0 = clk::now();
+            const Heard n = neeAt(L, rays, 7u);
+            auto t1 = clk::now();
+            deposit(F, rays, 7u);
+            auto t2 = clk::now();
+            Heard g; gather(sc, F, L, g);
+            auto t3 = clk::now();
+            auto ms = [](clk::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+            std::snprintf(line, sizeof line, "           %5d 本: NEE %.2f ms ／ 受取面 貯める %.2f ms・配る %.2f ms（見通しの線 %d 本）",
+                          rays, ms(t1 - t0), ms(t2 - t1), ms(t3 - t2), g.visTests);
+            std::puts(line);
+            (void)n;
+        }
+    }
+    delete w;
+}
+
 /// 【探り】後期はどこから来るか（AF_ONLY=lateorigin）
 ///   ★「隣の部屋にいるときは扉からの指向性が強いはず」を**レイで**測る物差し。エンジンは変えない。
 ///   traceRay と同じ式で NEE を追い、後期の寄与ごとに「放射した面が耳と同じ部屋に面しているか」で分ける。
@@ -3146,6 +3512,149 @@ void testDoorSweep() {
     std::printf("        最悪: 実音 %.2f dB（%.1f 度）／帳簿 %.2f dB（%.1f 度）\n", wR, wRd, wL, wLd);
 }
 
+/// 【探り】扉の開き角 × 音源の方向の地図（AF_ONLY=doormap）── 最終資料用
+///   ★場面は Unity の Flow_SwingDoor と同じ（検査の場面を実機と突き合わせる）:
+///     14×3×14 m を厚さ 0.2 m のコンクリートで仕切り、幅 1 m の戸口。木の扉 1×3×0.06 m、枠との隙間 4 mm、
+///     蝶番は左枠（x = −0.5）で +Z（向こうの部屋）へ振れる。耳 (0, 1.6, −3) で +Z を向く。音源は幅 0.2 m。
+///     （回帰の twoRoomsWithDoor は壁が 0.4 m 厚なので使わない）
+///   音源は戸口の中心から 3 m の円の上。方位 φ は耳から見て **負 = 蝶番の側（左）、正 = 自由端の側（右）**。
+///   出す物（どれも自由音場の直接音に対する比。帳簿の生の値なので平滑も重みも入らない）:
+///     合計 dB（帯域の単純平均）／低−高（125 Hz − 4 kHz、正でこもる）／到来の方位（エネルギーで重み付けした向き）／
+///     主な経路（直接・透過・回折のうち最大）／回折の出どころ（板の稜線か、枠の稜線か）
+///   AF_CSV=パス で全セルを CSV に書く（資料の図用）。
+void testDoorMap() {
+    std::printf("\n[探り] 扉の開き角 × 音源の方向（Flow_SwingDoor と同じ場面）\n");
+    const float half = 7.0f, h = 3.0f, t = 0.2f, gapL = -0.5f, gapR = 0.5f;
+    World w;
+    const int mWall = w.rules.materials.add(AcousticMaterial::concrete());
+    const int mLeaf = w.rules.materials.add(AcousticMaterial::woodDoor());
+    auto box = [&](Vec3 c, Vec3 size) { w.addBox(Obb::axisAligned(c, size * 0.5f), mWall, false); };
+    box(Vec3(0, -t * 0.5f, 0), Vec3(2 * half + 2 * t, t, 2 * half + 2 * t));
+    box(Vec3(0, h + t * 0.5f, 0), Vec3(2 * half + 2 * t, t, 2 * half + 2 * t));
+    box(Vec3(-half - t * 0.5f, h * 0.5f, 0), Vec3(t, h, 2 * half + 2 * t));
+    box(Vec3(half + t * 0.5f, h * 0.5f, 0), Vec3(t, h, 2 * half + 2 * t));
+    box(Vec3(0, h * 0.5f, -half - t * 0.5f), Vec3(2 * half + 2 * t, h, t));
+    box(Vec3(0, h * 0.5f, half + t * 0.5f), Vec3(2 * half + 2 * t, h, t));
+    const float leftW = gapL + half, rightW = half - gapR;
+    box(Vec3(-half + leftW * 0.5f, h * 0.5f, 0), Vec3(leftW, h, t));
+    box(Vec3(gapR + rightW * 0.5f, h * 0.5f, 0), Vec3(rightW, h, t));
+    const int leaf = w.addBox(doorLeaf(0.0f, gapL, gapR - gapL, h, 0.06f, 0.004f), mLeaf, true);
+    w.raysPerEmitter = 32; w.rayGroups = 1; w.budget.cfg.totalRays = 0; w.imageOrder = 1;
+    const Vec3 L(0, 1.6f, -3.0f);
+    w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+    const int e = w.addEmitter(Vec3(0, 1.6f, 3.0f), 0.2f);
+    w.build();
+    const float dt = 1.0f / 60.0f;
+
+    // AF_DEGS / AF_PHIS（コンマ区切り）で格子を差し替えられる。段が刻みの粗さか本物かを細かく見るとき用
+    auto parseList = [](const char* env, std::vector<float> def) {
+        const char* s = std::getenv(env);
+        if (!s) return def;
+        std::vector<float> v;
+        for (const char* q = s; *q; ) { v.push_back(static_cast<float>(std::atof(q))); const char* c = std::strchr(q, ','); if (!c) break; q = c + 1; }
+        return v.empty() ? def : v;
+    };
+    const std::vector<float> degs = parseList("AF_DEGS", {0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90});
+    const std::vector<float> phis = parseList("AF_PHIS", {-75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75});
+    const float* kDeg = degs.data(); const float* kPhi = phis.data();
+    const int nD = static_cast<int>(degs.size()), nP = static_cast<int>(phis.size());
+    struct Cell { double tot, lowHigh, az, spread, share[3], db3[3], gap, dPtX; int main, src; float vis; };
+    std::vector<Cell> cells(static_cast<std::size_t>(nD * nP));
+    const int bLow = 0, bMid = 3, bHigh = 5;
+
+    for (int ip = 0; ip < nP; ++ip) {
+        const float ph = kPhi[ip] * 3.14159265f / 180.0f;
+        const Vec3 S(3.0f * std::sin(ph), 1.6f, 3.0f * std::cos(ph));
+        w.setEmitter(e, S, 0.2f, false, 1.0f);
+        for (int id = 0; id < nD; ++id) {
+            w.setBoxTransform(leaf, doorLeaf(kDeg[id], gapL, gapR - gapL, h, 0.06f, 0.004f));
+            w.update(dt); w.update(dt);
+            const Mix* mx = w.mix(e); const TraceResult* tr = w.trace(e); const Diffraction* df = w.diffraction(e);
+            Cell& c = cells[static_cast<std::size_t>(id * nP + ip)];
+            // 帯域ごとに自由音場で割る（空気吸収も距離も消える）
+            double comp[3][kNumBands] = {}, sum[3] = {};
+            static const int kC[3] = {kDirect, kTransmit, kDiffract};
+            for (int k = 0; k < 3; ++k)
+                for (int b = 0; b < kNumBands; ++b) {
+                    const double f = std::max(1e-30, static_cast<double>(tr->freeDirect6[b]));
+                    comp[k][b] = mx->component6[kC[k]][b] / f;
+                    sum[k] += comp[k][b] / kNumBands;
+                }
+            const double tot = sum[0] + sum[1] + sum[2];
+            c.tot = afti::dB(std::max(tot, 1e-30));
+            auto bandDb = [&](int b) { return afti::dB(std::max(comp[0][b] + comp[1][b] + comp[2][b], 1e-30)); };
+            c.db3[0] = bandDb(bLow); c.db3[1] = bandDb(bMid); c.db3[2] = bandDb(bHigh);
+            c.lowHigh = c.db3[0] - c.db3[2];
+            for (int k = 0; k < 3; ++k) c.share[k] = (tot > 0.0) ? sum[k] / tot : 0.0;
+            c.main = (sum[0] >= sum[1] && sum[0] >= sum[2]) ? 0 : (sum[1] >= sum[2] ? 1 : 2);
+            // 到来の向き: 直接と透過は音源の向き、回折は回折点の向き。エネルギーで重み付けして足す
+            Vec3 toS = w.listener().toLocal(S - L); toS = toS * (1.0f / std::max(1e-6f, length(toS)));
+            Vec3 acc = toS * static_cast<float>(sum[0] + sum[1]);
+            if (df->valid) acc = acc + df->dirLocal * static_cast<float>(sum[2]);
+            c.az = std::atan2(acc.x, acc.z) * 180.0 / 3.14159265;
+            c.spread = (tot > 0.0) ? 1.0 - length(acc) / tot : 0.0;
+            c.vis = w.visibility(e)->visible;
+            c.gap = df->valid ? df->gapWidth : 0.0;
+            c.dPtX = df->valid ? df->point.x : 0.0;
+            c.src = df->valid ? (df->box == leaf ? 1 : 2) : 0;   // 1 板の稜線 / 2 枠（仕切り）の稜線
+        }
+    }
+
+    auto header = [&](const char* title) {
+        std::printf("\n      %s\n      %6s |", title, "角度＼φ");
+        for (int ip = 0; ip < nP; ++ip) std::printf(" %+5.0f", kPhi[ip]);
+        std::printf("\n");
+    };
+    auto grid = [&](const char* title, const std::function<void(const Cell&)>& put) {
+        header(title);
+        for (int id = 0; id < nD; ++id) {
+            std::printf("      %6.1f |", kDeg[id]);
+            for (int ip = 0; ip < nP; ++ip) put(cells[static_cast<std::size_t>(id * nP + ip)]);
+            std::printf("\n");
+        }
+    };
+    grid("合計 dB（自由音場比。φ 負 = 蝶番の側）", [](const Cell& c) { std::printf(" %5.1f", c.tot); });
+    grid("低 − 高 dB（125 Hz − 4 kHz。正でこもる）", [](const Cell& c) { std::printf(" %+5.1f", c.lowHigh); });
+    grid("到来の方位（度、耳から見て。正 = 右）", [](const Cell& c) { std::printf(" %+5.0f", c.az); });
+    grid("主な経路（D 直接 / T 透過 / d 回折）と回折の出どころ（p 板 / f 枠 / - 無し）", [](const Cell& c) {
+        static const char kM[3] = {'D', 'T', 'd'}; static const char kS[3] = {'-', 'p', 'f'};
+        std::printf("   %c%c ", kM[c.main], kS[c.src]); });
+    grid("見通しの割合", [](const Cell& c) { std::printf(" %5.2f", c.vis); });
+
+    // 蝶番の非対称: 同じ角度で φ と −φ の合計の差（自由端の側 − 蝶番の側）。φ の並びが 0 を挟んで対称なときだけ
+    bool symmetric = (nP % 2 == 1);
+    for (int ip = 0; symmetric && ip < nP; ++ip) if (std::fabs(kPhi[ip] + kPhi[nP - 1 - ip]) > 1e-3f) symmetric = false;
+    if (symmetric) {
+        std::printf("\n      蝶番の非対称（合計 dB: 自由端の側 +φ − 蝶番の側 −φ）\n      %6s |", "角度＼|φ|");
+        for (int ip = nP / 2 + 1; ip < nP; ++ip) std::printf(" %5.0f", kPhi[ip]);
+        std::printf("\n");
+        for (int id = 0; id < nD; ++id) {
+            std::printf("      %6.1f |", kDeg[id]);
+            for (int ip = nP / 2 + 1; ip < nP; ++ip) {
+                const Cell& r = cells[static_cast<std::size_t>(id * nP + ip)];
+                const Cell& l = cells[static_cast<std::size_t>(id * nP + (nP - 1 - ip))];
+                std::printf(" %+5.1f", r.tot - l.tot);
+            }
+            std::printf("\n");
+        }
+    }
+
+    if (const char* path = std::getenv("AF_CSV")) {
+        if (FILE* fp = std::fopen(path, "w")) {
+            std::fprintf(fp, "deg,phi,total_db,db125,db1k,db4k,low_minus_high_db,arrival_az_deg,spread,share_direct,share_transmit,share_diffract,main,diff_src,visible,gap_m,diff_point_x\n");
+            for (int id = 0; id < nD; ++id)
+                for (int ip = 0; ip < nP; ++ip) {
+                    const Cell& c = cells[static_cast<std::size_t>(id * nP + ip)];
+                    std::fprintf(fp, "%.2f,%.1f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.4f,%.5f,%.5f,%.5f,%d,%d,%.4f,%.4f,%.4f\n",
+                                 kDeg[id], kPhi[ip], c.tot, c.db3[0], c.db3[1], c.db3[2], c.lowHigh, c.az, c.spread,
+                                 c.share[0], c.share[1], c.share[2], c.main, c.src, c.vis, c.gap, c.dPtX);
+                }
+            std::fclose(fp);
+            std::printf("\n      CSV: %s\n", path);
+        }
+    }
+}
+
 void testClicks() {
     std::printf("\n[ぷつぷつ] 鳴らしながら波形の不連続を測る（正弦の和・ブロック同期）\n");
     const int fs = 48000, block = 512;
@@ -3279,7 +3788,7 @@ int main() {
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
         {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"wall", testWallReflect}, {"precedence", testPrecedence}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
-        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true}, {"doorcoh", testDoorCoherence, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
+        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true}, {"doorcoh", testDoorCoherence, true}, {"receiver", testReceiverFaces, true}, {"doormap", testDoorMap, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {
         // AF_ONLY はコンマ区切りで複数指定できる（例 AF_ONLY=world,bridge）
