@@ -169,7 +169,8 @@ public:
                 if (hrtfSet_ && hrtfSet_->isValid()) {
                     const int idx = hrtfSet_->nearestIndex(d.dir);
                     if (idx >= 0) {
-                        const float samp = hrtfSet_->itdSecondsScaled(idx, headCm_) * static_cast<float>(sampleRate_);
+                        // ITD は近い 4 方向から補間（格子をまたぐたびに跳ばないように。HrtfSet::itdSecondsSmooth の注記）
+                        const float samp = hrtfSet_->itdSecondsSmooth(d.dir, headCm_) * static_cast<float>(sampleRate_);
                         d.earDelay[0] = (samp < 0.0f) ? -samp : 0.0f;   // 右が先 → 左耳が遅れる
                         d.earDelay[1] = (samp > 0.0f) ? samp : 0.0f;    // 左が先 → 右耳が遅れる
                     }
@@ -590,8 +591,13 @@ private:
             //     モノラル 1 本を 2 本の拡散器へ通していたときは、左右のレベルが必ず同じ＝
             //     構造的に ILD が 0 で、しかも散乱が出力の 100〜179% を占めていた
             //     （実測・く字廊下）。方向を持つ成分がその下に埋もれていた。
-            const float scL = diffL_.process(scatSendL, scatterDiffusion_);
-            const float scR = diffR_.process(scatSendR, scatterDiffusion_);
+            // ★拡散の分は 1 サンプル遅らせてから撹拌する（2026-09-13）。allpass 3 段の最初のサンプルは (−g)³（g 0.62 で −0.238）なので、
+            //   同じタップの鏡面の分（素通し）と同じ瞬間に打ち消し合い、広がり s のタップが 2·√(s(1−s))·(−0.238) だけ小さくなっていた
+            //   （s 0.5 で −1.2 dB）。虚像のタップは広がりがほぼ 0 で隠れていて、受取面（広がり 0.3〜0.8）の [橋] で −0.57 dB として出た。
+            //   1 サンプル（21 µs）遅らせると、自分の鏡面の分との重なりは h(−1) = 0 で消える。
+            const float scL = diffL_.process(scatPrevL_, scatterDiffusion_);
+            const float scR = diffR_.process(scatPrevR_, scatterDiffusion_);
+            scatPrevL_ = scatSendL; scatPrevR_ = scatSendR;
             m.rmsScatter += (scL * scL + scR * scR) * 0.5f;
             l += scL; r += scR;
 
@@ -681,6 +687,7 @@ private:
     float tailWet_ = 1.0f;
     float tailSrcLevel_ = 1.0f;
     float scatterDiffusion_ = 0.62f;
+    float scatPrevL_ = 0.0f, scatPrevR_ = 0.0f;   // 拡散の分の 1 サンプル遅れ
 };
 
 }  // namespace dsp

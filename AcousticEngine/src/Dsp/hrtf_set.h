@@ -253,6 +253,39 @@ public:
         return base * (headCircumferenceCm / refHeadCm_);
     }
 
+    /// 向き（リスナー座標）の ITD（秒、頭囲で縮尺）を、近い 4 方向から補間して返す（2026-09-13）。
+    ///   重み w_i = cos_i − cos_5（5 番目に近い方向との近さの差）。並びが入れ替わる瞬間はその 2 方向の重みが 0 なので、向きに対して連続。
+    ///   ★いちばん近い方向の ITD（itdSecondsScaled(nearestIndex)）だと、向きがゆっくり動いても格子（合成で 5°）をまたぐたびに
+    ///     ITD が跳ぶ（仰角 64° で 15 µs ＝ 0.7 サンプル）。初期の 6 割を持つそろったタップの位相が跳び、直接音との干渉が
+    ///     ブロック単位で変わって −1.3 dB くぼんだ（clicks の扉だけ、受取面の天井のタップ）。方向バスのレーンへ送るタップで使う。
+    float itdSecondsSmooth(const float dir[3], float headCircumferenceCm) const {
+        if (!isValid() || !dir) return 0.0f;
+        float d[3] = {dir[0], dir[1], dir[2]};
+        const float len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        if (len2 < 1e-12f) return 0.0f;
+        const float inv = 1.0f / std::sqrt(len2);
+        d[0] *= inv; d[1] *= inv; d[2] *= inv;
+        int idx[5] = {-1, -1, -1, -1, -1};
+        float best[5] = {-2.0f, -2.0f, -2.0f, -2.0f, -2.0f};
+        const int n = directionCount();
+        for (int i = 0; i < n; ++i) {
+            const float* v = &dirVec_[static_cast<std::size_t>(i) * 3];
+            const float c = v[0] * d[0] + v[1] * d[1] + v[2] * d[2];
+            if (c <= best[4]) continue;
+            int k = 4;
+            while (k > 0 && c > best[k - 1]) { best[k] = best[k - 1]; idx[k] = idx[k - 1]; --k; }
+            best[k] = c; idx[k] = i;
+        }
+        double ws = 0.0, wi = 0.0;
+        for (int k = 0; k < 4; ++k) {
+            if (idx[k] < 0) continue;
+            const double w = std::max(0.0f, best[k] - best[4]);
+            ws += w; wi += w * itdSecondsScaled(idx[k], headCircumferenceCm);
+        }
+        if (ws <= 0.0) return (idx[0] >= 0) ? itdSecondsScaled(idx[0], headCircumferenceCm) : 0.0f;
+        return static_cast<float>(wi / ws);
+    }
+
 private:
     struct Reader {
         const unsigned char* p;

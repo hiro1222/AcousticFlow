@@ -497,12 +497,22 @@ private:
             a.gSpec += (b.gSpec - a.gSpec) * t;
             a.gDiff += (b.gDiff - a.gDiff) * t;
             a.hrtfW += (b.hrtfW - a.hrtfW) * t;
-            // レーンが同じなら重みを補間、違えば to の側へ乗り換える（途中の写しは稀なので近似でよい）。
+            // レーンが同じなら重みを補間。違えば to の組へ乗り換え、今の組で同じレーンに乗っていた分を足し込む。
+            //   ★以前は「途中の写しは稀」として to の重み × t だけにしていた。受取面のタップは向きが毎フレーム少しずつ動き、
+            //     差し替え（毎フレーム 10.7 ms）が補間（30 ms）の途中で来るので、途中の写しは普通に起きる。組がレーンの中心で
+            //     (0,1) → (1,2) と変わるたびに、共有するレーン 1 の分（ほぼ全部）を捨てて t ≈ 0.36 倍から立ち上げ直し、
+            //     タップの量が一瞬 1/3 に落ちていた（clicks の扉だけ、初期だけで −2.6 dB のくぼみ）。
+            //   外れるレーンの分は捨てる。組が中心で変わるとき、その重みはほぼ 0 なので落ちる量は無視できる。
             if (a.laneUse && b.laneUse && a.lane[0] == b.lane[0] && a.lane[1] == b.lane[1]) {
                 for (int e = 0; e < 2; ++e) a.laneW[e] += (b.laneW[e] - a.laneW[e]) * t;
             } else if (b.laneUse) {
+                float nw[2] = {b.laneW[0] * t, b.laneW[1] * t};
+                if (a.laneUse)
+                    for (int q = 0; q < 2; ++q)
+                        for (int e = 0; e < 2; ++e)
+                            if (a.lane[e] >= 0 && a.lane[e] == b.lane[q]) nw[q] += a.laneW[e] * (1.0f - t);
                 a.laneUse = true;
-                for (int e = 0; e < 2; ++e) { a.lane[e] = b.lane[e]; a.laneW[e] = b.laneW[e] * t; }
+                for (int e = 0; e < 2; ++e) { a.lane[e] = b.lane[e]; a.laneW[e] = nw[e]; }
             }
             for (int e = 0; e < 2; ++e) {
                 a.earDelay[e] += (b.earDelay[e] - a.earDelay[e]) * t;
