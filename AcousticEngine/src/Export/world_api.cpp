@@ -129,10 +129,16 @@ float AF_WorldAdjacentContain(AF_WorldHandle w) {
     acoustic::flow::World* W = asWorld(w); return W ? W->adjacentContain : 0.0f;
 }
 void AF_WorldSetEarlyModel(AF_WorldHandle w, int model) {
-    if (acoustic::flow::World* W = asWorld(w)) W->earlyModel = (model <= 0) ? 0 : 1;
+    if (acoustic::flow::World* W = asWorld(w)) W->earlyModel = (model <= 0) ? 0 : (model >= 2 ? 2 : 1);
 }
 int AF_WorldEarlyModel(AF_WorldHandle w) {
-    acoustic::flow::World* W = asWorld(w); return W ? W->earlyModel : 1;
+    acoustic::flow::World* W = asWorld(w); return W ? W->earlyModel : 2;
+}
+void AF_WorldSetEmitterEarlyModel(AF_WorldHandle w, int e, int model) {
+    if (acoustic::flow::World* W = asWorld(w)) W->setEmitterEarlyModel(e, model);
+}
+void AF_WorldSetEmitterAdjacentContain(AF_WorldHandle w, int e, float amount) {
+    if (acoustic::flow::World* W = asWorld(w)) W->setEmitterAdjacentContain(e, amount);
 }
 void AF_WorldSetWallReflect(AF_WorldHandle w, int on) {
     if (acoustic::flow::World* W = asWorld(w)) W->wallReflect = (on != 0) ? 1 : 0;
@@ -313,7 +319,8 @@ int AF_WorldArrivals(AF_WorldHandle w, int e, AF_Arrival* out, int maxOut) {
             push(AF_ARRIVAL_DIFFRACT, t.dirLocal.x, t.dirLocal.y, t.dirLocal.z, t.spread, et, t.delaySec, ok, ok ? df->point : none, -1);
             continue;
         }
-        if (ftaps && ftaps->count > 0 && (t.id >= acoustic::flow::FaceTapSet::kIdBase || t.id == acoustic::flow::FaceTapSet::kIdRest || t.id == acoustic::flow::FaceTapSet::kIdDoor)) {
+        const bool fromFaces = ftaps && ftaps->count > 0 && W->emitterEarlyModel(e) >= 1;
+        if (fromFaces) {
             // 受取面のタップ: 出どころは量で重みを付けた小片の中心、箱は面の持ち主
             const acoustic::flow::FaceTap* hit = nullptr;
             for (int q = 0; q < ftaps->count; ++q) if (ftaps->tap[q].id == t.id) { hit = &ftaps->tap[q]; break; }

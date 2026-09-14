@@ -212,6 +212,7 @@ inline void traceRay(const TraceScene& sc,
     float pathLen = 0.0f;
     int skip = -1;
     bool terminated = false;
+    std::int32_t prevKey = -1;                    // 受取面: ひとつ前に当たった面（箱*6+面）
     for (int bounce = 0; bounce < prm.maxBounces; ++bounce) {
         const SurfaceHit h = sceneNearest(sc, pos, dir, 1e4f, skip);
         if (!h.hit) { for (int b = 0; b < kNumBands; ++b) out.escaped6[b] += e[b]; terminated = true; break; }
@@ -234,14 +235,19 @@ inline void traceRay(const TraceScene& sc,
             if (ts < sink->maxSec && dot(h.normal, nFace) > 0.0f) {
                 float lu = 0.5f, lv = 0.5f;
                 const int pch = patchOfHit(sc, *sink->layout, h.index, h.point, h.normal, &lu, &lv);
+                const std::int32_t keyHere = (pch >= 0) ? sink->layout->faceOfPatch[static_cast<std::size_t>(pch)] : -1;
                 if (pch >= 0) {
                     Deposit d;
                     d.patch = pch; d.order = static_cast<std::uint8_t>(std::min(bounce, 255)); d.tSec = ts;
                     d.u8 = static_cast<std::uint8_t>(std::min(255.0f, lu * 256.0f)); d.v8 = static_cast<std::uint8_t>(std::min(255.0f, lv * 256.0f));
                     for (int b = 0; b < kNumBands; ++b) d.e6[b] = e[b] * sp[b].reflect * airEnergy(b, pathLen);
                     d.inDir[0] = dir.x; d.inDir[1] = dir.y; d.inDir[2] = dir.z;
+                    d.prevKey = prevKey;
                     sink->out->push_back(d);
                 }
+                prevKey = keyHere;
+            } else {
+                prevKey = -1;
             }
         }
         // ── NEE: この当たり点からリスナーへ ──

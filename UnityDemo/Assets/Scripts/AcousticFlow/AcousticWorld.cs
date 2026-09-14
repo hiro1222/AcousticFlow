@@ -90,11 +90,12 @@ namespace AcousticFlow
         //   切ると壁を抜けるのは透過の直接音だけ。開いた戸口を通る分はどちらでも同じ。
         [Tooltip("壁越しの反射（既定 切）。入れると旧: 壁を横切った反射と残響も薄めて届ける。切ると壁を抜けるのは透過の直接音だけ。実行中に変えられる")]
         public bool wallReflections = false;
-        // 初期反射の出し方（2026-09-13）。0 虚像（鏡に映した音源の点）／1 受取面（既定）。
-        //   受取面: 面をレイの受取面にして、面ごと・1 回目の当たりかどうかでタップを立てる。量は面が受けたレイ、耳へは見込みの大きさで配る。
-        //   壁に近いほど 1 回目の反射が早く・広く鳴る。実行中に切り替えて聞き比べられる。
-        [Tooltip("初期反射の出し方。0 虚像（点）／1 受取面（既定。面ごとのタップ、壁が近いと早く広く）。実行中に変えられる")]
-        [Range(0, 1)] public int earlyModel = 1;
+        // 初期反射の出し方。音源ごとに WorldVoice で上書きできる。実行中に切り替えて聞き比べられる。
+        //   0 虚像（鏡に映した音源の点。量は幾何の重み）
+        //   1 壁の受取面（面ごとのタップ。虚像は作らない）
+        //   2 虚像を面でつなぐ（既定）: 虚像の向き・遅れはそのまま、量は虚像の面が受けたレイ。壁に近いほど 1 回目の反射が大きく鳴る
+        [Tooltip("初期反射の出し方。0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ（既定）。音源ごとに WorldVoice で上書きできる。実行中に変えられる")]
+        [Range(0, 2)] public int earlyModel = 2;
         // 隣の部屋の閉じ込め（2026-09-14、既定 1）。音源が別の部屋にいるとき、その残響・反射を今いる部屋で響かせず、戸口から鳴らす。
         //   後期: 今いる部屋の響きへ流していた分を戸口の線音源から直接。初期: 今いる部屋の面の反射を戸口の 1 本へ。総量は変えない。
         //   0 で物理のまま（戸口から入った音が今いる部屋でも響く）。演出の摘み。
@@ -420,7 +421,11 @@ namespace AcousticFlow
             if (workers != _appliedWorkers) { NativeWorld.AF_WorldSetWorkers(_world, workers); _appliedWorkers = workers; }
             foreach (var v in _voices)
                 if (v != null && v.EmitterId >= 0)
+                {
                     NativeWorld.AF_WorldSetEmitter(_world, v.EmitterId, new AFVector3(v.transform.position), v.radius, v.operated ? 1 : 0, v.loudness);
+                    NativeWorld.AF_WorldSetEmitterEarlyModel(_world, v.EmitterId, v.earlyModelOverride);          // 音源ごとの上書き（−1 で世界の設定）
+                    NativeWorld.AF_WorldSetEmitterAdjacentContain(_world, v.EmitterId, v.adjacentContainOverride);
+                }
 
             NativeWorld.AF_WorldUpdate(_world, Mathf.Max(1e-4f, Time.deltaTime));
             if (NativeWorld.AF_WorldFdnStale(_world) != 0) RebindFdn();

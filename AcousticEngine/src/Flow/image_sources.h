@@ -85,6 +85,13 @@ struct ImageSet {
 };
 
 /// 静的な箱の面を並べる。
+/// 虚像のタップの素性（面の組で決まる。並び順に依らない）。面の番号が 127 を超えたら −1（遅延で繋ぐ）。
+///   distribute の ISM の道と、受取面で虚像をつなぐ道（receiver.h）で同じ式を使う ── 切り替えても同じタップとして繋がる。
+inline int imageTapId(const ImageSource& src) {
+    const int f0 = src.face[0] + 1, f1 = src.face[1] + 1, f2 = src.face[2] + 1;
+    return (f0 < 128 && f1 < 128 && f2 < 128) ? (16 + f0 + f1 * 128 + f2 * 16384) : -1;
+}
+
 inline void collectFaces(const Surfaces& surf, const MaterialTable& mats, std::vector<Face>& out) {
     out.clear();
     for (int i = 0; i < surf.count(); ++i) {
