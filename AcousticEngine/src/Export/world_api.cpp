@@ -122,6 +122,12 @@ void AF_WorldSetPrecedence(AF_WorldHandle w, float db, float sec) {
     W->precedenceDb = (db < 0.0f) ? 0.0f : db;
     W->precedenceSec = (sec < 0.001f) ? 0.001f : sec;
 }
+void AF_WorldSetAdjacentContain(AF_WorldHandle w, float amount) {
+    if (acoustic::flow::World* W = asWorld(w)) W->adjacentContain = (amount < 0.0f) ? 0.0f : (amount > 1.0f ? 1.0f : amount);
+}
+float AF_WorldAdjacentContain(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->adjacentContain : 0.0f;
+}
 void AF_WorldSetEarlyModel(AF_WorldHandle w, int model) {
     if (acoustic::flow::World* W = asWorld(w)) W->earlyModel = (model <= 0) ? 0 : 1;
 }
@@ -307,11 +313,12 @@ int AF_WorldArrivals(AF_WorldHandle w, int e, AF_Arrival* out, int maxOut) {
             push(AF_ARRIVAL_DIFFRACT, t.dirLocal.x, t.dirLocal.y, t.dirLocal.z, t.spread, et, t.delaySec, ok, ok ? df->point : none, -1);
             continue;
         }
-        if (ftaps && ftaps->count > 0 && (t.id >= acoustic::flow::FaceTapSet::kIdBase || t.id == acoustic::flow::FaceTapSet::kIdRest)) {
+        if (ftaps && ftaps->count > 0 && (t.id >= acoustic::flow::FaceTapSet::kIdBase || t.id == acoustic::flow::FaceTapSet::kIdRest || t.id == acoustic::flow::FaceTapSet::kIdDoor)) {
             // 受取面のタップ: 出どころは量で重みを付けた小片の中心、箱は面の持ち主
             const acoustic::flow::FaceTap* hit = nullptr;
             for (int q = 0; q < ftaps->count; ++q) if (ftaps->tap[q].id == t.id) { hit = &ftaps->tap[q]; break; }
             const bool dirOk = acoustic::length(t.dirLocal) > 0.5f;
+            // 戸口の 1 本（隣の部屋の閉じ込め）の出どころは戸口の中心
             push(dirOk ? AF_ARRIVAL_EARLY : AF_ARRIVAL_EARLY_DIFFUSE, t.dirLocal.x, t.dirLocal.y, t.dirLocal.z, dirOk ? t.spread : 1.0f, et, t.delaySec,
                  hit != nullptr && t.id != acoustic::flow::FaceTapSet::kIdRest, hit ? hit->point : none, hit ? hit->box : -1);
             continue;

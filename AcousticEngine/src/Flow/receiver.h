@@ -71,6 +71,7 @@ struct PatchView {
     Vec3  n{0, 0, 1};
     Vec3  c{0, 0, 0};
     float scatter = 0.5f;                // 1 kHz の散乱率（鏡面の重み）
+    int   room = -1;                     // 小片が面している部屋（表側へ押し出した点で引く）。隣の部屋の閉じ込めに使う
     float geoBase = 0.0f;                // Ω/(π·面積)（見え方は受け取りごとの影の線で掛ける）
     int   box = -1;
     Vec3  U{1, 0, 0}, V{0, 1, 0};
@@ -173,6 +174,7 @@ public:
             v.ok = true;
             v.box = g.box; v.U = g.U; v.V = g.V; v.hu = g.hu; v.hv = g.hv;
             v.geoBase = static_cast<float>(omega / (kPi * g.area));
+            v.room = sceneRoomAt(sc, g.c + g.n * std::max(0.3f, 1.25f * sc.roomCell));
             v.dist = static_cast<float>(dist);
             for (int b = 0; b < kNumBands; ++b) v.air[b] = airEnergy(b, v.dist);
             v.meanDir = Vec3(static_cast<float>(F[0] / omega), static_cast<float>(F[1] / omega), static_cast<float>(F[2] / omega));
@@ -211,12 +213,25 @@ struct FaceTapSet {
     static constexpr int kMax = 48;
     static constexpr int kIdBase = 0x40000000;          // 虚像の素性（16 + … < 2^22）と重ならない
     static constexpr int kIdRest = 0x40000000 - 1;      // 上限を超えて畳んだ方向なしの 1 本
+    static constexpr int kIdDoor = 0x40000000 - 2;      // 隣の部屋の閉じ込め: 耳の部屋の面の反射を移した戸口の 1 本
     FaceTap tap[kMax];
     int   count = 0;
     float total6[kNumBands] = {};                        // 初期の総量（帳簿の初期）
     float firstSec = -1.0f;                              // 量の 2% 以上あるタップの最短の遅れ（尾の開始）
     int   deposits = 0;                                  // 数えた受け取りの件数（情報）
     int   shadowRays = 0;                                // 縁の小片で引いた影の線の本数（情報）
+};
+
+/// 隣の部屋の閉じ込め（2026-09-14）。音源が耳と別の部屋にいるとき、耳の部屋の面で受けた反射を amount だけ戸口の 1 本へ移す。
+///   向きは戸口の中心、遅れは戸口を通る経路（音源 → 戸口 → 耳）、広がりは戸口の見込み。量は移すだけ（総量は変えない）。
+///   ★発注者「隣の部屋の残響・反射は今いる部屋では反響させず、ドアから鳴る音が絶対に支配的になるように」。
+struct FaceContain {
+    bool  active = false;
+    float amount = 0.0f;
+    int   listenerRoom = -1;
+    Vec3  doorPoint{0, 0, 0};
+    float doorDelaySec = 0.0f;
+    float doorSpread = 0.0f;
 };
 
 /// 面ごとにまとめる途中の器（音源ごとに持ち回す。確保をフレームごとにしない）。
@@ -245,7 +260,9 @@ constexpr double kFaceTimeSpread = 0.002;
 /// 受け取り（組ごとの配列の並び）→ 面ごとのタップ。
 inline void buildFaceTaps(const TraceScene& sc, const PatchLayout& L, const ReceiverView& V, const Vec3& listener,
                           const std::vector<Deposit>* const* groups, int nGroups,
-                          float mixSec, FaceScratch& S, FaceTapSet& out) {
+                          float mixSec, FaceScratch& S, FaceTapSet& out, const FaceContain* contain = nullptr) {
+    const bool doContain = contain && contain->active && contain->amount > 0.0f;
+    double doorE6[kNumBands] = {};
     out = FaceTapSet{};
     const std::size_t keys = static_cast<std::size_t>(L.boxCount) * 12;
     if (S.slotOfKey.size() != keys) { S.slotOfKey.assign(keys, -1); S.stamp.assign(keys, 0u); S.frame = 0u; }
@@ -276,6 +293,13 @@ inline void buildFaceTaps(const TraceScene& sc, const PatchLayout& L, const Rece
             for (int b = 0; b < kNumBands; ++b) { cb[b] = static_cast<double>(d.e6[b]) * v.geoBase * v.air[b]; cm += cb[b]; }
             cm /= kNumBands;
             if (!(cm > 0.0)) continue;
+            // 隣の部屋の閉じ込め: 耳の部屋の面で受けた分を amount だけ戸口の 1 本へ
+            if (doContain && v.room == contain->listenerRoom) {
+                const double a = contain->amount;
+                for (int b = 0; b < kNumBands; ++b) { doorE6[b] += cb[b] * a; cb[b] *= (1.0 - a); }
+                cm *= (1.0 - a);
+                if (!(cm > 0.0)) continue;
+            }
             // 鏡面の重み: 入ってきた向きを法線で折り返した向きが、耳を向くほど 1
             const double dn = d.inDir[0] * v.n.x + d.inDir[1] * v.n.y + d.inDir[2] * v.n.z;
             const double rx = d.inDir[0] - 2.0 * dn * v.n.x, ry = d.inDir[1] - 2.0 * dn * v.n.y, rz = d.inDir[2] - 2.0 * dn * v.n.z;
@@ -303,12 +327,16 @@ inline void buildFaceTaps(const TraceScene& sc, const PatchLayout& L, const Rece
             a.pt[0] += cm * v.c.x; a.pt[1] += cm * v.c.y; a.pt[2] += cm * v.c.z;
         }
     }
-    if (S.acc.empty()) return;
-    // 量の大きい順。上限を超えた分は方向なしの 1 本へ
+    double doorC = 0.0;
+    for (int b = 0; b < kNumBands; ++b) doorC += doorE6[b];
+    doorC /= kNumBands;
+    if (S.acc.empty() && !(doorC > 0.0)) return;
+    // 量の大きい順。上限を超えた分は方向なしの 1 本へ（戸口の 1 本の席は別に残す）
     std::sort(S.acc.begin(), S.acc.end(), [](const FaceAccum& x, const FaceAccum& y) { return x.c > y.c; });
-    double totalC = 0.0;
+    double totalC = doorC;
+    for (int b = 0; b < kNumBands; ++b) out.total6[b] += static_cast<float>(doorE6[b]);
     for (const FaceAccum& a : S.acc) { totalC += a.c; for (int b = 0; b < kNumBands; ++b) out.total6[b] += static_cast<float>(a.e6[b]); }
-    const int keep = std::min(static_cast<int>(S.acc.size()), FaceTapSet::kMax - 1);
+    const int keep = std::min(static_cast<int>(S.acc.size()), FaceTapSet::kMax - 2);
     for (int i = 0; i < keep; ++i) {
         const FaceAccum& a = S.acc[static_cast<std::size_t>(i)];
         FaceTap& t = out.tap[out.count++];
@@ -347,6 +375,17 @@ inline void buildFaceTaps(const TraceScene& sc, const PatchLayout& L, const Rece
             c += a.c; ct += a.ct;
         }
         t.delaySec = static_cast<float>(c > 0.0 ? ct / c : 0.0);
+    }
+    if (doorC > 0.0) {
+        FaceTap& t = out.tap[out.count++];
+        t.id = FaceTapSet::kIdDoor; t.order = 0; t.box = -1; t.face = -1;
+        for (int b = 0; b < kNumBands; ++b) t.e6[b] = static_cast<float>(doorE6[b]);
+        const Vec3 d = contain->doorPoint - listener;
+        const float ld = length(d);
+        t.dirWorld = (ld > 1e-4f) ? d * (1.0f / ld) : Vec3(0, 0, 0);
+        t.spread = (ld > 1e-4f) ? std::min(1.0f, std::max(0.0f, contain->doorSpread)) : 1.0f;
+        t.delaySec = contain->doorDelaySec;
+        t.point = contain->doorPoint;
     }
     for (int i = 0; i < out.count; ++i) {
         double cm = 0.0; for (int b = 0; b < kNumBands; ++b) cm += out.tap[i].e6[b];

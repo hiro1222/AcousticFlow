@@ -72,6 +72,10 @@ struct DistributeInput {
     bool  doorSource = false;              // 段 2-g。音源の部屋と耳の部屋が戸口で繋がり、戸口の線音源で鳴らすか
     float doorFeed = 0.0f;                 // 段 2-g。耳の部屋の分のうち戸口から入った割合（＝その戸口の開き具合 0..1）
     float doorPull = 0.0f;                 // 戸口寄せ（2026-09-12）。耳の部屋へ流す分のうち、戸口の線音源から直接鳴らす側へ移す割合 0..1
+    // 隣の部屋の閉じ込め（2026-09-14）。音源が耳と別の部屋にいるとき、耳の部屋で響かせる分（耳の部屋の FDN への送りと、
+    //   戸口の線音源から耳の部屋へ流す分）をこの割合だけ戸口から直接鳴らす側へ移す。0 で今までと 1 ビットも同じ。総量は変えない。
+    //   ★発注者「隣の部屋の残響・反射は今いる部屋では反響させず、ドアから鳴る音が絶対に支配的になるように」。演出の摘み。
+    float adjacentContain = 0.0f;
     // 先着の重み（2026-09-12）。到来が最初の到達（直接の到達時刻）から遅れるほど下げる。出口だけで、帳簿（component6）は物理のまま。
     //   重み = 10^(−precedenceDb/10 · (1 − e^(−Δ/precedenceSec)))。直接・透過は Δ=0 で変わらず、部屋の響きは大きく下がる。0 dB で今までと同じ。
     //   ★ゲームなので完全な物理でなく聞こえ方を優先する（発注者の指示）。先行音効果の窓 40 ms が τ の目安。
@@ -280,14 +284,23 @@ public:
         //   thru6 は戸口から耳へ直接出す分。★量の合計は変えない（耳の部屋へ直接 ＋ 戸口へ ＝ 後期）。
         //   ★開き具合で割るのは、閉じた扉ごしの分（板と壁の透過）まで戸口から鳴らさないため。開ききれば 1。
         const float feed = (apart && in.doorSource) ? std::min(1.0f, std::max(0.0f, in.doorFeed)) : 0.0f;
+        // 隣の部屋の閉じ込め: 耳の部屋で響かせる分（own ＝ (1−thru)(1−feed) と、流す分 fp·(1−pull)）を c だけ戸口から直接へ。
+        //   c = 0 のときは下の式を今までと同じ並びで書く（1 ビットも同じ。寄せの検査 ⑦ が総量の一致をビットで見ている）。
+        const float contain = apart ? std::min(1.0f, std::max(0.0f, in.adjacentContain)) : 0.0f;
         if (in.listenerRoom >= 0) {
             FdnSend* s = out.pushSend();
             if (s) {
                 s->room = in.listenerRoom;
-                for (int b = 0; b < kNumBands; ++b) { out.component6[kLate][b] += raw[kLate][b]; s->e6[b] = sm[kLate][b] * W.w[kLate] * (1.0f - thru[b]) * (1.0f - feed) * preRoom; }
+                for (int b = 0; b < kNumBands; ++b) {
+                    out.component6[kLate][b] += raw[kLate][b];
+                    s->e6[b] = (contain > 0.0f)
+                        ? sm[kLate][b] * W.w[kLate] * (1.0f - thru[b]) * (1.0f - feed) * (1.0f - contain) * preRoom
+                        : sm[kLate][b] * W.w[kLate] * (1.0f - thru[b]) * (1.0f - feed) * preRoom;
+                }
             }
             float eThru = 0.0f;
-            for (int b = 0; b < kNumBands; ++b) eThru += sm[kLate][b] * W.w[kLate] * (thru[b] + (1.0f - thru[b]) * feed);
+            for (int b = 0; b < kNumBands; ++b)
+                eThru += sm[kLate][b] * W.w[kLate] * (thru[b] + (1.0f - thru[b]) * feed + (1.0f - thru[b]) * (1.0f - feed) * contain);
             if (apart && eThru > 0.0f) {
                 FdnSend* o = out.pushSend();
                 if (o) {
@@ -303,8 +316,15 @@ public:
                         //     (preDoor = preRoom = 1) は pull によらず同じ式になり、寄せで総量が 1 ビットも変わらない（検査 ⑦）。
                         const float base = sm[kLate][b] * W.w[kLate];
                         const float fp = (1.0f - thru[b]) * feed;
-                        o->thru6[b] = base * (thru[b] + fp * pull) * preDoor;
-                        o->e6[b] = base * (thru[b] * preDoor + fp * (preRoom + pull * (preDoor - preRoom)));
+                        if (contain > 0.0f) {
+                            // 閉じ込め: 戸口から直接 ＝ thru ＋ fp·(pull ＋ (1−pull)·c) ＋ own·c、耳の部屋へ流す ＝ fp·(1−pull)·(1−c)
+                            const float own = (1.0f - thru[b]) * (1.0f - feed);
+                            o->thru6[b] = base * (thru[b] + fp * (pull + (1.0f - pull) * contain) + own * contain) * preDoor;
+                            o->e6[b] = o->thru6[b] + base * fp * (1.0f - pull) * (1.0f - contain) * preRoom;
+                        } else {
+                            o->thru6[b] = base * (thru[b] + fp * pull) * preDoor;
+                            o->e6[b] = base * (thru[b] * preDoor + fp * (preRoom + pull * (preDoor - preRoom)));
+                        }
                     }
                     float mass = 0.0f;
                     for (int b = 0; b < kNumBands; ++b) mass += T.lateOther6[b];

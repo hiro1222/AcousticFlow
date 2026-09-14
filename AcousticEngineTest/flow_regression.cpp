@@ -1716,6 +1716,76 @@ void testReceiverWorld() {
     }
 }
 
+// ================================ [閉じ込め] 隣の部屋の残響・反射を今いる部屋で響かせない（AF_ONLY=contain、2026-09-14）
+//   World::adjacentContain。音源が耳と別の部屋にいるとき、耳の部屋で響かせる分を戸口へ移す（総量は変えない）。
+//   ① 後期: 総量は同じまま、耳の部屋の FDN への送り（直接の送り＋戸口から流す分）が 0 になる
+//   ② 初期（受取面）: 総量は同じまま、戸口の 1 本ができ、耳の部屋の面のタップが消える
+//   ③ 音源が耳と同じ部屋なら何も変わらない（1 ビットも同じ）
+void testAdjacentContain() {
+    std::puts("");
+    std::puts("[閉じ込め] 隣の部屋の残響・反射を今いる部屋で響かせない（adjacentContain）");
+    char buf[320];
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    struct Got { double lateSum = 0.0, toListener = 0.0, earlySum = 0.0, doorTap = 0.0, listenerFaces = 0.0; Mix mix; int lroom = -1; };
+    auto run = [&](float contain, const Vec3& L, const Vec3& S) {
+        Got g;
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        w.addBox(doorLeaf(90.0f), lm, true);
+        w.adjacentContain = contain;
+        w.raysPerEmitter = 1024; w.budget.cfg.maxPerEmitter = 1024; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+        w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w.addEmitter(S, 0.2f);
+        w.build();
+        for (int f = 0; f < 60; ++f) w.update(1.0f / 60.0f);
+        g.mix = *w.mix(e);
+        g.lroom = w.roomAt(L);
+        for (int i = 0; i < g.mix.sendCount; ++i) {
+            const FdnSend& sd = g.mix.sends[i];
+            for (int b = 0; b < kNumBands; ++b) {
+                g.lateSum += sd.e6[b];
+                if (sd.room == g.lroom) g.toListener += sd.e6[b];                 // 耳の部屋の FDN への直接の送り
+                else g.toListener += std::max(0.0f, sd.e6[b] - sd.thru6[b]);      // 戸口の線音源から耳の部屋へ流す分
+            }
+        }
+        const FaceTapSet* ft = w.faceTaps(e);
+        for (int i = 0; i < ft->count; ++i) {
+            double te = 0.0; for (int b = 0; b < kNumBands; ++b) te += ft->tap[i].e6[b];
+            g.earlySum += te;
+            if (ft->tap[i].id == FaceTapSet::kIdDoor) g.doorTap += te;
+        }
+        // 耳の部屋の面のタップ: 箱が −z 側の壁（4）か、仕切りの −z 面（面 5 ＝ z の − 側）
+        for (int i = 0; i < ft->count; ++i) {
+            const FaceTap& t = ft->tap[i];
+            if (t.id == FaceTapSet::kIdDoor) continue;
+            if (t.box == 4 || ((t.box == 6 || t.box == 7) && t.face == 5)) { double te = 0.0; for (int b = 0; b < kNumBands; ++b) te += t.e6[b]; g.listenerFaces += te; }
+        }
+        return g;
+    };
+    const Vec3 Lapart(0.0f, 1.6f, -3.0f), Sapart(0.0f, 1.6f, 3.0f);
+    const Got a0 = run(0.0f, Lapart, Sapart), a1 = run(1.0f, Lapart, Sapart);
+    std::snprintf(buf, sizeof buf, "(後期の総量 %.4e → %.4e、耳の部屋で響く分 %.3e（%.0f%%）→ %.3e)",
+                  a0.lateSum, a1.lateSum, a0.toListener, a0.lateSum > 0 ? a0.toListener / a0.lateSum * 100.0 : 0.0, a1.toListener);
+    check("[閉じ込め] 後期: 総量は同じまま（1e-4）、耳の部屋で響く分が 0 になる",
+          std::fabs(a1.lateSum / std::max(a0.lateSum, 1e-30) - 1.0) < 1e-4 && a0.toListener > 0.0 && a1.toListener <= a0.toListener * 1e-6, buf);
+    std::snprintf(buf, sizeof buf, "(初期の総量 %.4e → %.4e、戸口の 1 本 %.3e → %.3e（%.0f%%）、耳の部屋の面のタップ %.3e → %.3e)",
+                  a0.earlySum, a1.earlySum, a0.doorTap, a1.doorTap, a1.earlySum > 0 ? a1.doorTap / a1.earlySum * 100.0 : 0.0, a0.listenerFaces, a1.listenerFaces);
+    check("[閉じ込め] 初期: 総量は同じまま（1%）、戸口の 1 本ができ、耳の部屋の −z の壁と仕切りの面のタップが消える",
+          std::fabs(a1.earlySum / std::max(a0.earlySum, 1e-30) - 1.0) < 0.01 && a0.doorTap == 0.0 && a1.doorTap > 0.0 && a1.listenerFaces == 0.0, buf);
+    // 同じ部屋
+    const Vec3 Lsame(1.0f, 1.6f, 1.5f);
+    const Got s0 = run(0.0f, Lsame, Sapart), s1 = run(1.0f, Lsame, Sapart);
+    bool same = (s0.mix.tapCount == s1.mix.tapCount) && (s0.mix.sendCount == s1.mix.sendCount);
+    for (int i = 0; same && i < s0.mix.tapCount; ++i)
+        for (int b = 0; b < kNumBands; ++b) if (s0.mix.taps[i].e6[b] != s1.mix.taps[i].e6[b]) same = false;
+    for (int i = 0; same && i < s0.mix.sendCount; ++i)
+        for (int b = 0; b < kNumBands; ++b) if (s0.mix.sends[i].e6[b] != s1.mix.sends[i].e6[b]) same = false;
+    std::snprintf(buf, sizeof buf, "(タップ %d / %d 本、送り %d / %d 本)", s0.mix.tapCount, s1.mix.tapCount, s0.mix.sendCount, s1.mix.sendCount);
+    check("[閉じ込め] 音源が耳と同じ部屋なら何も変わらない（1 ビットも同じ）", same, buf);
+}
+
 // ================================ [GPU] 計算デバイスの管が通るか（AF_ONLY=gpu）
 void testGpuPipe() {
     std::printf("\n[GPU] エンジン自前の計算デバイス ── 管が通るか\n");
@@ -3966,6 +4036,7 @@ void testClicks() {
     if (const char* lk = std::getenv("AF_LEAK")) w.leakModel = std::atoi(lk);   // 漏れの模型 0/1/2/3
     if (const char* wr = std::getenv("AF_WALL_REFLECT")) w.wallReflect = std::atoi(wr);   // 壁越しの反射 0/1
     if (const char* em = std::getenv("AF_EARLY_MODEL")) w.earlyModel = std::atoi(em);   // 初期反射 0 虚像 / 1 受取面
+    if (const char* ac = std::getenv("AF_CONTAIN")) w.adjacentContain = static_cast<float>(std::atof(ac));   // 隣の部屋の閉じ込め 0..1
         if (const char* lt = std::getenv("AF_LATE_THROUGH")) w.lateThrough = std::atoi(lt);   // 戸口越しの後期 0/1（段 2-f）
         w.budget.cfg.totalRays = (which == 3) ? 0 : 1536;
         w.rayGroups = (which == 2 || which == 3) ? 1 : 4;
@@ -4074,7 +4145,7 @@ int main() {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
-        {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"wall", testWallReflect}, {"precedence", testPrecedence}, {"recvworld", testReceiverWorld}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
+        {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"wall", testWallReflect}, {"precedence", testPrecedence}, {"recvworld", testReceiverWorld}, {"contain", testAdjacentContain}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
         {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true}, {"doorcoh", testDoorCoherence, true}, {"receiver", testReceiverFaces, true}, {"recvtaps", testReceiverTaps, true}, {"recvnear", testReceiverNear, true}, {"recvdoor", testReceiverDoor, true}, {"doormap", testDoorMap, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {

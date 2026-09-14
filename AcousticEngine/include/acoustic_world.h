@@ -116,6 +116,10 @@ ACOUSTIC_API void AF_WorldSetPrecedence(AF_WorldHandle w, float db, float sec);
 ACOUSTIC_API void AF_WorldSetWallReflect(AF_WorldHandle w, int on);
 /* 初期反射の出し方（既定 1）。0 虚像（ISM）／1 受取面（面をレイの受取面にして、面ごとのタップで鳴らす）。実行中に切り替えてよい。 */
 ACOUSTIC_API void AF_WorldSetEarlyModel(AF_WorldHandle w, int model);
+/* 隣の部屋の閉じ込め（0..1、既定 0）。音源が耳と別の部屋にいるとき、耳の部屋で響かせる分（後期の耳の部屋の FDN への送りと
+ * 戸口から流す分、初期の耳の部屋の面の反射）をこの割合だけ戸口へ移す。総量は変えない。1 で隣の部屋の音は戸口からだけ鳴る。実行中に動かしてよい。 */
+ACOUSTIC_API void  AF_WorldSetAdjacentContain(AF_WorldHandle w, float amount);
+ACOUSTIC_API float AF_WorldAdjacentContain(AF_WorldHandle w);
 ACOUSTIC_API int  AF_WorldEarlyModel(AF_WorldHandle w);
 ACOUSTIC_API int  AF_WorldWallReflect(AF_WorldHandle w);
 /* 尾のレーンの作り（既定 1）。実行中に切り替えられる（試聴の A/B）。

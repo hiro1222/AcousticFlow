@@ -166,6 +166,12 @@ public:
     ///   0 ＝ レイの割合のまま（既定）。1 ＝ 戸口から入った分を全部戸口から鳴らす（自分の部屋の響きは戸口を通らなかった分だけ）。
     ///   総量は変えない。実行中に動かしてよい（distribute の平滑した値に掛かるので段にならない）。
     float doorPull = 0.0f;
+    /// 隣の部屋の閉じ込め（2026-09-14、0..1、既定 0）。音源が耳と別の部屋にいるとき、耳の部屋で響かせる分を戸口へ移す:
+    ///   後期は耳の部屋の FDN への送りと戸口から流す分を、戸口の線音源から直接鳴らす側へ（distribute）。
+    ///   初期（受取面）は耳の部屋の面で受けた反射を、戸口の 1 本（向き＝戸口の中心、遅れ＝戸口を通る経路）へ（receiver.h）。
+    ///   総量は変えない。発注者「隣の部屋の残響・反射は今いる部屋では反響させず、ドアから鳴る音が絶対に支配的に」。
+    ///   ★戸口は耳の部屋と音源の部屋を繋ぐ物のうち 面積 × 開き具合 がいちばん大きい物。戸口が無ければ初期は移さない（後期は移す）。
+    float adjacentContain = 0.0f;
     /// 戸口の線音源の低域の相関の境（Hz、2026-09-12）。この境より下は 5 点が同じ波形、上は点ごとに別の波形。0 で旧（全帯域を別々に）。
     ///   FdnRoomMix::setPortalCoherence に毎フレーム置く。**既定 3000。**IACC の探り（AF_ONLY=doorcoh、戸口の正面 0.5〜3 m）:
     ///     0（旧）0.34〜0.54 ／ 500: 0.34〜0.53（低域はもともと相関が高く、ほぼ動かない）／ 1500: 0.43〜0.54 ／
@@ -458,7 +464,21 @@ public:
                 const std::vector<Deposit>* groups[TraceGroups::kMax];
                 const int G = std::max(1, s.groupCount);
                 for (int g = 0; g < G; ++g) groups[g] = &s.depParts[g];
-                buildFaceTaps(traceScene_, patchLayout_, recvView_, listener_.pos, groups, G, mixingSec, s.faceScratch, s.faceTaps);
+                FaceContain fc;
+                if (adjacentContain > 0.0f && lroom_ >= 0 && s.em.room >= 0 && s.em.room != lroom_) {
+                    const int door = doorBetween(lroom_, s.em.room);
+                    if (door >= 0) {
+                        const rooms::Aperture& ap = apertures_[static_cast<std::size_t>(door)];
+                        fc.active = true; fc.amount = std::min(1.0f, adjacentContain); fc.listenerRoom = lroom_;
+                        fc.doorPoint = ap.rectCenter;
+                        const float dL = length(ap.rectCenter - listener_.pos);
+                        fc.doorDelaySec = (length(s.em.pos - ap.rectCenter) + dL) / kSpeedOfSound;
+                        const bool uW = std::fabs(ap.axisU.y) <= std::fabs(ap.axisV.y);
+                        const float halfW = uW ? ap.halfU : ap.halfV;
+                        fc.doorSpread = std::atan2(halfW, std::max(dL, 1e-3f)) / (0.5f * 3.14159265f);   // 見込みの半角 ÷ 90°
+                    }
+                }
+                buildFaceTaps(traceScene_, patchLayout_, recvView_, listener_.pos, groups, G, mixingSec, s.faceScratch, s.faceTaps, &fc);
                 for (int b = 0; b < kNumBands; ++b) s.trace.early6[b] = s.faceTaps.total6[b];
             } else {
                 s.faceTaps = FaceTapSet{};
@@ -470,6 +490,7 @@ public:
             in.listenerRoom = lroom; in.weights = &rules.weights; in.response = &response; in.dt = dt;
             in.sourceRoom = (lateThrough != 0) ? s.em.room : -1;
             in.precedenceDb = precedenceDb; in.precedenceSec = precedenceSec;
+            in.adjacentContain = adjacentContain;
             {
                 const int er = s.em.room;
                 const int door = (lateThrough == 2 && er >= 0 && er < static_cast<int>(doorOf_.size())) ? doorOf_[static_cast<std::size_t>(er)] : -1;
@@ -740,6 +761,17 @@ private:
         return gpuTracer_.runBatch(traceScene_, listener_.pos, gpuJobs_.data(), static_cast<int>(gpuJobs_.size()));
     }
 
+    /// 2 つの部屋を繋ぐ戸口のうち、面積 × 開き具合（下限 1e-3）がいちばん大きい物（無ければ −1）。
+    int doorBetween(int roomA, int roomB) const {
+        int best = -1; float bestScore = 0.0f;
+        for (std::size_t a = 0; a < apertures_.size(); ++a) {
+            const rooms::Aperture& ap = apertures_[a];
+            if (!((ap.roomA == roomA && ap.roomB == roomB) || (ap.roomA == roomB && ap.roomB == roomA))) continue;
+            const float score = ap.area * std::max(openFrac_[a], 1e-3f);
+            if (score > bestScore) { bestScore = score; best = static_cast<int>(a); }
+        }
+        return best;
+    }
     /// レイを 1 音源ぶん解く。GPU が入っていれば GPU、そうでなければ CPU。dep があれば受取面の受け取りも取る。
     TraceResult runTrace(const Vec3& src, const TraceParams& prm, std::vector<Deposit>* dep = nullptr) const {
         DepositSink sink; sink.layout = &patchLayout_; sink.out = dep; sink.maxSec = prm.mixingSec;
