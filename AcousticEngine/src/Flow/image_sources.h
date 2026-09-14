@@ -58,6 +58,7 @@ struct Face {
     Vec3  center{0, 0, 0}, normal{0, 0, 0}, axisU{0, 0, 0}, axisV{0, 0, 0};
     float halfU = 0.0f, halfV = 0.0f;
     float reflect6[kNumBands] = {};
+    float scatter1k = 0.5f;             // 1 kHz の散乱率（虚像の面音源の幅に使う）
 };
 
 struct ImageSource {
@@ -108,6 +109,7 @@ inline void collectFaces(const Surfaces& surf, const MaterialTable& mats, std::v
             f.axisU = ax[(a + 1) % 3]; f.axisV = ax[(a + 2) % 3];
             f.halfU = he[(a + 1) % 3]; f.halfV = he[(a + 2) % 3];
             for (int k = 0; k < kNumBands; ++k) f.reflect6[k] = splitAt(m, k).reflect;
+            f.scatter1k = std::min(1.0f, std::max(0.0f, m.scattering[3]));
             out.push_back(f);
         }
     }

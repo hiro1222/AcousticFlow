@@ -122,6 +122,15 @@ void AF_WorldSetPrecedence(AF_WorldHandle w, float db, float sec) {
     W->precedenceDb = (db < 0.0f) ? 0.0f : db;
     W->precedenceSec = (sec < 0.001f) ? 0.001f : sec;
 }
+void AF_WorldSetImageSurface(AF_WorldHandle w, float roughDeg, float connectDeg, float connectMs, float densityPow, float nearPow) {
+    acoustic::flow::World* W = asWorld(w); if (!W) return;
+    const float k = 3.14159265f / 180.0f;
+    W->surface.roughRad = std::max(0.0f, roughDeg) * k;
+    W->surface.connectRad = std::max(0.0f, connectDeg) * k;
+    W->surface.connectSec = std::max(1e-4f, connectMs * 0.001f);
+    W->surface.densityPow = std::max(0.0f, densityPow);
+    W->surface.nearPow = std::max(0.0f, nearPow);
+}
 void AF_WorldSetAdjacentContain(AF_WorldHandle w, float amount) {
     if (acoustic::flow::World* W = asWorld(w)) W->adjacentContain = (amount < 0.0f) ? 0.0f : (amount > 1.0f ? 1.0f : amount);
 }
@@ -129,10 +138,10 @@ float AF_WorldAdjacentContain(AF_WorldHandle w) {
     acoustic::flow::World* W = asWorld(w); return W ? W->adjacentContain : 0.0f;
 }
 void AF_WorldSetEarlyModel(AF_WorldHandle w, int model) {
-    if (acoustic::flow::World* W = asWorld(w)) W->earlyModel = std::min(3, std::max(0, model));
+    if (acoustic::flow::World* W = asWorld(w)) W->earlyModel = std::min(4, std::max(0, model));
 }
 int AF_WorldEarlyModel(AF_WorldHandle w) {
-    acoustic::flow::World* W = asWorld(w); return W ? W->earlyModel : 3;
+    acoustic::flow::World* W = asWorld(w); return W ? W->earlyModel : 4;
 }
 void AF_WorldSetEmitterEarlyModel(AF_WorldHandle w, int e, int model) {
     if (acoustic::flow::World* W = asWorld(w)) W->setEmitterEarlyModel(e, model);
@@ -319,7 +328,7 @@ int AF_WorldArrivals(AF_WorldHandle w, int e, AF_Arrival* out, int maxOut) {
             push(AF_ARRIVAL_DIFFRACT, t.dirLocal.x, t.dirLocal.y, t.dirLocal.z, t.spread, et, t.delaySec, ok, ok ? df->point : none, -1);
             continue;
         }
-        const bool fromFaces = ftaps && ftaps->count > 0 && W->emitterEarlyModel(e) >= 1;
+        const bool fromFaces = ftaps && ftaps->count > 0 && W->emitterEarlyModel(e) >= 1 && W->emitterEarlyModel(e) <= 3;
         if (fromFaces) {
             // 受取面のタップ: 出どころは量で重みを付けた小片の中心、箱は面の持ち主
             const acoustic::flow::FaceTap* hit = nullptr;
@@ -328,6 +337,10 @@ int AF_WorldArrivals(AF_WorldHandle w, int e, AF_Arrival* out, int maxOut) {
             // 戸口の 1 本（隣の部屋の閉じ込め）の出どころは戸口の中心
             push(dirOk ? AF_ARRIVAL_EARLY : AF_ARRIVAL_EARLY_DIFFUSE, t.dirLocal.x, t.dirLocal.y, t.dirLocal.z, dirOk ? t.spread : 1.0f, et, t.delaySec,
                  hit != nullptr && t.id != acoustic::flow::FaceTapSet::kIdRest, hit ? hit->point : none, hit ? hit->box : -1);
+            continue;
+        }
+        if (t.id == acoustic::flow::FaceTapSet::kIdDoor) {                  // 虚像の面音源の閉じ込めの戸口の 1 本
+            push(AF_ARRIVAL_EARLY, t.dirLocal.x, t.dirLocal.y, t.dirLocal.z, t.width / 1.5707963f, et, t.delaySec, false, none, -1);
             continue;
         }
         if (t.id == 4) {                                                    // 方向なしの初期（distribute の素性 4）

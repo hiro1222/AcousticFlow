@@ -55,6 +55,8 @@ public:
     static constexpr int kNumBands = 6;
     // 方向バスへ書くときの ITD の上限（サンプル）。1 ms ≒ 48 本。行の末尾にこのぶんの余裕を持つ。
     static constexpr int kLaneItdMax = 64;
+    /// 幅を持つタップが書けるレーンの数（DirectionBus::kMaxLanes と同じ）。
+    static constexpr int kWideLanes = 16;
 
     // 1 タップ。audio thread で毎サンプル sqrt を呼ばないよう、構築時に畳んである。
     struct Tap {
@@ -103,6 +105,12 @@ public:
         bool  laneUse = false;
         int   lane[2] = {-1, -1};
         float laneW[2] = {0.0f, 0.0f};
+        // ── 幅（2026-09-14、虚像の面音源）──
+        //   半角（ラジアン、方位角）。0 なら点 ＝ 隣り合う 2 レーンだけ（今までと 1 ビットも同じ）。
+        //   VoiceRenderer::setTaps が幅の中のレーンへの重み wideW を埋め、点の分 laneW を √(1 − 幅の割合) 倍にする。
+        //   幅の分はレーンごとに固定の遅れ（wideDecor_）をずらして書き、同じ波形が 1 点に集まらないようにする（無相関で広がる）。
+        float width = 0.0f;
+        float wideW[kWideLanes] = {};
     };
 
     /// maxDelaySamples : 履歴リングの長さの目安（早期↔後期の境目ぶん）
@@ -116,6 +124,11 @@ public:
         static const float kCrossHz[kNumBands - 1] = {177.0f, 354.0f, 707.0f, 1414.0f, 2828.0f};
         for (int i = 0; i < kNumBands - 1; ++i)
             split_[i].setLowpass(kCrossHz[i], static_cast<float>(sampleRate_));
+        // 幅の分のレーンごとの固定の遅れ（48 kHz で 0〜21 サンプル ＝ 0〜0.44 ms）。隣り合うレーンで大きく違う並び。
+        //   ITD（最大およそ 32 サンプル）と足しても行の余裕 kLaneItdMax に収まる。
+        static const int kDecor48[kWideLanes] = {0, 11, 5, 17, 3, 13, 7, 19, 2, 15, 9, 21, 4, 12, 6, 18};
+        for (int l = 0; l < kWideLanes; ++l)
+            wideDecor_[l] = static_cast<int>(std::lround(kDecor48[l] * static_cast<float>(sampleRate_) / 48000.0f));
     }
 
     ~EarlyReflectConv() {
@@ -325,6 +338,20 @@ public:
                     if (b.laneUse)
                         for (int q = 0; q < 2; ++q)
                             if (b.lane[q] >= 0) scatter(b.lane[q], sp * b.laneW[q] * t);
+                    // 幅の分: 幅の中のレーンへ、レーンごとの固定の遅れをずらして書く（from は 1 − t、to は t）
+                    if (a.wide || b.wide) {
+                        for (int l = 0; l < kWideLanes; ++l) {
+                            const float wv = ((t < 1.0f) ? a.wideW[l] * (1.0f - t) : 0.0f) + b.wideW[l] * t;
+                            if (wv == 0.0f) continue;
+                            const float gw = sp * wv;
+                            for (int e = 0; e < 2; ++e) {
+                                const int o = std::min(off[e] + wideDecor_[l], kLaneItdMax - 2);
+                                float* row = outLanes + static_cast<std::size_t>(l * 2 + e) * laneStride;
+                                row[o]     += gw * (1.0f - fr[e]);
+                                row[o + 1] += gw * fr[e];
+                            }
+                        }
+                    }
                     continue;
                 }
             }
@@ -453,6 +480,8 @@ private:
         bool  laneUse = false;
         int   lane[2] = {-1, -1};
         float laneW[2] = {0.0f, 0.0f};
+        bool  wide = false;                   // 幅の分のレーンがあるか
+        float wideW[kWideLanes] = {};
 
         static RtTap from(const Tap& t) {
             RtTap r;
@@ -465,6 +494,7 @@ private:
             r.earUse = t.earUse;
             r.laneUse = t.laneUse;
             for (int e = 0; e < 2; ++e) { r.lane[e] = t.lane[e]; r.laneW[e] = t.laneW[e]; }
+            for (int l = 0; l < kWideLanes; ++l) { r.wideW[l] = t.wideW[l]; if (t.wideW[l] != 0.0f) r.wide = true; }
             for (int e = 0; e < 2; ++e) {
                 r.earDelay[e] = t.earDelay[e];
                 for (int b = 0; b < kNumBands; ++b) r.earGain[e][b] = t.earGain[e][b];
@@ -513,6 +543,10 @@ private:
                             if (a.lane[e] >= 0 && a.lane[e] == b.lane[q]) nw[q] += a.laneW[e] * (1.0f - t);
                 a.laneUse = true;
                 for (int e = 0; e < 2; ++e) { a.lane[e] = b.lane[e]; a.laneW[e] = nw[e]; }
+            }
+            if (a.wide || b.wide) {
+                for (int l = 0; l < kWideLanes; ++l) a.wideW[l] += (b.wideW[l] - a.wideW[l]) * t;
+                a.wide = true;
             }
             for (int e = 0; e < 2; ++e) {
                 a.earDelay[e] += (b.earDelay[e] - a.earDelay[e]) * t;
@@ -566,6 +600,7 @@ private:
     const int sampleRate_;
     std::vector<float> ring_;      // [帯域][時間] の入力履歴
     int ringMask_ = 0;
+    int wideDecor_[kWideLanes] = {};             // 幅の分のレーンごとの固定の遅れ（サンプル）
     int writePos_ = 0;
     Biquad split_[kNumBands - 1];  // 直列クロスオーバー用の lowpass 群
 

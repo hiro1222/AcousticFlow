@@ -63,6 +63,7 @@ struct MixTap {
     float   e6[kNumBands] = {};              // エネルギー（帯域別）
     Vec3    dirLocal{0, 0, 0};               // リスナー座標の到来方向（単位）。ゼロ = 方向なし
     float   spread = 0.0f;                   // 0 点 … 1 一様
+    float   width = 0.0f;                    // 面音源の幅（半角、ラジアン。0 = 点）。虚像の面音源（earlyModel 4）が使う
 };
 
 struct FdnSend {
@@ -98,7 +99,11 @@ struct Mix {
             for (int c = 0; c < kNumComponents; ++c) component6[c][b] = 0.0f;
         }
     }
-    MixTap* pushTap() { return (tapCount < kMaxTaps) ? &taps[tapCount++] : nullptr; }
+    MixTap* pushTap() {
+        if (tapCount >= kMaxTaps) return nullptr;
+        taps[tapCount] = MixTap{};                 // 前のフレームの値（幅など、書かない欄）を持ち越さない
+        return &taps[tapCount++];
+    }
     FdnSend* pushSend() { return (sendCount < kMaxSends) ? &sends[sendCount++] : nullptr; }
 
     float sumComponents(int b) const {

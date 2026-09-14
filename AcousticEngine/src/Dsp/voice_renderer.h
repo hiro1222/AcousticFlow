@@ -164,6 +164,29 @@ public:
                 // 方向バス行き: 隣り合う 2 レーンへ等パワー。バスの固有遅延（firstBlock）ぶんタップを早める。
                 DirectionBus::laneWeights(d.dir, lanes, d.lane, d.laneW);
                 d.laneUse = true;
+                if (d.width > 1e-4f) {
+                    // 幅（虚像の面音源）: 方位角 ±width の弧を刻み、各点の 2 レーンの量（重み²）を平均して幅の中のレーンの重みにする。
+                    //   幅の割合 amt = 幅 / (レーンの間隔の半分) を幅の分へ、残りを点の分（隣り合う 2 レーン）へ。量の和は変えない。
+                    //   幅 → 0 で点のパンに連続につながる（弧の平均が点に縮み、amt も 0 へ）。
+                    const float spacing = 6.28318531f / static_cast<float>(lanes);
+                    const float w = std::min(d.width, 3.14159265f);
+                    const float amt = std::min(1.0f, w / (0.5f * spacing));
+                    const int half = std::max(1, static_cast<int>(std::ceil(w / (0.25f * spacing))));
+                    const int M = 1 + 2 * half;
+                    float E[EarlyReflectConv::kWideLanes] = {};
+                    const float az0 = std::atan2(d.dir[0], d.dir[2]);
+                    for (int m = 0; m < M; ++m) {
+                        const float az = az0 + w * (2.0f * static_cast<float>(m) / static_cast<float>(M - 1) - 1.0f);
+                        const float dd[3] = {std::sin(az), 0.0f, std::cos(az)};
+                        int ln[2]; float lw[2];
+                        DirectionBus::laneWeights(dd, lanes, ln, lw);
+                        for (int q = 0; q < 2; ++q)
+                            if (ln[q] >= 0 && ln[q] < EarlyReflectConv::kWideLanes) E[ln[q]] += lw[q] * lw[q] / static_cast<float>(M);
+                    }
+                    for (int l = 0; l < EarlyReflectConv::kWideLanes; ++l) d.wideW[l] = std::sqrt(E[l] * amt);
+                    const float keep = std::sqrt(1.0f - amt);
+                    d.laneW[0] *= keep; d.laneW[1] *= keep;
+                }
                 d.delaySamples = std::max(0, d.delaySamples - busLatency);
                 // ITD はタップ自身の物を持つ（方向 × 耳の行へ別々に送る。ILD とスペクトルは行の HRIR が担当）。
                 if (hrtfSet_ && hrtfSet_->isValid()) {

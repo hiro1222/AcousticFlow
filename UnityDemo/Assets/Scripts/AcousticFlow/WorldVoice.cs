@@ -39,8 +39,8 @@ namespace AcousticFlow
         [Range(0f, 2f)] public float outputGain = 0.6f;
         public bool enableHrtf = true;
         // 音源ごとの上書き（2026-09-14）。−1（負）で AcousticWorld の設定に従う。特定の音源だけ受取面や閉じ込めを使うため。
-        [Tooltip("この音源の初期反射の出し方。−1 で AcousticWorld に従う / 0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網。実行中に変えられる")]
-        [Range(-1, 3)] public int earlyModelOverride = -1;
+        [Tooltip("この音源の初期反射の出し方。−1 で AcousticWorld に従う / 0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網 / 4 虚像の面音源。実行中に変えられる")]
+        [Range(-1, 4)] public int earlyModelOverride = -1;
         [Tooltip("この音源の隣の部屋の閉じ込め。負で AcousticWorld に従う / 0..1。実行中に変えられる")]
         [Range(-1f, 1f)] public float adjacentContainOverride = -1f;
 

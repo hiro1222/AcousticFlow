@@ -94,9 +94,21 @@ namespace AcousticFlow
         //   0 虚像（鏡に映した音源の点。量は幾何の重み）
         //   1 壁の受取面（面ごとのタップ。虚像は作らない）
         //   2 虚像を面でつなぐ: 虚像の向き・遅れはそのまま、量は虚像の面（壁）が受けたレイ
-        //   3 虚像の網（既定）: 受け取りごとの見かけの音源の点を、虚像を結んだ網で受けて角の虚像へ配る。壁に近いほど、その壁の虚像が大きく広く鳴る
-        [Tooltip("初期反射の出し方。0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網（既定）。音源ごとに WorldVoice で上書きできる。実行中に変えられる")]
-        [Range(0, 3)] public int earlyModel = 3;
+        //   3 虚像の網: 受け取りごとの見かけの音源の点を、虚像を結んだ網で受けて角の虚像へ配る
+        //   4 虚像の面音源（既定）: 虚像どうしをつないで面にし、向き・幅（ASW、部屋の広さ感）と、集まり・近さの重み（奥行き感）で鳴らす
+        [Tooltip("初期反射の出し方。0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網 / 4 虚像の面音源（既定）。音源ごとに WorldVoice で上書きできる。実行中に変えられる")]
+        [Range(0, 4)] public int earlyModel = 4;
+        // 虚像の面音源（earlyModel 4、2026-09-14）の摘み。どれも実行中に動かせる。
+        [Tooltip("散乱率 1 の面の虚像が持つ幅（半角、度）。凹凸のある壁ほど虚像が群になって広がる")]
+        [Range(0f, 60f)] public float surfaceRoughDeg = 20f;
+        [Tooltip("虚像どうしをつなぐ角度の尺度（度）。大きいほど離れた虚像まで 1 枚の面になり、幅が広がる（大きすぎると向きが部屋の重心へ寄る）")]
+        [Range(0f, 60f)] public float surfaceConnectDeg = 15f;
+        [Tooltip("虚像どうしをつなぐ到達の尺度（ms）。到達が近い虚像ほど強くつなぐ")]
+        [Range(0.1f, 30f)] public float surfaceConnectMs = 5f;
+        [Tooltip("虚像が集まった所を重くする強さ（0 で重みなし）。初期反射の総量は変えない。演出")]
+        [Range(0f, 3f)] public float surfaceDensity = 1f;
+        [Tooltip("経路が短い虚像を重くする強さ（0 で重みなし）。初期反射の総量は変えない。演出")]
+        [Range(0f, 3f)] public float surfaceNear = 1f;
         // 隣の部屋の閉じ込め（2026-09-14、既定 1）。音源が別の部屋にいるとき、その残響・反射を今いる部屋で響かせず、戸口から鳴らす。
         //   後期: 今いる部屋の響きへ流していた分を戸口の線音源から直接。初期: 今いる部屋の面の反射を戸口の 1 本へ。総量は変えない。
         //   0 で物理のまま（戸口から入った音が今いる部屋でも響く）。演出の摘み。
@@ -410,6 +422,7 @@ namespace AcousticFlow
             NativeWorld.AF_WorldSetDoorPull(_world, doorPull);             // 同上
             NativeWorld.AF_WorldSetWallReflect(_world, wallReflections ? 1 : 0);   // 同上
             NativeWorld.AF_WorldSetEarlyModel(_world, earlyModel);                  // 同上
+            NativeWorld.AF_WorldSetImageSurface(_world, surfaceRoughDeg, surfaceConnectDeg, surfaceConnectMs, surfaceDensity, surfaceNear);   // 同上
             NativeWorld.AF_WorldSetAdjacentContain(_world, adjacentContain);        // 同上
             NativeWorld.AF_WorldSetDoorCoherence(_world, doorCoherenceHz);         // 同上
             NativeWorld.AF_WorldSetPrecedence(_world, precedenceDb, precedenceMs * 0.001f);   // 同上

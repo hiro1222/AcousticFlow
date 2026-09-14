@@ -114,16 +114,20 @@ ACOUSTIC_API void AF_WorldSetPrecedence(AF_WorldHandle w, float db, float sec);
 /* 壁越しの反射（既定 0 ＝ 通さない）。1 で旧: 壁を横切った反射と残響も透過率で薄めて届ける。
  * 0 では壁を抜けるのは透過の直接音だけ。開いた戸口を通る分はどちらでも同じ。実行中に切り替えてよい。 */
 ACOUSTIC_API void AF_WorldSetWallReflect(AF_WorldHandle w, int on);
-/* 初期反射の出し方（既定 3）。実行中に切り替えてよい。
+/* 初期反射の出し方（既定 4）。実行中に切り替えてよい。
  *   0 虚像（ISM）／1 壁の受取面（面ごとのタップ）／2 虚像を面でつなぐ（虚像の面が受けたレイの量を虚像へ）
- *   3 虚像の網（受け取りごとの見かけの音源の点を、虚像を結んだ網で受けて角の虚像へ配る） */
+ *   3 虚像の網（受け取りごとの見かけの音源の点を、虚像を結んだ網で受けて角の虚像へ配る）
+ *   4 虚像の面音源（虚像どうしをつないで面にし、向き・幅・集まりと近さの重みで鳴らす） */
 ACOUSTIC_API void AF_WorldSetEarlyModel(AF_WorldHandle w, int model);
-/* 音源ごとの上書き。初期反射の出し方（−1 で世界の設定、0/1/2/3）と、隣の部屋の閉じ込め（負で世界の設定、0..1）。 */
+/* 音源ごとの上書き。初期反射の出し方（−1 で世界の設定、0〜4）と、隣の部屋の閉じ込め（負で世界の設定、0..1）。 */
 ACOUSTIC_API void AF_WorldSetEmitterEarlyModel(AF_WorldHandle w, int emitter, int model);
 ACOUSTIC_API void AF_WorldSetEmitterAdjacentContain(AF_WorldHandle w, int emitter, float amount);
 /* 隣の部屋の閉じ込め（0..1、既定 0）。音源が耳と別の部屋にいるとき、耳の部屋で響かせる分（後期の耳の部屋の FDN への送りと
  * 戸口から流す分、初期の耳の部屋の面の反射）をこの割合だけ戸口へ移す。総量は変えない。1 で隣の部屋の音は戸口からだけ鳴る。実行中に動かしてよい。 */
 ACOUSTIC_API void  AF_WorldSetAdjacentContain(AF_WorldHandle w, float amount);
+/* 虚像の面音源（earlyModel 4）の摘み。roughDeg 散乱率 1 の面の虚像の幅（半角）、connectDeg / connectMs つなぐ角度と到達の尺度、
+ * densityPow 集まりの重み、nearPow 近さの重み（どちらも 0 で重みなし。初期の総量は変えない）。実行中に動かしてよい。 */
+ACOUSTIC_API void  AF_WorldSetImageSurface(AF_WorldHandle w, float roughDeg, float connectDeg, float connectMs, float densityPow, float nearPow);
 ACOUSTIC_API float AF_WorldAdjacentContain(AF_WorldHandle w);
 ACOUSTIC_API int  AF_WorldEarlyModel(AF_WorldHandle w);
 ACOUSTIC_API int  AF_WorldWallReflect(AF_WorldHandle w);

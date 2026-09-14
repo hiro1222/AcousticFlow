@@ -101,13 +101,15 @@ namespace AcousticFlow
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetDoorPull(IntPtr w, float pull);
         // 壁越しの反射（既定 0 ＝ 通さない）。1 で旧: 壁を横切った反射と残響も透過率で薄めて届ける。実行中に切り替えてよい
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetWallReflect(IntPtr w, int on);
-        // 初期反射の出し方（既定 3）。0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網。実行中に切り替えてよい
+        // 初期反射の出し方（既定 4）。0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網 / 4 虚像の面音源。実行中に切り替えてよい
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetEarlyModel(IntPtr w, int model);
         // 音源ごとの上書き（−1 / 負で世界の設定）
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetEmitterEarlyModel(IntPtr w, int emitter, int model);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetEmitterAdjacentContain(IntPtr w, int emitter, float amount);
         // 隣の部屋の閉じ込め（0..1）。隣の部屋の残響・反射を耳の部屋で響かせず、戸口から鳴らす割合。実行中に動かせる
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetAdjacentContain(IntPtr w, float amount);
+        // 虚像の面音源（earlyModel 4）の摘み。散乱の幅（度）・つなぐ角度（度）・つなぐ到達（ms）・集まりの重み・近さの重み。実行中に動かせる
+        [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetImageSurface(IntPtr w, float roughDeg, float connectDeg, float connectMs, float densityPow, float nearPow);
         // 戸口の線音源の低域の相関の境（Hz、既定 3000）。下は 5 点が同じ波形、上は別の波形。0 で旧。実行中に動かせる
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetDoorCoherence(IntPtr w, float hz);
         // 先着の重み（dB と窓 s）。最初の到達から遅れる到来ほど出口で下げる。0 dB で今までと同じ。実行中に動かせる

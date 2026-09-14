@@ -46,6 +46,7 @@
 #include "Flow/emitter.h"
 #include "Flow/energy_trace.h"
 #include "Flow/image_sources.h"
+#include "Flow/image_surface.h"
 #include "Flow/receiver.h"
 #include "Flow/mix.h"
 #include "Flow/response.h"
@@ -65,6 +66,10 @@ struct DistributeInput {
     // 受取面（2026-09-13、World::earlyModel 1 / 2 / 3）。あれば初期はこのタップで鳴らす（2・3 では虚像のタップも入る。素性は imageTapId）。
     //   ★量の総量は trace->early6（World が受取面の合計に書き戻した物）。ここは取り分・遅れ・向き・広がりだけを使う。
     const FaceTapSet* faceTaps = nullptr;
+    // 虚像の面音源（2026-09-14、World::earlyModel 4）。images と同じ並び。あれば虚像のタップの向き・幅・出口の重みをここから取る。
+    const ImageSurface* surfaces = nullptr;
+    // 虚像の面音源の隣の部屋の閉じ込め。surfaces[i].toDoor の割合を戸口の 1 本（素性 FaceTapSet::kIdDoor）へ移す。
+    const FaceContain* imageContain = nullptr;
     Vec3 sourcePos{0, 0, 0};
     const Listener* listener = nullptr;
     int listenerRoom = -1;                 // −1 なら FDN の送りを作らない
@@ -243,6 +248,8 @@ public:
             }
         }
         if (!ft && im && im->count > 0) {
+            float doorE6[kNumBands] = {};
+            bool toDoor = false;
             for (int i = 0; i < im->count; ++i) {
                 const ImageSource& src = im->img[i];
                 MixTap* t = out.pushTap();
@@ -256,8 +263,35 @@ public:
                 }
                 t->dirLocal = in.listener->toLocal(src.pos - in.listener->pos);
                 t->spread = 1.0f - src.validity;
+                // 虚像の面音源: 向きは面の重心、幅は面の角度の広がり、量に出口の重み（集まり・近さ。Σ は変えない）
+                float sg = 1.0f, keep = 1.0f;
+                if (in.surfaces) {
+                    t->dirLocal = in.listener->toLocal(in.surfaces[i].dir);
+                    t->width = in.surfaces[i].width;
+                    sg = in.surfaces[i].gain;
+                    if (in.imageContain && in.surfaces[i].toDoor > 0.0f) {
+                        const float c = std::min(1.0f, in.surfaces[i].toDoor);
+                        keep = 1.0f - c;
+                        for (int b = 0; b < kNumBands; ++b) doorE6[b] += sm[kEarly][b] * W.w[kEarly] * dirFrac[b] * src.weight6[b] * sg * c;
+                        toDoor = true;
+                    }
+                }
                 const float pw = pre(src.pathSec);
-                for (int b = 0; b < kNumBands; ++b) t->e6[b] = sm[kEarly][b] * W.w[kEarly] * dirFrac[b] * src.weight6[b] * pw;
+                for (int b = 0; b < kNumBands; ++b) t->e6[b] = sm[kEarly][b] * W.w[kEarly] * dirFrac[b] * src.weight6[b] * sg * pw * keep;
+            }
+            if (toDoor) {
+                // 隣の部屋の閉じ込めの戸口の 1 本: 向きは戸口の中心、遅れは音源 → 戸口 → 耳、幅は戸口の見込みの半角
+                const FaceContain& fc = *in.imageContain;
+                MixTap* t = out.pushTap();
+                if (t) {
+                    t->kind = TapKind::Early; t->id = FaceTapSet::kIdDoor; t->delaySec = fc.doorDelaySec;
+                    const Vec3 dd = fc.doorPoint - in.listener->pos;
+                    t->dirLocal = (length(dd) > 1e-4f) ? in.listener->toLocal(dd) : Vec3(0, 0, 0);
+                    t->spread = 0.0f;
+                    t->width = std::min(1.0f, std::max(0.0f, fc.doorSpread)) * 1.5707963f;
+                    const float pw = pre(fc.doorDelaySec);
+                    for (int b = 0; b < kNumBands; ++b) t->e6[b] = doorE6[b] * pw;
+                }
             }
         }
         for (int b = 0; b < kNumBands; ++b) out.component6[kEarly][b] += raw[kEarly][b];   // 帳簿は 1 回だけ

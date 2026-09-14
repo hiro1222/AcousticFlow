@@ -1840,6 +1840,7 @@ void testImageFaces() {
         const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
         for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
         w.addBox(doorLeaf(90.0f), lm, true);
+        w.earlyModel = 2;
         w.adjacentContain = 0.0f;
         w.raysPerEmitter = 1024; w.budget.cfg.maxPerEmitter = 1024; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
         w.setListener(Vec3(0.0f, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
@@ -2009,6 +2010,221 @@ void testImageLattice() {
     }
 }
 
+// ================================ [虚像の面音源] 虚像どうしをつないで面にして鳴らす（AF_ONLY=imgsurface、2026-09-14）
+//   World::earlyModel = 4（image_surface.h）。
+//   ① 重みなし（集まり・近さ 0）なら量は虚像の道（0）と 1 ビットも同じ、幅だけが付く
+//   ② 近さ・集まりの重みは初期の総量を変えずに、近い虚像・集まった虚像の取り分を上げる
+//   ③ 耳が 1 cm 動いたときの面の向きと幅の動きが小さい（つないで滑らか）。つなぐ角度を広げるほど幅が広い
+//   ④ 鳴らした初期反射の左右の相関（IACC）が点より下がる（幅 ＝ ASW）
+void testImageSurface() {
+    std::puts("");
+    std::puts("[虚像の面音源] 虚像どうしをつないで面にして鳴らす（earlyModel = 4）");
+    char buf[420];
+    const float dt = 1.0f / 60.0f;
+    const Vec3 S(1.5f, 1.6f, -1.0f);
+    auto isImageId = [](int id) { return id >= 16 && id < FaceTapSet::kIdNear; };
+    auto run = [&](int model, const SurfaceParams& sp, const Vec3& L, int frames) {
+        World* w = makeWorldBox(3.5f, 3.0f, 0.2f);
+        w->earlyModel = model; w->surface = sp;
+        w->raysPerEmitter = 1024; w->budget.cfg.maxPerEmitter = 1024; w->rayGroups = 1; w->budget.cfg.totalRays = 0;
+        w->setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        w->addEmitter(S, 0.2f);
+        w->build();
+        for (int k = 0; k < frames; ++k) w->update(dt);
+        return w;
+    };
+    const Vec3 L0(-1.0f, 1.2f, 1.5f);
+    // ①
+    {
+        SurfaceParams sp;                                    // 既定（重みなし）
+        World* w0 = run(0, sp, L0, 30);
+        World* w4 = run(4, sp, L0, 30);
+        const Mix& a = *w0->mix(0); const Mix& b = *w4->mix(0);
+        double la = 0.0, lb = 0.0;
+        for (int q = 0; q < kNumBands; ++q) { la += a.component6[kEarly][q]; lb += b.component6[kEarly][q]; }
+        bool sameE = (a.tapCount == b.tapCount);
+        int wide = 0; double maxW = 0.0;
+        for (int i = 0; sameE && i < a.tapCount; ++i) {
+            if (a.taps[i].id != b.taps[i].id) sameE = false;
+            for (int q = 0; q < kNumBands; ++q) if (a.taps[i].e6[q] != b.taps[i].e6[q]) sameE = false;
+            if (a.taps[i].width != 0.0f) sameE = false;
+            if (b.taps[i].kind == TapKind::Early && isImageId(b.taps[i].id)) { if (b.taps[i].width > 0.05f) ++wide; maxW = std::max(maxW, static_cast<double>(b.taps[i].width)); }
+        }
+        std::snprintf(buf, sizeof buf, "(初期の帳簿 %.6e ／ %.6e、タップ %d 本、幅 0.05 rad（3°）超の虚像のタップ %d 本、最大の幅 %.1f°)",
+                      la, lb, b.tapCount, wide, maxW * 57.2958);
+        check("[虚像の面音源] 重みなしなら量とタップの並びは虚像の道と 1 ビットも同じで、虚像のタップに幅が付く", la == lb && sameE && wide >= 4, buf);
+        delete w0; delete w4;
+    }
+    // ②
+    {
+        auto shares = [&](const SurfaceParams& sp, double& total, double& nearest, double& densest) {
+            World* w = run(4, sp, L0, 30);
+            const Mix& m = *w->mix(0);
+            const ImageSet& im = *w->images(0);
+            const ImageSurface* sf = w->imageSurfaces(0);
+            int iNear = 0, iDense = 0;
+            for (int i = 1; i < im.count; ++i) {
+                if (im.img[i].pathSec < im.img[iNear].pathSec) iNear = i;
+                if (sf[i].density > sf[iDense].density) iDense = i;
+            }
+            total = 0.0; nearest = 0.0; densest = 0.0;
+            for (int t = 0; t < m.tapCount; ++t) {
+                if (m.taps[t].kind != TapKind::Early) continue;
+                double te = 0.0; for (int q = 0; q < kNumBands; ++q) te += m.taps[t].e6[q];
+                total += te;
+                if (m.taps[t].id == imageTapId(im.img[iNear])) nearest = te;
+                if (m.taps[t].id == imageTapId(im.img[iDense])) densest = te;
+            }
+            delete w;
+        };
+        SurfaceParams p0, pn, pd; pn.nearPow = 2.0f; pd.densityPow = 2.0f;
+        double t0, n0, d0, tn, nn, dn, td, nd, dd;
+        shares(p0, t0, n0, d0); shares(pn, tn, nn, dn); shares(pd, td, nd, dd);
+        std::snprintf(buf, sizeof buf, "(初期のタップの和 重みなし %.4e ／ 近さ 2 %.4e ／ 集まり 2 %.4e、いちばん近い虚像 %.1f%% → %.1f%%、いちばん集まった虚像 %.1f%% → %.1f%%)",
+                      t0, tn, td, n0 / t0 * 100.0, nn / tn * 100.0, d0 / t0 * 100.0, dd / td * 100.0);
+        check("[虚像の面音源] 近さ・集まりの重みは初期の総量を変えず（0.5%）、近い虚像・集まった虚像の取り分を上げる",
+              std::fabs(tn / t0 - 1.0) < 0.005 && std::fabs(td / t0 - 1.0) < 0.005 && nn / tn > n0 / t0 && dd / td > d0 / t0, buf);
+    }
+    // ③
+    {
+        SurfaceParams sp;
+        World* w = run(4, sp, L0, 5);
+        struct Prev { int id; Vec3 dir; float width; };
+        std::vector<Prev> prev;
+        double worstAng = 0.0, worstW = 0.0;
+        Vec3 L = L0;
+        for (int k = 0; k < 150; ++k) {
+            L.x += 0.01f;
+            w->setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+            w->update(dt);
+            const ImageSet& im = *w->images(0);
+            const ImageSurface* sf = w->imageSurfaces(0);
+            std::vector<Prev> cur;
+            for (int i = 0; i < im.count; ++i) {
+                cur.push_back(Prev{imageTapId(im.img[i]), sf[i].dir, sf[i].width});
+                if (im.img[i].validity < 0.5f) continue;             // 窓の縁で出入りしている虚像は可視率で連続に動く（ここでは見ない）
+                for (const Prev& p : prev)
+                    if (p.id == cur.back().id) {
+                        if (std::getenv("AF_SURF_LOG") && angleBetween(p.dir, sf[i].dir) > 0.5f / 57.2958f)
+                            std::printf("        動き %.2f° 虚像 id%d 可視率 %.3f 次数 %d 本数 %d → %d（耳 x %.2f）\n", angleBetween(p.dir, sf[i].dir) * 57.2958f, cur.back().id,
+                                        im.img[i].validity, im.img[i].order, static_cast<int>(prev.size()), im.count, L.x);
+                        worstAng = std::max(worstAng, static_cast<double>(angleBetween(p.dir, sf[i].dir)));
+                        worstW = std::max(worstW, static_cast<double>(std::fabs(p.width - sf[i].width)));
+                    }
+            }
+            prev.swap(cur);
+        }
+        delete w;
+        double meanW[3] = {0.0, 0.0, 0.0};
+        const float degs[3] = {0.0f, 15.0f, 40.0f};
+        for (int c = 0; c < 3; ++c) {
+            SurfaceParams q; q.connectRad = degs[c] * 3.14159265f / 180.0f;
+            World* wc = run(4, q, L0, 3);
+            const ImageSet& im = *wc->images(0);
+            const ImageSurface* sf = wc->imageSurfaces(0);
+            double se = 0.0, sw = 0.0;
+            for (int i = 0; i < im.count; ++i) { double e = 0.0; for (int b = 0; b < kNumBands; ++b) e += im.img[i].weight6[b]; se += e; sw += e * sf[i].width; }
+            meanW[c] = (se > 0.0) ? sw / se : 0.0;
+            delete wc;
+        }
+        std::snprintf(buf, sizeof buf, "(耳を 1 cm ずつ 1.5 m: 面の向きの動き 最大 %.2f°、幅の動き 最大 %.2f° ／ 量で平均した幅 つなぐ角度 0°・15°・40°: %.1f°・%.1f°・%.1f°)",
+                      worstAng * 57.2958, worstW * 57.2958, meanW[0] * 57.2958, meanW[1] * 57.2958, meanW[2] * 57.2958);
+        check("[虚像の面音源] 耳が 1 cm 動いたときの面の向き・幅の動きは 1° 未満、つなぐ角度を広げるほど幅が広い",
+              worstAng < 1.0 / 57.2958 && worstW < 1.0 / 57.2958 && meanW[0] < meanW[1] && meanW[1] < meanW[2], buf);
+    }
+    // ⑤ 隣の部屋の閉じ込め（虚像の面音源でも、耳の部屋の面で返る虚像の量を戸口の 1 本へ移す）
+    {
+        AcousticMaterial wall = AcousticMaterial::defaultWall();
+        for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+        auto runC = [&](float contain, double& sum, double& door, int& imgs) {
+            World w;
+            const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+            for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+            w.addBox(doorLeaf(90.0f), lm, true);
+            w.earlyModel = 4; w.adjacentContain = contain;
+            w.raysPerEmitter = 1024; w.budget.cfg.maxPerEmitter = 1024; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+            w.setListener(Vec3(0.0f, 1.6f, -3.0f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+            const int e = w.addEmitter(Vec3(0.0f, 1.6f, 3.0f), 0.2f);
+            w.build();
+            for (int f = 0; f < 40; ++f) w.update(dt);
+            const Mix& m = *w.mix(e);
+            sum = 0.0; door = 0.0; imgs = 0;
+            for (int t = 0; t < m.tapCount; ++t) {
+                if (m.taps[t].kind != TapKind::Early) continue;
+                double te = 0.0; for (int q = 0; q < kNumBands; ++q) te += m.taps[t].e6[q];
+                sum += te;
+                if (m.taps[t].id == FaceTapSet::kIdDoor) door += te;
+                if (isImageId(m.taps[t].id)) ++imgs;
+            }
+        };
+        double s0, d0, s1, d1; int n0, n1;
+        runC(0.0f, s0, d0, n0); runC(1.0f, s1, d1, n1);
+        std::snprintf(buf, sizeof buf, "(初期のタップの和 %.4e → %.4e、戸口の 1 本 %.1f%% → %.1f%%、虚像のタップ %d → %d 本)",
+                      s0, s1, s0 > 0 ? d0 / s0 * 100.0 : 0.0, s1 > 0 ? d1 / s1 * 100.0 : 0.0, n0, n1);
+        check("[虚像の面音源] 隣の部屋の閉じ込め: 初期の総量は同じまま（1%）、耳の部屋の面で返る虚像の量が戸口の 1 本へ移る",
+              s0 > 0.0 && std::fabs(s1 / s0 - 1.0) < 0.01 && d0 == 0.0 && d1 > 0.0, buf);
+    }
+    // ④ 鳴らした初期反射の IACC（初期だけを鳴らす。方向バス 8 レーン・合成 HRTF、Unity と同じ配線）
+    {
+        const int fs = 48000, block = 512;
+        auto iaccOf = [&](int model, const SurfaceParams& sp) {
+            World* wp = makeWorldBox(3.5f, 3.0f, 0.2f);
+            World& w = *wp;
+            w.earlyModel = model; w.surface = sp;
+            for (int c = 0; c < kNumComponents; ++c) w.rules.weights.w[c] = (c == kEarly) ? 1.0f : 0.0f;
+            w.raysPerEmitter = 512; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+            w.setListener(L0, Vec3(0, 0, 1), Vec3(0, 1, 0));
+            const int e = w.addEmitter(S, 0.2f);
+            w.build();
+            af::dsp::FdnRoomMix fdn(fs, block, 0.6f);
+            w.bindFdn(&fdn);
+            af::dsp::VoiceRenderer::Config vc; vc.sampleRate = fs; vc.maxFrames = block; vc.tailSeconds = 1.0f;
+            af::dsp::VoiceRenderer v(vc);
+            v.setOutputGain(1.0f); v.setTailLevel(1.0f); v.setFdnMix(&fdn);
+            af::dsp::HrtfSet hrtf = af::dsp::HrtfSet::createSynthetic(fs);
+            af::dsp::DirectionBus bus(fs, 8, block);
+            v.setHrtfEnabled(true); v.setHrtfSet(&hrtf);
+            bus.setHrtfSet(&hrtf, 57.0f); v.setDirectionBus(&bus); fdn.setDirectionBus(&bus, 57.0f);
+            std::vector<float> in(block), l(block), r(block), bl(block), br(block);
+            std::vector<float> outL, outR;
+            std::uint32_t st = 4242u;
+            for (int k = 0; k < 160; ++k) {
+                w.update(static_cast<float>(block) / fs);
+                if (w.fdnStale()) w.bindFdn(&fdn);
+                w.applyToVoice(e, v, fs);
+                for (int i = 0; i < block; ++i) { st = st * 1664525u + 1013904223u; in[static_cast<std::size_t>(i)] = static_cast<float>(st >> 8) / 16777216.0f * 0.2f - 0.1f; }
+                v.render(in.data(), block, l.data(), r.data(), nullptr);
+                std::fill(bl.begin(), bl.end(), 0.0f); std::fill(br.begin(), br.end(), 0.0f);
+                bus.render(block, bl.data(), br.data());
+                if (k < 40) continue;
+                for (int i = 0; i < block; ++i) { outL.push_back(l[static_cast<std::size_t>(i)] + bl[static_cast<std::size_t>(i)]); outR.push_back(r[static_cast<std::size_t>(i)] + br[static_cast<std::size_t>(i)]); }
+            }
+            // 700 Hz より上だけ（方向バスは下を両耳に共通で鳴らすので、幅が効くのは上）
+            {
+                const float coef = 2.0f * 3.14159265f * 700.0f / fs;
+                float zl = 0.0f, zr = 0.0f;
+                for (std::size_t i = 0; i < outL.size(); ++i) { zl += coef * (outL[i] - zl); outL[i] -= zl; zr += coef * (outR[i] - zr); outR[i] -= zr; }
+            }
+            const int n = static_cast<int>(outL.size()), maxLag = fs / 1000;
+            double ea = 0.0, eb = 0.0;
+            for (int i = 0; i < n; ++i) { ea += static_cast<double>(outL[i]) * outL[i]; eb += static_cast<double>(outR[i]) * outR[i]; }
+            double best = 0.0;
+            for (int lag = -maxLag; lag <= maxLag; ++lag) {
+                double c = 0.0;
+                for (int i = std::max(0, -lag); i < std::min(n, n - lag); ++i) c += static_cast<double>(outL[i]) * outR[i + lag];
+                best = std::max(best, std::fabs(c));
+            }
+            delete wp;
+            return best / std::sqrt(std::max(ea * eb, 1e-30));
+        };
+        SurfaceParams point; point.connectRad = 0.0f; point.roughRad = 0.0f; point.connectSec = 1e-4f;
+        SurfaceParams surf;
+        const double i0 = iaccOf(0, surf), ip = iaccOf(4, point), is = iaccOf(4, surf);
+        std::snprintf(buf, sizeof buf, "(初期だけ・700 Hz より上の IACC: 虚像の道 %.3f ／ 面音源（つながず、散乱の幅なし） %.3f ／ 面音源（既定） %.3f)", i0, ip, is);
+        check("[虚像の面音源] 鳴らした初期反射の左右の相関が、つながない点より下がる（幅 ＝ ASW）", is < ip, buf);
+    }
+}
+
 // ================================ [閉じ込め] 隣の部屋の残響・反射を今いる部屋で響かせない（AF_ONLY=contain、2026-09-14）
 //   World::adjacentContain。音源が耳と別の部屋にいるとき、耳の部屋で響かせる分を戸口へ移す（総量は変えない）。
 //   ① 後期: 総量は同じまま、耳の部屋の FDN への送り（直接の送り＋戸口から流す分）が 0 になる
@@ -2027,6 +2243,7 @@ void testAdjacentContain() {
         const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
         for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
         w.addBox(doorLeaf(90.0f), lm, true);
+        w.earlyModel = 3;                      // 初期の閉じ込めは受取面の形で見る（虚像の面音源は [虚像の面音源]）
         w.adjacentContain = contain;
         w.raysPerEmitter = 1024; w.budget.cfg.maxPerEmitter = 1024; w.rayGroups = 1; w.budget.cfg.totalRays = 0;
         w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
@@ -2286,7 +2503,7 @@ void testNearWall() {
         const float wallDist = d[k];
         World* w = makeWorldBox(half, h, 0.2f);
         w->raysPerEmitter = 512; w->rayGroups = 1; w->budget.cfg.totalRays = 0;
-        if (const char* em = std::getenv("AF_EARLY_MODEL")) w->earlyModel = std::atoi(em);   // 初期反射 0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網
+        if (const char* em = std::getenv("AF_EARLY_MODEL")) w->earlyModel = std::atoi(em);   // 初期反射 0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網 / 4 虚像の面音源
         { const char* io2 = std::getenv("AF_IMG_ORDER"); if (io2) w->imageOrder = std::atoi(io2); }
         // AF_NEAR=src なら**音源**を壁へ寄せる（耳は固定）。既定は耳を寄せる。
         //   ★虚像は「音源」の鏡映なので、音源が壁に近いほど虚像が音源のそばに集まる。
@@ -2364,7 +2581,7 @@ void testManySources() {
     { const char* r = std::getenv("AF_RAYS"); const int nr = r ? std::atoi(r) : 256;
       w.raysPerEmitter = nr; w.budget.cfg.maxPerEmitter = std::max(nr, w.budget.cfg.maxPerEmitter); }
     if (const char* wr = std::getenv("AF_WALL_REFLECT")) w.wallReflect = std::atoi(wr);   // 壁越しの反射 0/1
-    if (const char* em = std::getenv("AF_EARLY_MODEL")) w.earlyModel = std::atoi(em);   // 初期反射 0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網
+    if (const char* em = std::getenv("AF_EARLY_MODEL")) w.earlyModel = std::atoi(em);   // 初期反射 0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網 / 4 虚像の面音源
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     { const char* tr = std::getenv("AF_TOTAL_RAYS"); if (tr) w.budget.cfg.totalRays = std::atoi(tr); }
     { const char* gp = std::getenv("AF_GPU"); if (gp) w.gpuTrace = std::atoi(gp); }
@@ -4104,7 +4321,7 @@ void testDoorSweep() {
     { const char* r = std::getenv("AF_RAYS"); const int nr = r ? std::atoi(r) : 256;
       w.raysPerEmitter = nr; w.budget.cfg.maxPerEmitter = std::max(nr, w.budget.cfg.maxPerEmitter); }
     if (const char* wr = std::getenv("AF_WALL_REFLECT")) w.wallReflect = std::atoi(wr);   // 壁越しの反射 0/1
-    if (const char* em = std::getenv("AF_EARLY_MODEL")) w.earlyModel = std::atoi(em);   // 初期反射 0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網
+    if (const char* em = std::getenv("AF_EARLY_MODEL")) w.earlyModel = std::atoi(em);   // 初期反射 0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網 / 4 虚像の面音源
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     if (const char* lk = std::getenv("AF_LEAK")) w.leakModel = std::atoi(lk);   // 漏れの模型 0/1/2/3
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 1;
@@ -4349,8 +4566,10 @@ void testClicks() {
     { const char* g = std::getenv("AF_GROUPS"); w.rayGroups = g ? std::atoi(g) : 4; }   // Unity と同じ既定 4
     if (const char* lk = std::getenv("AF_LEAK")) w.leakModel = std::atoi(lk);   // 漏れの模型 0/1/2/3
     if (const char* wr = std::getenv("AF_WALL_REFLECT")) w.wallReflect = std::atoi(wr);   // 壁越しの反射 0/1
-    if (const char* em = std::getenv("AF_EARLY_MODEL")) w.earlyModel = std::atoi(em);   // 初期反射 0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網
+    if (const char* em = std::getenv("AF_EARLY_MODEL")) w.earlyModel = std::atoi(em);   // 初期反射 0 虚像 / 1 壁の受取面 / 2 虚像を面でつなぐ / 3 虚像の網 / 4 虚像の面音源
     if (const char* ac = std::getenv("AF_CONTAIN")) w.adjacentContain = static_cast<float>(std::atof(ac));   // 隣の部屋の閉じ込め 0..1
+    if (const char* sn = std::getenv("AF_SURF_NEAR")) w.surface.nearPow = static_cast<float>(std::atof(sn));        // 虚像の面音源: 近さの重み
+    if (const char* sd = std::getenv("AF_SURF_DENSITY")) w.surface.densityPow = static_cast<float>(std::atof(sd));  // 虚像の面音源: 集まりの重み
         if (const char* lt = std::getenv("AF_LATE_THROUGH")) w.lateThrough = std::atoi(lt);   // 戸口越しの後期 0/1（段 2-f）
         w.budget.cfg.totalRays = (which == 3) ? 0 : 1536;
         w.rayGroups = (which == 2 || which == 3) ? 1 : 4;
@@ -4459,7 +4678,7 @@ int main() {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
-        {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"wall", testWallReflect}, {"precedence", testPrecedence}, {"recvworld", testReceiverWorld}, {"imgface", testImageFaces}, {"imglattice", testImageLattice}, {"contain", testAdjacentContain}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
+        {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"wall", testWallReflect}, {"precedence", testPrecedence}, {"recvworld", testReceiverWorld}, {"imgface", testImageFaces}, {"imglattice", testImageLattice}, {"imgsurface", testImageSurface}, {"contain", testAdjacentContain}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
         {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true}, {"doorcoh", testDoorCoherence, true}, {"receiver", testReceiverFaces, true}, {"recvtaps", testReceiverTaps, true}, {"recvnear", testReceiverNear, true}, {"recvdoor", testReceiverDoor, true}, {"doormap", testDoorMap, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {

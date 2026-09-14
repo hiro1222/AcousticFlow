@@ -77,6 +77,7 @@ inline void applyMixToVoice(const Mix& m, af::dsp::VoiceRenderer& v, int sampleR
         const float s = std::min(1.0f, std::max(0.0f, t.spread));
         d.gSpec = std::sqrt(1.0f - s); d.gDiff = std::sqrt(s);
         d.panL = 0.70710678f; d.panR = 0.70710678f;
+        d.width = std::max(0.0f, t.width);          // 面音源の幅（方向バスのレーンへ幅で配るのは VoiceRenderer::setTaps）
         d.hrtfWeight = 0.0f;
     };
     for (int i = 0; i < m.tapCount; ++i)

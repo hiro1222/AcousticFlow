@@ -46,6 +46,7 @@
 #include "Flow/emitter.h"
 #include "Flow/energy_trace.h"
 #include "Flow/image_sources.h"
+#include "Flow/image_surface.h"
 #include "Flow/mix.h"
 #include "Flow/mix_to_voice.h"
 #include "Flow/probe.h"
@@ -214,9 +215,12 @@ public:
     ///   0 虚像（ISM、段 7。量は虚像の幾何の重みで配る）
     ///   1 壁の受取面（2026-09-13。面ごとのタップ、向きと遅れは面の中の重み。虚像は作らない）
     ///   2 虚像を面でつなぐ（2026-09-14）: 虚像の向き・遅れ・可視率はそのまま、量は虚像の面（壁）の器から取る（receiver.h 3）。
-    ///   3 虚像の網（2026-09-14、**既定**。発注者と決めた形）: 受け取りごとの見かけの音源の点を、虚像を結んだ網で受けて
-    ///     角の虚像へ配る（image_lattice.h、receiver.h 4）。残りは面のタップ、音源の角は方向なしの 1 本。
-    int earlyModel = 3;
+    ///   3 虚像の網（2026-09-14）: 受け取りごとの見かけの音源の点を、虚像を結んだ網で受けて角の虚像へ配る（image_lattice.h）。
+    ///   4 虚像の面音源（2026-09-14、**既定**。発注者の狙い）: 虚像どうしを耳から見た向きと到達でつないで面にし、向き・幅（ASW）・
+    ///     集まりと近さの重みで鳴らす（image_surface.h）。量はレイの初期の総量を虚像の幾何の重みで配る（0 と同じ）。受け取りは取らない。
+    int earlyModel = 4;
+    /// 虚像の面音源（earlyModel 4）の摘み。集まりと近さの重み（densityPow / nearPow）は演出で、エンジンの既定は 0（重みなし）。
+    SurfaceParams surface;
     /// 受取面の小片の一辺（m）。変えると次の更新で割り付けを作り直す。
     float patchCell = 0.5f;
     /// レイを GPU で解くか（0 切／1 入。**既定 0**）。2026-09-10。
@@ -304,11 +308,13 @@ public:
     const Visibility* visibility(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].vis : nullptr; }
     const Diffraction* diffraction(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].diff : nullptr; }
     const ImageSet* images(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].images : nullptr; }
-    /// 受取面のタップ（その音源の earlyModel が 1 / 2 / 3 のとき。2・3 は虚像のタップを含む。0 なら count 0）。
+    /// 受取面のタップ（その音源の earlyModel が 1 / 2 / 3 のとき。2・3 は虚像のタップを含む。0・4 なら count 0）。
+    /// 虚像の面音源（その音源の earlyModel が 4 のとき、images(id) と同じ並び）。
+    const ImageSurface* imageSurfaces(int id) const { return valid(id) ? slots_[static_cast<std::size_t>(id)].surf : nullptr; }
     const FaceTapSet* faceTaps(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].faceTaps : nullptr; }
     /// 音源ごとの上書き（2026-09-14）。初期反射の出し方（−1 で世界の設定、0/1/2）と、隣の部屋の閉じ込め（負で世界の設定、0..1）。
     ///   発注者「特定の音源に対してだけ制御するつもり」。受取面は費用が重いので、選んだ音源だけに使える。
-    void setEmitterEarlyModel(int id, int model) { if (valid(id)) slots_[static_cast<std::size_t>(id)].earlyOverride = (model < 0) ? -1 : std::min(3, model); }
+    void setEmitterEarlyModel(int id, int model) { if (valid(id)) slots_[static_cast<std::size_t>(id)].earlyOverride = (model < 0) ? -1 : std::min(4, model); }
     void setEmitterAdjacentContain(int id, float amount) { if (valid(id)) slots_[static_cast<std::size_t>(id)].containOverride = (amount < 0.0f) ? -1.0f : std::min(1.0f, amount); }
     int  emitterEarlyModel(int id) const { if (!valid(id)) return earlyModel; const int o = slots_[static_cast<std::size_t>(id)].earlyOverride; return (o >= 0) ? o : earlyModel; }
     const PatchLayout& patchLayout() const { return patchLayout_; }
@@ -342,7 +348,7 @@ public:
         if (patchLayout_.boxCount != traceScene_.boxCount() || patchLayout_.cell != std::max(0.05f, patchCell))
             buildPatchLayout(traceScene_, patchCell, patchLayout_);
         // 初期反射の出し方は音源ごと（上書きが無ければ世界の設定）。受取面を使う音源が 1 つでもあれば耳の側を解く。
-        auto modelOf = [&](const Slot& s) { return std::min(3, std::max(0, (s.earlyOverride >= 0) ? s.earlyOverride : earlyModel)); };
+        auto modelOf = [&](const Slot& s) { return std::min(4, std::max(0, (s.earlyOverride >= 0) ? s.earlyOverride : earlyModel)); };
         bool anyReceiver = false;
         // GPU の道（既定は切）。1 回だけ積んで、以後は毎フレーム場面を送るだけ。
         if (gpuTrace != 0 && !gpuTried_) { gpuTried_ = true; gpuReady_ = gpuTracer_.init(); }
@@ -405,7 +411,7 @@ public:
             prm.group = s.groupNext % G;
             JobRange& jr = jobRange_[static_cast<std::size_t>(k)];
             jr.first = static_cast<int>(jobs_.size());
-            const bool receiverHere = (modelOf(s) >= 1);
+            const bool receiverHere = (modelOf(s) >= 1 && modelOf(s) <= 3);   // 受け取りは 1〜3 だけ（0・4 は虚像だけ）
             anyReceiver = anyReceiver || receiverHere;
             // 受取面を使わなくなった音源は、組ごとの受け取りを空にする（古い受け取りでタップを作らない）
             if (!receiverHere) for (int g = 0; g < TraceGroups::kMax; ++g) s.depParts[g].clear();
@@ -489,24 +495,25 @@ public:
             // 受取面: 面ごとのタップにまとめ、初期の総量をレイの NEE から受取面の合計に置き換える（帳簿の初期）。
             const int model = modelOf(s);
             const float containHere = (s.containOverride >= 0.0f) ? s.containOverride : adjacentContain;
-            if (model >= 1) {
+            // 隣の部屋の閉じ込めの戸口の 1 本（受取面 1〜3 と虚像の面音源 4 が使う）
+            FaceContain fc;
+            if (model >= 1 && containHere > 0.0f && lroom_ >= 0 && s.em.room >= 0 && s.em.room != lroom_) {
+                const int door = doorBetween(lroom_, s.em.room);
+                if (door >= 0) {
+                    const rooms::Aperture& ap = apertures_[static_cast<std::size_t>(door)];
+                    fc.active = true; fc.amount = std::min(1.0f, containHere); fc.listenerRoom = lroom_;
+                    fc.doorPoint = ap.rectCenter;
+                    const float dL = length(ap.rectCenter - listener_.pos);
+                    fc.doorDelaySec = (length(s.em.pos - ap.rectCenter) + dL) / kSpeedOfSound;
+                    const bool uW = std::fabs(ap.axisU.y) <= std::fabs(ap.axisV.y);
+                    const float halfW = uW ? ap.halfU : ap.halfV;
+                    fc.doorSpread = std::atan2(halfW, std::max(dL, 1e-3f)) / (0.5f * 3.14159265f);   // 見込みの半角 ÷ 90°
+                }
+            }
+            if (model >= 1 && model <= 3) {
                 const std::vector<Deposit>* groups[TraceGroups::kMax];
                 const int G = std::max(1, s.groupCount);
                 for (int g = 0; g < G; ++g) groups[g] = &s.depParts[g];
-                FaceContain fc;
-                if (containHere > 0.0f && lroom_ >= 0 && s.em.room >= 0 && s.em.room != lroom_) {
-                    const int door = doorBetween(lroom_, s.em.room);
-                    if (door >= 0) {
-                        const rooms::Aperture& ap = apertures_[static_cast<std::size_t>(door)];
-                        fc.active = true; fc.amount = std::min(1.0f, containHere); fc.listenerRoom = lroom_;
-                        fc.doorPoint = ap.rectCenter;
-                        const float dL = length(ap.rectCenter - listener_.pos);
-                        fc.doorDelaySec = (length(s.em.pos - ap.rectCenter) + dL) / kSpeedOfSound;
-                        const bool uW = std::fabs(ap.axisU.y) <= std::fabs(ap.axisV.y);
-                        const float halfW = uW ? ap.halfU : ap.halfV;
-                        fc.doorSpread = std::atan2(halfW, std::max(dL, 1e-3f)) / (0.5f * 3.14159265f);   // 見込みの半角 ÷ 90°
-                    }
-                }
                 ImageLink link; link.images = &s.images; link.faceKey = &ismFaceKey_; link.faces = &faces_;
                 link.lattice = (model == 3); link.source = s.em.pos;
                 buildFaceTaps(traceScene_, patchLayout_, recvView_, listener_.pos, groups, G, mixingSec, s.faceScratch, s.faceTaps, &fc,
@@ -517,7 +524,22 @@ public:
             }
             DistributeInput in;
             in.trace = &s.trace; in.visibility = &s.vis; in.diffraction = &s.diff; in.images = &s.images;
-            in.faceTaps = (model >= 1) ? &s.faceTaps : nullptr;
+            in.faceTaps = (model >= 1 && model <= 3) ? &s.faceTaps : nullptr;
+            if (model == 4 && s.images.count > 0) {
+                buildImageSurfaces(s.images, faces_, listener_.pos, s.em.pos, s.em.effectiveRadius(s.trace.directDist, 1.0f), surface, s.surf,
+                                   mixingSec + 3.0f / kSpeedOfSound);   // buildImages と同じ打ち切り
+                in.surfaces = s.surf;
+                // 隣の部屋の閉じ込め: 耳の部屋の面で最後に返る虚像の量を、閉じ込めの割合だけ戸口の 1 本へ（distribute）
+                if (fc.active) {
+                    for (int i = 0; i < s.images.count; ++i) {
+                        const int f0 = s.images.img[i].face[0];
+                        if (f0 < 0 || f0 >= static_cast<int>(faces_.size())) continue;
+                        const Face& f = faces_[static_cast<std::size_t>(f0)];
+                        if (roomAt(f.center + f.normal * 0.3f) == fc.listenerRoom) s.surf[i].toDoor = fc.amount;
+                    }
+                    in.imageContain = &fc;
+                }
+            }
             in.sourcePos = s.em.pos; in.listener = &listener_;
             in.listenerRoom = lroom; in.weights = &rules.weights; in.response = &response; in.dt = dt;
             in.sourceRoom = (lateThrough != 0) ? s.em.room : -1;
@@ -543,7 +565,7 @@ public:
             for (int k = 0; k < n; ++k) {
                 if (budgetSlots_[static_cast<std::size_t>(k)].rays <= 0) continue;
                 const Slot& s = slots_[static_cast<std::size_t>(liveIdx_[static_cast<std::size_t>(k)])];
-                if (modelOf(s) < 1) continue;
+                if (modelOf(s) < 1 || modelOf(s) > 3) continue;
                 const int G = std::max(1, s.groupCount);
                 for (int g = 0; g < G; ++g) for (const Deposit& d : s.depParts[g]) recvView_.touch(d.patch);
             }
@@ -582,6 +604,7 @@ private:
         Diffraction  diff;
         ImageSet     images;
         FaceTapSet   faceTaps;                           // 受取面（earlyModel 1 / 2 / 3）
+        ImageSurface surf[ImageSet::kMaxImages];         // 虚像の面音源（earlyModel 4）
         int          earlyOverride = -1;                 // 音源ごとの初期反射の出し方（−1 で世界の設定）
         float        containOverride = -1.0f;            // 音源ごとの隣の部屋の閉じ込め（負で世界の設定）
         bool         hadReceiver = false;
