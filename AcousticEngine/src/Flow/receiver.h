@@ -29,6 +29,14 @@
  *      器の量のうち 可視率 × (1 − 散乱率) を虚像のタップへ渡し、面の器から抜く（器の和を全部同じ割合で）。残り（散乱の分・窓の外・
  *      3 回目以降・動く箱の面）は面のタップで鳴らす（向きと遅れは 1 と同じ鏡面の重み。同じ割合で抜くので平均は変わらない）。
  *      総量は渡す前に数えるので、1 と 2 で帳簿の初期は同じ。虚像のタップの素性は ISM と同じ式（imageTapId）。
+ *   4) 虚像の網（earlyModel 3、2026-09-14。発注者と決めた形の A 案。網そのものは image_lattice.h）
+ *      受け取り 1 件ごとに、当たった位置から耳への向きと道のり（音源 → 当たった位置 → 耳）で「見かけの音源の点」P を作る。
+ *        P = 耳 + (当たった位置 − 耳) の向き × 音速 × (音源 → 当たった位置の時刻 ＋ 当たった位置 → 耳の距離 / 音速)
+ *      点を虚像の網で受け、角の虚像の器・音源の角の器（方向なしの 1 本）・面の器（残り）へ配る。
+ *      虚像のタップは 遅れ・向きが虚像のまま、量は網から受けた分、広がりは max(1 − 可視率, 1 − |配られた受け取りの向きの平均|)。
+ *      受け取り 1 件を 2 つの点に分ける: 散乱の分（s）は上の P、鏡面の分（1 − s）は入ってきたレイの見かけの出どころを面で鏡に映した点。
+ *        鏡に映した点は、1 回目の当たりなら当たった位置によらず 1 次の虚像に、鏡面の 2 回目なら 2 次の虚像に重なる。
+ *      総量は配る前の受け取りの和（1・2 と同じ足し方）なので、帳簿の初期は 1 と 1 ビットも同じ。
  *
  * ■ 繋がり
  *   受ける: World が音源ごと・組ごとの受け取り（std::vector<Deposit>）と、このフレームの TraceScene・PatchLayout・耳の位置。
@@ -63,6 +71,7 @@
 #include "Core/material.h"
 #include "Core/vec3.h"
 #include "Flow/energy_trace.h"
+#include "Flow/image_lattice.h"
 #include "Flow/image_sources.h"
 #include "Flow/receiver_layout.h"
 #include "Flow/trace_scene.h"
@@ -224,6 +233,7 @@ struct FaceTapSet {
     static constexpr int kIdBase = 0x40000000;          // 虚像の素性（16 + … < 2^22）と重ならない
     static constexpr int kIdRest = 0x40000000 - 1;      // 上限を超えて畳んだ方向なしの 1 本
     static constexpr int kIdDoor = 0x40000000 - 2;      // 隣の部屋の閉じ込め: 耳の部屋の面の反射を移した戸口の 1 本
+    static constexpr int kIdNear = 0x40000000 - 3;      // 虚像の網: 音源の角（0 次）に落ちた方向なしの 1 本
     FaceTap tap[kMax];
     int   count = 0;
     float total6[kNumBands] = {};                        // 初期の総量（帳簿の初期）
@@ -253,6 +263,8 @@ struct FaceAccum {
     double ws = 0.0, wst = 0.0, wst2 = 0.0;              // 鏡面の分だけ（量 × lobe²）の和と到達の和・二乗の和（1 回目の遅れ）
     double dir[3] = {0.0, 0.0, 0.0};                     // 鏡面の重み × 向きのベクトル
     double pt[3] = {0.0, 0.0, 0.0};                      // 量 × 小片の中心
+    double full6[kNumBands] = {};                        // 配る前の受け取りの和（帳簿の初期。addScaled では動かさない）
+    double fullC = 0.0;
     /// o の k 倍を足す（k < 0 で引く。虚像へ渡した分を面の器から抜くのに使う）。
     void addScaled(const FaceAccum& o, double k) {
         for (int b = 0; b < kNumBands; ++b) e6[b] = std::max(0.0, e6[b] + o.e6[b] * k);
@@ -271,12 +283,19 @@ struct FaceScratch {
     std::vector<int> pairImage;                          // 2 次の虚像の番号（組の器と同じ並び）
     std::vector<int> pairKey0, pairKey1;                 // 耳の側の面、音源の側の面（箱*6+面）
     std::vector<FaceAccum> pairAcc;
+    // 虚像の網（earlyModel 3）
+    ImageLattice lattice;
+    std::vector<FaceAccum> imgAcc;                       // ImageSet の番号ごと
+    std::vector<double> imgDir;                          // 番号ごと、量 × 受け取りの向き（広がりに使う）
+    FaceAccum nearAcc;                                   // 音源の角
     std::vector<FaceTap> cand;
     std::vector<double> candC;
 };
 
 /// 鏡面の重みの幅（1 − cos の尺度）。0.1 ＝ およそ 26° で 1/e。小片の間隔（3 m 先で 10°）より十分広い。
 constexpr float kFaceLobe = 0.1f;
+/// 虚像の網の尾の開始: 早い順に量を積んでこの割合に届く時刻。
+constexpr double kOnsetQuantile = 0.05;
 /// 到達時刻の散らばりを広がりに換える尺度（秒）。σ = 2 ms で広がり 0.63。
 ///   2 ms は 500 Hz の半周期。これより散った写しを 1 本にそろえると、500 Hz より上で櫛形が掃いて聞こえる。
 constexpr double kFaceTimeSpread = 0.002;
@@ -288,6 +307,8 @@ struct ImageLink {
     const ImageSet* images = nullptr;
     const std::vector<int>* faceKey = nullptr;
     const std::vector<Face>* faces = nullptr;
+    bool lattice = false;                                // true: 虚像の網（earlyModel 3）／false: 虚像の面の器（earlyModel 2）
+    Vec3 source{0, 0, 0};                                // 網の原点（音源の位置）
 };
 
 /// 受け取り（組ごとの配列の並び）→ 面ごとのタップ。link を渡すと、虚像の面に届いた量を虚像のタップにつなぐ（earlyModel 2）。
@@ -297,6 +318,7 @@ inline void buildFaceTaps(const TraceScene& sc, const PatchLayout& L, const Rece
                           const ImageLink* link = nullptr) {
     const bool doContain = contain && contain->active && contain->amount > 0.0f;
     const bool linked = link && link->images && link->faceKey && link->faces;
+    const bool lattice = linked && link->lattice;
     double doorE6[kNumBands] = {};
     out = FaceTapSet{};
     const std::size_t keys = static_cast<std::size_t>(L.boxCount) * 12;
@@ -306,7 +328,14 @@ inline void buildFaceTaps(const TraceScene& sc, const PatchLayout& L, const Rece
     S.acc.clear();
     // 2 次の虚像の面の組を先に並べる（受け取りの「ひとつ前の面 → この面」がこの組なら、組の器にも足す）
     S.pairImage.clear(); S.pairKey0.clear(); S.pairKey1.clear(); S.pairAcc.clear();
-    if (linked) {
+    LatticeShare shareBuf[ImageLattice::kMaxShares];
+    if (lattice) {
+        S.lattice.build(*link->faces, *link->images, link->source, listener);
+        S.imgAcc.assign(static_cast<std::size_t>(link->images->count), FaceAccum{});
+        S.imgDir.assign(static_cast<std::size_t>(link->images->count) * 3, 0.0);
+        S.nearAcc = FaceAccum{};
+    }
+    if (linked && !lattice) {
         const ImageSet& im = *link->images;
         const int nf = static_cast<int>(link->faceKey->size());
         for (int i = 0; i < im.count; ++i) {
@@ -329,9 +358,9 @@ inline void buildFaceTaps(const TraceScene& sc, const PatchLayout& L, const Rece
             if (t >= mixSec) continue;
             ++out.deposits;
             // 見え方: 当たった位置から耳へ影の線（横切り無し・別の箱に埋まっていない）
+            const float du = (static_cast<float>(d.u8) + 0.5f) / 256.0f, dvv = (static_cast<float>(d.v8) + 0.5f) / 256.0f;
+            const Vec3 q0 = v.pointAt(du, dvv) + v.n * kEps;
             {
-                const float du = (static_cast<float>(d.u8) + 0.5f) / 256.0f, dvv = (static_cast<float>(d.v8) + 0.5f) / 256.0f;
-                const Vec3 q0 = v.pointAt(du, dvv) + v.n * kEps;
                 float tr[kNumBands]; int cr = 0;
                 if (scenePointInsideOther(sc, q0, v.box)) cr = 1;
                 else sceneTransmittance(sc, q0, listener, v.box, tr, &cr);
@@ -375,9 +404,57 @@ inline void buildFaceTaps(const TraceScene& sc, const PatchLayout& L, const Rece
             } else {
                 slot = S.slotOfKey[static_cast<std::size_t>(key)];
             }
-            S.acc[static_cast<std::size_t>(slot)].addScaled(one, 1.0);
+            {
+                FaceAccum& A = S.acc[static_cast<std::size_t>(slot)];
+                for (int b = 0; b < kNumBands; ++b) A.full6[b] = std::max(0.0, A.full6[b] + one.e6[b] * 1.0);
+                A.fullC = std::max(0.0, A.fullC + one.c * 1.0);
+            }
+            if (lattice) {
+                // 見かけの音源の点を 2 つ作って網で受ける。
+                //   散乱の分（s）  … 当たった位置から耳への向きに、音源 → 当たった位置 → 耳の道のり。面いっぱいに散る。
+                //   鏡面の分（1 − s）… 入ってきたレイの見かけの出どころ（当たった位置から入射の逆向きに 音速 × 到達）を、この面で鏡に映した点。
+                //                     1 回目の当たりなら当たった位置によらず 1 次の虚像に、鏡面の 2 回目なら 2 次の虚像に重なる。
+                //   ★受け取りの量はランバートで数えているので、分けずに P だけで配ると鏡面の壁でも点が面いっぱいに散り、
+                //     壁から 0.1 m でその壁の虚像が 2.3%（1.0 m の 4.0% より小さい）だった。
+                double rest = 0.0;
+                auto give = [&](const Vec3& P, double k, const Vec3& dv) {
+                    const int nsh = S.lattice.shares(P, shareBuf);
+                    for (int q = 0; q < nsh; ++q) {
+                        const LatticeShare& sh = shareBuf[q];
+                        const double w = k * sh.w;
+                        if (sh.image >= 0 && sh.image < static_cast<int>(S.imgAcc.size())) {
+                            S.imgAcc[static_cast<std::size_t>(sh.image)].addScaled(one, w);
+                            const std::size_t o3 = static_cast<std::size_t>(sh.image) * 3;
+                            S.imgDir[o3] += w * cm * dv.x; S.imgDir[o3 + 1] += w * cm * dv.y; S.imgDir[o3 + 2] += w * cm * dv.z;
+                        } else if (sh.image == ImageLattice::kNear) {
+                            S.nearAcc.addScaled(one, w);
+                        } else {
+                            rest += w;
+                        }
+                    }
+                };
+                const Vec3 toQ = q0 - listener;
+                const float dq = length(toQ);
+                if (dq > 1e-5f && s > 0.0) {
+                    const double pathM = (static_cast<double>(d.tSec) + static_cast<double>(dq) / kSpeedOfSound) * kSpeedOfSound;
+                    give(listener + toQ * static_cast<float>(pathM / dq), s, v.meanDir);
+                } else {
+                    rest += s;
+                }
+                if (s < 1.0) {
+                    const Vec3 inD(d.inDir[0], d.inDir[1], d.inDir[2]);
+                    const Vec3 O = q0 - inD * static_cast<float>(static_cast<double>(d.tSec) * kSpeedOfSound);
+                    const Vec3 Ps = O - v.n * (2.0f * dot(O - q0, v.n));
+                    const Vec3 toP = Ps - listener;
+                    const float lp = length(toP);
+                    give(Ps, 1.0 - s, (lp > 1e-5f) ? toP * (1.0f / lp) : Vec3(0, 0, 0));
+                }
+                if (rest > 0.0) S.acc[static_cast<std::size_t>(slot)].addScaled(one, std::min(1.0, rest));
+            } else {
+                S.acc[static_cast<std::size_t>(slot)].addScaled(one, 1.0);
+            }
             // 2 回目の当たりで、ひとつ前の面との組が 2 次の虚像なら、その組の器にも足す（面の器の内訳）
-            if (linked && d.order == 1 && d.prevKey >= 0)
+            if (linked && !lattice && d.order == 1 && d.prevKey >= 0)
                 for (std::size_t q = 0; q < S.pairAcc.size(); ++q)
                     if (S.pairKey0[q] == faceKey && S.pairKey1[q] == d.prevKey) { S.pairAcc[q].addScaled(one, 1.0); break; }
         }
@@ -386,10 +463,10 @@ inline void buildFaceTaps(const TraceScene& sc, const PatchLayout& L, const Rece
     for (int b = 0; b < kNumBands; ++b) doorC += doorE6[b];
     doorC /= kNumBands;
     if (S.acc.empty() && !(doorC > 0.0)) return;
-    // 総量（帳簿の初期）は虚像へ渡す前に数える。渡しても総量は変わらない。
+    // 総量（帳簿の初期）は虚像へ渡す前・網で配る前の受け取りの和（full）で数える。渡しても配っても総量は変わらない。
     double totalC = doorC;
     for (int b = 0; b < kNumBands; ++b) out.total6[b] += static_cast<float>(doorE6[b]);
-    for (const FaceAccum& a : S.acc) { totalC += a.c; for (int b = 0; b < kNumBands; ++b) out.total6[b] += static_cast<float>(a.e6[b]); }
+    for (const FaceAccum& a : S.acc) { totalC += a.fullC; for (int b = 0; b < kNumBands; ++b) out.total6[b] += static_cast<float>(a.full6[b]); }
 
     S.cand.clear(); S.candC.clear();
     auto slotOf = [&](int key) -> FaceAccum* {
@@ -399,7 +476,7 @@ inline void buildFaceTaps(const TraceScene& sc, const PatchLayout& L, const Rece
     // ── 虚像を面でつなぐ（earlyModel 2）──
     //   虚像の面の器（1 次: 耳の側の面に 1 回目に当たった量／2 次: 音源の側の面の次に耳の側の面に当たった量）のうち、
     //   可視率 × (1 − 散乱率) を虚像のタップへ渡す。遅れ・向きは虚像の正確な値、広がりは 1 − 可視率。残りは面のタップで鳴らす。
-    if (linked) {
+    if (linked && !lattice) {
         const ImageSet& im = *link->images;
         const int nf = static_cast<int>(link->faceKey->size());
         for (int i = 0; i < im.count; ++i) {
@@ -445,6 +522,39 @@ inline void buildFaceTaps(const TraceScene& sc, const PatchLayout& L, const Rece
             S.cand.push_back(t); S.candC.push_back(take.c);
         }
     }
+    // ── 虚像の網（earlyModel 3）: 網から受けた虚像ごとのタップ ──
+    if (lattice) {
+        const ImageSet& im = *link->images;
+        const int nf = static_cast<int>(link->faceKey->size());
+        for (int i = 0; i < im.count; ++i) {
+            const FaceAccum& A = S.imgAcc[static_cast<std::size_t>(i)];
+            if (!(A.c > 1e-12 * std::max(totalC, 1e-30))) continue;
+            const ImageSource& src = im.img[i];
+            if (src.face[0] < 0 || src.face[0] >= nf) continue;
+            const Face& f0 = (*link->faces)[static_cast<std::size_t>(src.face[0])];
+            const int k0 = (*link->faceKey)[static_cast<std::size_t>(src.face[0])];
+            FaceTap t;
+            t.id = imageTapId(src);
+            t.box = f0.box; t.face = (k0 >= 0) ? k0 % 6 : -1; t.order = src.order - 1;
+            for (int b = 0; b < kNumBands; ++b) t.e6[b] = static_cast<float>(A.e6[b]);
+            t.delaySec = src.pathSec;
+            const Vec3 dv = src.pos - listener;
+            const float ld = length(dv);
+            t.dirWorld = (ld > 1e-5f) ? dv * (1.0f / ld) : Vec3(0, 0, 0);
+            // 広がり: 見え方（1 − 可視率）と、この虚像へ配られた受け取りの向きの散らばり（1 − |量で平均した向き|）の大きい方。
+            //   壁に寄ると、その壁の虚像へ近い小片の広い向きの受け取りが集まり、平均の向きが短くなって広がる。
+            const std::size_t o3 = static_cast<std::size_t>(i) * 3;
+            const double mx = S.imgDir[o3] / A.c, my = S.imgDir[o3 + 1] / A.c, mz = S.imgDir[o3 + 2] / A.c;
+            const double mlen = std::sqrt(mx * mx + my * my + mz * mz);
+            t.spread = static_cast<float>(std::min(1.0, std::max({0.0, 1.0 - static_cast<double>(src.validity), 1.0 - mlen})));
+            {   // 出どころ（地図用）: 耳 → 虚像の線が、耳の側の面の平面と交わる点
+                const float den = dot(f0.normal, dv);
+                const float tt = (std::fabs(den) > 1e-6f) ? dot(f0.normal, f0.center - listener) / den : 0.0f;
+                t.point = (tt > 0.0f && tt < 1.0f) ? listener + dv * tt : f0.center;
+            }
+            S.cand.push_back(t); S.candC.push_back(A.c);
+        }
+    }
     // ── 面のタップ（虚像に渡らなかった分）──
     for (const FaceAccum& a : S.acc) {
         if (!(a.c > 1e-12 * std::max(totalC, 1e-30))) continue;
@@ -481,7 +591,7 @@ inline void buildFaceTaps(const TraceScene& sc, const PatchLayout& L, const Rece
     std::vector<std::size_t> idx(S.cand.size());
     for (std::size_t i = 0; i < idx.size(); ++i) idx[i] = i;
     std::sort(idx.begin(), idx.end(), [&](std::size_t x, std::size_t y) { return S.candC[x] > S.candC[y]; });
-    const int keep = std::min(static_cast<int>(idx.size()), FaceTapSet::kMax - 2);
+    const int keep = std::min(static_cast<int>(idx.size()), FaceTapSet::kMax - (lattice ? 3 : 2));   // 網のときは音源の角の席も残す
     for (int i = 0; i < keep; ++i) out.tap[out.count++] = S.cand[idx[static_cast<std::size_t>(i)]];
     if (static_cast<int>(idx.size()) > keep) {
         FaceTap& t = out.tap[out.count++];
@@ -505,10 +615,55 @@ inline void buildFaceTaps(const TraceScene& sc, const PatchLayout& L, const Rece
         t.delaySec = contain->doorDelaySec;
         t.point = contain->doorPoint;
     }
-    for (int i = 0; i < out.count; ++i) {
-        double cm = 0.0; for (int b = 0; b < kNumBands; ++b) cm += out.tap[i].e6[b];
-        cm /= kNumBands;
-        if (cm >= 0.02 * totalC && (out.firstSec < 0.0f || out.tap[i].delaySec < out.firstSec)) out.firstSec = out.tap[i].delaySec;
+    // 虚像の網: 音源の角（0 次）に落ちた分は方向なしの 1 本。遅れは量で平均した到達。
+    if (lattice && S.nearAcc.c > 1e-12 * std::max(totalC, 1e-30)) {
+        FaceTap& t = out.tap[out.count++];
+        t.id = FaceTapSet::kIdNear; t.order = 0; t.box = -1; t.face = -1;
+        for (int b = 0; b < kNumBands; ++b) t.e6[b] = static_cast<float>(S.nearAcc.e6[b]);
+        t.dirWorld = Vec3(0, 0, 0); t.spread = 1.0f;
+        t.delaySec = static_cast<float>(S.nearAcc.ct / S.nearAcc.c);
+        t.point = link->source;
+    }
+    if (lattice) {
+        // 尾の開始（虚像の網）: タップを早い順に並べて量を積み、kOnsetQuantile に届く時刻（隣のタップの間は線形）。
+        //   しきい値で入れ替えず、小さなタップは量に比例した分しか動かさない。
+        //   ★「取り分 2% 以上のうち最短」だと、遅れの短い小さな虚像のタップ（1〜2.5%）が 2% をまたぐたびに尾の開始が 1 フレームで
+        //     約 2 ms 跳び、FDN の送りの遅れが掃かれて clicks の扉だけ 0.755 → 1.02 dB、歩き＋扉 1.40 → 1.60 dB になった。
+        //   ★取り分 0 → 4% で候補の遅れを +10 ms から滑らせる形は、扉だけは 0.755 dB に戻ったが、歩くと小さなタップの取り分が
+        //     動くたびに尾の開始が動き続け、歩き＋扉が 2.57 dB になった。
+        int ord[FaceTapSet::kMax];
+        double mass[FaceTapSet::kMax];
+        double sum = 0.0;
+        for (int i = 0; i < out.count; ++i) {
+            ord[i] = i;
+            double cm = 0.0; for (int b = 0; b < kNumBands; ++b) cm += out.tap[i].e6[b];
+            mass[i] = std::max(0.0, cm / kNumBands);
+            sum += mass[i];
+        }
+        std::sort(ord, ord + out.count, [&](int x, int y) { return out.tap[x].delaySec < out.tap[y].delaySec; });
+        if (sum > 0.0) {
+            const double goal = kOnsetQuantile * sum;
+            double acc = 0.0;
+            for (int k = 0; k < out.count; ++k) {
+                const int i = ord[k];
+                if (!(mass[i] > 0.0)) continue;
+                if (acc + mass[i] >= goal) {
+                    if (k == 0 || acc <= 0.0) { out.firstSec = out.tap[i].delaySec; break; }
+                    int j = k - 1;
+                    while (j > 0 && !(mass[ord[j]] > 0.0)) --j;
+                    const double f = (goal - acc) / mass[i];
+                    out.firstSec = static_cast<float>(out.tap[ord[j]].delaySec + (out.tap[i].delaySec - out.tap[ord[j]].delaySec) * f);
+                    break;
+                }
+                acc += mass[i];
+            }
+        }
+    } else {
+        for (int i = 0; i < out.count; ++i) {
+            double cm = 0.0; for (int b = 0; b < kNumBands; ++b) cm += out.tap[i].e6[b];
+            cm /= kNumBands;
+            if (cm >= 0.02 * totalC && (out.firstSec < 0.0f || out.tap[i].delaySec < out.firstSec)) out.firstSec = out.tap[i].delaySec;
+        }
     }
 }
 

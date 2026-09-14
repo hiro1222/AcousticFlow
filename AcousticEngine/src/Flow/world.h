@@ -213,9 +213,10 @@ public:
     /// 初期反射の出し方。実行中に切り替えてよい。音源ごとに setEmitterEarlyModel で上書きできる。
     ///   0 虚像（ISM、段 7。量は虚像の幾何の重みで配る）
     ///   1 壁の受取面（2026-09-13。面ごとのタップ、向きと遅れは面の中の重み。虚像は作らない）
-    ///   2 虚像を面でつなぐ（2026-09-14、**既定**。発注者と話していた形）: 虚像の向き・遅れ・可視率はそのまま、
-    ///     量は虚像の面に届いたレイの受け取りから取る（receiver.h 3）。残りは面のタップ。
-    int earlyModel = 2;
+    ///   2 虚像を面でつなぐ（2026-09-14）: 虚像の向き・遅れ・可視率はそのまま、量は虚像の面（壁）の器から取る（receiver.h 3）。
+    ///   3 虚像の網（2026-09-14、**既定**。発注者と決めた形）: 受け取りごとの見かけの音源の点を、虚像を結んだ網で受けて
+    ///     角の虚像へ配る（image_lattice.h、receiver.h 4）。残りは面のタップ、音源の角は方向なしの 1 本。
+    int earlyModel = 3;
     /// 受取面の小片の一辺（m）。変えると次の更新で割り付けを作り直す。
     float patchCell = 0.5f;
     /// レイを GPU で解くか（0 切／1 入。**既定 0**）。2026-09-10。
@@ -303,11 +304,11 @@ public:
     const Visibility* visibility(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].vis : nullptr; }
     const Diffraction* diffraction(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].diff : nullptr; }
     const ImageSet* images(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].images : nullptr; }
-    /// 受取面のタップ（その音源の earlyModel が 1 / 2 のとき。2 は虚像をつないだタップを含む。0 なら count 0）。
+    /// 受取面のタップ（その音源の earlyModel が 1 / 2 / 3 のとき。2・3 は虚像のタップを含む。0 なら count 0）。
     const FaceTapSet* faceTaps(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].faceTaps : nullptr; }
     /// 音源ごとの上書き（2026-09-14）。初期反射の出し方（−1 で世界の設定、0/1/2）と、隣の部屋の閉じ込め（負で世界の設定、0..1）。
     ///   発注者「特定の音源に対してだけ制御するつもり」。受取面は費用が重いので、選んだ音源だけに使える。
-    void setEmitterEarlyModel(int id, int model) { if (valid(id)) slots_[static_cast<std::size_t>(id)].earlyOverride = (model < 0) ? -1 : std::min(2, model); }
+    void setEmitterEarlyModel(int id, int model) { if (valid(id)) slots_[static_cast<std::size_t>(id)].earlyOverride = (model < 0) ? -1 : std::min(3, model); }
     void setEmitterAdjacentContain(int id, float amount) { if (valid(id)) slots_[static_cast<std::size_t>(id)].containOverride = (amount < 0.0f) ? -1.0f : std::min(1.0f, amount); }
     int  emitterEarlyModel(int id) const { if (!valid(id)) return earlyModel; const int o = slots_[static_cast<std::size_t>(id)].earlyOverride; return (o >= 0) ? o : earlyModel; }
     const PatchLayout& patchLayout() const { return patchLayout_; }
@@ -341,7 +342,7 @@ public:
         if (patchLayout_.boxCount != traceScene_.boxCount() || patchLayout_.cell != std::max(0.05f, patchCell))
             buildPatchLayout(traceScene_, patchCell, patchLayout_);
         // 初期反射の出し方は音源ごと（上書きが無ければ世界の設定）。受取面を使う音源が 1 つでもあれば耳の側を解く。
-        auto modelOf = [&](const Slot& s) { return std::min(2, std::max(0, (s.earlyOverride >= 0) ? s.earlyOverride : earlyModel)); };
+        auto modelOf = [&](const Slot& s) { return std::min(3, std::max(0, (s.earlyOverride >= 0) ? s.earlyOverride : earlyModel)); };
         bool anyReceiver = false;
         // GPU の道（既定は切）。1 回だけ積んで、以後は毎フレーム場面を送るだけ。
         if (gpuTrace != 0 && !gpuTried_) { gpuTried_ = true; gpuReady_ = gpuTracer_.init(); }
@@ -478,7 +479,7 @@ public:
                 for (int b = 0; b < kNumBands; ++b) s.diff.energy6[b] *= openF;
             }
             // 虚像（段 7）: 初期の方向と正規化重み。簡易は作らない（方向なしの 1 本に落ちる）。
-            if (light || modelOf(s) == 1) s.images.count = 0;   // 1（壁の受取面）は虚像を作らない。0 と 2 は作る
+            if (light || modelOf(s) == 1) s.images.count = 0;   // 1（壁の受取面）は虚像を作らない。0・2・3 は作る
             else buildImages(surfaces, faces_, listener_, s.em.pos, rEff, mixingSec + 3.0f / kSpeedOfSound, s.images, imageOrder);
         };
         auto solveMix = [&](int k) {
@@ -507,8 +508,9 @@ public:
                     }
                 }
                 ImageLink link; link.images = &s.images; link.faceKey = &ismFaceKey_; link.faces = &faces_;
+                link.lattice = (model == 3); link.source = s.em.pos;
                 buildFaceTaps(traceScene_, patchLayout_, recvView_, listener_.pos, groups, G, mixingSec, s.faceScratch, s.faceTaps, &fc,
-                              (model == 2) ? &link : nullptr);
+                              (model >= 2) ? &link : nullptr);
                 for (int b = 0; b < kNumBands; ++b) s.trace.early6[b] = s.faceTaps.total6[b];
             } else {
                 s.faceTaps = FaceTapSet{};
@@ -579,7 +581,7 @@ private:
         Visibility   vis;
         Diffraction  diff;
         ImageSet     images;
-        FaceTapSet   faceTaps;                           // 受取面（earlyModel 1 / 2）
+        FaceTapSet   faceTaps;                           // 受取面（earlyModel 1 / 2 / 3）
         int          earlyOverride = -1;                 // 音源ごとの初期反射の出し方（−1 で世界の設定）
         float        containOverride = -1.0f;            // 音源ごとの隣の部屋の閉じ込め（負で世界の設定）
         bool         hadReceiver = false;

@@ -62,7 +62,7 @@ struct DistributeInput {
     const Visibility* visibility = nullptr;   // nullptr なら見通し 1（検査用）
     const Diffraction* diffraction = nullptr; // nullptr か valid=false なら回折 0
     const ImageSet* images = nullptr;         // nullptr か count=0 なら初期は方向なしの 1 本
-    // 受取面（2026-09-13、World::earlyModel 1 / 2）。あれば初期はこのタップで鳴らす（2 では虚像をつないだタップも入る。素性は imageTapId）。
+    // 受取面（2026-09-13、World::earlyModel 1 / 2 / 3）。あれば初期はこのタップで鳴らす（2・3 では虚像のタップも入る。素性は imageTapId）。
     //   ★量の総量は trace->early6（World が受取面の合計に書き戻した物）。ここは取り分・遅れ・向き・広がりだけを使う。
     const FaceTapSet* faceTaps = nullptr;
     Vec3 sourcePos{0, 0, 0};
@@ -179,7 +179,7 @@ public:
                 }
                 // 虚像をつないだタップ（earlyModel 2、素性は imageTapId）: 遅れ・向き・広がりは虚像の値を生のまま使う（ISM の道と同じ）。
                 //   虚像の遅れと向きは幾何で連続に動くので、均すと耳が動いたとき遅れが追いつかず、鏡の点の位置がずれて聞こえる。均すのは取り分だけ。
-                if (f.id >= 16 && f.id < FaceTapSet::kIdDoor) {
+                if (f.id >= 16 && f.id < FaceTapSet::kIdNear) {
                     z->delay = f.delaySec; z->dir = hasDir ? f.dirWorld : Vec3(0, 0, 0); z->spread = hasDir ? f.spread : 1.0f;
                     continue;
                 }

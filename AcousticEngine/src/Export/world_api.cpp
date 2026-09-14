@@ -129,10 +129,10 @@ float AF_WorldAdjacentContain(AF_WorldHandle w) {
     acoustic::flow::World* W = asWorld(w); return W ? W->adjacentContain : 0.0f;
 }
 void AF_WorldSetEarlyModel(AF_WorldHandle w, int model) {
-    if (acoustic::flow::World* W = asWorld(w)) W->earlyModel = (model <= 0) ? 0 : (model >= 2 ? 2 : 1);
+    if (acoustic::flow::World* W = asWorld(w)) W->earlyModel = std::min(3, std::max(0, model));
 }
 int AF_WorldEarlyModel(AF_WorldHandle w) {
-    acoustic::flow::World* W = asWorld(w); return W ? W->earlyModel : 2;
+    acoustic::flow::World* W = asWorld(w); return W ? W->earlyModel : 3;
 }
 void AF_WorldSetEmitterEarlyModel(AF_WorldHandle w, int e, int model) {
     if (acoustic::flow::World* W = asWorld(w)) W->setEmitterEarlyModel(e, model);
