@@ -131,6 +131,12 @@ void AF_WorldSetImageSurface(AF_WorldHandle w, float roughDeg, float connectDeg,
     W->surface.densityPow = std::max(0.0f, densityPow);
     W->surface.nearPow = std::max(0.0f, nearPow);
 }
+void AF_WorldSetLateDistanceShape(AF_WorldHandle w, float pow) {
+    if (acoustic::flow::World* W = asWorld(w)) W->lateDistancePow = std::max(0.0f, pow);
+}
+float AF_WorldLateDistanceShape(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->lateDistancePow : 0.0f;
+}
 void AF_WorldSetAdjacentContain(AF_WorldHandle w, float amount) {
     if (acoustic::flow::World* W = asWorld(w)) W->adjacentContain = (amount < 0.0f) ? 0.0f : (amount > 1.0f ? 1.0f : amount);
 }

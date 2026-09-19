@@ -675,6 +675,9 @@ namespace AcousticFlow
         // ── 方向バス（2026-09-04）: 反射・回折タップをリスナー座標で固定したレーンへ振り、レーンごとに固定の HRIR で畳む ──
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern IntPtr AF_DirectionBusCreate(int sampleRate, int lanes, int maxFrames);
+        // 上・下のレーンを足す版（2026-09-19）。verticalLanes = 2 で真上・真下の 2 本
+        [DllImport(Dll, CallingConvention = Cc)]
+        public static extern IntPtr AF_DirectionBusCreateVertical(int sampleRate, int horizontalLanes, int maxFrames, int verticalLanes);
         [DllImport(Dll, CallingConvention = Cc)]
         public static extern void AF_DirectionBusDestroy(IntPtr bus);
         [DllImport(Dll, CallingConvention = Cc)]

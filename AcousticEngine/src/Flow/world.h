@@ -196,6 +196,12 @@ public:
     ///   ★エンジンの既定は 0（物理のまま。検査と AfFlowWav は「出口の和 ＝ 帳簿」を見張る）。演出の既定は載る側（Unity は 6 dB）が持つ。
     float precedenceDb = 0.0f;
     float precedenceSec = 0.04f;
+    /// 自分の部屋の響きを、壁までの距離で方向バスのレーンへ配る強さ（2026-09-19）。0 で今までどおり一様（1 ビットも同じ）。
+    ///   耳から各レーンの向き（上・下のレーンがあればそれも）へ細い円錐の 5 本でレイを飛ばし、最初に当たる面までの距離 d で
+    ///   レーンの量を (1 / d)^p に比例させる（和は変えない）。近い壁の側ほど響きが濃い。扉が開けばその向きは隣の部屋まで抜けて薄くなる。
+    ///   ★発注者「FDN で用意した響きを 8 方位のバスに落とすとき、リスナー中心の 8 方位レイの距離でエネルギーの分布を分ける」「近い壁の方向ほど濃く」
+    ///     「ドアが開いていたらその方向からの反射があまり帰ってこないようにする仕組み」。響きそのもの（量・色・減衰）は FDN のまま。
+    float lateDistancePow = 0.0f;
     /// 壁越しの反射（2026-09-12）。**既定 0 ＝ 通さない。**1 で旧（壁を横切った影の線も τ を掛けて初期・後期に数える）。
     ///   試聴「壁の向こうの透過音がダブる。反射や残響は壁を抜けないから、透過は直接だけにしてほしい」。
     ///   壁を抜けるのは解析で出す透過の直接音（distribute の kTransmit）だけになる。開いた戸口を通る分は変わらない。
@@ -311,6 +317,14 @@ public:
     /// 受取面のタップ（その音源の earlyModel が 1 / 2 / 3 のとき。2・3 は虚像のタップを含む。0・4 なら count 0）。
     /// 虚像の面音源（その音源の earlyModel が 4 のとき、images(id) と同じ並び）。
     const ImageSurface* imageSurfaces(int id) const { return valid(id) ? slots_[static_cast<std::size_t>(id)].surf : nullptr; }
+    /// 自分の部屋の響きの配り方の形（lateDistancePow）。レーンごとのエネルギーの割合（和 1）と壁までの距離。n はレーンの本数（0 なら形なし）。
+    const float* lateLaneShape(int& n) const { n = laneShapeN_; return laneShape_; }
+    const float* lateLaneDistance() const { return laneDist_; }
+    /// 形の円錐の半角・近さの下限・遠さの上限（レイが何にも当たらないとき）・追う時間。
+    static constexpr float kLaneConeRad = 10.0f * 3.14159265f / 180.0f;
+    static constexpr float kLaneNearM = 0.3f;
+    static constexpr float kLaneFarM = 50.0f;
+    static constexpr float kLaneShapeSec = 0.1f;
     const FaceTapSet* faceTaps(int id) const { return valid(id) ? &slots_[static_cast<std::size_t>(id)].faceTaps : nullptr; }
     /// 音源ごとの上書き（2026-09-14）。初期反射の出し方（−1 で世界の設定、0/1/2）と、隣の部屋の閉じ込め（負で世界の設定、0..1）。
     ///   発注者「特定の音源に対してだけ制御するつもり」。受取面は費用が重いので、選んだ音源だけに使える。
@@ -575,7 +589,7 @@ public:
         if (pool_ && pool_->size() > 1 && n > 1) pool_->parallelFor(n, solveMix);
         else for (int k = 0; k < n; ++k) solveMix(k);
         spentRays_ = Budget::spentRays(budgetSlots_, n);
-        updateFdn();
+        updateFdn(dt);
     }
 
     /// 音源ごとのループを複数コアへ（0/1 で直列。既定は直列。★Unity は既に全コアを使っているので黙って増やさない）。
@@ -659,7 +673,7 @@ private:
         for (std::size_t r = 0; r < probes_.size(); ++r)
             applyOpenings(probes_[r], static_cast<int>(r), openings_.data(), static_cast<int>(openings_.size()));
     }
-    void updateFdn() {
+    void updateFdn(float dt) {
         if (!fdn_ || probes_.empty()) return;
         fdn_->setLaneModel(laneModel);                                     // 尾のレーンの作り（実行中に切り替えてよい）
         for (std::size_t r = 0; r < probes_.size(); ++r)
@@ -715,6 +729,53 @@ private:
             if (fdnDir_.size() != probes_.size() * 4) fdnDir_.assign(probes_.size() * 4, 0.0f);
             fdnDir_[r * 4] = dirLocal[0]; fdnDir_[r * 4 + 1] = dirLocal[1]; fdnDir_[r * 4 + 2] = dirLocal[2]; fdnDir_[r * 4 + 3] = spread;
             if (lateThrough != 0) fdn_->setListenerDirection(fdnRoomOf_[r], dirLocal, spread);   // 0 のときは触らない（旧と 1 ビット同じ）
+        }
+        // ── 自分の部屋の響きを、壁までの距離でレーンへ配る（lateDistancePow、上の注記）──
+        //   ★1 本のレイだと柱や扉の枠の縁をかすめたとき、当たる面が近い面から遠い面へ 1 フレームで跳ぶ。細い円錐の 5 本の
+        //     (1/d)^p を平均し、さらに kLaneShapeSec で追う（FdnRoomMix もレーンの重みを 60 ms で追う）。
+        //   ★扉の開きかけは、円錐の 5 本のうち扉の板に当たる本数と戸口を抜ける本数の割合で連続に変わる。
+        {
+            const af::dsp::DirectionBus* bus = fdn_->directionBus();
+            const int fr = (lroom_ >= 0 && lroom_ < static_cast<int>(fdnRoomOf_.size())) ? fdnRoomOf_[static_cast<std::size_t>(lroom_)] : -1;
+            const int L = bus ? std::min(bus->lanes(), af::dsp::DirectionBus::kMaxLanes) : 0;
+            const bool on = (lateDistancePow > 0.0f && fr >= 0 && L > 0);
+            if (shapedFdnRoom_ >= 0 && (!on || shapedFdnRoom_ != fr)) {
+                fdn_->setListenerLaneShape(shapedFdnRoom_, nullptr, 0);       // 耳が部屋を移った・摘みを 0 にした: 一様へ戻す
+                shapedFdnRoom_ = -1; laneShapeN_ = 0;
+            }
+            if (on) {
+                const Vec3 fw = normalized(listener_.forward), up = normalized(listener_.up), rt = normalized(cross(up, fw));
+                const float cc = std::cos(kLaneConeRad), ss = std::sin(kLaneConeRad);
+                float target[af::dsp::DirectionBus::kMaxLanes] = {};
+                double sum = 0.0;
+                for (int k = 0; k < L; ++k) {
+                    float d3[3]; bus->laneDirection(k, d3);
+                    const Vec3 dw = normalized(rt * d3[0] + up * d3[1] + fw * d3[2]);
+                    const Vec3 ref = (std::fabs(dw.y) < 0.9f) ? Vec3(0, 1, 0) : Vec3(1, 0, 0);
+                    const Vec3 a = normalized(cross(dw, ref)), b = cross(dw, a);
+                    const Vec3 rays[5] = { dw, dw * cc + a * ss, dw * cc - a * ss, dw * cc + b * ss, dw * cc - b * ss };
+                    double w = 0.0, dsum = 0.0;
+                    for (int q = 0; q < 5; ++q) {
+                        const SurfaceHit h = sceneNearest(traceScene_, listener_.pos, normalized(rays[q]), kLaneFarM, -1);
+                        const float d = h.hit ? std::max(kLaneNearM, h.t) : kLaneFarM;
+                        w += std::pow(static_cast<double>(d), -static_cast<double>(lateDistancePow));
+                        dsum += d;
+                    }
+                    target[k] = static_cast<float>(w / 5.0);
+                    laneDist_[k] = static_cast<float>(dsum / 5.0);
+                    sum += target[k];
+                }
+                if (sum > 0.0) {
+                    const float follow = (laneShapeN_ != L) ? 1.0f : (1.0f - std::exp(-std::max(0.0f, dt) / kLaneShapeSec));
+                    for (int k = 0; k < L; ++k) {
+                        const float tk = static_cast<float>(target[k] / sum);
+                        laneShape_[k] = (laneShapeN_ != L) ? tk : laneShape_[k] + (tk - laneShape_[k]) * follow;
+                    }
+                    laneShapeN_ = L;
+                    fdn_->setListenerLaneShape(fr, laneShape_, L);
+                    shapedFdnRoom_ = fr;
+                }
+            }
         }
         // ── 段 2-g: 戸口の線音源 ──
         //   戸口の横幅に 5 点（幅の −0.8, −0.4, 0, +0.4, +0.8）。点ごとに向き（リスナー座標）と見通しを出し、
@@ -794,6 +855,11 @@ private:
     bool fdnStale_ = false;
     TraceScene   traceScene_;   // レイが見る平らな場面（毎フレーム組み直す）
     std::vector<float> fdnDir_; // 段 2-f。部屋ごとの尾の向き（リスナー座標 xyz ＋ 広がり）。診断用
+    // 自分の部屋の響きの配り方の形（lateDistancePow）。レーンごとのエネルギーの割合（和 1）と、形を置いている FDN の部屋。
+    float laneShape_[af::dsp::DirectionBus::kMaxLanes] = {};
+    float laneDist_[af::dsp::DirectionBus::kMaxLanes] = {};   // レーンごとの壁までの距離（円錐の 5 本の平均、診断用）
+    int   laneShapeN_ = 0;
+    int   shapedFdnRoom_ = -1;
     int lroom_ = -1;                // 段 2-g。このフレームの耳の部屋（updateFdn が使う）
     std::vector<int> doorOf_;       // 段 2-g。部屋 → 耳の部屋と繋ぐ戸口の番号（-1 なし）
     std::vector<PortalDiag> portalDiag_;

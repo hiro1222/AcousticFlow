@@ -186,6 +186,10 @@ typedef void* AF_DirectionBusHandle;
 ACOUSTIC_API AF_DirectionBusHandle AF_DirectionBusCreate(int sampleRate, int lanes, int maxFrames);
 /* 分割の最小ブロック（＝固有遅延）と最大ブロックを指定する版。既定は Create（64 / 1024）。 */
 ACOUSTIC_API AF_DirectionBusHandle AF_DirectionBusCreateEx(int sampleRate, int lanes, int maxFrames, int firstBlock, int capBlock);
+/* 上・下のレーンを足す版（2026-09-19）。verticalLanes = 2 で水平の環のあとに真上・真下の 2 本（0 なら Create と同じ）。
+ * 反射のタップは水平の環だけ、上下のレーンには部屋の響き（FDN）だけが入る。上下に聞こえるかは差す HRTF 次第。 */
+ACOUSTIC_API AF_DirectionBusHandle AF_DirectionBusCreateVertical(int sampleRate, int horizontalLanes, int maxFrames, int verticalLanes);
+ACOUSTIC_API int  AF_DirectionBusHorizontalLanes(AF_DirectionBusHandle bus);
 ACOUSTIC_API void AF_DirectionBusDestroy(AF_DirectionBusHandle bus);
 /* レーンごとの固定 HRIR を焼く。hrtf は呼び手が生存を保証する。 */
 ACOUSTIC_API void AF_DirectionBusSetHrtf(AF_DirectionBusHandle bus, AF_HrtfHandle hrtf, float headCircumferenceCm);

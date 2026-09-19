@@ -126,6 +126,10 @@ namespace AcousticFlow
         [Range(0f, 24f)] public float precedenceDb = 6f;
         [Tooltip("先着の重みの窓（ms、既定 40 ＝ 先行音効果）。この時間で下げ幅の 63% に達する")]
         [Range(5f, 200f)] public float precedenceMs = 40f;
+        // 響きの配り方（2026-09-19）。FDN の響きを方向バスへ落とすとき、耳から各方位（と上下）の壁までの距離で配る。
+        //   近い壁の側ほど濃く、扉が開いた向きは隣の部屋まで抜けて薄くなる。響きそのもの（量・色・減衰）は変えない。
+        [Tooltip("響きを壁までの距離で配る強さ（量 ∝ (1/距離)^この値。0 で全方向に一様 ＝ 今まで）。大きいほど近い壁の側へ寄る。実行中に動かせる")]
+        [Range(0f, 3f)] public float lateDistancePow = 1f;
 
         // 尾のレーンの作り（方向バスへ載せる尾）
         //   0 耳ごとの行（旧）: 点の向きでも左右が別の波形。ITD が効かず、向きが変わると尾の波形が入れ替わる
@@ -426,6 +430,7 @@ namespace AcousticFlow
             NativeWorld.AF_WorldSetAdjacentContain(_world, adjacentContain);        // 同上
             NativeWorld.AF_WorldSetDoorCoherence(_world, doorCoherenceHz);         // 同上
             NativeWorld.AF_WorldSetPrecedence(_world, precedenceDb, precedenceMs * 0.001f);   // 同上
+            NativeWorld.AF_WorldSetLateDistanceShape(_world, lateDistancePow);                  // 同上
             NativeWorld.AF_WorldSetLaneModel(_world, laneModel);           // 同上
             NativeWorld.AF_WorldSetGpuTrace(_world, gpuTrace ? 1 : 0);
             GpuActive = NativeWorld.AF_WorldGpuActive(_world) != 0;

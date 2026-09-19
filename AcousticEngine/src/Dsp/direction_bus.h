@@ -16,6 +16,11 @@
 //   使い方は尾のバス（TailBus）と同じ: 音源が render の中で add() し、AudioListener のフィルタが render() を
 //   1 回呼んで左右へ足す。add() と render() は同じオーディオスレッドから順に呼ばれる前提。
 //   上下は畳む（水平の環）。本数の目安: 8（45°）が出発点、12（30°）が反射の弁別（10〜15°）と同じ桁で上限。
+//   ■ 上・下のレーン（2026-09-19、verticalLanes = 2）
+//     水平の環のあとに「真上」「真下」の 2 本を足せる（レーン H と H+1）。部屋の響きを天井・床の近さで配るため（FdnRoomMix の形）。
+//     反射のタップの振り分け（laneWeights）は今までどおり水平の環だけを使う（horizontalLanes()）。上下のレーンに送るのは尾だけ。
+//     ★上下の手がかりは HRTF 次第。合成の HRTF（球の頭）には上下の手がかりが無いので、実測の HRTF を差したときだけ上・下に聞こえる。
+//       Wwise に移るときは、上・下を含む向きをそのまま Audio Object として渡せる（向きを持つ形にしておく理由）。
 //   ■ 低域と高域を分ける（2026-09-12。setCrossover、既定 700 Hz。0 で旧＝全帯域を畳む）
 //     直接音の HrtfProcessor は 700 Hz で分け、低域は HRIR を通さず ITD だけ、高域だけを畳む。バスは全帯域を畳んでいた。
 //     合成 HRTF（低域の利得 1）では差が出ないが、実測の kemar は測定の都合で低域が落ちている（50 Hz −11.6 dB、
@@ -48,9 +53,11 @@ public:
     // 行の HRIR の長さ（タップ）。反射用なので 256 → 128（2.7 ms）に切る。費用が半分になり、低域の ILD の細部だけ落ちる。
     static constexpr int kLaneIrMax = 128;
 
-    DirectionBus(int sampleRate, int lanes, int maxFrames, int firstBlock = 128, int capBlock = 1024)
+    DirectionBus(int sampleRate, int lanes, int maxFrames, int firstBlock = 128, int capBlock = 1024, int verticalLanes = 0)
         : sampleRate_(sampleRate > 0 ? sampleRate : 48000),
-          lanes_(std::max(kMinLanes, std::min(lanes, kMaxLanes))),
+          vertical_(verticalLanes > 0 ? 2 : 0),
+          horizontal_(std::max(kMinLanes, std::min(lanes, kMaxLanes - (verticalLanes > 0 ? 2 : 0)))),
+          lanes_(horizontal_ + vertical_),
           maxFrames_(std::max(64, maxFrames)),
           firstBlock_(firstBlock), capBlock_(capBlock) {
         in_.assign(static_cast<std::size_t>(rows()) * maxFrames_, 0.0f);
@@ -58,15 +65,24 @@ public:
         scratchR_.assign(static_cast<std::size_t>(maxFrames_), 0.0f);
         hfBuf_.assign(static_cast<std::size_t>(maxFrames_), 0.0f);
         setCrossover(700.0f);
-        for (int k = 0; k < lanes_; ++k) {
-            const float az = 2.0f * kPi * static_cast<float>(k) / static_cast<float>(lanes_);
+        for (int k = 0; k < horizontal_; ++k) {
+            const float az = 2.0f * kPi * static_cast<float>(k) / static_cast<float>(horizontal_);
             laneDir_[k][0] = std::sin(az);   // +x = 右
             laneDir_[k][1] = 0.0f;
             laneDir_[k][2] = std::cos(az);   // +z = 正面
         }
+        if (vertical_ > 0) {                 // 上・下（リスナー座標の +y / −y）
+            laneDir_[horizontal_][0] = 0.0f; laneDir_[horizontal_][1] = 1.0f;  laneDir_[horizontal_][2] = 0.0f;
+            laneDir_[horizontal_ + 1][0] = 0.0f; laneDir_[horizontal_ + 1][1] = -1.0f; laneDir_[horizontal_ + 1][2] = 0.0f;
+        }
     }
 
+    /// レーンの本数（水平 ＋ 上下）。行の数や FDN の尾の配り先はこちら。
     int lanes() const { return lanes_; }
+    /// 水平の環の本数。反射のタップの振り分け（laneWeights）はこちらを渡す。
+    int horizontalLanes() const { return horizontal_; }
+    /// 上・下のレーンの本数（0 か 2）。
+    int verticalLanes() const { return vertical_; }
     /// 送りの行数 = 方向 × 2 耳。行 r = 方向 k * 2 + 耳 e（0 = 左 / 1 = 右）。
     int rows() const { return lanes_ * 2; }
     int maxFrames() const { return maxFrames_; }
@@ -238,6 +254,8 @@ public:
 private:
     static constexpr float kPi = 3.14159265358979f;
     int sampleRate_;
+    int vertical_ = 0;                      // 上・下のレーン（0 か 2）。★lanes_ より前に宣言（初期化の順）
+    int horizontal_ = 0;                    // 水平の環の本数
     int lanes_;
     int maxFrames_;
     int firstBlock_, capBlock_;

@@ -111,6 +111,10 @@ ACOUSTIC_API float AF_WorldDoorCoherence(AF_WorldHandle w);
 /* 先着の重み（既定 6 dB / 窓 0.04 s）。最初の到達（直接の到達時刻）から遅れる到来ほど出口の量を下げる。帳簿は物理のまま。
  * 重み = 10^(−db/10 · (1 − e^(−Δ/sec)))。0 dB で今までと同じ。実行中に動かしてよい。 */
 ACOUSTIC_API void AF_WorldSetPrecedence(AF_WorldHandle w, float db, float sec);
+/* 自分の部屋の響きを、耳から方向バスの各レーンの向きの壁までの距離 d で配る強さ p（レーンの量 ∝ (1/d)^p、和は変えない）。
+ * 0 で一様（今までどおり、既定）。近い壁の側ほど響きが濃く、扉が開いた向きは薄くなる。実行中に動かしてよい。 */
+ACOUSTIC_API void  AF_WorldSetLateDistanceShape(AF_WorldHandle w, float pow);
+ACOUSTIC_API float AF_WorldLateDistanceShape(AF_WorldHandle w);
 /* 壁越しの反射（既定 0 ＝ 通さない）。1 で旧: 壁を横切った反射と残響も透過率で薄めて届ける。
  * 0 では壁を抜けるのは透過の直接音だけ。開いた戸口を通る分はどちらでも同じ。実行中に切り替えてよい。 */
 ACOUSTIC_API void AF_WorldSetWallReflect(AF_WorldHandle w, int on);

@@ -155,7 +155,7 @@ public:
         if (!taps || count <= 0) { early_.setTaps(taps, count); return; }
         tapScratch_.assign(taps, taps + count);
         const bool cues = earCues_ && hrtfSet_ && hrtfSet_->hasEarBands();
-        const int lanes = dirBus_ ? dirBus_->lanes() : 0;
+        const int lanes = dirBus_ ? dirBus_->horizontalLanes() : 0;   // タップは水平の環へ振る（上下のレーンは尾だけ）
         const int busLatency = dirBus_ ? dirBus_->latency() : 0;
         for (int i = 1; i < count; ++i) {           // index 0 は直接音＝フル HRTF が担当
             EarlyReflectConv::Tap& d = tapScratch_[static_cast<std::size_t>(i)];

@@ -51,6 +51,9 @@ namespace AcousticFlow
         public bool enableDirectionBus = true;
         [Tooltip("レーンの本数（水平の環）。8 = 45° 刻みが出発点、12 = 30° が反射の上限。16 以上は聞き分けられない所に払う。")]
         [Range(4, 16)] public int directionLanes = 8;
+        [Tooltip("方向バスに真上・真下のレーンを足す（2026-09-19）。部屋の響きを天井・床の近さでも配る。\n"
+                 + "上下に聞こえるのは実測の HRTF（hrtfFile）を入れたときだけ（合成の HRTF には上下の手がかりが無い）。器を作るときに決まる")]
+        public bool verticalLanes = true;
         private System.IntPtr _dirBus = System.IntPtr.Zero;
         private System.IntPtr _busHrtf = System.IntPtr.Zero;     // 方向バスの HRTF（バスと FDN の戸口の線音源が借りる）
         /// 方向バスの HRTF の .afhr 名（StreamingAssets 内）。空なら合成。AcousticWorld がバスを作る前に入れる。
@@ -66,8 +69,12 @@ namespace AcousticFlow
         {
             if (!enableDirectionBus) return System.IntPtr.Zero;
             if (_dirBus != System.IntPtr.Zero) return _dirBus;
-            try { _dirBus = Native.AF_DirectionBusCreate(_sampleRate, directionLanes, Mathf.Max(maxFrames, 2048)); }
-            catch (System.EntryPointNotFoundException) { _dirBus = System.IntPtr.Zero; }
+            try { _dirBus = Native.AF_DirectionBusCreateVertical(_sampleRate, directionLanes, Mathf.Max(maxFrames, 2048), verticalLanes ? 2 : 0); }
+            catch (System.EntryPointNotFoundException)
+            {
+                try { _dirBus = Native.AF_DirectionBusCreate(_sampleRate, directionLanes, Mathf.Max(maxFrames, 2048)); }
+                catch (System.EntryPointNotFoundException) { _dirBus = System.IntPtr.Zero; }
+            }
             if (_dirBus != System.IntPtr.Zero) { try { Native.AF_DirectionBusSetCrossover(_dirBus, busCrossoverHz); } catch (System.EntryPointNotFoundException) { } }   // HRTF より先
             // ★方向バスにも HRTF を差す（2026-09-12）。差さないとバスは「左の行を左耳へ、右の行を右耳へ」流すだけで、
             //   反射と尾のレーンに左右の音量差と方向の音色が付かない（耳の時間差だけ）。検査と試聴の道具は差していたので、

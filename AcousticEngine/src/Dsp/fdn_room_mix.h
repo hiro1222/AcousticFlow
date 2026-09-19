@@ -84,6 +84,12 @@
 //     点と拡散が少し相関する（広がり 0.5 で両耳相関 0.204、量は +0.55 dB 以内）。戸口をまたいで点から一様へ移るときは
 //     波形が点から拡散の行へ替わるので、持続音で段差が出る（どの作りでも残る。段 2-g の「残り」と同じ物）。
 //
+// ■ 尾の配り方の形（2026-09-19、setListenerLaneShape）
+//   自分の部屋の尾は今まで全レーンへ一様（拡散音場）だった。形を置くと「一様」の代わりにその形で配る
+//   （レーン k のエネルギーの割合。World が耳から各レーンの向きの壁までの距離で作る ── 近い壁の側ほど濃い）。
+//   点（戸口越しの向き）との混ぜ方は今までと同じ式で、一様の所が形に替わるだけ。形を置かなければ 1 ビットも同じ。
+//   上・下のレーン（DirectionBus の verticalLanes）があれば、天井・床の近さでも配る。点の振り分けは水平の環だけ。
+//
 // ■ 尾の開始（手順 5）はここでなく VoiceRenderer 側（音源ごとの ITDG を送りの前の遅延に）。
 //
 // ■ 連続性
@@ -229,10 +235,11 @@ public:
         const int nr = count_.load(std::memory_order_acquire);
         for (int k = 0; k < nr; ++k) {
             Room& r = *rooms_[static_cast<std::size_t>(k)];
+            r.hasShape = false;                     // 形はレーンの数ごとの物なので、バスを差し直したら外す（World が次のフレームで置き直す）
             renormLanes(r.laneCur); renormLanes(r.laneTgt); renormLanes(r.lanePend);
             // laneModel 1 の重みは、最後に置かれた向きからこのバスのレーン数で作り直す（器を作った直後なので今・目標・置いた値を揃える）。
             //   点が無ければ拡散は laneModel 0 の重みをそのまま写す（今・目標もそれぞれ写す ＝ 広がり 1 で 1 ビットも同じ）。
-            const bool point = splitWeights(r.dirX, r.dirZ, r.spread, std::min(L, kMaxLanes), r.lanePend, r.difPend, r.ptPend, r.itdPend);
+            const bool point = splitWeights(r.dirX, r.dirZ, r.spread, std::min(L, kMaxLanes), r.lanePend, r.difPend, r.ptPend, r.itdPend, nullptr);
             for (int l = 0; l < kMaxLanes; ++l) {
                 r.difTgt[l] = point ? r.difPend[l] : r.laneTgt[l];
                 r.difCur[l] = point ? r.difPend[l] : r.laneCur[l];
@@ -257,17 +264,18 @@ public:
         if (!valid(room)) return;
         Room& r = *rooms_[static_cast<std::size_t>(room)];
         const int L = bus_ ? std::min(bus_->lanes(), kMaxLanes) : 0;
+        const int H = bus_ ? std::min(bus_->horizontalLanes(), kMaxLanes) : 0;   // 点を振るのは水平の環だけ
         float w[kMaxLanes] = {};
-        uniformLanes(w);
+        diffuseLanes(r, w);
         if (L > 0) {
             const float sp = std::min(1.0f, std::max(0.0f, spread));
             float pt[kMaxLanes] = {};
             const float x = dirLocal3 ? dirLocal3[0] : 0.0f, z = dirLocal3 ? dirLocal3[2] : 1.0f;
-            if (sp < 1.0f && (x * x + z * z) > 1e-8f) {
-                // 隣り合う 2 レーンへ等パワーで振る（反射タップと同じ）。レーン k の方位 = 2πk/L、+x 右・+z 前。
+            if (sp < 1.0f && H > 0 && (x * x + z * z) > 1e-8f) {
+                // 隣り合う 2 レーンへ等パワーで振る（反射タップと同じ）。レーン k の方位 = 2πk/H、+x 右・+z 前。
                 float az = std::atan2(x, z); if (az < 0.0f) az += 2.0f * 3.14159265f;
-                const float u = az / (2.0f * 3.14159265f) * static_cast<float>(L);
-                const int k0 = static_cast<int>(u) % L, k1 = (k0 + 1) % L;
+                const float u = az / (2.0f * 3.14159265f) * static_cast<float>(H);
+                const int k0 = static_cast<int>(u) % H, k1 = (k0 + 1) % H;
                 const float t = u - static_cast<float>(static_cast<int>(u));
                 pt[k0] += std::cos(t * 1.5707963f); pt[k1] += std::sin(t * 1.5707963f);
             } else {
@@ -286,9 +294,32 @@ public:
             r.dirX = dirLocal3 ? dirLocal3[0] : 0.0f;
             r.dirZ = dirLocal3 ? dirLocal3[2] : 1.0f;
             r.spread = sp;
-            splitWeights(r.dirX, r.dirZ, sp, L, r.lanePend, r.difPend, r.ptPend, r.itdPend);
+            splitWeights(r.dirX, r.dirZ, sp, L, r.lanePend, r.difPend, r.ptPend, r.itdPend, r.hasShape ? r.shape : nullptr);
         }
         version_.fetch_add(1, std::memory_order_release);
+    }
+
+    /// 尾をレーンへ配るときの形（上の■尾の配り方の形）。energy[k] はレーン k のエネルギー（和で割って割合にする）。
+    ///   nullptr か n <= 0 で形を外して一様に戻す。置いた向きと広がり（戸口越しの点）はそのまま混ぜ直す。制御スレッド。
+    void setListenerLaneShape(int room, const float* energy, int n) {
+        if (!valid(room)) return;
+        Room& r = *rooms_[static_cast<std::size_t>(room)];
+        const int L = bus_ ? std::min(bus_->lanes(), kMaxLanes) : 0;
+        bool on = false;
+        if (energy && n > 0 && L > 0) {
+            const int m = std::min(n, L);
+            double s = 0.0;
+            for (int k = 0; k < m; ++k) s += std::max(0.0f, energy[k]);
+            if (s > 1e-20) {
+                for (int k = 0; k < kMaxLanes; ++k)
+                    r.shape[k] = (k < m) ? static_cast<float>(std::sqrt(std::max(0.0f, energy[k]) / s)) : 0.0f;
+                on = true;
+            }
+        }
+        if (!on && !r.hasShape) return;             // 形を置いていない部屋に「外す」は何もしない（1 ビットも同じまま）
+        r.hasShape = on;
+        const float d[3] = { r.dirX, 0.0f, r.dirZ };
+        setListenerDirection(room, d, r.spread);
     }
 
     // ── 戸口の線音源（段 2-g、2026-09-12）──
@@ -551,6 +582,8 @@ private:
         float ptCur[kMaxLanes], ptTgt[kMaxLanes], ptPend[kMaxLanes];
         float itdCur[2], itdTgt[2], itdPend[2];
         float dirX = 0.0f, dirZ = 1.0f, spread = 1.0f;   // 最後に置かれた向きと広がり（バスを差し直したら重みを作り直す）
+        float shape[kMaxLanes] = {};                     // 尾の配り方の形（振幅、Σ² = 1）。hasShape のときだけ一様の代わりに使う
+        bool  hasShape = false;
         std::vector<float> ptHist;                       // [kPtHist] 点の波形の履歴（ptPos が最新）
         int ptPos = 0;
         std::vector<float> ptEar[2];                     // [maxFrames] 耳ごとに ITD ぶん遅らせた点の波形
@@ -570,6 +603,12 @@ private:
         if (e <= 1e-12) { uniformLanes(w); return; }
         const float g = static_cast<float>(1.0 / std::sqrt(e));
         for (int k = 0; k < L; ++k) w[k] *= g;
+    }
+
+    // 拡散の配り方: 形が置いてあれば形、無ければ一様（上の■尾の配り方の形）。
+    void diffuseLanes(const Room& r, float* w) const {
+        if (!r.hasShape) { uniformLanes(w); return; }
+        for (int k = 0; k < kMaxLanes; ++k) w[k] = r.shape[k];
     }
 
     // 一様のレーンの重み（バスのレーン数で 1/√L。バスが無ければ 1/√kMaxLanes。どちらも Σ² = 1）。
@@ -647,21 +686,23 @@ private:
     //     （一様と点を直交とみなしたときのエネルギーの割合）。
     //   点が無い（向きが無い・広がり 1・バスが無い）: dif に laneW（laneModel 0 の重み）をそのまま写し、pt = 0。
     //     ★同じ数を使うので、広がり 1 は laneModel 0 と 1 ビットも同じになる（一様を作り直すと 1 ulp ずれうる）。
-    bool splitWeights(float x, float z, float sp, int L, const float* laneW, float* dif, float* pt, float* itd2) const {
+    bool splitWeights(float x, float z, float sp, int L, const float* laneW, float* dif, float* pt, float* itd2, const float* shape) const {
         for (int k = 0; k < kMaxLanes; ++k) pt[k] = 0.0f;
         itd2[0] = 0.0f; itd2[1] = 0.0f;
         if (L <= 0 || sp >= 1.0f || (x * x + z * z) <= 1e-8f) {
             for (int k = 0; k < kMaxLanes; ++k) dif[k] = laneW[k];
             return false;
         }
-        uniformLanes(dif);
+        if (shape) { for (int k = 0; k < kMaxLanes; ++k) dif[k] = shape[k]; }
+        else uniformLanes(dif);
         const float ed = (sp * sp) / (sp * sp + (1.0f - sp) * (1.0f - sp));
         const float a = std::sqrt(ed), c = std::sqrt(1.0f - ed);
         for (int k = 0; k < L; ++k) dif[k] *= a;
-        // 隣り合う 2 レーンへ等パワー（setListenerDirection と同じ式）。レーン k の方位 = 2πk/L、+x 右・+z 前。
+        // 隣り合う 2 レーンへ等パワー（setListenerDirection と同じ式）。レーン k の方位 = 2πk/H（水平の環）、+x 右・+z 前。
+        const int H = bus_ ? std::max(1, std::min(bus_->horizontalLanes(), kMaxLanes)) : L;
         float az = std::atan2(x, z); if (az < 0.0f) az += 2.0f * 3.14159265f;
-        const float u = az / (2.0f * 3.14159265f) * static_cast<float>(L);
-        const int k0 = static_cast<int>(u) % L, k1 = (k0 + 1) % L;
+        const float u = az / (2.0f * 3.14159265f) * static_cast<float>(H);
+        const int k0 = static_cast<int>(u) % H, k1 = (k0 + 1) % H;
         const float t = u - static_cast<float>(static_cast<int>(u));
         pt[k0] += c * std::cos(t * 1.5707963f);
         pt[k1] += c * std::sin(t * 1.5707963f);
