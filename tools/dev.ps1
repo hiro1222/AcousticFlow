@@ -82,12 +82,41 @@ switch ($Cmd) {
 
   "deploy" {
     $src = Join-Path $bin "AcousticEngine.dll"
-    $dst = Join-Path $root "UnityDemo\Assets\Plugins\x86_64\AcousticEngine.dll"
+    $dst = Join-Path $root "Projects\UnityDemo\Assets\Plugins\x86_64\AcousticEngine.dll"
     Copy-Item $src $dst -Force
     "配備: $dst"
   }
 
+  "wwiseplugin" {
+    # 自前の Wwise プラグイン（WwisePlugin/AcousticFlow）を作り直して、Unity と Unreal の両方へ配る（2026-09-30）。
+    #   ★Unity は Assets/Wwise/.../x86_64/DSP、Unreal は Plugins/WwiseSoundEngine/ThirdParty/x64_vc170/<構成>/bin から、
+    #     Wwise が実行時に DLL を読む。どちらも Launcher が統合のときに 1 回写しただけなので、作り直したら毎回ここで配る。
+    #   ★エディタが開いていると DLL を掴んでいるので失敗する。閉じてから。
+    $wwise = if ($env:WWISEROOT) { $env:WWISEROOT } else { "C:\Audiokinetic\Wwise_2025.1.8.9170" }
+    $wp = Join-Path $wwise "Scripts\Build\Plugins\wp.py"
+    # ★PowerShell から呼ぶと、Wwise の道具が Visual Studio の場所を調べる所で文字コードを cp932 で読み違えて止まる。UTF-8 で読ませる。
+    $env:PYTHONUTF8 = "1"
+    # ★Wwise の道具は vswhere.exe を PATH から探す。シェルによっては入っていないので足す（2026-09-30 に止まった）。
+    $vi = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer"
+    if ((Test-Path $vi) -and ($env:PATH -notlike "*$vi*")) { $env:PATH = "$vi;$env:PATH" }
+    Push-Location (Join-Path $root "WwisePlugin\AcousticFlow")
+    foreach ($c in @("Release", "Profile")) { & python $wp build Windows_vc170 -c $c -x x64 | Where-Object { $_ -match 'error|AcousticFlow\.dll' } }
+    Pop-Location
+    $sdk = Join-Path $wwise "SDK\x64_vc170"
+    $targets = @(
+      @{ src = "Profile"; dst = "Projects\UnityDemo\Assets\Wwise\API\Runtime\Plugins\Windows\x86_64\DSP" },
+      @{ src = "Profile"; dst = "Projects\UnrealDemo\Plugins\WwiseSoundEngine\ThirdParty\x64_vc170\Profile\bin" },
+      @{ src = "Release"; dst = "Projects\UnrealDemo\Plugins\WwiseSoundEngine\ThirdParty\x64_vc170\Release\bin" }
+    )
+    foreach ($t in $targets) {
+      $d = Join-Path $root $t.dst
+      if (-not (Test-Path $d)) { "（無いので飛ばす）$($t.dst)"; continue }
+      Copy-Item (Join-Path $sdk "$($t.src)\bin\AcousticFlow.dll") $d -Force
+      "配備: $($t.dst)\AcousticFlow.dll（$($t.src)）"
+    }
+  }
+
   default {
-    "dev.ps1 build|test|table|pdf|pptx|csharp|deploy  （先頭のコメントを参照）"
+    "dev.ps1 build|test|table|pdf|pptx|csharp|deploy|wwiseplugin  （先頭のコメントを参照）"
   }
 }

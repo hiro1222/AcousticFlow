@@ -76,7 +76,7 @@ cbuffer Cb : register(b0) {
     float3 gListener; float gPad0;
     uint   gBoxCount; uint gNodeCount; uint gItemCount; uint gBlockCount;
     float3 gRoomOrigin; float gRoomCell;
-    int    gRoomNx; int gRoomNy; int gRoomNz; int gListenerRoom;   // gListenerRoom < 0 なら出どころを分けない
+    int    gRoomNx; int gRoomNy; int gRoomNz; int gListenerRoom;   // −1 なら出どころを分けない（−2 は外の耳）
     int    gWallReflect; int gPad1; int gPad2; int gPad3;          // 0 なら壁を横切る影の線を数えない（CPU の wallReflect）
 };
 
@@ -286,7 +286,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             if (tSec < em.mixingSec) { o.earlyLo += cLo; o.earlyHi += cHi; }
             else                   { o.lateLo  += cLo; o.lateHi  += cHi; }
             // ── 後期の出どころ（段 2-f。CPU の traceRay と同じ式）──
-            if (any && gListenerRoom >= 0 && tSec >= em.mixingSec) {
+            if (any && gListenerRoom != -1 && tSec >= em.mixingSec) {   // −2 ＝ 外の耳（kListenerOutside）: どの部屋の面も別の部屋
                 int room = roomAtP(h.p + side * max(0.3f, 1.25f * gRoomCell));
                 if (room >= 0 && room != gListenerRoom) {
                     o.lateOtherLo += cLo; o.lateOtherHi += cHi;

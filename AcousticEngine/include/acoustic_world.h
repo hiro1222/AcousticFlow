@@ -50,6 +50,17 @@ ACOUSTIC_API void AF_WorldSetRoomCell(AF_WorldHandle w, float meters);
  *   ★要求 ≠ 実際 なら、上限に収めるために粗くされている＝音の結果が変わっている。 */
 ACOUSTIC_API void AF_WorldRoomCellInfo(AF_WorldHandle w, float* outRequested, float* outEffective,
                                        double* outVoxels, double* outMaxVoxels);
+/* 部屋を口で割る半径(m)（2026-10-04、既定 0.6）。幅がこの 2 倍に満たない口で部屋が分かれる。AF_WorldBuild の**前**に置く。
+ *   ★洞窟の口（幅 3 m など）で洞窟を部屋にしたい場面は大きく（口の半幅 ＋ 0.3 m 程度）。
+ *     部屋のいちばん狭い所の半分より大きくすると、その廊下は部屋にならない（近くの部屋へ塗り戻される）。 */
+ACOUSTIC_API void  AF_WorldSetRoomSeedRadius(AF_WorldHandle w, float meters);
+ACOUSTIC_API float AF_WorldRoomSeedRadius(AF_WorldHandle w);
+/* 外への口と屋外の耳（2026-10-04、既定 0 ＝ 今までどおり）。AF_WorldBuild の**前**に置く（部屋グラフを組み直す）。
+ *   1: 部屋と外の世界の間の口も口にする。外への口を Sabine に入れ（口から逃げる分で RT60 が短くなる）、
+ *      耳が外にいるとき、音源の部屋の響きをその部屋の外への口から戸口の線音源で鳴らす（洞窟の前で中の響きが漏れる）。
+ *   0: 外への口は口でない。耳が外にいるとどの部屋の響きも聞こえない（口を入った所で 0 から立ち上がる）。 */
+ACOUSTIC_API void AF_WorldSetOutsideMouth(AF_WorldHandle w, int on);
+ACOUSTIC_API int  AF_WorldOutsideMouth(AF_WorldHandle w);
 
 ACOUSTIC_API void AF_WorldBuild(AF_WorldHandle w);
 ACOUSTIC_API int  AF_WorldRoomCount(AF_WorldHandle w);
@@ -85,6 +96,15 @@ ACOUSTIC_API int  AF_WorldSpentRays(AF_WorldHandle w);
 ACOUSTIC_API int  AF_WorldEmitterTier(AF_WorldHandle w, int emitter);
 ACOUSTIC_API int  AF_WorldEmitterRays(AF_WorldHandle w, int emitter);
 ACOUSTIC_API void AF_WorldSetWeights(AF_WorldHandle w, const float* w5);          /* 直接・初期・後期・回折・透過。NULL で全部 1 */
+/* 隣の部屋の響き（2026-10-01、エネルギー比、0..4、既定 1）。音源が耳と別の部屋にいるときの後期だけに、後期の重みへさらに掛ける。
+ *   戸口から抜けてくる響きと、耳の部屋で響かせる分の両方。同じ部屋の音源には効かない。形は変えず量だけ。実行中に動かしてよい。 */
+ACOUSTIC_API void  AF_WorldSetAdjacentLateWeight(AF_WorldHandle w, float weight);
+ACOUSTIC_API float AF_WorldAdjacentLateWeight(AF_WorldHandle w);
+/* 影のこもり（2026-10-06、dB、0..24、既定 0）。遮られた直接の道（透過・回折）にだけ、高域を余分に落とす。
+ *   125 Hz は 0、4 kHz で −dB、間はオクターブに比例（1 オクターブあたり dB/5）。直接・初期・響きには効かない。
+ *   帳簿（AF_WorldMixInfo の component6）は物理のまま、出口だけ。実行中に動かしてよい。 */
+ACOUSTIC_API void  AF_WorldSetShadowMuffle(AF_WorldHandle w, float db);
+ACOUSTIC_API float AF_WorldShadowMuffle(AF_WorldHandle w);
 ACOUSTIC_API void AF_WorldSetResponse(AF_WorldHandle w, float levelSec, float colourSec, float statSec, float directionSec);
 ACOUSTIC_API void AF_WorldSetHeadCm(AF_WorldHandle w, float headCircumferenceCm);
 /* 閉じた扉から漏れる回折の扱い。**既定 1（案A）**。
@@ -115,6 +135,12 @@ ACOUSTIC_API void AF_WorldSetPrecedence(AF_WorldHandle w, float db, float sec);
  * 0 で一様（今までどおり、既定）。近い壁の側ほど響きが濃く、扉が開いた向きは薄くなる。実行中に動かしてよい。 */
 ACOUSTIC_API void  AF_WorldSetLateDistanceShape(AF_WorldHandle w, float pow);
 ACOUSTIC_API float AF_WorldLateDistanceShape(AF_WorldHandle w);
+/* いまの配り方そのものを読む（表示・検査用。音には影響しない）。
+ *   outShare[k]    レーン k の取り分（和 1）
+ *   outDistance[k] そのレーンの壁までの距離（m、円錐 5 本の平均。当たらなければ上限 50）
+ *   outDir3[3k..]  レーン k の向き（リスナー座標の単位ベクトル。要らなければ NULL）
+ * 返り: 書いたレーンの本数。0 = 形が無い（摘みが 0、または耳が部屋の外）。 */
+ACOUSTIC_API int AF_WorldLateLaneShape(AF_WorldHandle w, float* outShare, float* outDistance, float* outDir3, int maxLanes);
 /* 壁越しの反射（既定 0 ＝ 通さない）。1 で旧: 壁を横切った反射と残響も透過率で薄めて届ける。
  * 0 では壁を抜けるのは透過の直接音だけ。開いた戸口を通る分はどちらでも同じ。実行中に切り替えてよい。 */
 ACOUSTIC_API void AF_WorldSetWallReflect(AF_WorldHandle w, int on);

@@ -132,7 +132,7 @@ def main():
     print(f"書き出し: {args.output}  "
           f"({ir.shape[0]} 方向 × {ir.shape[2]} タップ × 2ch)")
     print("\nUnity 側の使い方:")
-    print("  1) 出力を UnityDemo/Assets/StreamingAssets/ に置く")
+    print("  1) 出力を Projects/UnityDemo/Assets/StreamingAssets/ に置く")
     print("  2) IrConvolver の Hrtf File Name にファイル名を入れる")
 
 

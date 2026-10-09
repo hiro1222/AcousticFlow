@@ -195,6 +195,11 @@ ACOUSTIC_API void AF_DirectionBusDestroy(AF_DirectionBusHandle bus);
 ACOUSTIC_API void AF_DirectionBusSetHrtf(AF_DirectionBusHandle bus, AF_HrtfHandle hrtf, float headCircumferenceCm);
 /* 方向バスの低域と高域の境（Hz、既定 700）。0 で分けない（旧: 全帯域を HRIR で畳む）。★HRTF を差す前に。 */
 ACOUSTIC_API void AF_DirectionBusSetCrossover(AF_DirectionBusHandle bus, float hz);
+/* タップを隣り合う 2 レーンへ分けるか（1 既定 ＝ 今までどおり / 0 かぶりなし ＝ いちばん近い 1 レーンだけ）。
+ * 0 にすると 1 レーンの担当する扇（8 本なら ±22.5°）の中だけで鳴るので方向がはっきり分かれる代わりに、
+ * 扇の境目をまたぐ瞬間に音が乗り換える。実行中に切り替えてよい（次のタップの組み立てから効く）。 */
+ACOUSTIC_API void AF_DirectionBusSetPanSplit(AF_DirectionBusHandle bus, int on);
+ACOUSTIC_API int  AF_DirectionBusPanSplit(AF_DirectionBusHandle bus);
 ACOUSTIC_API int  AF_DirectionBusHasHrtf(AF_DirectionBusHandle bus);
 ACOUSTIC_API int  AF_DirectionBusLanes(AF_DirectionBusHandle bus);
 /* 溜まった送りをレーンごとに畳んで outL/outR へ**足す**。音源が送っていないブロックでも呼ぶこと。 */

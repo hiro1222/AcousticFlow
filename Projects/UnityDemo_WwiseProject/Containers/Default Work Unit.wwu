@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WwiseDocument Type="WorkUnit" ID="{5F8A78C3-2D18-4B24-9B31-4DC4686B9506}" SchemaVersion="133">
+	<Containers>
+		<WorkUnit Name="Default Work Unit" ID="{5F8A78C3-2D18-4B24-9B31-4DC4686B9506}" PersistMode="Standalone">
+			<ChildrenList>
+				<Sound Name="AF_TestTone" ID="{2F108005-87B3-493F-A1A8-C98F98D6860A}" ShortID="959693134">
+					<PropertyList>
+						<Property Name="3DSpatialization" Type="int16" Value="1"/>
+						<Property Name="EnableAttenuation" Type="bool" Value="False"/>
+						<Property Name="IsLoopingEnabled" Type="bool" Value="True"/>
+						<Property Name="OverrideOutput" Type="bool" Value="True"/>
+						<Property Name="OverridePositioning" Type="bool" Value="True"/>
+					</PropertyList>
+					<ReferenceList>
+						<Reference Name="Conversion">
+							<ObjectRef Name="Default Conversion Settings" ID="{6D1B890C-9826-4384-BF07-C15223E9FB56}" WorkUnitID="{52A69BD3-4B82-4E9A-A8B7-CC413EFE0729}"/>
+						</Reference>
+						<Reference Name="OutputBus">
+							<ObjectRef Name="AcousticFlow" ID="{8607387E-5855-49ED-A7F5-752DAA69348E}" WorkUnitID="{10AD80B8-5BCD-448C-8CED-627075BD4D89}"/>
+						</Reference>
+					</ReferenceList>
+					<ChildrenList>
+						<AudioFileSource Name="videoplayback" ID="{67A49BEE-E922-4299-B3A4-20725E620C3D}">
+							<Language>SFX</Language>
+							<AudioFile>videoplayback.wav</AudioFile>
+							<MediaIDList>
+								<MediaID ID="239429028"/>
+							</MediaIDList>
+						</AudioFileSource>
+						<AudioFileSource Name="DemonDanceTokyo_Eve" ID="{4690E7F1-32DF-471A-BBC5-674679C26247}">
+							<Language>SFX</Language>
+							<AudioFile>DemonDanceTokyo_Eve.wav</AudioFile>
+							<MediaIDList>
+								<MediaID ID="389972254"/>
+							</MediaIDList>
+						</AudioFileSource>
+						<AudioFileSource Name="FreeTestSound" ID="{CCB5BAC4-2A89-45D4-AF20-BFA5526EB904}">
+							<Language>SFX</Language>
+							<AudioFile>FreeTestSound.wav</AudioFile>
+							<MediaIDList>
+								<MediaID ID="858526041"/>
+							</MediaIDList>
+						</AudioFileSource>
+					</ChildrenList>
+					<ActiveSourceList>
+						<ActiveSource Name="FreeTestSound" ID="{CCB5BAC4-2A89-45D4-AF20-BFA5526EB904}" Platform="Linked"/>
+					</ActiveSourceList>
+				</Sound>
+			</ChildrenList>
+		</WorkUnit>
+	</Containers>
+</WwiseDocument>

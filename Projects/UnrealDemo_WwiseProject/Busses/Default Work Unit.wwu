@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WwiseDocument Type="WorkUnit" ID="{D3227422-1BC0-4A16-8333-A087EA25FF4F}" SchemaVersion="133">
+	<Busses>
+		<WorkUnit Name="Default Work Unit" ID="{D3227422-1BC0-4A16-8333-A087EA25FF4F}" PersistMode="Standalone">
+			<ChildrenList>
+				<Bus Name="Main Audio Bus" ID="{1514A4D8-1DA6-412A-A17E-75CA0C2149F3}">
+					<ReferenceList>
+						<Reference Name="AudioDevice" PluginName="System" CompanyID="0" PluginID="174" PluginType="7">
+							<ObjectRef Name="System" ID="{12E9C909-A1E5-4B35-9BB4-17B80AF538BA}" WorkUnitID="{81B46F6C-9EBF-4F00-A299-190BA5F6B339}"/>
+						</Reference>
+					</ReferenceList>
+					<ChildrenList>
+						<Bus Name="AcousticFlow" ID="{4EB34B87-AEB0-4ECB-9476-CB374F2A4371}">
+							<PropertyList>
+								<Property Name="BusChannelConfig" Type="int32">
+									<ValueList>
+										<Value>768</Value>
+									</ValueList>
+								</Property>
+							</PropertyList>
+							<ObjectLists>
+								<ObjectList Name="Effects">
+									<EffectSlot Name="" ID="{C54341CA-3910-4049-8188-D6BCF1FF38E9}" ShortID="770775574">
+										<ReferenceList>
+											<Reference Name="Effect">
+												<Custom>
+													<Effect Name="AF_Renderer" ID="{765F4FD4-2639-4FD6-B602-83BFEE81345D}" ShortID="412822075" PluginName="AcousticFlow" CompanyID="64" PluginID="20311" PluginType="3"/>
+												</Custom>
+											</Reference>
+										</ReferenceList>
+									</EffectSlot>
+								</ObjectList>
+							</ObjectLists>
+						</Bus>
+					</ChildrenList>
+				</Bus>
+			</ChildrenList>
+		</WorkUnit>
+	</Busses>
+</WwiseDocument>

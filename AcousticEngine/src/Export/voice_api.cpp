@@ -232,6 +232,15 @@ void AF_DirectionBusSetCrossover(AF_DirectionBusHandle bus, float hz) {
     if (af::dsp::DirectionBus* b = asDirBus(bus)) b->setCrossover(hz);
 }
 
+void AF_DirectionBusSetPanSplit(AF_DirectionBusHandle bus, int on) {
+    if (af::dsp::DirectionBus* b = asDirBus(bus)) b->setPanSplit(on != 0);
+}
+
+int AF_DirectionBusPanSplit(AF_DirectionBusHandle bus) {
+    af::dsp::DirectionBus* b = asDirBus(bus);
+    return (b && b->panSplit()) ? 1 : 0;
+}
+
 int AF_DirectionBusHasHrtf(AF_DirectionBusHandle bus) {
     af::dsp::DirectionBus* b = asDirBus(bus);
     return (b && b->hasHrtf()) ? 1 : 0;

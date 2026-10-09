@@ -146,9 +146,9 @@ int renderCorridor(const char* outPath, bool earCues, bool useClick, bool noTail
     AF_VoiceHandle voice = AF_VoiceCreate(&cfg);
     AF_VoiceSetOutputGain(voice, 0.6f);
     // ★実測 HRTF を使う。合成（球体頭）は前後が同一で、定位を聴く目的に合わない。
-    AF_HrtfHandle hrtf = AF_HrtfLoadFile("UnityDemo/Assets/StreamingAssets/kemar.afhr");
-    if (!hrtf) hrtf = AF_HrtfLoadFile("../UnityDemo/Assets/StreamingAssets/kemar.afhr");
-    if (!hrtf) hrtf = AF_HrtfLoadFile("../../UnityDemo/Assets/StreamingAssets/kemar.afhr");
+    AF_HrtfHandle hrtf = AF_HrtfLoadFile("Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr");
+    if (!hrtf) hrtf = AF_HrtfLoadFile("../Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr");
+    if (!hrtf) hrtf = AF_HrtfLoadFile("../../Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr");
     if (hrtf) {
         char nm[64];
         AF_HrtfGetName(hrtf, nm, 64);

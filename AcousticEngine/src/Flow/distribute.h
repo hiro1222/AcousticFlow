@@ -19,6 +19,7 @@
  *   3) 速度: 成分ごとに Follower6（response.h）。量は即時、形は colourSec。レイ由来（初期・後期）は量にも statSec。
  *      ★直接と透過は解析なので平滑しない（量は levelSec=0 で即時）。扉の立ち上がりはここから来る。
  *   4) 世界の重み: 出口で 1 回だけ掛ける。帳簿には掛けない。
+ *      影のこもり（WorldWeights::shadowMuffleDb、2026-10-06）も同じ所で、透過と回折のタップにだけ高域の傾きを掛ける。
  *   5) 尾の開始 onsetSec = 最初の反射の到達。段 7 で最初の虚像の到達に置き換わる。
  *
  * ■ 繋がり
@@ -29,11 +30,16 @@
  *   ・後期の量を「部屋の結合の式」で別に減らす: 旧実装の穴そのもの。減らすのは 1 か所（レイ）。
  *   ・平滑してから帳簿に書く: 成分ごとに時定数が違うので和が総量に一致しなくなり、検査が意味を失う。
  *   ・見通しの割合を直接音だけに掛けて透過に触らない: 板の向こうの音源が「見えない ＝ 直接 0」で終わり、透過が消える。
+ *   ・影のこもりを「見えていない（visible < 0.5）なら掛ける」の二値にする: 影の縁で音色が 1 フレームで切り替わる。
+ *     透過・回折の量そのものが (1 − 見通し) に比例するので、そこに掛ければ縁で連続になる。
+ *   ・影のこもりを響き（後期）や初期にも掛ける: 響きは音源の部屋に帰属し、耳の影で色を変えない（2026-10-04 の原則）。
  *
  * ■ 壊れる所
  *   ・重みを帳簿にも掛けると conserves が通ったまま二重に効く。帳簿は生。
+ *   ・影のこもりを直接（kDirect）にも掛けると、見えている音源まで曇る（半影では見えている分まで暗くなる）。透過と回折だけ。
  *   ・visible を平滑すると扉の立ち上がりが鈍る。解析値は毎フレームそのまま。
- *   ・listenerRoom が −1（外）のとき送りを作ると FdnRoomMix が範囲外を引く。送りは部屋があるときだけ。
+ *   ・listenerRoom が −1（外）のとき耳の部屋への送りを作ると FdnRoomMix が範囲外を引く。耳の部屋への送りは部屋があるときだけ
+ *     （外の耳 outsideListener が作るのは音源の部屋への送りだけ）。
  */
 #ifndef ACOUSTICFLOW_FLOW_DISTRIBUTE_H
 #define ACOUSTICFLOW_FLOW_DISTRIBUTE_H
@@ -81,6 +87,10 @@ struct DistributeInput {
     //   戸口の線音源から耳の部屋へ流す分）をこの割合だけ戸口から直接鳴らす側へ移す。0 で今までと 1 ビットも同じ。総量は変えない。
     //   ★発注者「隣の部屋の残響・反射は今いる部屋では反響させず、ドアから鳴る音が絶対に支配的になるように」。演出の摘み。
     float adjacentContain = 0.0f;
+    // 外の耳（2026-10-04、World::setOutsideMouth）。listenerRoom が −1 でもこれが立っていて音源が部屋にいれば、
+    //   後期のうち部屋の面から来た分（lateOther6）だけを音源の部屋の送り（戸口の線音源で口から直接、thru6 ＝ e6）にする。
+    //   外の面から来た分は響かせる器が無いので鳴らさない（帳簿には載る）。閉じ込め・流し込みは 0（耳の部屋が無い）。
+    bool  outsideListener = false;
     // 先着の重み（2026-09-12）。到来が最初の到達（直接の到達時刻）から遅れるほど下げる。出口だけで、帳簿（component6）は物理のまま。
     //   重み = 10^(−precedenceDb/10 · (1 − e^(−Δ/precedenceSec)))。直接・透過は Δ=0 で変わらず、部屋の響きは大きく下がる。0 dB で今までと同じ。
     //   ★ゲームなので完全な物理でなく聞こえ方を優先する（発注者の指示）。先行音効果の窓 40 ms が τ の目安。
@@ -94,7 +104,11 @@ struct DistributeInput {
 /// 音源 1 つぶんの配分の状態（成分ごとの追従）。世界が音源ごとに 1 つ持つ。
 class EmitterMixer {
 public:
-    void reset() { for (int c = 0; c < kNumComponents; ++c) f_[c].reset(); fOther_.reset(); faceSm_.clear(); onsetSm_ = -1.0f; }
+    void reset() {
+        for (int c = 0; c < kNumComponents; ++c) f_[c].reset();
+        fOther_.reset(); faceSm_.clear(); onsetSm_ = -1.0f;
+        otherDirSm_ = Vec3(0, 0, 0); otherFocusSm_ = 0.0f;
+    }
 
     void run(const DistributeInput& in, Mix& out) {
         out.clear();
@@ -138,14 +152,19 @@ public:
             const float k = 1.0f - std::exp(-d / std::max(1e-3f, in.precedenceSec));
             return std::pow(10.0f, -in.precedenceDb * 0.1f * k);
         };
+        // 影のこもり（WorldWeights::shadowMuffleDb）: 遮られた直接の道（透過・回折）の出口にだけ掛ける高域の傾き。
+        //   帳簿（component6）には掛けない（重みと同じ）。0 dB なら全帯域 1.0f で、掛けても値は 1 ビットも変わらない。
+        float shadow6[kNumBands];
+        W.shadowMuffle6(shadow6);
         auto emitTap = [&](TapKind kind, int comp, float delaySec, const Vec3& dir, float spread, int id) {
             MixTap* t = out.pushTap();
             if (!t) return;
             t->kind = kind; t->id = id; t->delaySec = delaySec; t->dirLocal = dir; t->spread = spread;
             const float pw = pre(delaySec);
+            const bool shadowed = (comp == kTransmit || comp == kDiffract);
             for (int b = 0; b < kNumBands; ++b) {
                 out.component6[comp][b] += raw[comp][b];
-                t->e6[b] = sm[comp][b] * W.w[comp] * pw;
+                t->e6[b] = sm[comp][b] * W.w[comp] * pw * (shadowed ? shadow6[b] : 1.0f);
             }
         };
         emitTap(TapKind::Direct,   kDirect,   T.directSec, dirLocal, 0.0f, 1);
@@ -301,7 +320,9 @@ public:
         //   ★割合は**平滑した値どうしの比**で取る。生の比を平滑済みの総量に掛けると、組の入れ替わりで割合だけが跳ぶ。
         //   ★音源が耳と同じ部屋なら割らない（戸口越しの分は耳の部屋へ畳む ＝ 今までと同じ）。
         //   ★帳簿（component6）は総量を 1 回だけ。割るのは出口だけ。
-        const bool apart = (in.listenerRoom >= 0 && in.sourceRoom >= 0 && in.sourceRoom != in.listenerRoom);
+        // 外の耳（in.outsideListener）: 耳に部屋は無いが、音源の部屋の響きを外への口から鳴らす ＝ 別の部屋の音源と同じ扱い。
+        const bool outside = in.outsideListener && in.listenerRoom < 0 && in.sourceRoom >= 0;
+        const bool apart = (in.listenerRoom >= 0 && in.sourceRoom >= 0 && in.sourceRoom != in.listenerRoom) || outside;
         // 尾の開始 = 最初の虚像の到達（ITDG）。虚像が無ければレイの最初の反射、それも無ければ直接。（先着の重みの遅れにも使う）
         const float onsetSec = (ft && onsetSm_ > 0.0f) ? onsetSm_
                              : (im && im->count > 0 && im->firstSec > 0.0f) ? im->firstSec
@@ -323,24 +344,30 @@ public:
         //   音源の部屋の送りへ回す。そこから戸口の線音源が耳の部屋の FDN へ流す（戸口の音から鳴り始める）。
         //   thru6 は戸口から耳へ直接出す分。★量の合計は変えない（耳の部屋へ直接 ＋ 戸口へ ＝ 後期）。
         //   ★開き具合で割るのは、閉じた扉ごしの分（板と壁の透過）まで戸口から鳴らさないため。開ききれば 1。
-        const float feed = (apart && in.doorSource) ? std::min(1.0f, std::max(0.0f, in.doorFeed)) : 0.0f;
+        //   外の耳では 0（流し込む耳の部屋が無い）。
+        const float feed = (apart && !outside && in.doorSource) ? std::min(1.0f, std::max(0.0f, in.doorFeed)) : 0.0f;
         // 隣の部屋の閉じ込め: 耳の部屋で響かせる分（own ＝ (1−thru)(1−feed) と、流す分 fp·(1−pull)）を c だけ戸口から直接へ。
         //   c = 0 のときは下の式を今までと同じ並びで書く（1 ビットも同じ。寄せの検査 ⑦ が総量の一致をビットで見ている）。
-        const float contain = apart ? std::min(1.0f, std::max(0.0f, in.adjacentContain)) : 0.0f;
-        if (in.listenerRoom >= 0) {
-            FdnSend* s = out.pushSend();
+        //   外の耳では 0（耳の部屋で響かせる分が無い。外の面から来た分を口へ移すと、地面の遅い反射まで洞窟の響きになる）。
+        const float contain = (apart && !outside) ? std::min(1.0f, std::max(0.0f, in.adjacentContain)) : 0.0f;
+        // 隣の部屋の響き（WorldWeights::lateAdjacent、2026-10-01）: 音源が耳と別の部屋なら、後期の重みにさらに掛ける。
+        //   耳の部屋へ響かせる分・戸口から鳴らす分の両方に同じだけ（配り方は変えず量だけ）。同じ部屋なら 1。
+        const float wLate = W.w[kLate] * (apart ? std::max(0.0f, W.lateAdjacent) : 1.0f);
+        if (in.listenerRoom >= 0 || outside) {
+            FdnSend* s = outside ? nullptr : out.pushSend();
+            if (outside) for (int b = 0; b < kNumBands; ++b) out.component6[kLate][b] += raw[kLate][b];   // 帳簿は 1 回だけ
             if (s) {
                 s->room = in.listenerRoom;
                 for (int b = 0; b < kNumBands; ++b) {
                     out.component6[kLate][b] += raw[kLate][b];
                     s->e6[b] = (contain > 0.0f)
-                        ? sm[kLate][b] * W.w[kLate] * (1.0f - thru[b]) * (1.0f - feed) * (1.0f - contain) * preRoom
-                        : sm[kLate][b] * W.w[kLate] * (1.0f - thru[b]) * (1.0f - feed) * preRoom;
+                        ? sm[kLate][b] * wLate * (1.0f - thru[b]) * (1.0f - feed) * (1.0f - contain) * preRoom
+                        : sm[kLate][b] * wLate * (1.0f - thru[b]) * (1.0f - feed) * preRoom;
                 }
             }
             float eThru = 0.0f;
             for (int b = 0; b < kNumBands; ++b)
-                eThru += sm[kLate][b] * W.w[kLate] * (thru[b] + (1.0f - thru[b]) * feed + (1.0f - thru[b]) * (1.0f - feed) * contain);
+                eThru += sm[kLate][b] * wLate * (thru[b] + (1.0f - thru[b]) * feed + (1.0f - thru[b]) * (1.0f - feed) * contain);
             if (apart && eThru > 0.0f) {
                 FdnSend* o = out.pushSend();
                 if (o) {
@@ -354,7 +381,7 @@ public:
                         // 戸口から直接の分（thru6）は戸口の遅れ、耳の部屋へ流す分は部屋の遅れで重み付け。
                         //   ★e6 は「thru·preDoor ＋ fp·(preRoom ＋ pull·(preDoor − preRoom))」の並びで書く。先着の重みが無いとき
                         //     (preDoor = preRoom = 1) は pull によらず同じ式になり、寄せで総量が 1 ビットも変わらない（検査 ⑦）。
-                        const float base = sm[kLate][b] * W.w[kLate];
+                        const float base = sm[kLate][b] * wLate;
                         const float fp = (1.0f - thru[b]) * feed;
                         if (contain > 0.0f) {
                             // 閉じ込め: 戸口から直接 ＝ thru ＋ fp·(pull ＋ (1−pull)·c) ＋ own·c、耳の部屋へ流す ＝ fp·(1−pull)·(1−c)
@@ -366,15 +393,34 @@ public:
                             o->e6[b] = base * (thru[b] * preDoor + fp * (preRoom + pull * (preDoor - preRoom)));
                         }
                     }
+                    // 戸口越しの分の向きと集まり具合（段 2-f）。★向きの時定数（directionSec）で追う（2026-10-01）。
+                    //   生の値のまま使っていた頃、扉が開いて板の端が枠を抜け、戸口越しのレイが生まれた瞬間に集まり具合が
+                    //   0 → 1 と跳んだ。FDN はその部屋の響きを「広がり」から「戸口の点」へ一度に移すので、出口が 1 ブロック
+                    //   +2.2 dB 跳ねて次で −2.6 dB 落ちた（AF_ONLY=shadowexit、耳 x=−2・扉 7.2°。発注者「扉の影から出た瞬間がおかしい」）。
+                    //   初期反射の向き・広がり（受取面のタップ）と同じ追い方。量（e6）は今までどおり即時 ── すき間が開いた変化は残す。
                     float mass = 0.0f;
                     for (int b = 0; b < kNumBands; ++b) mass += T.lateOther6[b];
                     const float len = std::sqrt(T.otherDir[0] * T.otherDir[0] + T.otherDir[1] * T.otherDir[1] + T.otherDir[2] * T.otherDir[2]);
+                    const float aD = (rs.directionSec > 1e-4f) ? 1.0f - std::exp(-in.dt / rs.directionSec) : 1.0f;
+                    float focusT = 0.0f;                     // 戸口越しのレイが無ければ集まり 0（広がり 1）へ戻っていく
                     if (len > 0.0f && mass > 0.0f) {
-                        o->dir[0] = T.otherDir[0] / len; o->dir[1] = T.otherDir[1] / len; o->dir[2] = T.otherDir[2] / len;
-                        o->focus = std::min(1.0f, len / mass);
+                        const Vec3 dT(T.otherDir[0] / len, T.otherDir[1] / len, T.otherDir[2] / len);
+                        focusT = std::min(1.0f, len / mass);
+                        if (length(otherDirSm_) < 0.5f) otherDirSm_ = dT;   // 向きを持っていなかった（集まり 0）なら、そのまま置く
+                        else {
+                            const Vec3 d = otherDirSm_ + (dT - otherDirSm_) * aD;
+                            const float ld = length(d);
+                            otherDirSm_ = (ld > 1e-6f) ? d * (1.0f / ld) : dT;
+                        }
+                    }
+                    otherFocusSm_ += aD * (focusT - otherFocusSm_);
+                    if (length(otherDirSm_) > 0.5f) {
+                        o->dir[0] = otherDirSm_.x; o->dir[1] = otherDirSm_.y; o->dir[2] = otherDirSm_.z;
+                        o->focus = std::min(1.0f, std::max(0.0f, otherFocusSm_));
                     }
                 }
             }
+            if (!apart) { otherFocusSm_ = 0.0f; otherDirSm_ = Vec3(0, 0, 0); }   // 同じ部屋に入った: 次に分かれるときは広がりから
         } else {
             for (int b = 0; b < kNumBands; ++b) out.component6[kLate][b] += raw[kLate][b];
         }
@@ -398,6 +444,8 @@ private:
     };
     std::vector<FaceSmooth> faceSm_;
     float onsetSm_ = -1.0f;
+    Vec3  otherDirSm_{0, 0, 0};   // 戸口越しの後期の向き（ワールド、directionSec で追う）。ゼロ = まだ向きが無い
+    float otherFocusSm_ = 0.0f;   // その集まり具合（0 一様 … 1 一点）
     Follower6 f_[kNumComponents];
     Follower6 fOther_;   // 段 2-f。後期のうち戸口越しの分。後期と同じ速さで追い、比を取る
 };

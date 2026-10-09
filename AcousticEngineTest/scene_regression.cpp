@@ -4027,8 +4027,8 @@ void testHrtfLeftRight() {
     AF_HrtfHandle syn = AF_HrtfCreateSynthetic(kSr);
     check1(syn, "合成");
     AF_HrtfDestroy(syn);
-    AF_HrtfHandle km = AF_HrtfLoadFile("UnityDemo/Assets/StreamingAssets/kemar.afhr");
-    if (!km) km = AF_HrtfLoadFile("../UnityDemo/Assets/StreamingAssets/kemar.afhr");
+    AF_HrtfHandle km = AF_HrtfLoadFile("Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr");
+    if (!km) km = AF_HrtfLoadFile("../Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr");
     if (km) {
         std::printf("      実測 HRTF: %d 方向\n", AF_HrtfDirectionCount(km));
         check1(km, "実測");

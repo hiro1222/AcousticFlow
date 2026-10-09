@@ -19,9 +19,9 @@ constexpr int   kBlock = 512;      // Unity の DSP バッファ（Best Latency 
 constexpr float kSeconds = 10.0f;
 
 AF_HrtfHandle loadHrtf() {
-    const char* paths[] = {"UnityDemo/Assets/StreamingAssets/kemar.afhr",
-                           "../UnityDemo/Assets/StreamingAssets/kemar.afhr",
-                           "../../UnityDemo/Assets/StreamingAssets/kemar.afhr"};
+    const char* paths[] = {"Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr",
+                           "../Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr",
+                           "../../Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr"};
     for (const char* p : paths) { AF_HrtfHandle h = AF_HrtfLoadFile(p); if (h) return h; }
     return AF_HrtfCreateSynthetic(kRate);
 }

@@ -39,7 +39,7 @@ if (-not $?) { throw "DLL のビルドに失敗しました。" }
 
 # 2) Unity の Plugins へコピー。
 $src = Join-Path $root "build\bin\Release\AcousticEngine.dll"
-$dstDir = Join-Path $root "UnityDemo\Assets\Plugins\x86_64"
+$dstDir = Join-Path $root "Projects\UnityDemo\Assets\Plugins\x86_64"
 if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Force -Path $dstDir | Out-Null }
 $dst = Join-Path $dstDir "AcousticEngine.dll"
 

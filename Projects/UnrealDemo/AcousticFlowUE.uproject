@@ -1,0 +1,13 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.6",
+	"Category": "",
+	"Description": "AcousticFlow audition stand on Unreal (engine + Wwise plugin)",
+	"Modules": [
+		{
+			"Name": "AcousticFlowUE",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

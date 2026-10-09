@@ -14,10 +14,31 @@ set(ACOUSTIC_SOURCES
     src/Export/scene_api.cpp
     src/Export/voice_api.cpp
     src/Export/world_api.cpp
+    src/Export/host_api.cpp    # 外の器（Wwise のプラグイン）との台帳（2026-09-29）
     src/Core/material.cpp
 )
 
-add_library(AcousticEngine SHARED ${ACOUSTIC_SOURCES})
+# ── IDE に見せるヘッダ（2026-09-24）──
+#   このエンジンはほぼ全部がヘッダ（59 本）で、.cpp は 5 本しかない。ヘッダを target に載せないと
+#   Visual Studio のソリューション エクスプローラにはその 5 本しか出ず、中身をたどれなかった。
+#   ★載せてもコンパイル対象は増えない（ヘッダは翻訳単位にならない）。出来上がる DLL は 1 バイトも変わらない。
+#   ★CONFIGURE_DEPENDS: ファイルを足したときに cmake を手で回し直さなくて済む。代わりにビルドのたびに
+#     glob が 1 回走るが、64 ファイルなので費用は無視できる。明示列挙にすると、新しい段を書くたびに
+#     ここへ足す手間が増え、忘れると「IDE から見えないファイル」が生まれる（それが今の状態だった）。
+file(GLOB_RECURSE ACOUSTIC_HEADERS CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
+     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h")
+
+add_library(AcousticEngine SHARED ${ACOUSTIC_SOURCES} ${ACOUSTIC_HEADERS})
+
+# 置いてあるフォルダの形（include / src/Core / src/Dsp / src/Flow / src/Debug / src/Export / src/Gpu）
+# のままツリーに出す。既定の「ソース ファイル / ヘッダー ファイル」の 2 つ山だと、59 本が一列に並んで探せない。
+set(ACOUSTIC_SOURCES_ABS "")
+foreach(s IN LISTS ACOUSTIC_SOURCES)
+    list(APPEND ACOUSTIC_SOURCES_ABS "${CMAKE_CURRENT_SOURCE_DIR}/${s}")
+endforeach()
+source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" PREFIX "AcousticEngine"
+             FILES ${ACOUSTIC_SOURCES_ABS} ${ACOUSTIC_HEADERS})
 
 # 公開ヘッダ（C API）の場所を利用側にも伝える（PUBLIC）。
 target_include_directories(AcousticEngine PUBLIC include)

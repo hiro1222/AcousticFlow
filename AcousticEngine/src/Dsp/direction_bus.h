@@ -96,9 +96,17 @@ public:
         out[0] = laneDir_[k][0]; out[1] = laneDir_[k][1]; out[2] = laneDir_[k][2];
     }
 
+    /// タップを 2 レーンに分けるか（既定 入 ＝ 今までどおり）。切ると「かぶりなし」＝ いちばん近い 1 本だけに入る。
+    ///   ★入: 向きが 2 レーンにまたがるので、耳では 45° ぶんにじむ代わりに、境目をまたいでも跳ばない。
+    ///     切: 1 レーンが担当する扇（8 本なら ±22.5°）の中だけで鳴るので方向がはっきり分かれる代わりに、
+    ///         扇の境目をまたぐ瞬間に音が乗り換える。どちらが良いかは耳で決める（発注者の指示、2026-09-25）。
+    void setPanSplit(bool on) { panSplit_ = on; }
+    bool panSplit() const { return panSplit_; }
+
     /// タップの方向（リスナー座標。+x 右 / +z 正面）→ 隣り合う 2 方向と等パワーの重み。
     ///   方位角だけを見る（上下は畳む）。真上・真下（水平成分が無い）は正面扱い。
-    static void laneWeights(const float dir[3], int lanes, int outLane[2], float outW[2]) {
+    ///   split=false なら近い方のレーンに 1、もう片方に 0（かぶりなし。呼び手は同じ形のまま使える）。
+    static void laneWeights(const float dir[3], int lanes, int outLane[2], float outW[2], bool split = true) {
         lanes = std::max(kMinLanes, std::min(lanes, kMaxLanes));
         float az = std::atan2(dir[0], dir[2]);           // 0 = 正面、+ = 右回り
         if (az < 0.0f) az += 2.0f * kPi;
@@ -109,8 +117,14 @@ public:
         const float f = pos - std::floor(pos);
         outLane[0] = k0;
         outLane[1] = (k0 + 1) % lanes;
-        outW[0] = std::cos(f * 0.5f * kPi);
-        outW[1] = std::sin(f * 0.5f * kPi);
+        if (split) {
+            outW[0] = std::cos(f * 0.5f * kPi);
+            outW[1] = std::sin(f * 0.5f * kPi);
+        } else {
+            // かぶりなし: 扇の真ん中で乗り換える（f < 0.5 なら手前のレーン）。量は 1 のまま（等パワーの和も 1）。
+            outW[0] = (f < 0.5f) ? 1.0f : 0.0f;
+            outW[1] = 1.0f - outW[0];
+        }
     }
 
     /// 低域と高域の境（Hz）。0 で分けない（旧: 全帯域を HRIR で畳む）。★HRTF を差す前に決める（量の揃え方が変わる）。
@@ -262,6 +276,7 @@ private:
     float laneDir_[kMaxLanes][3] = {};
     std::vector<std::unique_ptr<NonUniformConvolver>> conv_;   // 行ごと（モノラル IR）
     bool hasHrtf_ = false;
+    bool panSplit_ = true;      // タップを隣り合う 2 レーンへ分けるか（既定 入 ＝ 今までどおり）
     const HrtfSet* hrtfSet_ = nullptr;
     std::vector<float> in_;                 // [行][maxFrames] 溜まった送り
     int pending_ = 0;                       // このブロックで触った長さ

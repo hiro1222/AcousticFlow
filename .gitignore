@@ -1,6 +1,6 @@
 # --- ルート直下の stray Unity プロジェクト ---
-# 本体は UnityDemo/ 配下。ルートの Packages/ ProjectSettings/ は誤って生成された
-# 空プロジェクトなので追跡しない（UnityDemo/ 配下は別途追跡される）。
+# 本体は Projects/UnityDemo/ 配下（2026-09-30 に UnityDemo/ から移した）。ルートの Packages/ ProjectSettings/ は誤って生成された
+# 空プロジェクトなので追跡しない（Projects/UnityDemo/ 配下は別途追跡される）。
 /Packages/
 /ProjectSettings/
 
@@ -50,7 +50,7 @@ obj/
 # --- Wwise 音声バンク（巨大＋楽曲の著作権のため公開リポジトリに含めない）---
 # .bnk は Wwise プロジェクトから生成する成果物。コードではないので追跡しない。
 # 詳細は docs/CODE_GUIDE.md（ビルド&デプロイ）参照。
-UnityDemo/Assets/StreamingAssets/WwiseBanks/*.bnk
+Projects/UnityDemo/Assets/StreamingAssets/WwiseBanks/*.bnk
 
 # OneDrive/Windows がフォルダに作るゴミ
 desktop.ini
@@ -58,9 +58,60 @@ desktop.ini
 **/desktop.ini.meta
 build2/
 
+# ミドルウェア（開発環境）のビルド出力。
+# Middleware/ は独立した CMake プロジェクトなので、生成先もその下にある。
+Middleware/build/
+
+# remote.ps1 が撮った画面。ノートから確かめるための使い捨てなので追跡しない。
+# 資料に載せる図は portfolio/ 側へ置くこと。
+Middleware/shots/
+
 # --- 生の音声素材（商用曲を含むため公開リポジトリに入れない）---
 # ロクデナシ「ブリザード」は商用音源で、**出荷にもリポジトリにも載せられません**。
 # 検証用に手元へ置いているだけなので、まとめて追跡から外す。
 # 差し替え可能な効果音を入れるときは、ここに例外を書くこと。
-UnityDemo/Assets/Audio/*.wav
-UnityDemo/Assets/Audio/*.wav.meta
+Projects/UnityDemo/Assets/Audio/*.wav
+Projects/UnityDemo/Assets/Audio/*.wav.meta
+
+# Wwise（2026-09-29）: 生成物・キャッシュ・音の素材・個人設定は入れない。バンクは tools/wwise_setup.py で作り直せる
+#   Wwise のプロジェクトは Projects/ の直下に、ゲームのプロジェクトと並べて置く（Unity 用・Unreal 用とも同じ規則）
+Projects/*_WwiseProject/.cache/
+Projects/*_WwiseProject/GeneratedSoundBanks/
+Projects/*_WwiseProject/Originals/**/*.wav
+Projects/*_WwiseProject/*.wsettings
+Projects/*_WwiseProject/*.akd
+Projects/*_WwiseProject/*.validationcache
+Projects/UnityDemo/WwiseUnityIntegration_*_Src.zip
+
+# Unreal の試聴台（2026-09-29）: ビルド生成物・キャッシュ・Wwise の統合本体は入れない
+Projects/UnrealDemo/Binaries/
+Projects/UnrealDemo/Intermediate/
+Projects/UnrealDemo/Saved/
+Projects/UnrealDemo/DerivedDataCache/
+Projects/UnrealDemo/.vs/
+Projects/UnrealDemo/*.sln
+Projects/UnrealDemo/Plugins/Wwise/
+# 2026-10-10（別の PC へ git で移すため）: Wwise の統合の残り（SDK の ThirdParty は 1 つ 345 MB の Mac 用ライブラリがあり GitHub に載らない）と、
+#   エンジンのテンプレートから写したキャラクター素材も入れない。向こうでは Audiokinetic Launcher とエンジンのテンプレートから入れ直す（docs/SETUP_OTHER_PC.md）
+Projects/UnrealDemo/Plugins/
+Projects/UnrealDemo/Content/Characters/
+# Unity 用の Wwise の統合（Launcher が入れる。Mac 用の dSYM が 80 MB 近くある）
+Projects/UnityDemo/Assets/Wwise/
+Projects/UnityDemo/Assets/Wwise.meta
+**/__pycache__/
+
+# 物置（2026-09-30 の整理で最上位から移した、git に入っていない物。要らなければ消してよい）
+/_attic/
+
+# 学習用のサイト（docs/study/make_site.py が作る。Artifact「AcousticFlow を学ぶ」に出す物。作り直せるので入れない）
+docs/study/_site/
+docs/study/_site_web/
+
+# --- 例外: フリー音源の試験の音（2026-10-10、発注者の指定。別の PC へ git で持っていくため）---
+#   上の「Assets/Audio/*.wav」「Originals/**/*.wav」で外している中から、これだけを入れる。前の 2 曲は著作物なので入れない
+!Projects/UnityDemo/Assets/Audio/FreeTestSound.wav
+!Projects/UnityDemo/Assets/Audio/FreeTestSound.wav.meta
+!Projects/*_WwiseProject/Originals/SFX/FreeTestSound.wav
+
+# Unity の起動のログ
+Projects/UnityDemo/logRunSetup.txt

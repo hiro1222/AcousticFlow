@@ -67,9 +67,30 @@ enum Component : int { kDirect = 0, kEarly = 1, kLate = 2, kDiffract = 3, kTrans
 //   ★掛けるのは distribute の出口 1 か所だけ。
 struct WorldWeights {
     float w[kNumComponents] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    /// 隣の部屋の響き（2026-10-01）。音源が耳と別の部屋にいるときの後期だけに、w[kLate] へさらに掛ける（エネルギー比）。
+    ///   戸口から抜けてくる響き（戸口の線音源）と、耳の部屋で響かせる分の両方。音源と耳が同じ部屋なら掛けない。
+    ///   発注者「隣の部屋から抜ける反射音が支配的過ぎて、角度による音色の変化がはっきりしない・隣の部屋で反響が大きすぎる」。
+    ///   手前の部屋では 10〜60° の間、響きが角度で変わる音（直接・回折・透過・初期）より 10〜14 dB 大きかった（AF_ONLY=shadowexit）。
+    ///   形（RT60・向き・遅れ）は変えず量だけ（S2: 量は耳で決める）。既定 1 ＝ 今までと 1 ビットも同じ。
+    float lateAdjacent = 1.0f;
+    /// 影のこもり（2026-10-06、dB、0..24、既定 0）。遮られた直接の道（透過・回折）の出口にだけ、高域を余分に落とす。
+    ///   帯域 b（125 Hz … 4 kHz）で −S·b/5 dB ＝ オクターブあたり S/5 dB の傾き。125 Hz は 0、4 kHz で −S。
+    ///   発注者「ドアの影の時のこもりをもう少し大きくしたい」。扉の部屋では響きが帳簿の 3〜8 割を占め、
+    ///   透過・回折のこもり（閉 +20 dB）が響きに薄められていた（全部込みで +14 dB、10° で +6 dB）。
+    ///   ★傾きにしたのは、物理の 2 つ（板の質量則 ≈ 6 dB/oct、前川の回折 ≈ 3 dB/oct）がどちらも傾きだから。
+    ///     棚（500 Hz から上だけ）にすると角ができ、「板が厚くなった」ではなく「フィルタを掛けた」に聞こえる。
+    ///   ★見通しの割合で連続に効く: 透過も回折も量が (1 − 見通し) に比例するので、影から出れば掛かる量ごと 0 へ下りる（二値の切り替えなし）。
+    ///   演出の摘み（先着の重みと同じ形）: エンジンの既定は 0（物理どおり）、聞かせたい値は載る側が持つ。
+    float shadowMuffleDb = 0.0f;
+    /// 影のこもりを帯域ごとの係数（エネルギー比）にする。S = 0 なら厳密に 1（今までと 1 ビットも同じ）。
+    void shadowMuffle6(float g6[kNumBands]) const {
+        const float s = std::fmin(24.0f, std::fmax(0.0f, shadowMuffleDb));
+        for (int b = 0; b < kNumBands; ++b)
+            g6[b] = (s > 0.0f) ? std::pow(10.0f, -0.1f * s * static_cast<float>(b) / static_cast<float>(kNumBands - 1)) : 1.0f;
+    }
     bool isIdentity() const {
         for (int i = 0; i < kNumComponents; ++i) if (std::fabs(w[i] - 1.0f) > 1e-6f) return false;
-        return true;
+        return std::fabs(lateAdjacent - 1.0f) <= 1e-6f && shadowMuffleDb <= 0.0f;
     }
 };
 

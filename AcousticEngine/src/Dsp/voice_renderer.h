@@ -15,7 +15,8 @@
 //
 // スレッド規約:
 //   setTaps / setTailIr / setDirection … 制御スレッド
-//   render()                            … オーディオスレッド（確保・ロックなし）
+//   setFdnMix / setDirectionBus         … 制御スレッド（行き先を atomic に置くだけ。鳴らしている最中に呼んでよい）
+//   render()                            … オーディオスレッド（確保・ロックなし）。行き先はチャンクの頭で 1 回だけ読む
 //
 // 移行元は UnityDemo/Assets/Scripts/AcousticFlow/IrConvolver.cs の OnAudioFilterRead。
 // FDN 尾（tailMode=Fdn）は比較用の旧方式なので移していない。本命は実測エコグラム由来の尾。
@@ -135,6 +136,11 @@ public:
         tailOutL_.assign(mf, 0.0f);
         tailOutR_.assign(mf, 0.0f);
         maxFrames_ = static_cast<int>(mf);
+        // 方向バスへの送りの箱は、最大の行数（kMaxLanes × 2 耳）で先に取っておく（2026-09-30）。
+        //   バスを差すときに制御スレッドで取り直すと、鳴らしている最中の箱を解放して落ちうる。
+        //   render で取るのは「確保しない」の約束に反する。1 音源あたり 32 行 × (maxFrames + 64) 個。
+        laneStride_ = maxFrames_ + EarlyReflectConv::kLaneItdMax;
+        laneBuf_.assign(static_cast<std::size_t>(DirectionBus::kMaxLanes * 2) * laneStride_, 0.0f);
         // 尾の FDN の開始（手順 5）: 送りの前の遅延線。上限 240 ms ＋ 1 チャンク。
         fdnDelayLen_ = static_cast<int>(0.25f * static_cast<float>(sampleRate_)) + maxFrames_ + 2;
         fdnDelay_.assign(static_cast<std::size_t>(fdnDelayLen_), 0.0f);
@@ -155,14 +161,17 @@ public:
         if (!taps || count <= 0) { early_.setTaps(taps, count); return; }
         tapScratch_.assign(taps, taps + count);
         const bool cues = earCues_ && hrtfSet_ && hrtfSet_->hasEarBands();
-        const int lanes = dirBus_ ? dirBus_->horizontalLanes() : 0;   // タップは水平の環へ振る（上下のレーンは尾だけ）
-        const int busLatency = dirBus_ ? dirBus_->latency() : 0;
+        DirectionBus* const bus = dirBus_.load(std::memory_order_acquire);   // 1 回だけ読む（途中で外されても同じバスで割り当てる）
+        const int lanes = bus ? bus->horizontalLanes() : 0;   // タップは水平の環へ振る（上下のレーンは尾だけ）
+        const int busLatency = bus ? bus->latency() : 0;
         for (int i = 1; i < count; ++i) {           // index 0 は直接音＝フル HRTF が担当
             EarlyReflectConv::Tap& d = tapScratch_[static_cast<std::size_t>(i)];
             if (!d.dirValid || d.hrtfWeight > 0.0f) continue;   // 方向なし／HRTF バス行き
             if (lanes > 0) {
                 // 方向バス行き: 隣り合う 2 レーンへ等パワー。バスの固有遅延（firstBlock）ぶんタップを早める。
-                DirectionBus::laneWeights(d.dir, lanes, d.lane, d.laneW);
+                // かぶりなし（バスの設定）なら、いちばん近い 1 レーンだけに入る。既定は今までどおり 2 レーンへ等パワー。
+                const bool split = bus->panSplit();
+                DirectionBus::laneWeights(d.dir, lanes, d.lane, d.laneW, split);
                 d.laneUse = true;
                 if (d.width > 1e-4f) {
                     // 幅（虚像の面音源）: 方位角 ±width の弧を刻み、各点の 2 レーンの量（重み²）を平均して幅の中のレーンの重みにする。
@@ -179,7 +188,7 @@ public:
                         const float az = az0 + w * (2.0f * static_cast<float>(m) / static_cast<float>(M - 1) - 1.0f);
                         const float dd[3] = {std::sin(az), 0.0f, std::cos(az)};
                         int ln[2]; float lw[2];
-                        DirectionBus::laneWeights(dd, lanes, ln, lw);
+                        DirectionBus::laneWeights(dd, lanes, ln, lw, split);
                         for (int q = 0; q < 2; ++q)
                             if (ln[q] >= 0 && ln[q] < EarlyReflectConv::kWideLanes) E[ln[q]] += lw[q] * lw[q] / static_cast<float>(M);
                     }
@@ -276,7 +285,7 @@ public:
             return 1.0f;
         }
         // ★尾の FDN に預けているなら IR を組まない（形は部屋の FDN が持つ。ここは量だけ）。
-        if (fdnMix_) {
+        if (fdnMix_.load(std::memory_order_acquire)) {
             tailGain_ = ReverbTailIr::calibrateGain(directGain, targetRatio);
             return 1.0f;
         }
@@ -324,8 +333,10 @@ public:
     // ── 尾の FDN（tailModel=1、docs/TAIL_FDN_PLAN.md 手順 4）──
     /// 部屋ごとの FDN へ預ける。null で畳み込みに戻る（既定）。**制御スレッド**。
     ///   差すと、この音源は IR を組まず（rebuildTail は量だけ）、送るだけになる。畳み込みの器はそのまま眠る。
-    void setFdnMix(FdnRoomMix* mix) { fdnMix_ = mix; }
-    const FdnRoomMix* fdnMix() const { return fdnMix_; }
+    ///   ★鳴らしている最中に呼んでよい（片付けで null、器の作り直しで新しい器）。render はチャンクの頭で 1 回だけ読む。
+    ///     古い器を壊してよいのは、差し替えてから 1 ブロック以上たってから（ホストは 1 秒おく）。
+    void setFdnMix(FdnRoomMix* mix) { fdnMix_.store(mix, std::memory_order_release); }
+    const FdnRoomMix* fdnMix() const { return fdnMix_.load(std::memory_order_acquire); }
     /// 送り先の部屋と重み（振幅、最大 kMaxFdnSends 本）。ホストが毎フレーム置く（scene の fdnRoomWeights）。
     ///   重みは render がチャンク内で線形に繋ぐ。並びが変わっても同じ部屋への送りは前の値から繋ぐ。
     void setFdnSends(const int* rooms, const float* gains, int n) {
@@ -356,13 +367,10 @@ public:
 
     /// 反射・回折のタップを方向バスへ預ける。bus=NULL で自前の両耳化（軽量両耳化／パン）に戻る。
     ///   ★次の setTaps から効く（レーンの割り当てはタップを受け取るときに決める）。
-    void setDirectionBus(DirectionBus* bus) {
-        dirBus_ = bus;
-        laneStride_ = maxFrames_ + EarlyReflectConv::kLaneItdMax;
-        if (bus) laneBuf_.assign(static_cast<std::size_t>(bus->rows()) * laneStride_, 0.0f);
-        laneCarry_ = 0;
-    }
-    const DirectionBus* directionBus() const { return dirBus_; }
+    ///   ★鳴らしている最中に呼んでよい。置くだけで、送りの箱には触らない（箱は構築時に最大で取ってある。
+    ///     ここで取り直していた頃は、鳴らしている最中の箱を解放しうる形だった）。持ち越しの捨て方は render が決める。
+    void setDirectionBus(DirectionBus* bus) { dirBus_.store(bus, std::memory_order_release); }
+    const DirectionBus* directionBus() const { return dirBus_.load(std::memory_order_acquire); }
 
     /// 尾 IR のクロスフェードの長さ(ms)。0 で即差し替え（＝ふくらむ。A/B 用）。
     void setTailCrossfadeMs(float ms) {
@@ -414,6 +422,13 @@ private:
 
     void renderChunk(const float* input, int n, float* outL, float* outR, Metering& m,
                      int dstOffset = 0) {
+        // ⓪ 行き先（尾の FDN・方向バス）は**チャンクの頭で 1 回だけ**読み、このチャンクの間はずっとそれを使う（2026-09-30）。
+        //   「空か確かめる → 後で使う」と 2 回読んでいた頃、その間に制御スレッドが外して（片付けの Detach）
+        //   空ポインタを踏んだ（Unreal の Play 終了時、0x10 番地の読み出しで落ちた）。
+        //   読んだ器はこのチャンクの間は生きている（器を壊すのは外してから 1 秒後 ── ホストの約束）。
+        FdnRoomMix* const fdn = fdnMix_.load(std::memory_order_acquire);
+        DirectionBus* const bus = dirBus_.load(std::memory_order_acquire);
+        if (bus != laneBus_) { laneCarry_ = 0; laneBus_ = bus; }   // バスが替わったら ITD の持ち越しは捨てる（別のバスの続きではない）
         // ① 後期尾はブロック単位（周波数領域）。サンプルループより前に済ませる。
         std::fill(tailOutL_.begin(), tailOutL_.begin() + n, 0.0f);
         std::fill(tailOutR_.begin(), tailOutR_.begin() + n, 0.0f);
@@ -423,7 +438,7 @@ private:
         //   ★尾の FDN に預けているときは tailSrcLevel_（反射込みの生存＝遮蔽）を掛けない。
         //     部屋をまたぐ減りは配線（開口率² × 立体角）が持つので、ここでも掛けると二重になる
         //     （実測 2026-09-09: 扉 60° 越しで畳み込みより −21 dB。配線ぶんがそのまま出ていた）。
-        const float lvl = tailLevel_ * (fdnMix_ ? 1.0f : tailSrcLevel_);
+        const float lvl = tailLevel_ * (fdn ? 1.0f : tailSrcLevel_);
         // 差し替えの混ぜは器の中（新旧の IR スペクトルを等振幅で。遅延線は共有）。
         // 【尾の量の傾斜】tailGain_ は組み直し（ホストは 8 フレームに 1 回）でしか動かない。
         //   チャンク境界でそのまま掛けると**段差**になり、扉が動くと量が速く動くので
@@ -440,7 +455,7 @@ private:
         //   ⚠ IR が違う音源を同じバスへ入れてはいけない。部屋ごとに 1 本。
         //   ⚠ クロスフェードもバスが持つ（IR がバス側にあるので）。
         //   ⚠ この音源の rmsTail は 0 になる。計器はバス側の rms() を見ること。
-        if (fdnMix_) {
+        if (fdn) {
             // 【尾の FDN】部屋ごとの FDN へ**送るだけ**（tailModel=1）。IR も器も無い。
             //   送り先と重みはホストが毎フレーム置く（fdnRoomWeights: 自分の部屋＝占め方、戸口越しの隣室＝開口率²×立体角）。
             //   量の傾斜は共有バスと同じ（tgStart → tgEnd をチャンク内で線形）。送りの重みも前のチャンクの値から繋ぐ。
@@ -516,7 +531,7 @@ private:
                 if (fdnRoom_[k] < 0) continue;
                 const float gS = tgStart * outputGain_ * fdnGainCur_[k];
                 const float gE = tgEnd * outputGain_ * fdnGainTgt_[k];
-                if (gS > 0.0f || gE > 0.0f) fdnMix_->add(fdnRoom_[k], sendSrc, n, gS, gE, dstOffset);
+                if (gS > 0.0f || gE > 0.0f) fdn->add(fdnRoom_[k], sendSrc, n, gS, gE, dstOffset);
                 fdnGainCur_[k] = fdnGainTgt_[k];
                 if (fdnGainTgt_[k] <= 0.0f) fdnRoom_[k] = -1;   // 繋ぎ終えた送りは片付ける
             }
@@ -561,12 +576,12 @@ private:
         if (difActive) hrtfDif_.beginBlock();
         early_.beginBlock();
         // 方向バスがあれば、このチャンクぶんのレーンの箱を 0 にしておく（[レーン][maxFrames]）。
-        const int rows = dirBus_ ? dirBus_->rows() : 0;   // 方向 × 2 耳
+        //   箱は構築時に最大の行数で取ってあるので、ここでは取らない（足りなければレーンを使わない ── 起きないはず）。
+        int rows = bus ? bus->rows() : 0;   // 方向 × 2 耳
+        if (static_cast<std::size_t>(rows) * laneStride_ > laneBuf_.size()) rows = 0;
         float* laneOut = nullptr;
         if (rows > 0) {
             // 行は maxFrames + kLaneItdMax。前のチャンクで末尾の余裕へ書かれた ITD ぶんを頭へ持ち越してから、残りを 0 にする。
-            if (laneBuf_.size() < static_cast<std::size_t>(rows) * laneStride_)
-                laneBuf_.assign(static_cast<std::size_t>(rows) * laneStride_, 0.0f);
             const int carry = EarlyReflectConv::kLaneItdMax;
             for (int k = 0; k < rows; ++k) {
                 float* row = laneBuf_.data() + static_cast<std::size_t>(k) * laneStride_;
@@ -644,7 +659,7 @@ private:
                 for (int i = 0; i < n; ++i) e += v[i] * v[i];
             }
             m.rmsEarly += e * outputGain_ * outputGain_;
-            dirBus_->add(laneOut, n, laneStride_, outputGain_, dstOffset);
+            bus->add(laneOut, n, laneStride_, outputGain_, dstOffset);
             laneCarry_ = n;   // 末尾の余裕（[n, n+kLaneItdMax)）は次のチャンクの頭へ
         }
     }
@@ -662,13 +677,14 @@ private:
     // 共有バス。null なら自前で畳む（既定＝これまでどおり）。
     //   バスを差すと、この音源は尾を**送るだけ**になり、畳み込みは 1 回に集約される。
     TailBus* tailBus_ = nullptr;
-    DirectionBus* dirBus_ = nullptr;   // 反射・回折タップの行き先（リスナーに 1 組、全音源で共有）
-    std::vector<float> laneBuf_;       // [行][maxFrames + kLaneItdMax] このチャンクの送り（末尾は ITD の持ち越し）
+    std::atomic<DirectionBus*> dirBus_{nullptr};   // 反射・回折タップの行き先（リスナーに 1 組、全音源で共有）。制御スレッドが置く
+    DirectionBus* laneBus_ = nullptr;  // render が前のチャンクで使ったバス（オーディオスレッドだけが触る）
+    std::vector<float> laneBuf_;       // [行][maxFrames + kLaneItdMax] このチャンクの送り（末尾は ITD の持ち越し）。構築時に最大で取る
     int laneStride_ = 0;
-    int laneCarry_ = 0;                 // 前のチャンクの長さ（持ち越しの読み出し位置）
+    int laneCarry_ = 0;                 // 前のチャンクの長さ（持ち越しの読み出し位置）。オーディオスレッドだけが触る
     bool tailBusOwner_ = false;    // この音源が IR をバスへ入れる係か（部屋の代表）
     // 尾の FDN（tailModel=1）。null なら従来（畳み込み）。差すと IR を組まず、部屋ごとの FDN へ送るだけ。
-    FdnRoomMix* fdnMix_ = nullptr;
+    std::atomic<FdnRoomMix*> fdnMix_{nullptr};   // 制御スレッドが置き、render がチャンクの頭で 1 回だけ読む
     int   fdnRoom_[kMaxFdnSends] = { -1, -1, -1, -1 };      // オーディオスレッドの写し
     float fdnGainTgt_[kMaxFdnSends] = {};
     float fdnGainCur_[kMaxFdnSends] = {};                   // 直前のチャンクの終わりの重み（傾斜の出発点）

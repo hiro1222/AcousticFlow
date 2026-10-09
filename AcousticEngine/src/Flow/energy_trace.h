@@ -91,6 +91,8 @@ inline float airEnergy(int band, float dist) {
 }
 
 struct TraceGroups { static constexpr int kMax = 8; };
+/// TraceParams::listenerRoom の「耳が外にいる」（World::setOutsideMouth）。−1（分けない）と区別する。GPU の核も同じ値で見る。
+constexpr int kListenerOutside = -2;
 
 struct TraceParams {
     int   rays = 256;               // 予算（budget が音源ごとに決める）。この本数で割った 1 本の重み 1/rays を使う
@@ -109,6 +111,7 @@ struct TraceParams {
     //   耳のいる部屋。0 以上なら、後期の NEE を「放射した面が耳と同じ部屋に面しているか」で分け、
     //   別の部屋（戸口越し）の分を lateOther6 と otherDir に**足す**。late6 は総量のまま変えない。
     //   -1 なら分けない（今までと 1 ビットも同じ）。
+    //   kListenerOutside（−2）は「耳が外にいる」（World::setOutsideMouth）。どれかの部屋に面した面から来た分を全部、別の部屋の分にする。
     int   listenerRoom = -1;
     // ── 壁越しの反射（2026-09-12）──
     //   1 なら旧: 影の線が壁を横切っても τ を掛けて初期・後期に数える（向こうの部屋の反射と残響が壁越しに薄まって届く）。
@@ -280,7 +283,7 @@ inline void traceRay(const TraceScene& sc,
                 //   ★面の上の点は格子では壁の中（実体）に落ちるので、リスナーの側へ押し出した点で部屋を引く。
                 //     押す量は 0.3 m と格子 1.25 個ぶんの大きい方（格子が粗くなる場面でも壁のボクセルを抜けるように）。
                 //   ★足すだけで late6 は触らない。分けても分けなくても後期の総量は同じ（検査で 1 ビット一致を見る）。
-                if (any && prm.listenerRoom >= 0 && tSec >= prm.mixingSec) {
+                if (any && (prm.listenerRoom >= 0 || prm.listenerRoom == kListenerOutside) && tSec >= prm.mixingSec) {
                     const float push = std::max(0.3f, 1.25f * sc.roomCell);
                     const int room = sceneRoomAt(sc, h.point + side * push);
                     if (room >= 0 && room != prm.listenerRoom) {

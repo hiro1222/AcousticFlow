@@ -15,7 +15,7 @@ target_link_libraries(SceneRegressionTest PRIVATE AcousticEngine)
 #   パスはここで焼く（実行時の作業ディレクトリに依存させない）。
 target_compile_definitions(SceneRegressionTest PRIVATE
     AF_BUILT_DLL_PATH="$<TARGET_FILE:AcousticEngine>"
-    AF_UNITY_DLL_PATH="${CMAKE_SOURCE_DIR}/UnityDemo/Assets/Plugins/x86_64/AcousticEngine.dll"
+    AF_UNITY_DLL_PATH="${CMAKE_SOURCE_DIR}/Projects/UnityDemo/Assets/Plugins/x86_64/AcousticEngine.dll"
     AF_DIST_DLL_PATH="${CMAKE_SOURCE_DIR}/DistDemo/Assets/Plugins/x86_64/AcousticEngine.dll")
 
 # エンジン単体で音を作って WAV へ書き出すツール。
@@ -29,6 +29,10 @@ target_link_libraries(AfRenderWav PRIVATE AcousticEngine)
 #   ★旧コアの入口を 1 つも呼ばないので、段 10 で render_wav.cpp を消してもこちらは残る。
 add_executable(AfFlowWav render_wav_flow.cpp)
 target_link_libraries(AfFlowWav PRIVATE AcousticEngine)
+
+# 録画の記録（Unreal の -AFCapture が書く AFCapture_scene.txt）を同じ API で呼び直して音にする（tools/record_unreal_demo.ps1 が使う）。
+add_executable(AfReplayWav replay_capture.cpp)
+target_link_libraries(AfReplayWav PRIVATE AcousticEngine)
 
 # DSP(段4: C++移行) の数値回帰テスト。
 # ヘッダを直接取り込むので DLL には依存しない（移行中は API がまだ生えていないため）。
@@ -69,3 +73,16 @@ target_include_directories(FlowRegressionTest PRIVATE ${CMAKE_SOURCE_DIR}/Acoust
 target_compile_features(FlowRegressionTest PRIVATE cxx_std_17)
 # GPU の道も検査から回す（Unity 無しで確かめられるようにするのが目的）。
 target_link_libraries(FlowRegressionTest PRIVATE d3d11 d3dcompiler dxgi)
+
+# 外の器（Wwise のプラグイン）との台帳の検査（2026-09-29）。
+#   DLL にリンクする（台帳は DLL の中のグローバル。プラグインも Unity と同じ DLL を名前で引いて同じ台帳を読む）。
+add_executable(HostRegressionTest host_regression.cpp)
+target_link_libraries(HostRegressionTest PRIVATE AcousticEngine)
+
+# ── Visual Studio での並び（2026-09-24）──
+#   的が 10 個あってソリューションの根が埋まるので、役割で 2 つのフォルダに分ける。
+#   ★これは IDE の見た目だけの指定で、ビルドの依存も出力先も変わらない。
+set_property(TARGET SceneRegressionTest DspRegressionTest BtmRegressionTest FlowRegressionTest HostRegressionTest
+             PROPERTY FOLDER "検査")
+set_property(TARGET AfRenderWav AfFlowWav AfAnalyzeWav AfPatternTable AfCapScan AfDspBench
+             PROPERTY FOLDER "道具")

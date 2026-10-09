@@ -137,6 +137,24 @@ void AF_WorldSetLateDistanceShape(AF_WorldHandle w, float pow) {
 float AF_WorldLateDistanceShape(AF_WorldHandle w) {
     acoustic::flow::World* W = asWorld(w); return W ? W->lateDistancePow : 0.0f;
 }
+int AF_WorldLateLaneShape(AF_WorldHandle w, float* outShare, float* outDistance, float* outDir3, int maxLanes) {
+    acoustic::flow::World* W = asWorld(w);
+    if (!W || maxLanes <= 0) return 0;
+    int n = 0;
+    const float* share = W->lateLaneShape(n);
+    const float* dist = W->lateLaneDistance();
+    if (n > maxLanes) n = maxLanes;
+    for (int k = 0; k < n; ++k) {
+        if (outShare) outShare[k] = share[k];
+        if (outDistance) outDistance[k] = dist[k];
+        if (outDir3) {
+            float d3[3] = {0.0f, 0.0f, 0.0f};
+            W->lateLaneDirection(k, d3);                 // 器が無ければ 0 のまま（呼び手は長さで判る）
+            outDir3[3 * k] = d3[0]; outDir3[3 * k + 1] = d3[1]; outDir3[3 * k + 2] = d3[2];
+        }
+    }
+    return n;
+}
 void AF_WorldSetAdjacentContain(AF_WorldHandle w, float amount) {
     if (acoustic::flow::World* W = asWorld(w)) W->adjacentContain = (amount < 0.0f) ? 0.0f : (amount > 1.0f ? 1.0f : amount);
 }
@@ -184,6 +202,19 @@ void AF_WorldRoomCellInfo(AF_WorldHandle w, float* req, float* eff, double* vox,
     if (eff) *eff = W->roomCellEffective();
     if (vox) *vox = W->roomVoxels();
     if (maxVox) *maxVox = W->roomMaxVoxels();
+}
+
+void AF_WorldSetRoomSeedRadius(AF_WorldHandle w, float meters) {
+    if (acoustic::flow::World* W = asWorld(w)) W->setRoomSeedRadius((meters < 0.0f) ? 0.0f : (meters > 10.0f ? 10.0f : meters));
+}
+float AF_WorldRoomSeedRadius(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->roomSeedRadius() : 0.0f;
+}
+void AF_WorldSetOutsideMouth(AF_WorldHandle w, int on) {
+    if (acoustic::flow::World* W = asWorld(w)) W->setOutsideMouth(on);
+}
+int AF_WorldOutsideMouth(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->outsideMouth() : 0;
 }
 
 int AF_WorldAddBox(AF_WorldHandle w, AF_Vector3 c, AF_Vector3 he, AF_Vector3 ax, AF_Vector3 ay, int material, int dynamic) {
@@ -251,6 +282,18 @@ int  AF_WorldEmitterRays(AF_WorldHandle w, int e) { acoustic::flow::World* W = a
 void AF_WorldSetWeights(AF_WorldHandle w, const float* w5) {
     acoustic::flow::World* W = asWorld(w); if (!W) return;
     for (int c = 0; c < acoustic::flow::kNumComponents; ++c) W->rules.weights.w[c] = w5 ? w5[c] : 1.0f;
+}
+void AF_WorldSetAdjacentLateWeight(AF_WorldHandle w, float weight) {
+    if (acoustic::flow::World* W = asWorld(w)) W->rules.weights.lateAdjacent = (weight < 0.0f) ? 0.0f : (weight > 4.0f ? 4.0f : weight);
+}
+float AF_WorldAdjacentLateWeight(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->rules.weights.lateAdjacent : 1.0f;
+}
+void AF_WorldSetShadowMuffle(AF_WorldHandle w, float db) {
+    if (acoustic::flow::World* W = asWorld(w)) W->rules.weights.shadowMuffleDb = (db > 0.0f) ? (db < 24.0f ? db : 24.0f) : 0.0f;   // NaN も 0
+}
+float AF_WorldShadowMuffle(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->rules.weights.shadowMuffleDb : 0.0f;
 }
 void AF_WorldSetResponse(AF_WorldHandle w, float level, float colour, float stat, float dir) {
     acoustic::flow::World* W = asWorld(w); if (!W) return;

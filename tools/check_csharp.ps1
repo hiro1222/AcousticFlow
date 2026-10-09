@@ -30,7 +30,7 @@ param([switch]$SelfTest)
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 
-$verFile = Join-Path $root "UnityDemo\ProjectSettings\ProjectVersion.txt"
+$verFile = Join-Path $root "Projects\UnityDemo\ProjectSettings\ProjectVersion.txt"
 if (-not (Test-Path $verFile)) { throw "ProjectVersion.txt が見つかりません" }
 $ver = (Select-String -Path $verFile -Pattern "^m_EditorVersion:\s*(\S+)").Matches[0].Groups[1].Value
 $ue = "C:\Program Files\Unity\Hub\Editor\$ver\Editor\Data"
@@ -122,7 +122,7 @@ public static class Broken { public static string S = "閉じていない
     }
 
     # ── 1) 本番 ──────────────────────────────────────────────
-    $srcDir = Join-Path $root "UnityDemo\Assets\Scripts\AcousticFlow"
+    $srcDir = Join-Path $root "Projects\UnityDemo\Assets\Scripts\AcousticFlow"
     $all = Get-ChildItem "$srcDir\*.cs" -Recurse
     # Unity の分け方に合わせる: パスに \Editor\ を含むものが Editor アセンブリ。
     $editorSrc  = @($all | Where-Object { $_.FullName -match "\\Editor\\" })

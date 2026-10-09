@@ -3,8 +3,11 @@
 // 方針は scene_regression.cpp と同じで、**絶対値ではなく関係**を確かめる。
 // ただし FFT だけは「素朴な DFT と一致する」という絶対の正解があるので、それで押さえる。
 // 移行は「Unity C# 版と同じ音が出る」ことが要件なので、各段で参照実装と突き合わせる。
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -1595,10 +1598,10 @@ void testDiffractionHrtf() {
     af::dsp::HrtfSet real;
     bool haveReal = false;
     const char* kPaths[] = {
-        "UnityDemo/Assets/StreamingAssets/kemar.afhr",
-        "../UnityDemo/Assets/StreamingAssets/kemar.afhr",
-        "../../UnityDemo/Assets/StreamingAssets/kemar.afhr",
-        "../../../UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "../Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "../../Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "../../../Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr",
     };
     for (const char* p : kPaths)
         if (af::dsp::HrtfSet::loadFromFile(p, real) && real.isValid()) { haveReal = true; break; }
@@ -1864,10 +1867,10 @@ void testTapEarCues() {
     af::dsp::HrtfSet real;
     bool haveReal = false;
     const char* kPaths[] = {
-        "UnityDemo/Assets/StreamingAssets/kemar.afhr",
-        "../UnityDemo/Assets/StreamingAssets/kemar.afhr",
-        "../../UnityDemo/Assets/StreamingAssets/kemar.afhr",
-        "../../../UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "../Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "../../Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr",
+        "../../../Projects/UnityDemo/Assets/StreamingAssets/kemar.afhr",
     };
     for (const char* p : kPaths)
         if (af::dsp::HrtfSet::loadFromFile(p, real) && real.isValid()) { haveReal = true; break; }
@@ -2450,7 +2453,7 @@ void renderReference(const af::dsp::HrtfSet& set, const std::vector<float>& x, c
 }
 // レーン: タップを 2 方向へ等パワーで振り、耳ごとに自分の ITD で遅らせて 方向×耳 の行へ送り、バスで畳む。
 void renderLanes(const af::dsp::HrtfSet& set, const std::vector<float>& x, const Ring& ring, int sr, int lanes,
-                 std::vector<float>& L, std::vector<float>& R) {
+                 std::vector<float>& L, std::vector<float>& R, bool split = true) {
     using af::dsp::DirectionBus;
     const int N = static_cast<int>(x.size());
     const int B = 512;
@@ -2463,7 +2466,7 @@ void renderLanes(const af::dsp::HrtfSet& set, const std::vector<float>& x, const
     for (std::size_t t = 0; t < ring.az.size(); ++t) {
         const float az = ring.az[t] * 3.14159265f / 180.0f;
         const float dir[3] = { std::sin(az), 0.0f, std::cos(az) };
-        DirectionBus::laneWeights(dir, lanes, &ln[t * 2], &w[t * 2]);
+        DirectionBus::laneWeights(dir, lanes, &ln[t * 2], &w[t * 2], split);
         const int idx = set.nearestIndex(dir);
         const float itd = set.itdSecondsScaled(idx, 57.0f);
         earD[t * 2 + 0] = (itd < 0.0f) ? static_cast<int>(std::lround(-itd * sr)) : 0;
@@ -2534,6 +2537,34 @@ void testDirectionBus() {
         bus.add(in.data(), 512, 512, 1.0f, 0); bus.render(512, L.data() + 512, R.data() + 512);
         std::snprintf(buf, sizeof(buf), "(左 %.2e / 右 %.2e、右のピーク %d サンプル、固有遅延 %d)", energy(L), energy(R), peakAt(R), bus.latency());
         check("右の行に入れると右耳にだけ出る（ピークは固有遅延の後）", energy(L) < 1e-9 && energy(R) > 1e-4 && peakAt(R) >= bus.latency(), buf);
+    }
+    // 2.5) かぶり（隣り合う 2 レーンへ分ける）を切ったときの段差（2026-09-25）。
+    //   音源を 0°→45° へ 1° ずつ動かし、鳴った音の左右差（ILD）が 1° あたり何 dB 動くかを見る。
+    //   かぶり 入 なら扇の境目（22.5°）でも滑らかに渡るはず。切ると境目で乗り換えるので、そこだけ段になる。
+    //   ★実機ではタップの組み直しに 30 ms のクロスフェードが掛かるので、ここで出る段差が**そのまま**は聞こえない。
+    {
+        const int sr = 48000, N = sr / 5;   // 0.2 秒
+        af::dsp::HrtfSet set = af::dsp::HrtfSet::createSynthetic(sr);
+        std::vector<float> x(static_cast<std::size_t>(N));
+        unsigned rs = 12345u;
+        for (int i = 0; i < N; ++i) { rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5; x[static_cast<std::size_t>(i)] = static_cast<int>(rs) * (0.5f / 2147483648.0f); }
+        double worst[2] = {0.0, 0.0};
+        float at[2] = {0.0f, 0.0f};
+        for (int m = 0; m < 2; ++m) {
+            double prev = 0.0;
+            for (int a2 = 0; a2 <= 45; ++a2) {
+                dirbus::Ring r; r.az.push_back(static_cast<float>(a2)); r.delay.push_back(200);
+                std::vector<float> L, R;
+                dirbus::renderLanes(set, x, r, sr, 8, L, R, m == 0);
+                const double d = dirbus::ildDb(L, R);
+                if (a2 > 0 && std::fabs(d - prev) > worst[m]) { worst[m] = std::fabs(d - prev); at[m] = static_cast<float>(a2); }
+                prev = d;
+            }
+        }
+        std::printf("      1° あたりの左右差の動き（0°→45°）: かぶり 入 最大 %.2f dB（%.0f°）／ 切 最大 %.2f dB（%.0f°）\n",
+                    worst[0], at[0], worst[1], at[1]);
+        std::snprintf(buf, sizeof(buf), "(かぶり 入 %.2f dB / 切 %.2f dB、扇の境目は 22.5°)", worst[0], worst[1]);
+        check("かぶりを切ると扇の境目で乗り換える（入では 1 dB 未満で渡る）", worst[0] < 1.0, buf);
     }
     // 3) 物差し: 右半分の環（0°〜180°、30° 刻み、7 本）と、レーンの真ん中の 1 本（22.5°）。
     {
@@ -3461,6 +3492,75 @@ void testFdnRoomDecorrelation() {
     check("[FDN 相関] 1 つの音源を同じ大きさの 2 部屋へ割っても量は変わらない（±0.5 dB）", std::fabs(d) < 0.5, buf);
 }
 
+/// 【落ちない】鳴らしている最中に、別のスレッドが行き先（尾の FDN・方向バス）を付けたり外したりしても落ちない（2026-09-30）。
+///   Unreal の Play 終了時、片付け（Detach で行き先を null）と Wwise の音のスレッドの render が重なり、
+///   render が「空か確かめる → 後で使う」と 2 回読む間に空にされて 0x10 番地を読んで落ちた。
+///   直した形: render は行き先をチャンクの頭で 1 回だけ読む／setDirectionBus は置くだけ（送りの箱は構築時に最大で取る）。
+///   ⚠ 取り合いは運なので、通ったことは「この回で起きなかった」まで。付け外しの回数と鳴らしたブロック数を出す。
+void testVoiceRetargetWhileRendering() {
+    std::printf("\n[落ちない] 鳴らしている最中に行き先を付け外しする\n");
+    using af::dsp::EarlyReflectConv;
+    const int sr = 48000, block = 512, blocks = 3000;
+    af::dsp::VoiceRenderer::Config cfg;
+    cfg.sampleRate = sr; cfg.maxFrames = block; cfg.tailSeconds = 0.25f;
+    af::dsp::VoiceRenderer v(cfg);
+    v.setOutputGain(0.6f);
+    af::dsp::DirectionBus bus(sr, 8, block);
+    af::dsp::FdnRoomMix mix(sr, block, 0.6f);
+    const float rt[6] = { 1, 1, 1, 1, 1, 1 };
+    const int room = mix.addRoom(1.0f, rt, false);
+    mix.setDirectionBus(&bus, 57.0f);
+    const float one[6] = { 1, 1, 1, 1, 1, 1 };
+    mix.setListenerWeight(room, one);
+    // 直接 1 本 ＋ 方向つきの反射 3 本（方向バス行き）
+    EarlyReflectConv::Tap taps[4];
+    for (int b = 0; b < 6; ++b) taps[0].g[b] = 1.0f;
+    const float az[3] = { 30.0f, -60.0f, 120.0f };
+    for (int t = 1; t < 4; ++t) {
+        for (int b = 0; b < 6; ++b) taps[t].g[b] = 0.5f;
+        taps[t].delaySamples = 200 * t;
+        af::dsp::HrtfSet::angleToVector(az[t - 1], 0.0f, taps[t].dir);
+        taps[t].dirValid = true;
+    }
+    v.setDirectionBus(&bus);
+    v.setFdnMix(&mix);
+    v.setTaps(taps, 4);
+    const int rooms[1] = { room };
+    const float gains[1] = { 1.0f };
+    v.setFdnSends(rooms, gains, 1);
+    v.setTailAmount(1.0f, 1.0f);
+
+    std::atomic<bool> done{false};
+    std::atomic<long long> flips{0};
+    std::thread ctl([&] {
+        long long k = 0;
+        while (!done.load(std::memory_order_acquire)) {
+            v.setFdnMix((k & 1) ? &mix : nullptr);
+            v.setDirectionBus((k & 2) ? &bus : nullptr);
+            if ((k & 63) == 0) v.setTaps(taps, 4);   // タップのレーンの割り当ても、バスが有ったり無かったりの間に
+            flips.store(++k, std::memory_order_release);
+            std::this_thread::yield();
+        }
+    });
+    std::vector<float> in(static_cast<std::size_t>(block)), L(in.size()), R(in.size()), bl(in.size()), br(in.size());
+    std::uint32_t seed = 20260930u;
+    bool finite = true;
+    for (int b = 0; b < blocks; ++b) {
+        for (float& x : in) { seed = seed * 1664525u + 1013904223u; x = 0.1f * (static_cast<float>(seed >> 8) / 16777216.0f * 2.0f - 1.0f); }
+        v.render(in.data(), block, L.data(), R.data(), nullptr);
+        mix.render(block, nullptr, nullptr);
+        std::fill(bl.begin(), bl.end(), 0.0f); std::fill(br.begin(), br.end(), 0.0f);
+        bus.render(block, bl.data(), br.data());
+        for (int i = 0; i < block; ++i)
+            if (!std::isfinite(L[i]) || !std::isfinite(R[i]) || !std::isfinite(bl[i]) || !std::isfinite(br[i])) finite = false;
+    }
+    done.store(true, std::memory_order_release);
+    ctl.join();
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "(%d ブロック鳴らす間に付け外し %lld 回、出力は有限 %s)", blocks, flips.load(), finite ? "はい" : "いいえ");
+    check("[落ちない] render の最中に尾の FDN・方向バスを付け外ししても落ちず、出力が壊れない", finite && flips.load() > 1000, buf);
+}
+
 int main() {
     std::printf("=== DSP 数値回帰テスト（段4: C++ 移行）===\n");
     testFft();
@@ -3481,6 +3581,7 @@ int main() {
     testTailCalibration();
     testVoiceTailBus();
     testVoiceRenderer();
+    testVoiceRetargetWhileRendering();
     diagnoseTailCatchUp();
     diagnoseTailTrackingLag();
     testFdnTail();

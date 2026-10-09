@@ -211,6 +211,9 @@ public:
     ///   1 点と拡散を分ける: 点は 1 本の波形＋点の向きの ITD。自室（広がり 1）は 0 と 1 ビットも同じ
     ///   ★効くのはレーンを通る尾だけ。lateThrough=2 で戸口の線音源になった部屋はレーンを通らない。
     int laneModel = 1;
+    /// 戸口の線音源とレーンの受け渡しの時間（秒、2026-10-04、FdnRoomMix::setPortalCrossfade）。**既定 0.3。**0 で旧（1 ブロックで切り替え）。
+    ///   耳が部屋の口をまたいだとき、その部屋の尾は量を保ったまま「口の幅から」⇔「周りから」へこの時間で移る（包まれ具合だけが変わる）。
+    float portalCrossfadeSec = 0.3f;
     /// 虚像の次数（1..3）。既定 2。
     ///   ★3 にすると壁際で「詰まった連続反射」が出る。同じ壁を繰り返し使う経路が 3 次で初めて現れるため。
     ///     2 次までだと、近づいた壁が絡む虚像だけが前へ寄り、群としては詰まらない
@@ -249,6 +252,26 @@ public:
     ///   build() の前に置く。
     void setRoomCell(float meters) { builder_.setCell(meters); dirty_ = true; }
     float roomCellRequested() const { return builder_.cell(); }
+    /// 部屋を口で割る半径(m)（既定 0.6）。幅がこの 2 倍に満たない口で部屋が分かれる（room_graph.h の setSeedRadius）。
+    ///   洞窟の口のように広い口で部屋を分けたい場面は大きくする。★部屋のいちばん狭い所の半分より小さく（廊下が消える）。
+    void setRoomSeedRadius(float meters) { builder_.setSeedRadius(meters); dirty_ = true; }
+    float roomSeedRadius() const { return builder_.seedRadius(); }
+    /// 外への口と屋外の耳（2026-10-04、洞窟の場面から）。**既定 0 ＝ 今までどおり**（1 ビットも同じ）。
+    ///   0: 部屋と「外の世界」の間の口は口として扱わない。耳が外（どの部屋でもない所）にいると後期の送りを作らない
+    ///      ＝ どの部屋の響きも聞こえない。部屋の Sabine にも外への口は入らない（外へ開いた部屋の RT60 は長めに出る）。
+    ///   1: 外への口も口にする（部屋グラフの includeOutside）。
+    ///      ① 外への口を吸音率 1 で Sabine に入れる（口から逃げる分）
+    ///      ② 耳が外にいるとき、音源の部屋の響きを、その部屋の外への口から戸口の線音源で鳴らす（耳の部屋が無いので流し込みは 0）
+    ///      ③ レイの後期を「部屋の面から来た分」と「外の面から来た分」に分け、部屋の分だけを口から鳴らす
+    ///         （外の分は響かせる器が無いので鳴らさない。閉じ込め・流し込みも外の耳では 0）
+    ///   ★0 だと、洞窟の中の音源の響きが口の前ではまったく聞こえず、口を入った所で 0 から立ち上がる（AF_ONLY=cavewalk）。
+    ///   ★build の前に置く（部屋グラフを組み直す）。
+    void setOutsideMouth(int on) {
+        const int v = (on != 0) ? 1 : 0;
+        if (v == outsideMouth_) return;
+        outsideMouth_ = v; builder_.setIncludeOutside(v != 0); dirty_ = true;
+    }
+    int outsideMouth() const { return outsideMouth_; }
     /// 実際に使われた一辺。総ボクセル数が上限を超えると 1.5 倍ずつ粗くなるので、要求と食い違うことがある。
     ///   ★食い違ったら音の結果が変わっている。呼び出し側が 2 つを比べて気づけるように分けてある。
     float roomCellEffective() const { return builder_.result().grid.cell; }
@@ -320,8 +343,20 @@ public:
     /// 自分の部屋の響きの配り方の形（lateDistancePow）。レーンごとのエネルギーの割合（和 1）と壁までの距離。n はレーンの本数（0 なら形なし）。
     const float* lateLaneShape(int& n) const { n = laneShapeN_; return laneShape_; }
     const float* lateLaneDistance() const { return laneDist_; }
+    /// レーン k の向き（リスナー座標の単位ベクトル、+x 右 / +y 上 / +z 前）。器が無ければ false。
+    ///   ★向きを持つのは方向バス（DSP）で、世界ではない。表示のためだけにここから覗く（音には使わない）。
+    bool lateLaneDirection(int k, float out3[3]) const {
+        const af::dsp::DirectionBus* bus = fdn_ ? fdn_->directionBus() : nullptr;
+        if (!bus || k < 0 || k >= bus->lanes()) return false;
+        bus->laneDirection(k, out3);
+        return true;
+    }
     /// 形の円錐の半角・近さの下限・遠さの上限（レイが何にも当たらないとき）・追う時間。
+    ///   ★半角は実際には「レーンの間隔の半分」を使う（8 本なら 22.5°。updateFdn の注記）。
+    ///     この定数は方向バスが無いときの保険。
     static constexpr float kLaneConeRad = 10.0f * 3.14159265f / 180.0f;
+    /// 1 レーンあたりのレイの本数（中心・縁 4 本・中間 4 本）。
+    static constexpr int kLaneRays = 9;
     static constexpr float kLaneNearM = 0.3f;
     static constexpr float kLaneFarM = 50.0f;
     static constexpr float kLaneShapeSec = 0.1f;
@@ -376,7 +411,8 @@ public:
         // 段 2-g: 耳の部屋と戸口で繋がる部屋ごとに、使う戸口を 1 つ選ぶ（面積 × 開き具合がいちばん大きい物）。
         //   ★閉じた扉でも選ぶ（開き具合は下限 1e-3 で並べるだけ）。量のほうが開き具合で 0 へ寄るので段にならない。
         doorOf_.assign(probes_.size(), -1);
-        if (lateThrough == 2 && lroom >= 0) {
+        // 外の耳（setOutsideMouth）: 外への口（roomA = −1）も同じ選び方で。耳の部屋の番号 −1 と口の −1 がそのまま合う。
+        if (lateThrough == 2 && (lroom >= 0 || outsideMouth_)) {
             std::vector<float> bestScore(probes_.size(), 0.0f);
             for (std::size_t a = 0; a < apertures_.size(); ++a) {
                 const rooms::Aperture& ap = apertures_[a];
@@ -417,6 +453,7 @@ public:
             prm.rays = bs.rays; prm.maxBounces = light ? std::min(maxBounces, 12) : maxBounces; prm.mixingSec = mixingSec;
             prm.seed = static_cast<std::uint32_t>(s.em.id + 1) * 0x9E3779B1u;    // 音源ごとに固定
             prm.listenerRoom = (lateThrough != 0) ? lroom : -1;                  // 段 2-f。-1 なら出どころを分けない（今までと 1 ビットも同じ）
+            if (lateThrough != 0 && lroom < 0 && outsideMouth_) prm.listenerRoom = kListenerOutside;   // 外の耳: 部屋の面から来た分を分ける
             prm.wallReflect = wallReflect;
             // フレーム分散（設計文書 Ⅶ）: 組を 1 つだけ飛ばし、残りは前回の結果を使う。
             //   本数が変わったら組を全部作り直す（重み 1/rays が変わるので混ぜられない）。
@@ -559,6 +596,7 @@ public:
             in.sourceRoom = (lateThrough != 0) ? s.em.room : -1;
             in.precedenceDb = precedenceDb; in.precedenceSec = precedenceSec;
             in.adjacentContain = containHere;
+            in.outsideListener = (outsideMouth_ != 0 && lroom < 0);   // 外の耳: 音源の部屋の響きを外への口から（distribute）
             {
                 const int er = s.em.room;
                 const int door = (lateThrough == 2 && er >= 0 && er < static_cast<int>(doorOf_.size())) ? doorOf_[static_cast<std::size_t>(er)] : -1;
@@ -676,6 +714,7 @@ private:
     void updateFdn(float dt) {
         if (!fdn_ || probes_.empty()) return;
         fdn_->setLaneModel(laneModel);                                     // 尾のレーンの作り（実行中に切り替えてよい）
+        fdn_->setPortalCrossfade(portalCrossfadeSec);                      // 戸口の線音源とレーンの受け渡し
         for (std::size_t r = 0; r < probes_.size(); ++r)
             if (fdnRoomOf_[r] >= 0) fdn_->setRoomRt60(fdnRoomOf_[r], probes_[r].rt60, false);
         fdn_->setPortalCoherence(doorCoherenceHz);
@@ -744,8 +783,17 @@ private:
                 shapedFdnRoom_ = -1; laneShapeN_ = 0;
             }
             if (on) {
+                // ★円錐の半角はレーンの間隔の半分（8 本なら 22.5°）＝ 隣とちょうど接して重ならない（2026-09-25、発注者の指示）。
+                //   前は固定 10° で、円の 44% しか見ていなかった（レーンとレーンの間に誰も見ない帯が残り、
+                //   そこに壁があっても濃さに出なかった）。半分にすると 8 つの扇が円を隙間なく分け合う。
+                //   ★本数も 5 → 9 へ。扇が広くなったぶん、中心と縁だけでは扇の中の物を取りこぼす
+                //   （中心・縁 4 本・中間 4 本）。費用はレーン 10 本で 90 本／フレーム（下に実測）。
+                const float coneRad = (bus->horizontalLanes() > 0)
+                                        ? (3.14159265f / static_cast<float>(bus->horizontalLanes()))
+                                        : kLaneConeRad;
                 const Vec3 fw = normalized(listener_.forward), up = normalized(listener_.up), rt = normalized(cross(up, fw));
-                const float cc = std::cos(kLaneConeRad), ss = std::sin(kLaneConeRad);
+                const float cc = std::cos(coneRad), ss = std::sin(coneRad);
+                const float ch = std::cos(0.5f * coneRad), sh = std::sin(0.5f * coneRad);
                 float target[af::dsp::DirectionBus::kMaxLanes] = {};
                 double sum = 0.0;
                 for (int k = 0; k < L; ++k) {
@@ -753,16 +801,19 @@ private:
                     const Vec3 dw = normalized(rt * d3[0] + up * d3[1] + fw * d3[2]);
                     const Vec3 ref = (std::fabs(dw.y) < 0.9f) ? Vec3(0, 1, 0) : Vec3(1, 0, 0);
                     const Vec3 a = normalized(cross(dw, ref)), b = cross(dw, a);
-                    const Vec3 rays[5] = { dw, dw * cc + a * ss, dw * cc - a * ss, dw * cc + b * ss, dw * cc - b * ss };
+                    const Vec3 rays[kLaneRays] = {
+                        dw,
+                        dw * cc + a * ss, dw * cc - a * ss, dw * cc + b * ss, dw * cc - b * ss,
+                        dw * ch + a * sh, dw * ch - a * sh, dw * ch + b * sh, dw * ch - b * sh };
                     double w = 0.0, dsum = 0.0;
-                    for (int q = 0; q < 5; ++q) {
+                    for (int q = 0; q < kLaneRays; ++q) {
                         const SurfaceHit h = sceneNearest(traceScene_, listener_.pos, normalized(rays[q]), kLaneFarM, -1);
                         const float d = h.hit ? std::max(kLaneNearM, h.t) : kLaneFarM;
                         w += std::pow(static_cast<double>(d), -static_cast<double>(lateDistancePow));
                         dsum += d;
                     }
-                    target[k] = static_cast<float>(w / 5.0);
-                    laneDist_[k] = static_cast<float>(dsum / 5.0);
+                    target[k] = static_cast<float>(w / kLaneRays);
+                    laneDist_[k] = static_cast<float>(dsum / kLaneRays);
                     sum += target[k];
                 }
                 if (sum > 0.0) {
@@ -787,8 +838,12 @@ private:
         portalDiag_.clear();
         const int K = af::dsp::FdnRoomMix::kPortalPoints;
         int slot = 0;
+        if (portalSeen_.size() != probes_.size()) portalSeen_.assign(probes_.size(), 0);
+        std::fill(portalSeen_.begin(), portalSeen_.end(), static_cast<char>(0));
         const bool listenerHasFdn = lroom_ >= 0 && lroom_ < roomCount() && fdnRoomOf_[static_cast<std::size_t>(lroom_)] >= 0;
-        if (lateThrough == 2 && listenerHasFdn) {
+        // 外の耳（setOutsideMouth）: 耳の部屋の FDN が無いので、口から直接だけ鳴らす（流し込み先 −1。送りの thru6 ＝ e6 なので feedG も 0）。
+        const bool outsideEar = (outsideMouth_ != 0 && lroom_ < 0);
+        if (lateThrough == 2 && (listenerHasFdn || outsideEar)) {
             for (std::size_t r = 0; r < probes_.size() && slot < af::dsp::FdnRoomMix::kMaxPortals; ++r) {
                 if (r >= doorOf_.size() || doorOf_[r] < 0 || fdnRoomOf_[r] < 0 || portalE[r] <= 1e-30) continue;
                 const rooms::Aperture& ap = apertures_[static_cast<std::size_t>(doorOf_[r])];
@@ -820,10 +875,33 @@ private:
                 }
                 for (int k = 0; k < K; ++k)
                     gains[k] = (vsum > 1e-4) ? static_cast<float>(std::sqrt(vis[k] / vsum)) : static_cast<float>(std::sqrt(1.0 / K));
+                // ★点の重みは向きの時定数（directionSec）で追う（2026-10-01）。見え具合は点ごとに 1 本の視線なので、
+                //   扉の板の端が視線から外れた瞬間に 0.01 → 1 と跳び、重みが 1 フレームで「均等 0.45×5」から「0.98 と 0.09×4」へ
+                //   替わって、出口が 1 ブロック +2.2 dB 跳ねて次で −2.6 dB 落ちた（AF_ONLY=shadowexit、耳 x=−2・扉 7.2°。
+                //   発注者「扉の影から出た瞬間がおかしい」）。追ったあと Σ重み² = 1 に戻す（量は変えない、配り方だけ追う）。
+                //   戸口が初めて鳴る（前のフレームに線音源が無かった）ときは、そのまま置く。
+                {
+                    if (portalGainSm_.size() != probes_.size() * static_cast<std::size_t>(K)) {
+                        portalGainSm_.assign(probes_.size() * static_cast<std::size_t>(K), 0.0f);
+                        portalSmOn_.assign(probes_.size(), 0);
+                    }
+                    float* sm = portalGainSm_.data() + r * static_cast<std::size_t>(K);
+                    const float a = (response.directionSec > 1e-4f) ? 1.0f - std::exp(-dt / response.directionSec) : 1.0f;
+                    if (!portalSmOn_[r]) { for (int k = 0; k < K; ++k) sm[k] = gains[k]; portalSmOn_[r] = 1; }
+                    else {
+                        double s2 = 0.0;
+                        for (int k = 0; k < K; ++k) { sm[k] += a * (gains[k] - sm[k]); s2 += static_cast<double>(sm[k]) * sm[k]; }
+                        const float g = (s2 > 1e-12) ? static_cast<float>(1.0 / std::sqrt(s2)) : 1.0f;
+                        for (int k = 0; k < K; ++k) sm[k] *= g;
+                    }
+                    for (int k = 0; k < K; ++k) gains[k] = sm[k];
+                    portalSeen_[r] = 1;
+                }
                 const double E = portalE[r], T = std::min(portalT[r], E);
                 const float directG = static_cast<float>(std::sqrt(T / E));
                 const float feedG = static_cast<float>(std::sqrt(std::max(0.0, E - T) / E));
-                fdn_->setPortal(slot, fdnRoomOf_[r], fdnRoomOf_[static_cast<std::size_t>(lroom_)], dirs, gains, K, directG, feedG, headCm);
+                const int dstFdn = listenerHasFdn ? fdnRoomOf_[static_cast<std::size_t>(lroom_)] : -1;
+                fdn_->setPortal(slot, fdnRoomOf_[r], dstFdn, dirs, gains, K, directG, feedG, headCm);
                 // 診断: 戸口の縁どうしの見込み角（横幅）
                 {
                     Vec3 a0 = (ap.rectCenter - wAxis * halfW) - listener_.pos, a1 = (ap.rectCenter + wAxis * halfW) - listener_.pos;
@@ -838,6 +916,8 @@ private:
             }
         }
         for (; slot < af::dsp::FdnRoomMix::kMaxPortals; ++slot) fdn_->setPortal(slot, -1, -1, nullptr, nullptr, 0, 0.0f, 0.0f);
+        // このフレームに鳴らなかった戸口は、追った重みを捨てる（次に鳴り始めるときは、その時の重みをそのまま置く）
+        for (std::size_t r = 0; r < portalSmOn_.size() && r < portalSeen_.size(); ++r) if (!portalSeen_[r]) portalSmOn_[r] = 0;
     }
 
     rooms::Builder builder_;
@@ -863,6 +943,9 @@ private:
     int lroom_ = -1;                // 段 2-g。このフレームの耳の部屋（updateFdn が使う）
     std::vector<int> doorOf_;       // 段 2-g。部屋 → 耳の部屋と繋ぐ戸口の番号（-1 なし）
     std::vector<PortalDiag> portalDiag_;
+    std::vector<float> portalGainSm_;        // 戸口の線音源の点の重み（部屋 × 点、directionSec で追う）
+    std::vector<char>  portalSmOn_;          // その部屋の重みを追っている途中か
+    std::vector<char>  portalSeen_;          // このフレームに鳴ったか（鳴らなかった部屋は追いを捨てる）
     mutable gpu::GpuTracer gpuTracer_;
     bool gpuTried_ = false, gpuReady_ = false;
 
@@ -911,6 +994,7 @@ private:
         return R;
     }
     int  buildCount_ = 0;
+    int  outsideMouth_ = 0;                              // setOutsideMouth（外への口と屋外の耳）
     // 受取面（2026-09-13）
     PatchLayout  patchLayout_;
     ReceiverView recvView_;
