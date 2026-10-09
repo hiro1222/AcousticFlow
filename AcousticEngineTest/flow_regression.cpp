@@ -2268,6 +2268,18 @@ void testLateDistance() {
         std::snprintf(buf, sizeof buf, "(壁から 0.3 m・耳の高さ 1.2 m、摘み 1、レーン %d 本:%s ／ 和 %.4f ／ 摘み 0 のときの形 %d 本)", n, lanes, sum, n0);
         check("[響きの配り方] 壁際に立つと壁側（左）のレーンがいちばん濃く右の 3 倍以上、和は 1、摘み 0 なら形を置かない",
               n == 10 && maxH == 6 && sh[6] > 3.0f * sh[2] && std::fabs(sum - 1.0) < 1e-4 && n0 == 0, buf);
+        // 摘みの強さ（lateDistancePow）ごとの濃さ。どれくらい「寄る」かを耳で決めるための表（検査ではない）。
+        {
+            static const float kP[4] = {1.0f, 1.5f, 2.0f, 3.0f};
+            for (int i = 0; i < 4; ++i) {
+                float s2[16], d2[16]; int n2 = 0;
+                shapeAt(kP[i], Vec3(-3.2f, 1.2f, 0.0f), 2, s2, d2, n2);
+                if (n2 < 10) continue;
+                std::printf("        摘み %.1f: 左 %.1f%% 左後 %.1f%% 左前 %.1f%% ／ 前 %.1f%% 右 %.1f%% ／ 上 %.1f%% 下 %.1f%%（左 ÷ 右 %.0f 倍）\n",
+                            kP[i], s2[6] * 100.0f, s2[5] * 100.0f, s2[7] * 100.0f, s2[0] * 100.0f, s2[2] * 100.0f,
+                            s2[8] * 100.0f, s2[9] * 100.0f, (s2[2] > 1e-9f ? s2[6] / s2[2] : 0.0f));
+            }
+        }
     }
     // ② 扉を開けていく（耳は戸口の正面 2 m、前のレーンが戸口を向く）
     {
@@ -2301,10 +2313,13 @@ void testLateDistance() {
         }
         for (int k = 0; k < 30; ++k) w.update(dt);
         { int n = 0; const float* sh = w.lateLaneShape(n); if (n > 0) { s90 = sh[0]; d90 = w.lateLaneDistance()[0]; } }
-        std::snprintf(buf, sizeof buf, "(前（戸口）のレーン: 扉 0° %.1f%%（%.2f m）→ 90° %.1f%%（%.2f m）、1 ブロックの動き 最大 %.2f%%)",
-                      s0 * 100.0f, d0, s90 * 100.0f, d90, worstStep * 100.0f);
-        check("[響きの配り方] 扉を開けていくと戸口の向きのレーンが薄くなり（半分未満）、1 ブロックの動きは 1% 未満",
-              s90 < 0.5f * s0 && worstStep < 0.01f, buf);
+        std::snprintf(buf, sizeof buf, "(前（戸口）のレーン: 扉 0° %.1f%%（%.2f m）→ 90° %.1f%%（%.2f m）＝ %.2f 倍、1 ブロックの動き 最大 %.2f%%)",
+                      s0 * 100.0f, d0, s90 * 100.0f, d90, (s0 > 0.0f ? s90 / s0 : 1.0f), worstStep * 100.0f);
+        // ★2026-09-25: 閾値を「半分未満」→「0.75 倍未満」に緩めた。レーンの扇を ±10° から ±22.5°（かぶりなし）へ
+        //   広げたので、戸口（2 m 先で ±14°）が扇に占める割合が下がり、開けたときの減り方も 0.37 → 0.59 倍になった。
+        //   ★「薄くなる向きがある」という性質は保たれている（下の摘みを強くすると差は広がる）。
+        check("[響きの配り方] 扉を開けていくと戸口の向きのレーンが薄くなり（0.75 倍未満）、1 ブロックの動きは 1% 未満",
+              s90 < 0.75f * s0 && worstStep < 0.01f, buf);
     }
     // ③ 鳴らした響き（後期だけ）の左右差と総量。壁から 0.3 m、摘み 0 と 1。方向バスは水平 8 本（合成 HRTF）
     {
@@ -4613,6 +4628,110 @@ void testDoorSweep() {
     std::printf("        最悪: 実音 %.2f dB（%.1f 度）／帳簿 %.2f dB（%.1f 度）\n", wR, wRd, wL, wLd);
 }
 
+/// 【隣の部屋の響き】後期の重み lateAdjacent は、別の部屋の音源の後期だけに効く（AF_ONLY=lateadj、2026-10-01）
+///   同じ台本を重み 1 と 0.5 で 2 回まわし、出口（Mix）を比べる。レイの種は同じなので、違うのは重みを掛けた所だけになる。
+void testAdjacentLateWeight() {
+    std::printf("\n[隣の部屋の響き] 別の部屋の音源の後期だけを下げる（lateAdjacent）\n");
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    struct Sum { double late = 0.0, taps = 0.0; };
+    struct Out { Sum other, same; };
+    auto run = [&](float adj) {
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        w.addBox(doorLeaf(45.0f), lm, true);
+        w.adjacentContain = 1.0f;                    // Unity / Unreal の既定と同じ
+        w.rules.weights.lateAdjacent = adj;
+        w.setListener(Vec3(0, 1.6f, -2.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int eo = w.addEmitter(Vec3(0.0f, 1.6f, 3.0f), 0.2f);    // 向こうの部屋
+        const int es = w.addEmitter(Vec3(1.5f, 1.6f, -1.0f), 0.2f);   // 耳と同じ部屋
+        w.build();
+        for (int k = 0; k < 12; ++k) w.update(1.0f / 60.0f);
+        auto sum = [&](int e) {
+            Sum s;
+            if (const Mix* mx = w.mix(e)) {
+                for (int q = 0; q < mx->sendCount; ++q) for (int b = 0; b < kNumBands; ++b) s.late += mx->sends[q].e6[b];
+                for (int i = 0; i < mx->tapCount; ++i) for (int b = 0; b < kNumBands; ++b) s.taps += mx->taps[i].e6[b];
+            }
+            return s;
+        };
+        return Out{sum(eo), sum(es)};
+    };
+    const Out a = run(1.0f), h = run(0.5f);
+    char buf[256];
+    const double rOther = (a.other.late > 0.0) ? h.other.late / a.other.late : -1.0;
+    std::snprintf(buf, sizeof(buf), "(別の部屋の音源の後期 %.3e → %.3e ＝ ×%.4f、重み 0.5)", a.other.late, h.other.late, rOther);
+    check("[隣の部屋の響き] 重み 0.5 で、別の部屋の音源の後期（戸口から鳴らす分を含む）がちょうど半分になる", std::fabs(rOther - 0.5) < 1e-4, buf);
+    std::snprintf(buf, sizeof(buf), "(同じ部屋の音源の後期 %.3e / %.3e、タップ 別 %.3e / %.3e・同 %.3e / %.3e)",
+                  a.same.late, h.same.late, a.other.taps, h.other.taps, a.same.taps, h.same.taps);
+    check("[隣の部屋の響き] 同じ部屋の音源の後期と、直接・初期・回折・透過は 1 ビットも変わらない",
+          a.same.late == h.same.late && a.other.taps == h.other.taps && a.same.taps == h.same.taps && a.same.late > 0.0, buf);
+}
+
+/// 【影のこもり】shadowMuffleDb は、遮られた直接の道（透過・回折のタップ）の高域だけを落とす（AF_ONLY=shadowmuffle、2026-10-06）
+///   同じ台本を 0 dB と 12 dB で 2 回まわし、出口（Mix）を比べる。レイの種は同じなので、違うのは傾きを掛けた所だけになる。
+///   扉 10° で耳は板の影（透過も回折もある）。もう 1 つの音源は耳と同じ部屋で見えている（傾きが掛からないはず）。
+void testShadowMuffle() {
+    std::printf("\n[影のこもり] 遮られた直接の道（透過・回折）の高域だけを落とす（shadowMuffleDb）\n");
+    AcousticMaterial wall = AcousticMaterial::defaultWall();
+    for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
+    struct Out { Mix other, same; };
+    auto run = [&](float db, bool touch) {
+        World w;
+        const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
+        for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
+        w.addBox(doorLeaf(10.0f), lm, true);
+        w.adjacentContain = 1.0f; w.precedenceDb = 6.0f; w.precedenceSec = 0.04f;   // Unity / Unreal の既定と同じ
+        if (touch) w.rules.weights.shadowMuffleDb = db;
+        w.setListener(Vec3(0, 1.6f, -2.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int eo = w.addEmitter(Vec3(0.0f, 1.6f, 3.0f), 0.2f);    // 向こうの部屋（板の影）
+        const int es = w.addEmitter(Vec3(1.5f, 1.6f, -1.0f), 0.2f);   // 耳と同じ部屋（見えている）
+        w.build();
+        for (int k = 0; k < 12; ++k) w.update(1.0f / 60.0f);
+        return Out{*w.mix(eo), *w.mix(es)};
+    };
+    const Out base = run(0.0f, false), zero = run(0.0f, true), s12 = run(12.0f, true);
+    auto bitSame = [](const Mix& a, const Mix& b) {
+        if (a.tapCount != b.tapCount || a.sendCount != b.sendCount) return false;
+        for (int i = 0; i < a.tapCount; ++i) for (int q = 0; q < kNumBands; ++q) if (a.taps[i].e6[q] != b.taps[i].e6[q]) return false;
+        for (int i = 0; i < a.sendCount; ++i) for (int q = 0; q < kNumBands; ++q) if (a.sends[i].e6[q] != b.sends[i].e6[q]) return false;
+        for (int c = 0; c < kNumComponents; ++c) for (int q = 0; q < kNumBands; ++q) if (a.component6[c][q] != b.component6[c][q]) return false;
+        return true;
+    };
+    char buf[320];
+    check("[影のこもり] 0 dB を渡しても、渡さないとき（今まで）と出口も帳簿も 1 ビットも同じ",
+          bitSame(base.other, zero.other) && bitSame(base.same, zero.same), "(タップ・送り・帳簿をすべて比べた)");
+
+    // 透過と回折のタップ: 帯域 b で ×10^(−1.2·b/5)（125 Hz は ×1、4 kHz は ×0.0631 ＝ −12 dB）
+    double worst = 0.0, eT = 0.0, eD = 0.0; double r125 = -1.0, r4k = -1.0; bool sameOrder = base.other.tapCount == s12.other.tapCount;
+    bool othersSame = sameOrder;
+    for (int i = 0; sameOrder && i < base.other.tapCount; ++i) {
+        const MixTap& a = base.other.taps[i]; const MixTap& c = s12.other.taps[i];
+        const bool shadowed = a.kind == TapKind::Transmit || a.kind == TapKind::Diffract;
+        for (int q = 0; q < kNumBands; ++q) {
+            if (!shadowed) { if (a.e6[q] != c.e6[q]) othersSame = false; continue; }
+            if (a.kind == TapKind::Transmit) eT += a.e6[q]; else eD += a.e6[q];
+            if (!(a.e6[q] > 0.0f)) continue;
+            const double want = std::pow(10.0, -1.2 * q / 5.0), got = static_cast<double>(c.e6[q]) / a.e6[q];
+            worst = std::max(worst, std::fabs(got / want - 1.0));
+            if (a.kind == TapKind::Transmit && q == 0) r125 = got;
+            if (a.kind == TapKind::Transmit && q == kNumBands - 1) r4k = got;
+        }
+    }
+    std::snprintf(buf, sizeof(buf), "(透過 125 Hz ×%.4f・4 kHz ×%.4f ＝ %+.2f dB、狙いからのずれ最大 %.1e、透過 %.2e・回折 %.2e)",
+                  r125, r4k, 10.0 * std::log10(std::max(r4k, 1e-30)), worst, eT, eD);
+    check("[影のこもり] 12 dB で、透過と回折のタップが 125 Hz は そのまま・4 kHz は −12 dB、間はオクターブに比例して落ちる",
+          sameOrder && eT > 0.0 && eD > 0.0 && worst < 1e-5 && r125 == 1.0, buf);
+    bool sendsSame = base.other.sendCount == s12.other.sendCount, ledgerSame = true;
+    for (int i = 0; sendsSame && i < base.other.sendCount; ++i) for (int q = 0; q < kNumBands; ++q) if (base.other.sends[i].e6[q] != s12.other.sends[i].e6[q]) sendsSame = false;
+    for (int c = 0; c < kNumComponents; ++c) for (int q = 0; q < kNumBands; ++q) if (base.other.component6[c][q] != s12.other.component6[c][q]) ledgerSame = false;
+    check("[影のこもり] 12 dB でも、直接・初期のタップと響きの送り、帳簿は 1 ビットも変わらない（掛かるのは出口の透過と回折だけ）",
+          othersSame && sendsSame && ledgerSame, "(影の音源のタップ・送り・帳簿)");
+    check("[影のこもり] 12 dB でも、耳と同じ部屋で見えている音源は 1 ビットも変わらない",
+          bitSame(base.same, s12.same), "(見えている音源には透過・回折が無い)");
+}
+
 /// 【探り】扉の開き角 × 音源の方向の地図（AF_ONLY=doormap）── 最終資料用
 ///   ★場面は Unity の Flow_SwingDoor と同じ（検査の場面を実機と突き合わせる）:
 ///     14×3×14 m を厚さ 0.2 m のコンクリートで仕切り、幅 1 m の戸口。木の扉 1×3×0.06 m、枠との隙間 4 mm、
@@ -4639,7 +4758,15 @@ void testDoorMap() {
     const float leftW = gapL + half, rightW = half - gapR;
     box(Vec3(-half + leftW * 0.5f, h * 0.5f, 0), Vec3(leftW, h, t));
     box(Vec3(gapR + rightW * 0.5f, h * 0.5f, 0), Vec3(rightW, h, t));
-    const int leaf = w.addBox(doorLeaf(0.0f, gapL, gapR - gapL, h, 0.06f, 0.004f), mLeaf, true);
+    // AF_LEAFZ: 板の置き場所（閉じたときの z、m）。0 = 壁（厚み 0.2 m）の真ん中、+0.07 = 奥の面、−0.07 = 手前の面。
+    //   ★板が壁の厚みの中にある間は、自由端と枠の隙間（4 mm）しか経路が無い。奥へ振れる扉は
+    //     sinθ > (0.1 − z0)/幅 で枠を抜ける（真ん中なら 5.7°、奥の面なら 1.7°）。
+    //   ★既定 0 ＝ 壁の真ん中 ＝ Unity の Flow_SwingDoor・Unreal と同じ（2026-10-01 の決定。9/24 の「奥の面 0.07」を取り消した）。
+    //     大事なのは「開け始めが分かるか」ではなく「すき間が開いたときに変化するか」。真ん中は約 4° までこもったまま残り、
+    //     板の端が枠を抜けた所で音色が変わる。0.07 にすると 1° でこもりがほぼ抜ける（9/24〜9/30 の置き方）。
+    const float leafZ = std::getenv("AF_LEAFZ") ? static_cast<float>(std::atof(std::getenv("AF_LEAFZ"))) : 0.0f;
+    auto leafAt = [&](float deg) { Obb o = doorLeaf(deg, gapL, gapR - gapL, h, 0.06f, 0.004f); o.center.z += leafZ; return o; };
+    const int leaf = w.addBox(leafAt(0.0f), mLeaf, true);
     w.raysPerEmitter = 32; w.rayGroups = 1; w.budget.cfg.totalRays = 0; w.imageOrder = 1;
     const Vec3 L(0, 1.6f, -3.0f);
     w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
@@ -4659,7 +4786,7 @@ void testDoorMap() {
     const std::vector<float> phis = parseList("AF_PHIS", {-75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75});
     const float* kDeg = degs.data(); const float* kPhi = phis.data();
     const int nD = static_cast<int>(degs.size()), nP = static_cast<int>(phis.size());
-    struct Cell { double tot, lowHigh, az, spread, share[3], db3[3], gap, dPtX; int main, src; float vis; };
+    struct Cell { double tot, lowHigh, az, spread, share[3], db3[3], gap, dPtX; int main, src; float vis; float weight; int edge; };
     std::vector<Cell> cells(static_cast<std::size_t>(nD * nP));
     const int bLow = 0, bMid = 3, bHigh = 5;
 
@@ -4668,7 +4795,7 @@ void testDoorMap() {
         const Vec3 S(3.0f * std::sin(ph), 1.6f, 3.0f * std::cos(ph));
         w.setEmitter(e, S, 0.2f, false, 1.0f);
         for (int id = 0; id < nD; ++id) {
-            w.setBoxTransform(leaf, doorLeaf(kDeg[id], gapL, gapR - gapL, h, 0.06f, 0.004f));
+            w.setBoxTransform(leaf, leafAt(kDeg[id]));
             w.update(dt); w.update(dt);
             const Mix* mx = w.mix(e); const TraceResult* tr = w.trace(e); const Diffraction* df = w.diffraction(e);
             Cell& c = cells[static_cast<std::size_t>(id * nP + ip)];
@@ -4698,6 +4825,8 @@ void testDoorMap() {
             c.gap = df->valid ? df->gapWidth : 0.0;
             c.dPtX = df->valid ? df->point.x : 0.0;
             c.src = df->valid ? (df->box == leaf ? 1 : 2) : 0;   // 1 板の稜線 / 2 枠（仕切り）の稜線
+            c.weight = df->valid ? df->weight : 0.0f;
+            c.edge = df->valid ? df->edge : -1;
         }
     }
 
@@ -4721,6 +4850,7 @@ void testDoorMap() {
         static const char kM[3] = {'D', 'T', 'd'}; static const char kS[3] = {'-', 'p', 'f'};
         std::printf("   %c%c ", kM[c.main], kS[c.src]); });
     grid("見通しの割合", [](const Cell& c) { std::printf(" %5.2f", c.vis); });
+    grid("回折の重み（脚の貫通。1 = 脚が完全に通る）・稜線の番号", [](const Cell& c) { std::printf(" %4.2f/%-2d", c.weight, c.edge); });
 
     // 蝶番の非対称: 同じ角度で φ と −φ の合計の差（自由端の側 − 蝶番の側）。φ の並びが 0 を挟んで対称なときだけ
     bool symmetric = (nP % 2 == 1);
@@ -4754,6 +4884,433 @@ void testDoorMap() {
             std::printf("\n      CSV: %s\n", path);
         }
     }
+}
+
+/// 【探り】戸口をまたいで歩く（AF_ONLY=doorcross、2026-10-01）── Unity / Unreal の Flow_SwingDoor と同じ場面・同じ設定で
+///   「戸口をくぐるとぷつっと変わる」を数字にする。扉は 90° 開け、耳は z = −2.5 → +2.5 を 1.4 m/s（FlowWalker と同じ）で正面を向いて歩く。
+///   設定は Unity の場面に保存された値と Unreal の PushKnobs と同じ（lateThrough 2・lateDistancePow 1.5・先着 6 dB・閉じ込め 1・
+///   響き −9 dB（重み 0.126）・earlyModel 4）。段差の測り方は [後期の向き] ⑦ と同じ（正弦の和、ブロックに揃えた RMS の隣どうしの差）。
+///   響きの向き付け（lateDistancePow）を 1.5 と 0 で並べ、段差がどこから出ているかを分ける。AF_DC_TRACE で戸口の前後の時系列。
+void testDoorCross() {
+    std::printf("\n[探り] 戸口をまたいで歩く（Flow_SwingDoor と同じ場面・同じ設定）\n");
+    const float half = 7.0f, h = 3.0f, t = 0.2f, gapL = -0.5f, gapR = 0.5f, leafZ = 0.0f;   // 板は壁の真ん中（doormap と同じ）
+    const int fs = 48000, block = 512;
+    const float dt = static_cast<float>(block) / fs;
+    const Vec3 S(0.0f, 1.6f, 3.0f);
+    struct Res { double worst; float atZ; double calm; float switchZ; std::vector<std::array<double, 6>> rows; };
+    auto run = [&](float ldp, float lateW) {
+        World w;
+        const int mWall = w.rules.materials.add(AcousticMaterial::concrete());
+        const int mLeaf = w.rules.materials.add(AcousticMaterial::woodDoor());
+        auto box = [&](Vec3 c, Vec3 size) { w.addBox(Obb::axisAligned(c, size * 0.5f), mWall, false); };
+        box(Vec3(0, -t * 0.5f, 0), Vec3(2 * half + 2 * t, t, 2 * half + 2 * t));
+        box(Vec3(0, h + t * 0.5f, 0), Vec3(2 * half + 2 * t, t, 2 * half + 2 * t));
+        box(Vec3(-half - t * 0.5f, h * 0.5f, 0), Vec3(t, h, 2 * half + 2 * t));
+        box(Vec3(half + t * 0.5f, h * 0.5f, 0), Vec3(t, h, 2 * half + 2 * t));
+        box(Vec3(0, h * 0.5f, -half - t * 0.5f), Vec3(2 * half + 2 * t, h, t));
+        box(Vec3(0, h * 0.5f, half + t * 0.5f), Vec3(2 * half + 2 * t, h, t));
+        const float leftW = gapL + half, rightW = half - gapR;
+        box(Vec3(-half + leftW * 0.5f, h * 0.5f, 0), Vec3(leftW, h, t));
+        box(Vec3(gapR + rightW * 0.5f, h * 0.5f, 0), Vec3(rightW, h, t));
+        Obb leaf = doorLeaf(90.0f, gapL, gapR - gapL, h, 0.06f, 0.004f); leaf.center.z += leafZ;
+        w.addBox(leaf, mLeaf, true);
+        // Unity の場面に保存された値・Unreal の PushKnobs と同じ
+        w.lateThrough = 2; w.lateDistancePow = ldp; w.laneModel = 1; w.earlyModel = 4;
+        w.precedenceDb = 6.0f; w.precedenceSec = 0.04f; w.adjacentContain = 1.0f; w.leakModel = 1; w.wallReflect = 0;
+        w.doorCoherenceHz = 3000.0f;
+        if (const char* sx = std::getenv("AF_XFADE")) w.portalCrossfadeSec = static_cast<float>(std::atof(sx));   // 戸口の線音源とレーンの受け渡し（0 で旧）
+        w.budget.cfg.totalRays = 1536; w.rayGroups = 4;
+        for (int c = 0; c < kNumComponents; ++c) w.rules.weights.w[c] = 1.0f;
+        w.rules.weights.w[kLate] = lateW;
+        Vec3 L(0, 1.6f, -2.5f);
+        w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w.addEmitter(S, 0.2f);
+        w.build();
+        af::dsp::FdnRoomMix fdn(fs, 4096, 0.6f);
+        af::dsp::DirectionBus bus(fs, 8, 4096, 128, 1024, 2);
+        af::dsp::HrtfSet hrtf = af::dsp::HrtfSet::createSynthetic(fs);
+        bus.setCrossover(700.0f); bus.setHrtfSet(&hrtf, 57.0f); bus.setPanSplit(false);
+        fdn.setDirectionBus(&bus, 57.0f);
+        w.bindFdn(&fdn);
+        af::dsp::VoiceRenderer::Config vc; vc.sampleRate = fs; vc.maxFrames = 4096; vc.tailSeconds = 1.0f;
+        af::dsp::VoiceRenderer v(vc);
+        v.setOutputGain(0.6f); v.setTailLevel(1.0f); v.setHrtfEnabled(true); v.setHrtfSet(&hrtf);
+        v.setFdnMix(&fdn); v.setDirectionBus(&bus);
+        afti::SineSum sig(fs, block);
+        std::vector<float> in(block), l(block), r(block), fl(block), fr(block);
+        Res res{0.0, 0.0f, 0.0, 0.0f, {}};
+        double prevE = -1.0;
+        int prevRoom = w.roomAt(L), nb = 0;
+        const int frames = 380;
+        for (int k = 0; k < frames; ++k) {
+            const float tt = k * dt;
+            if (k > 30) { L.z = std::min(2.5f, -2.5f + 1.4f * (tt - 30 * dt)); w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0)); }
+            w.update(dt);
+            if (w.fdnStale()) w.bindFdn(&fdn);
+            w.applyToVoice(e, v, fs);
+            const int rm = w.roomAt(L);
+            if (rm != prevRoom) { res.switchZ = L.z; prevRoom = rm; }
+            for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = sig.next();
+            v.render(in.data(), block, l.data(), r.data(), nullptr);
+            std::fill(fl.begin(), fl.end(), 0.0f); std::fill(fr.begin(), fr.end(), 0.0f);
+            fdn.render(block, fl.data(), fr.data());
+            double eD = 0.0, eF = 0.0, eB = 0.0;
+            for (int i = 0; i < block; ++i) eD += double(l[i]) * l[i] + double(r[i]) * r[i];
+            for (int i = 0; i < block; ++i) eF += double(fl[i]) * fl[i] + double(fr[i]) * fr[i];
+            for (int i = 0; i < block; ++i) { l[i] += fl[i]; r[i] += fr[i]; }
+            std::fill(fl.begin(), fl.end(), 0.0f); std::fill(fr.begin(), fr.end(), 0.0f);
+            bus.render(block, fl.data(), fr.data());
+            for (int i = 0; i < block; ++i) eB += double(fl[i]) * fl[i] + double(fr[i]) * fr[i];
+            for (int i = 0; i < block; ++i) { l[i] += fl[i]; r[i] += fr[i]; }
+            if (k < 40) continue;
+            double e2 = 0.0;
+            for (int i = 0; i < block; ++i) e2 += double(l[i]) * l[i] + double(r[i]) * r[i];
+            e2 /= block;
+            const double st = (prevE > 0.0 && e2 > 0.0) ? afti::dB(e2 / prevE) : 0.0;
+            res.rows.push_back({double(L.z), st, afti::dB(std::max(eD / block, 1e-30)), afti::dB(std::max(eF / block, 1e-30)),
+                                afti::dB(std::max(eB / block, 1e-30)), double(rm)});
+            if (nb < 20) res.calm = std::max(res.calm, std::fabs(st));
+            else if (std::fabs(st) > res.worst) { res.worst = std::fabs(st); res.atZ = L.z; }
+            prevE = e2;
+            ++nb;
+        }
+        return res;
+    };
+    const float kLateW = 0.126f;   // −9 dB（2026-10-01 に決めた既定）
+    const Res a = run(1.5f, kLateW), b = run(0.0f, kLateW);
+    std::printf("      耳の部屋が変わる z: %+.2f m（向き付け 1.5）／ %+.2f m（0）\n", a.switchZ, b.switchZ);
+    std::printf("      止まっている間の揺れ（最初の 20 ブロック）: %.2f dB ／ %.2f dB\n", a.calm, b.calm);
+    std::printf("      歩いている間の最悪の段差: 向き付け 1.5 → %.2f dB（z=%+.2f）／ 向き付け 0 → %.2f dB（z=%+.2f）\n", a.worst, a.atZ, b.worst, b.atZ);
+    if (std::getenv("AF_DC_TRACE")) {
+        std::printf("      [向き付け 1.5] 戸口の前後（z、段差 dB、Voice（直接・初期）dB、FDN の直出し dB、方向バス dB、耳の部屋）\n");
+        for (const auto& row : a.rows)
+            if (std::fabs(row[0]) < 0.6) std::printf("        z=%+.3f  %+6.2f   %6.1f  %6.1f  %6.1f   %d\n", row[0], row[1], row[2], row[3], row[4], int(row[5]));
+    }
+}
+
+/// 【探り】扉の影から出る（AF_ONLY=shadowexit、2026-10-01）── 発注者「扉の影から出た瞬間の変化がおかしい」を数字にする。
+///   場面と設定は doorcross と同じ（Flow_SwingDoor、板は壁の真ん中、Unity / Unreal の摘み、響き −9 dB）。2 つの動き:
+///     ① 耳は出発点 (0, 1.6, −3) のまま、扉を 0 → 90° へ 45°/s で開ける（板が見通し線から外れる）
+///     ② 扉を AF_SE_DEG（既定 30°と 60°）で止め、耳が z = −3 を x = −2.5 → +2.5 へ 1.4 m/s で横に歩く（耳が板の陰から出る）
+///   ブロックごとに出口の段差と、鳴らしている段（タップ）の種類ごとの量（直接・初期・回折・透過、帯域平均 dB）・
+///   響き（FDN と方向バスの出口）・見通しの割合を出し、最悪の段差の前後を並べる（どの段が跳ねたか）。
+void testShadowExit() {
+    std::printf("\n[探り] 扉の影から出る（Flow_SwingDoor と同じ場面・同じ設定）\n");
+    const float half = 7.0f, h = 3.0f, t = 0.2f, gapL = -0.5f, gapR = 0.5f;
+    const int fs = 48000, block = 512;
+    const float dt = static_cast<float>(block) / fs;
+    const Vec3 S(0.0f, 1.6f, 3.0f);
+    struct Row { float pos, deg, vis; double step, dir, early, diff, trans, late, mainDb, lowHigh, az; };
+    auto leafAt = [&](float deg) { return doorLeaf(deg, gapL, gapR - gapL, h, 0.06f, 0.004f); };   // 板は壁の真ん中
+    // mode 0: 扉を開けていく / mode 1: 横に歩く
+    auto run = [&](int mode, float fixedDeg, std::vector<Row>& rows) {
+        World w;
+        const int mWall = w.rules.materials.add(AcousticMaterial::concrete());
+        const int mLeaf = w.rules.materials.add(AcousticMaterial::woodDoor());
+        auto box = [&](Vec3 c, Vec3 size) { w.addBox(Obb::axisAligned(c, size * 0.5f), mWall, false); };
+        box(Vec3(0, -t * 0.5f, 0), Vec3(2 * half + 2 * t, t, 2 * half + 2 * t));
+        box(Vec3(0, h + t * 0.5f, 0), Vec3(2 * half + 2 * t, t, 2 * half + 2 * t));
+        box(Vec3(-half - t * 0.5f, h * 0.5f, 0), Vec3(t, h, 2 * half + 2 * t));
+        box(Vec3(half + t * 0.5f, h * 0.5f, 0), Vec3(t, h, 2 * half + 2 * t));
+        box(Vec3(0, h * 0.5f, -half - t * 0.5f), Vec3(2 * half + 2 * t, h, t));
+        box(Vec3(0, h * 0.5f, half + t * 0.5f), Vec3(2 * half + 2 * t, h, t));
+        const float leftW = gapL + half, rightW = half - gapR;
+        box(Vec3(-half + leftW * 0.5f, h * 0.5f, 0), Vec3(leftW, h, t));
+        box(Vec3(gapR + rightW * 0.5f, h * 0.5f, 0), Vec3(rightW, h, t));
+        float deg = (mode == 0) ? 0.0f : fixedDeg;
+        const int leaf = w.addBox(leafAt(deg), mLeaf, true);
+        w.lateThrough = 2; w.lateDistancePow = 1.5f; w.laneModel = 1; w.earlyModel = 4;
+        w.precedenceDb = 6.0f; w.precedenceSec = 0.04f; w.adjacentContain = 1.0f; w.leakModel = 1; w.wallReflect = 0;
+        w.doorCoherenceHz = 3000.0f;
+        w.budget.cfg.totalRays = 1536; w.rayGroups = 4;
+        for (int c = 0; c < kNumComponents; ++c) w.rules.weights.w[c] = 1.0f;
+        w.rules.weights.w[kLate] = 0.126f;
+        // AF_SE_LX: ① のときの耳の横位置（既定 0 ＝ 戸口の正面。負 ＝ 蝶番の側）
+        const float lx0 = std::getenv("AF_SE_LX") ? static_cast<float>(std::atof(std::getenv("AF_SE_LX"))) : 0.0f;
+        Vec3 L(mode == 0 ? lx0 : -2.5f, 1.6f, -3.0f);
+        w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const int e = w.addEmitter(S, 0.2f);
+        w.build();
+        af::dsp::FdnRoomMix fdn(fs, 4096, 0.6f);
+        af::dsp::DirectionBus bus(fs, 8, 4096, 128, 1024, 2);
+        af::dsp::HrtfSet hrtf = af::dsp::HrtfSet::createSynthetic(fs);
+        bus.setCrossover(700.0f); bus.setHrtfSet(&hrtf, 57.0f); bus.setPanSplit(false);
+        fdn.setDirectionBus(&bus, 57.0f);
+        w.bindFdn(&fdn);
+        af::dsp::VoiceRenderer::Config vc; vc.sampleRate = fs; vc.maxFrames = 4096; vc.tailSeconds = 1.0f;
+        af::dsp::VoiceRenderer v(vc);
+        v.setOutputGain(0.6f); v.setTailLevel(1.0f); v.setHrtfEnabled(true); v.setHrtfSet(&hrtf);
+        v.setFdnMix(&fdn); v.setDirectionBus(&bus);
+        afti::SineSum sig(fs, block);
+        std::vector<float> in(block), l(block), r(block), fl(block), fr(block);
+        // 響きが落ち着くまで待つ（RT60 3〜5 秒。40 ブロック＝0.4 秒では立ち上がりの途中で、止まっていても段差が出た）
+        const int warm = std::getenv("AF_SE_WARM") ? std::atoi(std::getenv("AF_SE_WARM")) : 300;
+        // AF_SE_TRACE=下限,上限: その区間（① は角度、② は x）のブロックごとの中身を出す
+        float trA = 1e9f, trB = -1e9f;
+        if (const char* tr = std::getenv("AF_SE_TRACE")) { trA = static_cast<float>(std::atof(tr)); if (const char* c = std::strchr(tr, ',')) trB = static_cast<float>(std::atof(c + 1)); }
+        const int frames = warm + ((mode == 0) ? 200 : 360);
+        double prevE = -1.0;
+        for (int k = 0; k < frames; ++k) {
+            const float tt = (k - warm) * dt;
+            if (k >= warm) {
+                if (mode == 0) { deg = std::min(90.0f, 45.0f * tt); w.setBoxTransform(leaf, leafAt(deg)); }
+                else { L.x = std::min(2.5f, -2.5f + 1.4f * tt); w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0)); }
+            }
+            w.update(dt);
+            if (w.fdnStale()) w.bindFdn(&fdn);
+            w.applyToVoice(e, v, fs);
+            double tap[4] = {0, 0, 0, 0};
+            double main6[kNumBands] = {}, ax = 0.0, az = 0.0;   // 主な音（直接・回折・透過）の帯域と向き（初期は除く）
+            if (const Mix* mx = w.mix(e))
+                for (int i = 0; i < mx->tapCount; ++i) {
+                    const MixTap& tp = mx->taps[i];
+                    double te = 0.0; for (int b = 0; b < kNumBands; ++b) te += tp.e6[b];
+                    tap[static_cast<int>(tp.kind)] += te / kNumBands;
+                    if (tp.kind == TapKind::Early) continue;
+                    for (int b = 0; b < kNumBands; ++b) main6[b] += tp.e6[b];
+                    ax += te * tp.dirLocal.x; az += te * tp.dirLocal.z;
+                }
+            double mainE = 0.0; for (int b = 0; b < kNumBands; ++b) mainE += main6[b] / kNumBands;
+            for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = sig.next();
+            v.render(in.data(), block, l.data(), r.data(), nullptr);
+            double eVoice = 0.0;
+            for (int i = 0; i < block; ++i) eVoice += double(l[i]) * l[i] + double(r[i]) * r[i];
+            std::fill(fl.begin(), fl.end(), 0.0f); std::fill(fr.begin(), fr.end(), 0.0f);
+            fdn.render(block, fl.data(), fr.data());
+            double eLate = 0.0;
+            for (int i = 0; i < block; ++i) { eLate += double(fl[i]) * fl[i] + double(fr[i]) * fr[i]; l[i] += fl[i]; r[i] += fr[i]; }
+            std::fill(fl.begin(), fl.end(), 0.0f); std::fill(fr.begin(), fr.end(), 0.0f);
+            bus.render(block, fl.data(), fr.data());
+            double eBus = 0.0;
+            for (int i = 0; i < block; ++i) { eBus += double(fl[i]) * fl[i] + double(fr[i]) * fr[i]; l[i] += fl[i]; r[i] += fr[i]; }
+            const float posNow = (mode == 0) ? deg : L.x;
+            if (k >= warm && posNow >= trA && posNow <= trB) {
+                double eAll = 0.0; for (int i = 0; i < block; ++i) eAll += double(l[i]) * l[i] + double(r[i]) * r[i];
+                std::printf("          [中身] %+7.3f 出口 %6.1f | Voice %6.1f FDN %6.1f 方向バス %6.1f | 戸口の開き %.3f | 送り", posNow,
+                            afti::dB(std::max(eAll / block, 1e-30)), afti::dB(std::max(eVoice / block, 1e-30)), afti::dB(std::max(eLate / block, 1e-30)), afti::dB(std::max(eBus / block, 1e-30)),
+                            w.apertureCount() > 0 ? w.apertureOpenFrac(0) : -1.0f);
+                if (const Mix* mx = w.mix(e))
+                    for (int q = 0; q < mx->sendCount; ++q) {
+                        const FdnSend& sd = mx->sends[q];
+                        double me = 0.0, mt = 0.0; for (int bb = 0; bb < kNumBands; ++bb) { me += sd.e6[bb]; mt += sd.thru6[bb]; }
+                        std::printf(" [部屋%d %6.1f dB 戸口から %6.1f 集まり %.2f]", sd.room, afti::dB(std::max(me / kNumBands, 1e-30)),
+                                    afti::dB(std::max(mt / kNumBands, 1e-30)), sd.focus);
+                    }
+                for (const World::PortalDiag& pd : w.portalDiag()) {   // 戸口の線音源の 5 点（見え具合と重み）
+                    std::printf(" | 線音源 見え %.2f 重み", pd.visible);
+                    for (int q = 0; q < af::dsp::FdnRoomMix::kPortalPoints; ++q) std::printf(" %.2f", pd.pointGain[q]);
+                }
+                std::printf("\n");
+            }
+            if (k < warm - 10) continue;
+            double e2 = 0.0;
+            for (int i = 0; i < block; ++i) e2 += double(l[i]) * l[i] + double(r[i]) * r[i];
+            e2 /= block;
+            const double st = (prevE > 0.0 && e2 > 0.0) ? afti::dB(e2 / prevE) : 0.0;
+            prevE = e2;
+            auto db = [](double x) { return afti::dB(std::max(x, 1e-30)); };
+            rows.push_back(Row{mode == 0 ? deg : L.x, deg, w.visibility(e) ? w.visibility(e)->visible : -1.0f, st,
+                               db(tap[0]), db(tap[1]), db(tap[2]), db(tap[3]), db(eLate / block),
+                               db(mainE), db(main6[0]) - db(main6[kNumBands - 1]), std::atan2(ax, az) * 180.0 / 3.14159265});
+        }
+    };
+    auto report = [&](const char* title, const std::vector<Row>& rows, const char* posName) {
+        double calm = 0.0, worst = 0.0; int wi = -1, over1 = 0;
+        for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+            const double a = std::fabs(rows[static_cast<std::size_t>(i)].step);
+            if (i < 10) { calm = std::max(calm, a); continue; }
+            if (a > 1.0) ++over1;
+            if (a > worst) { worst = a; wi = i; }
+        }
+        std::printf("      %s: 最悪の段差 %.2f dB（%s=%+.2f）・1 dB を超えた段差 %d 回・止まっている間の揺れ %.2f dB\n",
+                    title, worst, posName, wi >= 0 ? rows[static_cast<std::size_t>(wi)].pos : 0.0f, over1, calm);
+        if (wi < 0) return;
+        std::printf("        %7s %6s %6s %7s | %7s %7s %7s %7s | %7s\n", posName, "角度", "見通し", "段差", "直接", "初期", "回折", "透過", "響き");
+        for (int i = std::max(10, wi - 6); i <= std::min(static_cast<int>(rows.size()) - 1, wi + 4); ++i) {
+            const Row& q = rows[static_cast<std::size_t>(i)];
+            std::printf("        %+7.3f %6.1f %6.2f %+7.2f | %7.1f %7.1f %7.1f %7.1f | %7.1f%s\n", q.pos, q.deg, q.vis, q.step,
+                        q.dir, q.early, q.diff, q.trans, q.late, (i == wi) ? "  ← 最悪" : "");
+        }
+        // 影から出る瞬間（見通しが 0 から開いた所）の前後: 主な音（直接・回折・透過）の量・こもり・向き
+        int xi = -1;
+        for (int i = 11; i < static_cast<int>(rows.size()); ++i)
+            if (rows[static_cast<std::size_t>(i - 1)].vis <= 1e-4f && rows[static_cast<std::size_t>(i)].vis > 1e-4f) { xi = i; break; }
+        if (xi < 0) { std::printf("        （見通しが 0 から開く所は無かった）\n"); return; }
+        std::printf("        影から出る瞬間の前後（主な音 ＝ 直接＋回折＋透過）\n");
+        std::printf("        %7s %6s %7s | %7s %7s %7s | %7s %7s %7s\n", posName, "見通し", "段差", "直接", "回折", "透過", "主な音", "低−高", "向き°");
+        for (int i = std::max(10, xi - 6); i <= std::min(static_cast<int>(rows.size()) - 1, xi + 8); ++i) {
+            const Row& q = rows[static_cast<std::size_t>(i)];
+            std::printf("        %+7.3f %6.3f %+7.2f | %7.1f %7.1f %7.1f | %7.1f %+7.1f %+7.1f%s\n", q.pos, q.vis, q.step,
+                        q.dir, q.diff, q.trans, q.mainDb, q.lowHigh, q.az, (i == xi) ? "  ← 見通しが開いた" : "");
+        }
+    };
+    {
+        std::vector<Row> rows; run(0, 0.0f, rows);
+        report("① 扉を 0→90° へ開ける（耳は出発点）", rows, "角度");
+    }
+    std::vector<float> degs = {30.0f, 60.0f};
+    if (const char* s = std::getenv("AF_SE_DEG")) degs = {static_cast<float>(std::atof(s))};
+    for (float d : degs) {
+        std::vector<Row> rows; run(1, d, rows);
+        char title[96]; std::snprintf(title, sizeof(title), "② 扉 %.0f° で横に歩く（z=−3）", d);
+        report(title, rows, "x");
+    }
+}
+
+/// 【探り】洞窟に歩いて入る（AF_ONLY=cavewalk、2026-10-04）── Unreal の Cave_ThirdPerson の下ごしらえ。
+///   場面は Unreal の Cave_ThirdPerson（AcousticFlowScene::BuildCave）と同じ: 屋外の地面（60 m 四方）の上に、厚さ 1 m の岩の殻で
+///   囲った洞窟（中 12 × 7 × 18 m、岩肌 cave()）。手前の壁に口（幅 M × 高さ 3.5 m）。
+///   耳は x = 0 を z = −14（出発点）→ +12（洞窟の奥）へ 1.4 m/s で正面を向いて歩く。口は z = 0〜1。
+///   音源は 洞窟の中 (2.5, 1.4, 15) か 屋外 (−3, 1.4, −10)。摘みは Unity / Unreal の既定（響き −9 dB・隣の部屋 −12 dB・先着 6 dB ほか）。
+///   見る物: ① 洞窟が部屋になるか（口が広いと屋外とつながって部屋にならない ＝ 響きが無い）と部屋を割る半径
+///           ② 耳の部屋が変わる位置 ③ 成分ごとの量（Voice ＝ 直接・初期、FDN の直出し、方向バス）と段差
+///   ④ 外への口（World::setOutsideMouth）の 0 / 1 で、口の前（屋外）で洞窟の響きが漏れて聞こえるか
+///   既定は 口 3.5 m で（半径 0.6・外への口 0）（2.1・0）（2.1・1 ＝ Unreal の地図）。AF_CW_MOUTH=幅、AF_CW_SEED=半径、AF_CW_OUT=0|1 で 1 通りに絞る。
+///   AF_CW_SRC=in|out（既定 両方）、AF_CW_ADJ=隣の部屋の響きの重み（既定 1 ＝ 0 dB）、AF_CW_XFADE=受け渡しの秒（0 で旧）、
+///   AF_CW_TRACE で 0.5 m ごとの表。
+void testCaveWalk() {
+    std::printf("\n[探り] 洞窟に歩いて入る（屋外 → 口 → 洞窟の奥）\n");
+    const int fs = 48000, block = 512;
+    const float dt = static_cast<float>(block) / fs;
+    const float halfW = 6.0f, H = 7.0f, z0 = 1.0f, z1 = 19.0f, rock = 1.0f, mouthH = 3.5f;   // Unreal の BuildCave と同じ
+    struct Res { int rooms = 0; float rt = 0.0f, vol = 0.0f; float switchZ = 1e9f; double worst = 0.0; float atZ = 0.0f;
+                 std::vector<std::array<double, 9>> rows; };
+    auto run = [&](float mouthW, float seed, int outside, bool srcIn) {
+        World w;
+        const int mRock = w.rules.materials.add(AcousticMaterial::cave());
+        auto box = [&](float x0, float x1, float y0, float y1, float zz0, float zz1) {
+            w.addBox(Obb::axisAligned(Vec3((x0 + x1) * 0.5f, (y0 + y1) * 0.5f, (zz0 + zz1) * 0.5f),
+                                      Vec3((x1 - x0) * 0.5f, (y1 - y0) * 0.5f, (zz1 - zz0) * 0.5f)), mRock, false);
+        };
+        box(-30, 30, -0.2f, 0, -35, 25);                                   // 地面（屋外と洞窟の床）
+        box(-halfW - rock, -halfW, 0, H, 0, z1 + rock);                    // 左の壁
+        box(halfW, halfW + rock, 0, H, 0, z1 + rock);                      // 右の壁
+        box(-halfW - rock, halfW + rock, 0, H, z1, z1 + rock);             // 奥の壁
+        box(-halfW - rock, halfW + rock, H, H + rock, 0, z1 + rock);       // 天井
+        box(-halfW, -mouthW * 0.5f, 0, H, 0, z0);                          // 手前の壁（口の左）
+        box(mouthW * 0.5f, halfW, 0, H, 0, z0);                            // 手前の壁（口の右）
+        box(-mouthW * 0.5f, mouthW * 0.5f, mouthH, H, 0, z0);              // 口の上
+        w.setRoomSeedRadius(seed);
+        w.setOutsideMouth(outside);
+        w.lateThrough = 2; w.lateDistancePow = 1.5f; w.laneModel = 1; w.earlyModel = 4;   // Unity の場面・Unreal の既定と同じ
+        w.precedenceDb = 6.0f; w.precedenceSec = 0.04f; w.adjacentContain = 1.0f; w.leakModel = 1; w.wallReflect = 0;
+        w.doorCoherenceHz = 3000.0f;
+        w.budget.cfg.totalRays = 1536; w.rayGroups = 4;
+        for (int c = 0; c < kNumComponents; ++c) w.rules.weights.w[c] = 1.0f;
+        w.rules.weights.w[kLate] = 0.126f;                                 // −9 dB
+        w.rules.weights.lateAdjacent = 1.0f;                               // 0 dB（2026-10-04 に Unity / Unreal の既定を戻した）
+        if (const char* sa = std::getenv("AF_CW_ADJ")) w.rules.weights.lateAdjacent = static_cast<float>(std::atof(sa));   // 隣の部屋の響きの重み
+        if (const char* sx = std::getenv("AF_CW_XFADE")) w.portalCrossfadeSec = static_cast<float>(std::atof(sx));   // 戸口の線音源とレーンの受け渡し（秒、0 で旧）
+        if (const char* lt = std::getenv("AF_CW_LT")) w.lateThrough = std::atoi(lt);   // 1 案1（レーンの点）／2 戸口の線音源（量の突き合わせ用）
+        Vec3 L(0, 1.6f, -14.0f);                                           // 出発点（口の 14 m 手前、耳は頭の高さ）
+        w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
+        const Vec3 S = srcIn ? Vec3(2.5f, 1.4f, 15.0f) : Vec3(-3.0f, 1.4f, -10.0f);
+        const int e = w.addEmitter(S, 0.2f);
+        w.build();
+        Res res;
+        res.rooms = w.roomCount();
+        for (int r = 0; r < w.roomCount(); ++r)
+            if (w.probe(r).volume > res.vol) { res.vol = w.probe(r).volume; res.rt = w.probe(r).rt60[2]; }
+        af::dsp::FdnRoomMix fdn(fs, 4096, 0.6f);
+        af::dsp::DirectionBus bus(fs, 8, 4096, 128, 1024, 2);
+        af::dsp::HrtfSet hrtf = af::dsp::HrtfSet::createSynthetic(fs);
+        bus.setCrossover(700.0f); bus.setHrtfSet(&hrtf, 57.0f); bus.setPanSplit(false);
+        fdn.setDirectionBus(&bus, 57.0f);
+        w.bindFdn(&fdn);
+        af::dsp::VoiceRenderer::Config vc; vc.sampleRate = fs; vc.maxFrames = 4096; vc.tailSeconds = 1.0f;
+        af::dsp::VoiceRenderer v(vc);
+        v.setOutputGain(0.6f); v.setTailLevel(1.0f); v.setHrtfEnabled(true); v.setHrtfSet(&hrtf);
+        v.setFdnMix(&fdn); v.setDirectionBus(&bus);
+        afti::SineSum sig(fs, block);
+        const bool noise = std::getenv("AF_CW_NOISE") != nullptr;
+        std::uint32_t rng = 12345u;
+        std::vector<float> in(block), l(block), r(block), fl(block), fr(block);
+        double prevE = -1.0;
+        int prevRoom = w.roomAt(L);
+        const int warm = 300;
+        const int frames = warm + static_cast<int>(26.0f / 1.4f / dt) + 10;
+        for (int k = 0; k < frames; ++k) {
+            if (k > warm) { L.z = std::min(12.0f, -14.0f + 1.4f * (k - warm) * dt); w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0)); }
+            w.update(dt);
+            if (w.fdnStale()) w.bindFdn(&fdn);
+            w.applyToVoice(e, v, fs);
+            double rawLate = 0.0, sendE = 0.0;   // 帳簿の後期（耳に届いた生の量）と、FDN へ入れる量（送りの合計）
+            if (const Mix* mx = w.mix(e)) {
+                for (int b = 0; b < kNumBands; ++b) rawLate += mx->component6[kLate][b] / kNumBands;
+                for (int q = 0; q < mx->sendCount; ++q) for (int b = 0; b < kNumBands; ++b) sendE += mx->sends[q].e6[b] / kNumBands;
+            }
+            const int rm = w.roomAt(L);
+            if (rm != prevRoom && res.switchZ > 1e8f) res.switchZ = L.z;
+            prevRoom = rm;
+            // AF_CW_NOISE: 白色雑音（量を比べる用。正弦は低域ばかりで、戸口の線音源の 5 点の位相の重なりを強く受ける）
+            if (noise) for (int i = 0; i < block; ++i) { rng = rng * 1664525u + 1013904223u; in[static_cast<std::size_t>(i)] = (static_cast<float>(rng >> 8) / 16777216.0f - 0.5f) * 0.4f; }
+            else for (int i = 0; i < block; ++i) in[static_cast<std::size_t>(i)] = sig.next();
+            v.render(in.data(), block, l.data(), r.data(), nullptr);
+            std::fill(fl.begin(), fl.end(), 0.0f); std::fill(fr.begin(), fr.end(), 0.0f);
+            fdn.render(block, fl.data(), fr.data());
+            double eD = 0.0, eF = 0.0, eB = 0.0;
+            for (int i = 0; i < block; ++i) eD += double(l[i]) * l[i] + double(r[i]) * r[i];
+            for (int i = 0; i < block; ++i) eF += double(fl[i]) * fl[i] + double(fr[i]) * fr[i];
+            for (int i = 0; i < block; ++i) { l[i] += fl[i]; r[i] += fr[i]; }
+            std::fill(fl.begin(), fl.end(), 0.0f); std::fill(fr.begin(), fr.end(), 0.0f);
+            bus.render(block, fl.data(), fr.data());
+            for (int i = 0; i < block; ++i) eB += double(fl[i]) * fl[i] + double(fr[i]) * fr[i];
+            for (int i = 0; i < block; ++i) { l[i] += fl[i]; r[i] += fr[i]; }
+            if (std::getenv("AF_CW_DIAG") && k >= warm && L.z > 0.3f && L.z < 0.8f)   // 口をまたぐ前後の器の中身
+                std::printf("        [器] z=%+.3f 部屋 %d | 枠0 src %d 量 %.3f Σg² %.3f 消えかけ %d | レーンの割合 %.3f | 帯域の重み² %.3f | FDN %6.1f バス %6.1f\n",
+                            L.z, w.roomAt(L), fdn.portalSource(0), fdn.portalDirect(0), fdn.portalGainSq(0), fdn.portalFading(0) ? 1 : 0,
+                            fdn.roomLaneShare(0), fdn.roomWeightSq(0), afti::dB(std::max(eF / block, 1e-30)), afti::dB(std::max(eB / block, 1e-30)));
+            if (k < warm) continue;
+            double e2 = 0.0;
+            for (int i = 0; i < block; ++i) e2 += double(l[i]) * l[i] + double(r[i]) * r[i];
+            e2 /= block;
+            const double st = (prevE > 0.0 && e2 > 0.0) ? afti::dB(e2 / prevE) : 0.0;
+            res.rows.push_back({double(L.z), st, afti::dB(std::max(eD / block, 1e-30)), afti::dB(std::max(eF / block, 1e-30)),
+                                afti::dB(std::max(eB / block, 1e-30)), afti::dB(std::max(e2, 1e-30)), double(rm),
+                                afti::dB(std::max(rawLate, 1e-30)), afti::dB(std::max(sendE, 1e-30))});
+            if (k > warm + 1 && std::fabs(st) > res.worst) { res.worst = std::fabs(st); res.atZ = L.z; }
+            prevE = e2;
+        }
+        return res;
+    };
+    struct Cfg { float mouth, seed; int out; };
+    std::vector<Cfg> cfgs = {{3.5f, 0.6f, 0}, {3.5f, 2.1f, 0}, {3.5f, 2.1f, 1}};
+    if (std::getenv("AF_CW_MOUTH") || std::getenv("AF_CW_SEED") || std::getenv("AF_CW_OUT")) {
+        Cfg c{3.5f, 2.1f, 1};
+        if (const char* s = std::getenv("AF_CW_MOUTH")) c.mouth = static_cast<float>(std::atof(s));
+        if (const char* s = std::getenv("AF_CW_SEED")) c.seed = static_cast<float>(std::atof(s));
+        if (const char* s = std::getenv("AF_CW_OUT")) c.out = std::atoi(s);
+        cfgs = {c};
+    }
+    std::vector<int> srcs = {1, 0};
+    if (const char* s = std::getenv("AF_CW_SRC")) srcs = {std::string(s) == "out" ? 0 : 1};
+    for (const Cfg& cf : cfgs)
+            for (int si : srcs) {
+                const float m = cf.mouth, sd = cf.seed;
+                const Res a = run(m, sd, cf.out, si != 0);
+                std::printf("    口 %.1f m・半径 %.1f m・外への口 %d・音源 %s: 部屋 %d（いちばん大きい部屋 %.0f m3、RT60 500Hz %.2f s）",
+                            m, sd, cf.out, si ? "洞窟の中" : "屋外", a.rooms, a.vol, a.rt);
+                if (a.switchZ < 1e8f) std::printf("・耳の部屋が変わる z %+.2f", a.switchZ); else std::printf("・耳の部屋は変わらない");
+                std::printf("・最悪の段差 %.2f dB（z=%+.2f）\n", a.worst, a.atZ);
+                // 響き ＝ FDN の直出し（外の耳では戸口の線音源）と方向バス（中の耳ではレーン）。地点ごとに 2 つと合計を出す。
+                for (float zq : {-10.0f, -0.5f, 2.0f}) {
+                    for (const auto& row : a.rows)
+                        if (row[0] >= zq - 1e-4) {
+                            std::printf("        z=%+5.1f: FDN %6.1f dB／バス %6.1f dB／Voice %6.1f dB／合計 %6.1f dB\n", zq, row[3], row[4], row[2], row[5]);
+                            break;
+                        }
+                }
+                if (std::getenv("AF_CW_TRACE")) {
+                    std::printf("      z       段差    Voice    FDN     バス    合計   部屋  帳簿の後期  送り\n");
+                    float next = -14.0f;
+                    const bool fine = std::getenv("AF_CW_FINE") != nullptr;   // 口の前後（z −0.3〜+1.2）は 1 ブロックずつ
+                    for (const auto& row : a.rows)
+                        if (row[0] >= next - 1e-4 || (fine && row[0] > -0.3 && row[0] < 1.2)) {
+                            std::printf("      %+5.2f  %+6.2f  %6.1f  %6.1f  %6.1f  %6.1f   %d   %6.1f  %6.1f\n", row[0], row[1], row[2], row[3], row[4], row[5], int(row[6]), row[7], row[8]);
+                            next += 0.5f;
+                        }
+                }
+            }
 }
 
 /// 【探り】こもりの出どころ（AF_ONLY=muffle）── 扉まわりの帯域の形を、部品と結果の両方で出す（資料の図用）
@@ -4826,6 +5383,14 @@ void testMuffle() {
       w.raysPerEmitter = nr; w.budget.cfg.maxPerEmitter = std::max(nr, w.budget.cfg.maxPerEmitter); }
     // ★組は 1 つ（毎フレーム全部のレイ）。4 組に割ると 1 フレームに 1 組しか解かず、途中の帳簿を読んで後期の取り分が角度ごとに 92% → 7% と跳んだ
     w.rayGroups = 1; w.budget.cfg.totalRays = 0;
+    // AF_HOST=1: Unity / Unreal の既定と同じ摘み（先着の重み 6 dB・隣の部屋の閉じ込め 1・響き −9 dB・壁までの距離で配る 1.5 など）。
+    //   出口（タップと FDN の送り）の欄はこの摘みで読む。帳簿の欄は摘みによらない（物理）。
+    // AF_SHADOW=dB: 影のこもり（WorldWeights::shadowMuffleDb）。出口の欄だけが変わる。
+    if (std::getenv("AF_HOST")) {
+        w.precedenceDb = 6.0f; w.precedenceSec = 0.04f; w.adjacentContain = 1.0f; w.leakModel = 1; w.wallReflect = 0;
+        w.doorCoherenceHz = 3000.0f; w.lateDistancePow = 1.5f; w.rules.weights.w[kLate] = 0.126f;
+    }
+    if (const char* sh = std::getenv("AF_SHADOW")) w.rules.weights.shadowMuffleDb = static_cast<float>(std::atof(sh));
     const Vec3 L(0, 1.6f, -3.0f);
     w.setListener(L, Vec3(0, 0, 1), Vec3(0, 1, 0));
     const int e = w.addEmitter(Vec3(0, 1.6f, 3.0f), 0.2f);
@@ -4836,7 +5401,7 @@ void testMuffle() {
     for (float phi : {0.0f, 15.0f, -15.0f}) {
         const float ph = phi * 3.14159265f / 180.0f;
         w.setEmitter(e, Vec3(3.0f * std::sin(ph), 1.6f, 3.0f * std::cos(ph)), 0.2f, false, 1.0f);
-        std::printf("\n      φ %+4.0f°  扉 | 道（直接＋透過＋回折）dB: 125   250   500    1k    2k    4k | 低−高 道 / 全部 | 取り分 直/透/回/初/後 %%\n", phi);
+        std::printf("\n      φ %+4.0f°  扉 | 道（直接＋透過＋回折）dB: 125   250   500    1k    2k    4k | 低−高 道 / 全部 | 取り分 直/透/回/初/後 %% | 出口 低−高・影の道 %%\n", phi);
         for (float deg : kDegs) {
             w.setBoxTransform(leaf, doorLeaf(deg, gapL, gapR - gapL, h, 0.06f, 0.004f));
             for (int k = 0; k < 3; ++k) w.update(dt);
@@ -4856,6 +5421,15 @@ void testMuffle() {
                         afti::dB(std::max(all[0], 1e-30)) - afti::dB(std::max(all[5], 1e-30)));
             static const int kOrd[5] = {kDirect, kTransmit, kDiffract, kEarly, kLate};
             for (int c : kOrd) std::printf(" %3.0f", tot > 0.0 ? 100.0 * sum[c] / tot : 0.0);
+            // 出口: 鳴らす側へ渡る量（タップ ＋ FDN の送り）。重み・先着の重み・影のこもりが掛かった後。
+            double ex[kNumBands] = {}, exShadow = 0.0, exTot = 0.0;
+            for (int i = 0; i < mx->tapCount; ++i) {
+                const bool sh = mx->taps[i].kind == TapKind::Transmit || mx->taps[i].kind == TapKind::Diffract;
+                for (int b = 0; b < kNumBands; ++b) { ex[b] += mx->taps[i].e6[b]; exTot += mx->taps[i].e6[b]; if (sh) exShadow += mx->taps[i].e6[b]; }
+            }
+            for (int q = 0; q < mx->sendCount; ++q) for (int b = 0; b < kNumBands; ++b) { ex[b] += mx->sends[q].e6[b]; exTot += mx->sends[q].e6[b]; }
+            std::printf(" | %+5.1f %3.0f", afti::dB(std::max(ex[0], 1e-30)) - afti::dB(std::max(ex[5], 1e-30)), exTot > 0.0 ? 100.0 * exShadow / exTot : 0.0);
+            row("exit", phi, deg, "all", ex);
             std::printf("\n");
         }
     }
@@ -5002,8 +5576,8 @@ int main() {
         {"rules", testWorldRules}, {"probe", testProbe}, {"emitter", testEmitter}, {"mix", testMix}, {"instruments", testInstruments},
         {"trace", testEnergyTrace}, {"response", testResponse}, {"distribute", testDistribute},
         {"world", testWorld}, {"bridge", testBridge}, {"aperture", testAperture}, {"diffraction", testDiffraction}, {"images", testImageSources},
-        {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"wall", testWallReflect}, {"precedence", testPrecedence}, {"recvworld", testReceiverWorld}, {"imgface", testImageFaces}, {"imglattice", testImageLattice}, {"imgsurface", testImageSurface}, {"latedist", testLateDistance}, {"contain", testAdjacentContain}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
-        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true}, {"doorcoh", testDoorCoherence, true}, {"receiver", testReceiverFaces, true}, {"recvtaps", testReceiverTaps, true}, {"recvnear", testReceiverNear, true}, {"recvdoor", testReceiverDoor, true}, {"doormap", testDoorMap, true}, {"latedistwalk", testLateDistanceWalk, true}, {"muffle", testMuffle, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
+        {"budget", testBudget}, {"raycap", testRayCap}, {"material", testMaterialChange}, {"wall", testWallReflect}, {"precedence", testPrecedence}, {"recvworld", testReceiverWorld}, {"imgface", testImageFaces}, {"imglattice", testImageLattice}, {"imgsurface", testImageSurface}, {"latedist", testLateDistance}, {"contain", testAdjacentContain}, {"lateadj", testAdjacentLateWeight}, {"shadowmuffle", testShadowMuffle}, {"clicks", testClicks}, {"gpu", testGpuPipe}, {"leak", testLeakModels}, {"latedir", testLateThrough}, {"doorline", testDoorLineSource},
+        {"doorsweep", testDoorSweep, true}, {"wallshadow", testWallShadow, true}, {"doorside", testDoorSide, true}, {"manysrc", testManySources, true}, {"nearwall", testNearWall, true}, {"lateorigin", testLateOrigin, true}, {"doorprobe", testDoorProbe, true}, {"doorcoh", testDoorCoherence, true}, {"receiver", testReceiverFaces, true}, {"recvtaps", testReceiverTaps, true}, {"recvnear", testReceiverNear, true}, {"recvdoor", testReceiverDoor, true}, {"doormap", testDoorMap, true}, {"doorcross", testDoorCross, true}, {"shadowexit", testShadowExit, true}, {"cavewalk", testCaveWalk, true}, {"latedistwalk", testLateDistanceWalk, true}, {"muffle", testMuffle, true},   // 探り。名指しのときだけ（AF_ONLY=doorsweep）
     };
     for (const auto& s : suites) {
         // AF_ONLY はコンマ区切りで複数指定できる（例 AF_ONLY=world,bridge）

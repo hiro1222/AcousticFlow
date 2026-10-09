@@ -1,0 +1,49 @@
+{
+  "_note": "asset_pipeline_spec.md Phase 0-1 / 0-2 の成果物。世界観・ステージ構成レーンが起票。",
+  "_resolved": "★2026-08-20 決着。草原の植生だけ意図的な例外。詳細は resolved_2026_08_20 と docs/WORLD_VISUAL.md。",
+
+  "master": {
+    "deep_slate":      { "hex": "#36434F", "role": "影・遠景シルエット" },
+    "mid_blue_gray":   { "hex": "#56697A", "role": "建物中間色" },
+    "light_blue_gray": { "hex": "#8195A5", "role": "ハイライト面" },
+    "pale_mist":       { "hex": "#B6C3CD", "role": "フォグ・空気遠近" },
+    "moss_accent":     { "hex": "#6E7F63", "role": "植生（低彩度）" }
+  },
+
+  "biome_shift": {
+    "ruin":  { "hue": 0,   "value": 0.00, "fog": "中", "note": "プロジェクトの基準点。ここでスタイルを確立する" },
+    "cave":  { "hue": 5,   "value": -0.30, "fog": "高", "note": "光源は自発光に依存" },
+    "field": { "hue": -10, "value": 0.10, "fog": "低", "note": "彩度は上げすぎない" },
+    "snow":  { "hue": 15,  "value": 0.20, "fog": "高", "note": "白は純白にせず #B6C3CD 基調" }
+  },
+
+  "implemented_2026_08_20": {
+    "_source": "UnityDemo/Assets/Scripts/BellGame/Editor/BellGameLayout.cs の kPalette",
+    "_verdict": "石とフォグはほぼ一致。植生だけ彩度が 2.5〜3.3 倍あり、指示書と食い違う。",
+    "on_spec": {
+      "Shrine_Stone": { "hex": "#99A3AD", "s": 0.12, "v": 0.68, "vs": "light_blue_gray (S 0.22 / V 0.65)" },
+      "fog":          { "hex": "#B8D6EB", "s": 0.22, "v": 0.92, "vs": "pale_mist (S 0.11 / V 0.80)：やや明るく青い" }
+    },
+    "off_spec": {
+      "Grass_Ground": { "hex": "#6E9C45", "s": 0.56, "v": 0.61, "vs": "moss_accent (S 0.22 / V 0.50)" },
+      "Grass_Blade":  { "hex": "#70992B", "s": 0.72, "v": 0.60, "vs": "moss_accent：彩度 3.3 倍" },
+      "Tree_Leaf":    { "hex": "#4D7533", "s": 0.56, "v": 0.46, "vs": "moss_accent：彩度 2.5 倍" }
+    }
+  },
+
+  "resolved_2026_08_20": {
+    "_decision": "★草原だけ例外。後の三世界（崩壊都市・洞窟・雪山）は導出値どおりの寒色系。",
+    "_by": "発注者",
+    "_reason": "音響の性格が草原だけ違う。後の三つは全部どこかが壊れているか奪われている（屋根が落ちる／方向が嘘をつく／高域が消える）のに対し、草原だけが無傷・遮蔽なし・尾なしの基準世界。色の例外が音響の設計から出てくる。",
+    "_scope": "例外は**植生の緑だけ**。草原の石・空・霧は導出値へ寄せる。例外を 2 つ作った時点で『スタイル基準は 1 つ』が崩れるので、これ以上は増やさない。",
+    "_detail": "docs/WORLD_VISUAL.md"
+  },
+
+  "derived": {
+    "_note": "マスターパレットに biome_shift を HSV で機械的に掛けた結果。手で選ばない。",
+    "ruin": { "deep": "#36434F", "mid": "#56697A", "light": "#8195A5", "mist": "#B6C3CD", "moss": "#6E7F63" },
+    "cave": { "deep": "#262D37", "mid": "#3C4755", "light": "#5A6674", "mist": "#7F8790", "moss": "#4B5945" },
+    "field": { "deep": "#3B4E57", "mid": "#5F7A86", "light": "#8EABB6", "mist": "#C8DBE2", "moss": "#7E8C6D（★使わない。例外）" },
+    "snow": { "deep": "#41495F", "mid": "#677392", "light": "#9BA8C6", "mist": "#DAE3F6", "moss": "#7C9877" }
+  }
+}

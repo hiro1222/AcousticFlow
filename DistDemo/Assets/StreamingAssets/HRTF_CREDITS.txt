@@ -1,0 +1,41 @@
+AcousticFlow — 同梱している HRTF データの出典とライセンス
+===========================================================
+
+kemar.afhr
+-----------
+出典: HRTF Measurements of a KEMAR Dummy-Head Microphone
+著者: Bill Gardner and Keith Martin, MIT Media Lab (1994)
+入手元: https://sound.media.mit.edu/resources/KEMAR.html
+
+ライセンス（配布元の記載）:
+    "This data is Copyright 1994 by the MIT Media Laboratory.
+     It is provided free with no restrictions on use, provided the authors
+     are cited when the data is used in any research or commercial application."
+
+    → 利用に制限はないが、研究・商用を問わず利用時には著者を明記すること。
+      このファイルがその明記にあたる。作品として公開・提出する際は、
+      README や About 画面にも同じクレジットを記載すること。
+
+このリポジトリでの加工内容:
+    配布物 compact.zip（方位角 0〜180 の半球・368 方向・44.1kHz・16bit・
+    128 タップのステレオ WAV）を、Unity エディタの
+    AcousticFlow > HRTF Tools から以下の処理をして .afhr へ変換した。
+      ・左右対称性を利用して反対側の方向を生成（L/R を入れ替え、方位角を反転）
+      ・出力サンプリング周波数へ Lanczos リサンプル
+      ・データセット全体のピークを 1.0 に正規化
+    変換コード: UnityDemo/Assets/Scripts/AcousticFlow/Editor/KemarImporter.cs
+
+
+synthetic.afhr
+---------------
+出典: なし（AcousticFlow が球体頭モデルから生成したもの）
+    Woodworth の球体近似による ITD と、頭部の影による高域減衰を模したもの。
+    耳介を模擬していないため仰角・前後の手がかりは出ない。
+    実測データが無い環境でパイプラインを検証するためのフォールバック。
+
+
+他のデータセットを追加する場合の注意
+-------------------------------------
+HRTF データセットはライセンスが提供元ごとに大きく異なる。研究利用限定のもの、
+再配布不可のものもある。リポジトリへ同梱する前に必ず配布条件を確認し、
+不可・不明なものは同梱せず「利用者が各自 StreamingAssets に置く」運用にすること。

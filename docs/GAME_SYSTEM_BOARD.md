@@ -15,6 +15,8 @@
 | **ゲームシステム** | `UnityDemo/Assets/Scripts/BellGame/` `docs/` | `AcousticEngine/` `AcousticFlow/` `tools/StageModelGen/` |
 | **造形**（世界観・ステージ構成） | `tools/StageModelGen/` `UnityDemo/Assets/Models/` `UnityDemo/Assets/Textures/` | 上の 2 つ |
 | **ミドルウェア** ★2026-08-29 新設 | `Middleware/`（新設）`portfolio/` | 上の 3 つ |
+| **資料** ★2026-09-13 新設 | `Deck/`（作業中の資料 `Deck/就職作品資料_技術選定.pptx` を**その場で直す**。09-14 から）。発注者の `Downloads\就職作品資料*.pptx` は読むだけ。数字は回帰テストの exe を**回して読むだけ** | 本家の全部（コード・DLL・Unity・`portfolio/`）。ビルドもしない（古い exe なら依頼する） |
+| **理解**（サブレーン）★2026-09-10 新設 | `C:\dev\AcousticStudy`（**別プロジェクト**。本家のコードを 1 行も持ち込まず C++ を 1 から。`src/` は発注者が手打ち） | 本家の全部。**この板にも書かない**。旧 `C:\dev\AcousticFlowSelf` は役目を終えた |
 
 境界で注意が要る 3 箇所:
 
@@ -214,6 +216,12 @@ Wwise の土俵に降りないため。再生は**試聴に足りるだけ**（�
 ## 往復ログ
 
 追記のみ。古いものは消さない。
+
+### 2026-09-13 資料レーン — 新設。就職作品資料の「03 技術選定」6 枚を埋めた
+
+- 土台は発注者の `就職作品資料.pptx`（17:40 版）。出力は `就職作品資料_技術選定.pptx`。差し替えたのは slide8〜13 の XML だけ
+- 数字は `FlowRegressionTest.exe`（17:26 ビルド、ソースより新しい）を回して取った。Flow 164 件合格／`AF_ONLY=doormap`。旧コアの数字は「旧実装」と明記
+- ⚠ `DspRegressionTest.exe`（09-12 2:53）は `fdn_room_mix.h`（09-12 8:49）より古い。資料では Dsp の数字を使っていない
 
 ### 2026-09-01 ミドルウェアレーン — フェードとスムージングを入れた（T40 完了）
 
@@ -9220,3 +9228,46 @@ FDN 側は IR もエコグラムも使わず、部屋グラフの Sabine（開�
 ## いまの構図
 
 音の計算は**音響エンジン（C++）だけ**です。C# が持つのは「音の面の操作」── 何を鳴らすか（AudioSource のクリップ）、切り替え、計器の読み出し（`AudioMonitor.cs` の `Solo` / `Scope`）。
+
+---
+
+# 【サウンド】自前コアのサブレーンを新設しました（発注者の指示、2026-09-10）
+
+`C:\dev\AcousticFlowSelf\`（別リポジトリ、`7e0da54`）。本家の新コア `Flow/` を、**発注者が設計文書と地図に沿って自分の手で書く**場所です。
+★同日訂正: 当初「そこの Claude は書かない」で組んだが、発注者の指示で**実装は Claude・ファイルごとに 5 項目と核のコード**に改めた。順序も本家の地図と違い、発注者の 8 段（環境 → FDN → プローブと混合 → レイ → ISM → 回折 → 扉 → State、`docs/BUILD_ORDER.md`）。段 0（WASAPI の C++ ホストで歩ける）まで出した（`71ee805`）。目的は「書ける」でなく「仕組みが分かる」。
+
+- 持ち込み: 本家 `8462ae5`（段 4）から Core 12 本・Dsp 12 本・物差し・設計文書・地図。Flow/ は空から
+- 検査: 本家 `flow_regression.cpp` を Flow のファイルごとに割った 8 本（71 件）。揃ったファイルの検査だけ組まれる
+- 本家が段を進めたら、あちらの `tools/dev.ps1 import` で検査と文書を取り込む。**本家側のお願い**: `flow_regression.cpp` の検査は今の「// ==== [名前] ファイル（段 n）」の区切りを保ってください（割る目印）
+- このレーンは板に書きません。本家に何かが要るときは発注者が本家のセッションで言います
+
+---
+
+# 【サウンド】理解のレーンを C:\dev\AcousticStudy へ作り直しました（発注者の指示、2026-09-10 夜）
+
+同日の朝に作った `C:\dev\AcousticFlowSelf`（本家の Core/Dsp を写して段 0 から）は役目を終えました。
+発注者の指示 ──「もう完全別プロジェクトからってのがいいかな」「Visual Studio で C++ を 1 から」「エンジンを先に理解したい」。
+
+- `C:\dev\AcousticStudy`（初回 `c6d0e12`）。**本家のコードは 1 行も入っていません。**Unity なし・外部ライブラリなし
+- `src/` は発注者が手で打ち、Claude はコードを会話に出すだけ。配管（WAV 書き出し・検査・デモ）は Claude
+- 梯子は 12 段（信号 → 遅延 → 両耳 → 鏡像 → 箱の虚像 → Sabine → FDN → 帯域 → 遮蔽 → 開口 → 回折 → 配分）
+- 段 01 は検査 17 件とデモを用意済み。参照実装で通ることを確かめてから消しました
+- **本家への影響はありません。**向こうは本家に依存しないので、段が進んでも取り込む物はありません（前に書いた「区切りコメントを保って」のお願いも不要になりました）
+
+---
+
+# 【サウンド】フォルダを整理しました ── UnityDemo は Projects/UnityDemo へ（発注者の指示、2026-09-30）
+
+発注者「Project フォルダを用意して、その中に一つ一つプロジェクトを分けて管理」。
+
+```
+Projects/
+  UnityDemo/                Unity の試聴台（旧 UnityDemo/。git mv したので履歴はそのまま）
+  UnityDemo_WwiseProject/   Unity 用の Wwise プロジェクト（旧 UnityDemo/UnityDemo_WwiseProject）
+  UnrealDemo/               Unreal の試聴台（新規、UE 5.6）
+```
+
+- 最上位の Unity の残骸（Assets/ Library/ Logs/ Packages/ ProjectSettings/ Temp/ UserSettings/）と build2/ out/ などは **消さずに `_attic/` へ**移しました。要る物があれば戻してください
+- サウンドのレーンのスクリプト・検査・CMake・.gitignore は新しい場所に直してあります（Flow 190 / Dsp 159 / 台帳 6 すべて合格）
+- **別レーンへのお願い**: `tools/StageModelGen/Program.cs` の出力先の既定が `UnityDemo/Assets/Models` のままです（引数で渡せば動きます）。直すなら `Projects/UnityDemo/Assets/Models` へ
+- Middleware/、DistDemo/、Deck/、_recovered/ は動かしていません

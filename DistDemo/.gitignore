@@ -1,0 +1,21 @@
+# Unity が作るもの（作り直せる）
+/Library/
+/Temp/
+/Obj/
+/Build/
+/Builds/
+/Logs/
+/UserSettings/
+*.csproj
+*.sln
+*.user
+
+# ★音源はリポジトリに入れない（権利の確認できない素材を置かないため）
+*.wav
+*.wav.meta
+*.mp3
+*.mp3.meta
+*.ogg
+*.ogg.meta
+*.aiff
+*.aiff.meta

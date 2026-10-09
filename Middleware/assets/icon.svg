@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!--
+    AfHost のアイコン。参考図（月と山の夜景）に沿って起こしたもの。
+
+    ★小さい寸法で読めることを優先している。
+      Explorer と タスクバーが実際に使うのは 16 と 32 で、そこでは
+      星の粒も稜線の細かい起伏も潰れて消える。だから参考図より
+      **星を減らして大きく**し、**山を 3 層に整理**してある。
+      16px まで落として残るのは「丸い月」と「山の稜線」の 2 つだけ ── そこを立てる。
+  -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"    stop-color="#0b1b33"/>
+      <stop offset="0.55" stop-color="#12406b"/>
+      <stop offset="1"    stop-color="#1d6f96"/>
+    </linearGradient>
+
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0.55"/>
+      <stop offset="0.72" stop-color="#cfe6f5" stop-opacity="0.18"/>
+      <stop offset="1"    stop-color="#cfe6f5" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="moon" x1="0.2" y1="0.1" x2="0.85" y2="0.95">
+      <stop offset="0"   stop-color="#ffffff"/>
+      <stop offset="0.7" stop-color="#f4f7fa"/>
+      <stop offset="1"   stop-color="#dfe7ee"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" fill="url(#sky)"/>
+
+  <!-- 星。参考図より数を減らして粒を大きくしてある（小寸法で消えないように） -->
+  <g fill="#ffffff">
+    <circle cx="26"  cy="30"  r="2.6"/>
+    <circle cx="62"  cy="16"  r="1.9"/>
+    <circle cx="104" cy="38"  r="2.2"/>
+    <circle cx="212" cy="26"  r="2.6"/>
+    <circle cx="238" cy="62"  r="2.0"/>
+    <circle cx="18"  cy="86"  r="2.2"/>
+    <circle cx="46"  cy="132" r="2.4"/>
+    <circle cx="228" cy="118" r="2.4"/>
+    <circle cx="196" cy="150" r="2.0"/>
+    <circle cx="86"  cy="162" r="1.9"/>
+    <circle cx="150" cy="22"  r="1.7"/>
+    <circle cx="14"  cy="160" r="1.7"/>
+  </g>
+
+  <!-- 月のかさ -->
+  <circle cx="128" cy="96" r="76" fill="url(#glow)"/>
+
+  <!-- 月本体 -->
+  <circle cx="128" cy="96" r="46" fill="url(#moon)"/>
+
+  <!-- 火口。3 つだけ。16px では消えるが 32px 以上で「月らしさ」を出す -->
+  <g fill="#d8e2ea">
+    <circle cx="112" cy="80"  r="11"/>
+    <circle cx="146" cy="104" r="13"/>
+    <circle cx="120" cy="115" r="7"/>
+  </g>
+
+  <!-- 山。奥から手前へ 3 層。色差をはっきり付けて小寸法でも層が分かるようにする -->
+  <path d="M0 196 L44 166 L82 190 L118 158 L138 172 L176 142 L216 176 L256 154 L256 256 L0 256 Z"
+        fill="#123a5c"/>
+  <path d="M0 220 L38 196 L76 214 L120 184 L164 212 L204 190 L256 214 L256 256 L0 256 Z"
+        fill="#0d2942"/>
+  <path d="M0 240 L52 224 L104 238 L150 222 L200 236 L256 226 L256 256 L0 256 Z"
+        fill="#07121e"/>
+</svg>
