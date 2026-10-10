@@ -220,6 +220,11 @@ namespace AcousticFlow
         //   ★既定 6 dB は仮（耳で決めるまで）。エンジンの既定は 0 ＝ 物理どおり（演出の既定は載る側が持つ。先着の重みと同じ）。
         [Tooltip("影のこもり（dB）。遮られた直接の道（透過・回折）の高域だけを余分に落とす（4 kHz で −この値）。Play 中は − キーで回す")]
         [Range(0f, 24f)] public float shadowMuffleDb = 6f;
+        // 影のこもりが一番深くなる周波数（2026-10-10、Hz）。125 Hz を 0 にして、ここで −shadowMuffleDb に届き、それより上はその深さのまま。
+        //   既定 4000 ＝ 今までと同じ。高域の少ない音（試験のフリー音源は 2 kHz より上が 0.4%）は 1000 などに下げると中域からこもる。
+        //   Play 中は = キーで 4000 → 2000 → 1000 → 500 Hz を回す。★Unreal の AAcousticFlowWorld::ShadowMuffleFullHz と同じ値にそろえる。
+        [Tooltip("影のこもりが一番深くなる周波数（Hz）。下げると中域からこもる。Play 中は = キーで回す")]
+        [Range(250f, 4000f)] public float shadowMuffleFullHz = 4000f;
 
         [Header("速度の表（秒。0 = 毎フレーム）")]
         public float levelSec = 0f;
@@ -498,10 +503,18 @@ namespace AcousticFlow
             return Mathf.Pow(10f, next / 10f);
         }
 
-        /// 影のこもり（dB）を 3 dB ずつ上げる（0 → 3 → 6 → 9 → 12 → 0）。Unreal の − キーと同じ回し方。
+        /// 影のこもり（dB）を上げる（0 → 3 → 6 → 9 → 12 → 18 → 24 → 0）。Unreal の − キーと同じ回し方（2026-10-10 に 24 まで）。
         private static float NextShadowDb(float db)
         {
-            return (db >= 11.5f) ? 0f : Mathf.Round(db / 3f) * 3f + 3f;
+            float[] steps = { 0f, 3f, 6f, 9f, 12f, 18f, 24f };
+            foreach (float s in steps) if (s > db + 0.5f) return s;
+            return 0f;
+        }
+
+        /// 影のこもりが一番深くなる周波数を半分ずつ下げる（4000 → 2000 → 1000 → 500 → 4000 Hz）。Unreal の = キーと同じ回し方。
+        private static float NextShadowFullHz(float hz)
+        {
+            return (hz <= 750f) ? 4000f : Mathf.Round(hz / 2f);
         }
 
         /// 毎フレームの本体。押す順に意味がある。
@@ -532,11 +545,14 @@ namespace AcousticFlow
             if (Input.GetKeyDown(KeyCode.Alpha9)) { weightLate = NextStepDb(weightLate); Debug.Log($"[AcousticWorld] 響き（後期）の重み {weightLate:F3}（{10f * Mathf.Log10(Mathf.Max(weightLate, 1e-6f)):+0;-0;0} dB）"); }
             if (Input.GetKeyDown(KeyCode.Alpha0)) { weightLateAdjacent = NextStepDb(weightLateAdjacent); Debug.Log($"[AcousticWorld] 隣の部屋の響きの重み {weightLateAdjacent:F3}（{10f * Mathf.Log10(Mathf.Max(weightLateAdjacent, 1e-6f)):+0;-0;0} dB）"); }
             // − キー: 影のこもりを 0 → 3 → 6 → 9 → 12 dB → 0 と回す（Unreal と同じ）
-            if (Input.GetKeyDown(KeyCode.Minus)) { shadowMuffleDb = NextShadowDb(shadowMuffleDb); Debug.Log($"[AcousticWorld] 影のこもり {shadowMuffleDb:0} dB（4 kHz で）"); }
+            if (Input.GetKeyDown(KeyCode.Minus)) { shadowMuffleDb = NextShadowDb(shadowMuffleDb); Debug.Log($"[AcousticWorld] 影のこもり {shadowMuffleDb:0} dB（{shadowMuffleFullHz:0} Hz から上で）"); }
+            // = キー: 影のこもりが一番深くなる周波数を 4000 → 2000 → 1000 → 500 Hz と回す（Unreal と同じ）
+            if (Input.GetKeyDown(KeyCode.Equals)) { shadowMuffleFullHz = NextShadowFullHz(shadowMuffleFullHz); Debug.Log($"[AcousticWorld] 影のこもりが一番深くなる周波数 {shadowMuffleFullHz:0} Hz（{shadowMuffleDb:0} dB）"); }
             _w5[0] = weightDirect; _w5[1] = weightEarly; _w5[2] = weightLate; _w5[3] = weightDiffract; _w5[4] = weightTransmit;
             NativeWorld.AF_WorldSetWeights(_world, _w5);
             try { NativeWorld.AF_WorldSetAdjacentLateWeight(_world, weightLateAdjacent); } catch (EntryPointNotFoundException) { }   // 古い DLL では無い
             try { NativeWorld.AF_WorldSetShadowMuffle(_world, shadowMuffleDb); } catch (EntryPointNotFoundException) { }            // 同上（2026-10-06 から）
+            try { NativeWorld.AF_WorldSetShadowMuffleFullHz(_world, shadowMuffleFullHz); } catch (EntryPointNotFoundException) { }  // 同上（2026-10-10 から）
             NativeWorld.AF_WorldSetResponse(_world, levelSec, colourSec, statSec, directionSec);
             NativeWorld.AF_WorldSetRays(_world, raysPerEmitter, maxBounces);
             NativeWorld.AF_WorldSetLeakModel(_world, leakModel);   // 実行中に切り替えられる（試聴の A/B）

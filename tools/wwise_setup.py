@@ -108,13 +108,17 @@ def main():
 
         # 5) プロジェクトの設定（バンクの作り方）。Unreal 版の Wwise が読むのに要る 10 個（統合の AkAssetMigrationHelper と同じ）。
         #    ★Unity 用は Launcher が入れてくれたが、Unreal 用は空だった（Unreal のエディタを開いたときに統合が自分で直す作り）。
-        #      エディタを開かずに進めるので、ここで入れる。Unity 用に入れても害は無い。
+        #      エディタを開かずに進めるので、ここで入れる。
+        #    ★MediaAutoBankSubFolders（バンクと素材を番号のサブフォルダに分ける）は Unreal 用だけ。2026-10-10 まで Unity 用にも入れていて、
+        #      バンクが Event/33/Play_AF_Test.bnk に出て、Unity の統合（既定はサブフォルダを使わない）が見つけられず無音になっていた
+        #      （Unity のログ: Bank Play_AF_Test failed to load (AK_FileNotFound)）。Unity 用は切る。
         proj = w.call("ak.wwise.core.object.get", {"waql": "$ from type Project"}, {"return": ["id", "name"]})["return"][0]
         for prop in ["AutoSoundBankEnabled", "CopyLooseStreamedMedia", "GenerateMultipleBanks", "GenerateSoundBankJSON",
                      "MediaAutoBankSubFolders", "RemoveUnusedGeneratedFiles", "SoundBankGenerateEstimatedDuration",
                      "SoundBankGenerateMaxAttenuationInfo", "SoundBankGeneratePrintGUID", "SoundBankGeneratePrintPath"]:
+            value = not (prop == "MediaAutoBankSubFolders" and target == "unity")
             try:
-                w.call("ak.wwise.core.object.setProperty", {"object": proj["id"], "property": prop, "value": True})
+                w.call("ak.wwise.core.object.setProperty", {"object": proj["id"], "property": prop, "value": value})
             except RuntimeError as e:
                 print("  （設定できなかった）", prop, str(e)[:160])
         print("プロジェクトの設定: 自動バンク・JSON など 10 個を入")

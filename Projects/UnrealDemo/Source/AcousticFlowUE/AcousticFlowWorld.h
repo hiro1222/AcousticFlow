@@ -75,6 +75,10 @@ public:
 	///   直接・初期・響きには効かない。Play 中は − キーで 0/3/6/9/12 dB を回す。★Unity の AcousticWorld.shadowMuffleDb と同じ値にそろえる。
 	///   ★既定 6 dB は仮（耳で決めるまで）。エンジンの既定は 0 ＝ 物理どおり。
 	UPROPERTY(EditAnywhere, Category = "AcousticFlow|Weights", meta = (ClampMin = "0", ClampMax = "24")) float ShadowMuffleDb = 6.0f;
+	/// 影のこもりが一番深くなる周波数（2026-10-10、Hz、250..4000）。125 Hz を 0 にして、ここで −ShadowMuffleDb に届き、それより上はその深さのまま。
+	///   既定 4000 ＝ 今までと同じ（4 kHz で −S）。高域の少ない音（試験のフリー音源は 2 kHz より上が 0.4%）は 1000 などに下げると中域からこもる。
+	///   Play 中は = キーで 4000 → 2000 → 1000 → 500 Hz を回す。★Unity の AcousticWorld.shadowMuffleFullHz と同じ値にそろえる。
+	UPROPERTY(EditAnywhere, Category = "AcousticFlow|Weights", meta = (ClampMin = "250", ClampMax = "4000")) float ShadowMuffleFullHz = 4000.0f;
 
 	/// 耳をキャラクターの頭に置く（三人称の地図）。切ればカメラ（一人称の地図）。向きはどちらもカメラ。
 	UPROPERTY(EditAnywhere, Category = "AcousticFlow") bool bListenerAtPawn = false;

@@ -82,11 +82,27 @@ struct WorldWeights {
     ///   ★見通しの割合で連続に効く: 透過も回折も量が (1 − 見通し) に比例するので、影から出れば掛かる量ごと 0 へ下りる（二値の切り替えなし）。
     ///   演出の摘み（先着の重みと同じ形）: エンジンの既定は 0（物理どおり）、聞かせたい値は載る側が持つ。
     float shadowMuffleDb = 0.0f;
+    /// 影のこもりが一番深くなる周波数（2026-10-10、Hz、250..4000、既定 4000）。発注者「扉の開閉によるこもりがわかりにくい、調整できるように」。
+    ///   125 Hz を 0 にして、この周波数で −shadowMuffleDb に届き、それより上はその深さのまま（間はオクターブに比例）。
+    ///   既定 4000 ＝ 今までと 1 ビットも同じ（4 kHz で −S）。高域の少ない素材（試験のフリー音源は 2 kHz より上が 0.4%）だと
+    ///   4 kHz で深くしても聞こえないので、1000 Hz などに下げると中域からこもる。
+    float shadowMuffleFullHz = 4000.0f;
     /// 影のこもりを帯域ごとの係数（エネルギー比）にする。S = 0 なら厳密に 1（今までと 1 ビットも同じ）。
     void shadowMuffle6(float g6[kNumBands]) const {
         const float s = std::fmin(24.0f, std::fmax(0.0f, shadowMuffleDb));
-        for (int b = 0; b < kNumBands; ++b)
-            g6[b] = (s > 0.0f) ? std::pow(10.0f, -0.1f * s * static_cast<float>(b) / static_cast<float>(kNumBands - 1)) : 1.0f;
+        const float full = std::isfinite(shadowMuffleFullHz) ? std::fmin(4000.0f, std::fmax(250.0f, shadowMuffleFullHz)) : 4000.0f;
+        if (full >= 4000.0f) {
+            //既定: 今までと同じ式（帯域 b で −S·b/5）
+            for (int b = 0; b < kNumBands; ++b)
+                g6[b] = (s > 0.0f) ? std::pow(10.0f, -0.1f * s * static_cast<float>(b) / static_cast<float>(kNumBands - 1)) : 1.0f;
+            return;
+        }
+        //125 Hz から full までのオクターブ数で割って、そこから上は一番深いまま
+        const float span = std::log2(full / kBandHz[0]);
+        for (int b = 0; b < kNumBands; ++b) {
+            const float frac = std::fmin(1.0f, static_cast<float>(b) / span);
+            g6[b] = (s > 0.0f) ? std::pow(10.0f, -0.1f * s * frac) : 1.0f;
+        }
     }
     bool isIdentity() const {
         for (int i = 0; i < kNumComponents; ++i) if (std::fabs(w[i] - 1.0f) > 1e-6f) return false;

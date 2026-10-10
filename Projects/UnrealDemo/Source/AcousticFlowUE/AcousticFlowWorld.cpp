@@ -160,6 +160,7 @@ void AAcousticFlowWorld::PushKnobs()
 	AF_WorldSetWeights(World, W5);
 	AF_WorldSetAdjacentLateWeight(World, WeightLateAdjacent);   // 隣の部屋の響き（Unity の weightLateAdjacent と同じ）
 	AF_WorldSetShadowMuffle(World, ShadowMuffleDb);             // 影のこもり（Unity の shadowMuffleDb と同じ）
+	AF_WorldSetShadowMuffleFullHz(World, ShadowMuffleFullHz);   // 影のこもりが一番深くなる周波数（Unity の shadowMuffleFullHz と同じ）
 	AF_WorldSetResponse(World, 0.0f, 0.04f, 0.05f, 0.06f);
 	AF_WorldSetRays(World, RaysPerEmitter, 40);
 	AF_WorldSetLeakModel(World, 1);
@@ -265,11 +266,20 @@ void AAcousticFlowWorld::Tick(float Dt)
 			WeightLateAdjacent = FMath::Pow(10.0f, Next / 10.0f);
 			UE_LOG(LogTemp, Log, TEXT("[AcousticFlow] 隣の部屋の響きの重み %.3f（%+.0f dB）"), WeightLateAdjacent, Next);
 		}
-		// − キー: 影のこもりを 0 → 3 → 6 → 9 → 12 dB → 0（Unity の AcousticWorld.NextShadowDb と同じ回し方）
+		// − キー: 影のこもりを 0 → 3 → 6 → 9 → 12 → 18 → 24 dB → 0（Unity の AcousticWorld.NextShadowDb と同じ回し方。2026-10-10 に 24 まで）
 		if (PC8->WasInputKeyJustPressed(EKeys::Hyphen))
 		{
-			ShadowMuffleDb = (ShadowMuffleDb >= 11.5f) ? 0.0f : FMath::RoundToFloat(ShadowMuffleDb / 3.0f) * 3.0f + 3.0f;
-			UE_LOG(LogTemp, Log, TEXT("[AcousticFlow] 影のこもり %.0f dB（4 kHz で）"), ShadowMuffleDb);
+			static const float Steps[] = { 0.0f, 3.0f, 6.0f, 9.0f, 12.0f, 18.0f, 24.0f };
+			float Next = 0.0f;
+			for (float S : Steps) if (S > ShadowMuffleDb + 0.5f) { Next = S; break; }
+			ShadowMuffleDb = Next;
+			UE_LOG(LogTemp, Log, TEXT("[AcousticFlow] 影のこもり %.0f dB（%.0f Hz から上で）"), ShadowMuffleDb, ShadowMuffleFullHz);
+		}
+		// = キー: 影のこもりが一番深くなる周波数を 4000 → 2000 → 1000 → 500 Hz → 4000（Unity の AcousticWorld.NextShadowFullHz と同じ）
+		if (PC8->WasInputKeyJustPressed(EKeys::Equals))
+		{
+			ShadowMuffleFullHz = (ShadowMuffleFullHz <= 750.0f) ? 4000.0f : FMath::RoundToFloat(ShadowMuffleFullHz / 2.0f);
+			UE_LOG(LogTemp, Log, TEXT("[AcousticFlow] 影のこもりが一番深くなる周波数 %.0f Hz（%.0f dB）"), ShadowMuffleFullHz, ShadowMuffleDb);
 		}
 	}
 	if (bShowAreasInGame) { EnsureLabelDraw(); DrawAreas(World); }
@@ -325,8 +335,8 @@ void AAcousticFlowWorld::Tick(float Dt)
 		auto ToDb = [](float R) { return 20.0f * FMath::LogX(10.0f, FMath::Max(R, 1e-6f)); };
 		//   ★実体は 1 つのはず。2 つ以上なら、バスに AF_Renderer が 2 段挿さっている（直列で 2 段目が 1 段目の音を消す）か、
 		//     聞き手・出力が複数。09-30 は前者だった（tools/wwise_setup.py が枠を付け足していた）。
-		const FString Line3 = FString::Printf(TEXT("LATE (reverb) %+.0f dB (9) | ADJACENT ROOM LATE %+.0f dB (0) | SHADOW MUFFLE %.0f dB (-) | plugin instances %d%s | in %.1f dBFS | wwise gain %.3f | out %.1f dBFS | wwise listener: %s (7)"),
-			10.0f * FMath::LogX(10.0f, FMath::Max(WeightLate, 1e-6f)), 10.0f * FMath::LogX(10.0f, FMath::Max(WeightLateAdjacent, 1e-6f)), ShadowMuffleDb,
+		const FString Line3 = FString::Printf(TEXT("LATE (reverb) %+.0f dB (9) | ADJACENT ROOM LATE %+.0f dB (0) | SHADOW MUFFLE %.0f dB (-) @ %.0f Hz (=) | plugin instances %d%s | in %.1f dBFS | wwise gain %.3f | out %.1f dBFS | wwise listener: %s (7)"),
+			10.0f * FMath::LogX(10.0f, FMath::Max(WeightLate, 1e-6f)), 10.0f * FMath::LogX(10.0f, FMath::Max(WeightLateAdjacent, 1e-6f)), ShadowMuffleDb, ShadowMuffleFullHz,
 			Inst, Inst > 1 ? TEXT(" (!! expected 1: check the AcousticFlow bus has ONE AF_Renderer)") : TEXT(""),
 			ToDb(InRms), Gain, ToDb(OutRms), bListenerCameraOnly ? TEXT("camera only") : TEXT("default (all)"));
 		GEngine->AddOnScreenDebugMessage(0x4148, 0.6f, FColor::Yellow, Line3);

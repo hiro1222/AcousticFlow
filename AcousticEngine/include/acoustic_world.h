@@ -105,6 +105,10 @@ ACOUSTIC_API float AF_WorldAdjacentLateWeight(AF_WorldHandle w);
  *   帳簿（AF_WorldMixInfo の component6）は物理のまま、出口だけ。実行中に動かしてよい。 */
 ACOUSTIC_API void  AF_WorldSetShadowMuffle(AF_WorldHandle w, float db);
 ACOUSTIC_API float AF_WorldShadowMuffle(AF_WorldHandle w);
+/* 影のこもりが一番深くなる周波数（2026-10-10、Hz、250..4000、既定 4000 ＝ 今までと同じ）。125 Hz を 0 にして、ここで −dB に届き、
+ *   それより上はその深さのまま。1000 Hz などに下げると中域からこもる（高域の少ない素材向け）。実行中に動かしてよい。 */
+ACOUSTIC_API void  AF_WorldSetShadowMuffleFullHz(AF_WorldHandle w, float hz);
+ACOUSTIC_API float AF_WorldShadowMuffleFullHz(AF_WorldHandle w);
 ACOUSTIC_API void AF_WorldSetResponse(AF_WorldHandle w, float levelSec, float colourSec, float statSec, float directionSec);
 ACOUSTIC_API void AF_WorldSetHeadCm(AF_WorldHandle w, float headCircumferenceCm);
 /* 閉じた扉から漏れる回折の扱い。**既定 1（案A）**。

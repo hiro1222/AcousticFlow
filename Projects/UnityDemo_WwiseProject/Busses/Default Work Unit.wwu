@@ -20,11 +20,11 @@
 							</PropertyList>
 							<ObjectLists>
 								<ObjectList Name="Effects">
-									<EffectSlot Name="" ID="{35038B0F-A2D0-4A2A-899B-C17D880C9873}" ShortID="671206179">
+									<EffectSlot Name="" ID="{7A7464CC-F6BF-4AFC-AA0E-B04C0F12D6CE}" ShortID="282150303">
 										<ReferenceList>
 											<Reference Name="Effect">
 												<Custom>
-													<Effect Name="AF_Renderer" ID="{62AE908D-536F-4710-B989-D97B54C6C00F}" ShortID="748049291" PluginName="AcousticFlow" CompanyID="64" PluginID="20311" PluginType="3"/>
+													<Effect Name="AF_Renderer" ID="{FD5A7472-B638-499E-A12C-24321175A37A}" ShortID="465331862" PluginName="AcousticFlow" CompanyID="64" PluginID="20311" PluginType="3"/>
 												</Custom>
 											</Reference>
 										</ReferenceList>

@@ -4677,13 +4677,14 @@ void testShadowMuffle() {
     AcousticMaterial wall = AcousticMaterial::defaultWall();
     for (int b = 0; b < kNumBands; ++b) { wall.absorption[b] = 0.2f; wall.transmission[b] = 0.001f; wall.scattering[b] = 0.5f; }
     struct Out { Mix other, same; };
-    auto run = [&](float db, bool touch) {
+    auto run = [&](float db, bool touch, float fullHz = -1.0f) {
         World w;
         const int m2 = w.rules.materials.add(wall), lm = w.rules.materials.add(AcousticMaterial::woodDoor());
         for (const rooms::SolidBox& sb : twoRoomsWithDoor(wall)) w.addBox(sb.obb, m2, false);
         w.addBox(doorLeaf(10.0f), lm, true);
         w.adjacentContain = 1.0f; w.precedenceDb = 6.0f; w.precedenceSec = 0.04f;   // Unity / Unreal の既定と同じ
         if (touch) w.rules.weights.shadowMuffleDb = db;
+        if (fullHz > 0.0f) w.rules.weights.shadowMuffleFullHz = fullHz;
         w.setListener(Vec3(0, 1.6f, -2.5f), Vec3(0, 0, 1), Vec3(0, 1, 0));
         const int eo = w.addEmitter(Vec3(0.0f, 1.6f, 3.0f), 0.2f);    // 向こうの部屋（板の影）
         const int es = w.addEmitter(Vec3(1.5f, 1.6f, -1.0f), 0.2f);   // 耳と同じ部屋（見えている）
@@ -4730,6 +4731,29 @@ void testShadowMuffle() {
           othersSame && sendsSame && ledgerSame, "(影の音源のタップ・送り・帳簿)");
     check("[影のこもり] 12 dB でも、耳と同じ部屋で見えている音源は 1 ビットも変わらない",
           bitSame(base.same, s12.same), "(見えている音源には透過・回折が無い)");
+
+    // 一番深くなる周波数（shadowMuffleFullHz、2026-10-10）: 4000 Hz は今までと同じ、1000 Hz なら 1 kHz から上が −12 dB
+    const Out f4k = run(12.0f, true, 4000.0f), f1k = run(12.0f, true, 1000.0f);
+    check("[影のこもり] 一番深くなる周波数 4000 Hz（既定）は、渡さないときと 1 ビットも同じ",
+          bitSame(s12.other, f4k.other) && bitSame(s12.same, f4k.same), "(タップ・送り・帳簿をすべて比べた)");
+    double worst1k = 0.0; double g500 = -1.0, g1k = -1.0, g4k = -1.0; bool order1k = base.other.tapCount == f1k.other.tapCount; int seen = 0;
+    for (int i = 0; order1k && i < base.other.tapCount; ++i) {
+        const MixTap& a = base.other.taps[i]; const MixTap& c = f1k.other.taps[i];
+        if (!(a.kind == TapKind::Transmit || a.kind == TapKind::Diffract)) continue;
+        for (int q = 0; q < kNumBands; ++q) {
+            if (!(a.e6[q] > 0.0f)) continue;
+            const double want = std::pow(10.0, -1.2 * std::min(1.0, q / 3.0)), got = static_cast<double>(c.e6[q]) / a.e6[q];
+            worst1k = std::max(worst1k, std::fabs(got / want - 1.0));
+            ++seen;
+            if (a.kind == TapKind::Transmit && q == 2) g500 = got;
+            if (a.kind == TapKind::Transmit && q == 3) g1k = got;
+            if (a.kind == TapKind::Transmit && q == 5) g4k = got;
+        }
+    }
+    std::snprintf(buf, sizeof(buf), "(透過 500 Hz %+.2f dB・1 kHz %+.2f dB・4 kHz %+.2f dB、狙いからのずれ最大 %.1e)",
+                  10.0 * std::log10(std::max(g500, 1e-30)), 10.0 * std::log10(std::max(g1k, 1e-30)), 10.0 * std::log10(std::max(g4k, 1e-30)), worst1k);
+    check("[影のこもり] 一番深くなる周波数 1000 Hz・12 dB で、500 Hz は −8 dB、1 kHz から上は −12 dB（中域からこもる）",
+          order1k && seen > 0 && worst1k < 1e-5, buf);
 }
 
 /// 【探り】扉の開き角 × 音源の方向の地図（AF_ONLY=doormap）── 最終資料用

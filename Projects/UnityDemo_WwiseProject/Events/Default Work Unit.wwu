@@ -3,9 +3,9 @@
 	<Events>
 		<WorkUnit Name="Default Work Unit" ID="{F771A24A-61A6-4F7A-A65B-1A48093DC658}" PersistMode="Standalone">
 			<ChildrenList>
-				<Event Name="Play_AF_Test" ID="{1FE638E9-05F3-4B38-8828-830E30B5A756}">
+				<Event Name="Play_AF_Test" ID="{5DBD31CC-73EC-4EFF-9F97-E4B44273FC0C}">
 					<ChildrenList>
-						<Action Name="" ID="{964DDC2B-8E57-4269-98C1-E53FC6523BCD}" ShortID="776155032">
+						<Action Name="" ID="{AE0DAF94-07DF-43BA-9941-4817BF2918DA}" ShortID="784273044">
 							<ReferenceList>
 								<Reference Name="Target">
 									<ObjectRef Name="AF_TestTone" ID="{2F108005-87B3-493F-A1A8-C98F98D6860A}" WorkUnitID="{5F8A78C3-2D18-4B24-9B31-4DC4686B9506}"/>

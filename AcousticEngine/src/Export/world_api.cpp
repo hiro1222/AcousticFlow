@@ -295,6 +295,12 @@ void AF_WorldSetShadowMuffle(AF_WorldHandle w, float db) {
 float AF_WorldShadowMuffle(AF_WorldHandle w) {
     acoustic::flow::World* W = asWorld(w); return W ? W->rules.weights.shadowMuffleDb : 0.0f;
 }
+void AF_WorldSetShadowMuffleFullHz(AF_WorldHandle w, float hz) {
+    if (acoustic::flow::World* W = asWorld(w)) W->rules.weights.shadowMuffleFullHz = std::isfinite(hz) ? (hz < 250.0f ? 250.0f : (hz > 4000.0f ? 4000.0f : hz)) : 4000.0f;
+}
+float AF_WorldShadowMuffleFullHz(AF_WorldHandle w) {
+    acoustic::flow::World* W = asWorld(w); return W ? W->rules.weights.shadowMuffleFullHz : 4000.0f;
+}
 void AF_WorldSetResponse(AF_WorldHandle w, float level, float colour, float stat, float dir) {
     acoustic::flow::World* W = asWorld(w); if (!W) return;
     W->response.levelSec = level; W->response.colourSec = colour; W->response.statSec = stat; W->response.directionSec = dir;

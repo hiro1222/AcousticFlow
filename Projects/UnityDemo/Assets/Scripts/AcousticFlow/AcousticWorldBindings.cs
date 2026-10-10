@@ -173,6 +173,7 @@ namespace AcousticFlow
         // 隣の部屋の響き（2026-10-01）。別の部屋の音源の後期だけに、後期の重みへさらに掛ける（エネルギー比、既定 1）
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetAdjacentLateWeight(IntPtr w, float weight);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetShadowMuffle(IntPtr w, float db);
+        [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetShadowMuffleFullHz(IntPtr w, float hz);
         // 部屋の割り方（2026-10-04）。部屋を口で割る半径(m、既定 0.6)と、外への口（既定 0）。どちらも AF_WorldBuild の前に
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetRoomSeedRadius(IntPtr w, float meters);
         [DllImport(Dll, CallingConvention = Cc)] public static extern void AF_WorldSetOutsideMouth(IntPtr w, int on);

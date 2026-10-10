@@ -46,9 +46,16 @@
 								<MediaID ID="858526041"/>
 							</MediaIDList>
 						</AudioFileSource>
+						<AudioFileSource Name="FreeTestSound" ID="{316D4D7F-AA0D-43C7-A737-B7A5240CFF99}">
+							<Language>SFX</Language>
+							<AudioFile>FreeTestSound.wav</AudioFile>
+							<MediaIDList>
+								<MediaID ID="858526041"/>
+							</MediaIDList>
+						</AudioFileSource>
 					</ChildrenList>
 					<ActiveSourceList>
-						<ActiveSource Name="FreeTestSound" ID="{CCB5BAC4-2A89-45D4-AF20-BFA5526EB904}" Platform="Linked"/>
+						<ActiveSource Name="FreeTestSound" ID="{316D4D7F-AA0D-43C7-A737-B7A5240CFF99}" Platform="Linked"/>
 					</ActiveSourceList>
 				</Sound>
 			</ChildrenList>
